@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import type {
   ApprovalDecision,
+  DiscoveredCliSession,
   HarnessCapabilities,
   HarnessInfo,
   HarnessKind,
@@ -11,6 +12,8 @@ import type {
   ToolKind,
 } from '@harnessmate/protocol';
 import { buildPromptWithFileAttachments } from './codex-adapter.js';
+import { runAgyCommand } from './agy-commands.js';
+import { agyDataDirectory, readAgyIndexedHistory, type HistoryMessage } from './history-scanner.js';
 import { StdioJsonRpcClient, type JsonRpcServerRequest } from './jsonrpc.js';
 import { execCliQuick, resolveBinary, spawnCliProcess } from './process.js';
 import type {
@@ -234,6 +237,8 @@ export class AcpAdapter implements HarnessAdapter {
     }
 
     const launchArgs = [...this.args];
+    const dataDirectory = agyDataDirectory(config.nativeHistorySource);
+    if (this.kind === 'agy' && dataDirectory) launchArgs.push('--app-data-dir', dataDirectory);
     if (
       this.kind === 'agy' &&
       config.permissionMode === 'auto' &&
@@ -243,9 +248,69 @@ export class AcpAdapter implements HarnessAdapter {
     }
 
     const child = spawnCliProcess(binaryPath, launchArgs, { cwd: config.cwd, env: this.env });
-    const handle = new AcpSessionHandle(child, config);
-    await handle.initialize();
-    return handle;
+    const handle = new AcpSessionHandle(child, config, this.kind === 'agy' ? binaryPath : undefined);
+    try {
+      await handle.initialize();
+      return handle;
+    } catch (err) {
+      await handle.dispose();
+      throw err;
+    }
+  }
+
+  async readHistory(session: DiscoveredCliSession, cwd: string): Promise<HistoryMessage[]> {
+    const binary = await resolveBinary(this.command, this.binaryOverride);
+    if (!binary) {
+      const indexed = readAgyIndexedHistory(session);
+      if (indexed.length) return indexed;
+      throw new Error(`ACP CLI binary "${this.command}" not found.`);
+    }
+    const args = [...this.args];
+    const dataDirectory = agyDataDirectory(session.source);
+    if (dataDirectory) args.push('--app-data-dir', dataDirectory);
+    const messages: HistoryMessage[] = [];
+    let separated = false;
+    const rpc = new StdioJsonRpcClient(spawnCliProcess(binary, args, { cwd, env: this.env }), {
+      onNotification(method, params) {
+        if (method !== 'session/update') return;
+        const { sessionId, update } = params as {
+          sessionId?: string;
+          update?: { sessionUpdate?: string; content?: { type?: string; text?: string } };
+        };
+        if (sessionId !== session.nativeSessionId || !update) return;
+        if (update.sessionUpdate === 'tool_call') {
+          separated = true;
+          return;
+        }
+        if (update.content?.type !== 'text') return;
+        const role = update.sessionUpdate === 'user_message_chunk' ? 'user'
+          : update.sessionUpdate === 'agent_message_chunk' ? 'assistant' : undefined;
+        const text = update.content.text;
+        if (!role || !text) return;
+        const last = messages.at(-1);
+        if (last?.role === role && !separated) last.text += text;
+        else messages.push({ role, text });
+        separated = false;
+      },
+      onServerRequest: ({ id }) => rpc.respondError(id, -32601, 'History replay only'),
+      onDiagnostic: () => {},
+      onExit: () => {},
+    });
+    try {
+      await rpc.request('initialize', { protocolVersion: 1, clientCapabilities: {} }, 15_000);
+      await rpc.request('session/load', { sessionId: session.nativeSessionId, cwd, mcpServers: [] }, 45_000);
+      if (messages.some((message) => message.role === 'user') && messages.some((message) => message.role === 'assistant')) {
+        return messages;
+      }
+      const indexed = readAgyIndexedHistory(session);
+      return indexed.length > messages.length ? indexed : messages;
+    } catch (err) {
+      const indexed = readAgyIndexedHistory(session);
+      if (indexed.length) return indexed;
+      throw err;
+    } finally {
+      await rpc.dispose();
+    }
   }
 }
 
@@ -333,6 +398,9 @@ class AcpSessionHandle implements AdapterSessionHandle {
   private currentTurnId: string | null = null;
   private assistantAccum = '';
   private thinkingAccum = '';
+  private nativeCommandAbort?: AbortController;
+  private nativeCommandTask?: Promise<void>;
+  private hasAcpTurn = false;
 
   // Authoritative server-side model/config state tracked from session/new + set_config_option
   private configOptions: AcpConfigOption[] = [];
@@ -345,6 +413,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
   constructor(
     child: ReturnType<typeof spawnCliProcess>,
     private readonly config: AdapterSessionConfig,
+    private readonly agyBinary?: string,
   ) {
     this.rpc = new StdioJsonRpcClient(child, {
       onNotification: (method, params) => this.handleNotification(method, params),
@@ -352,7 +421,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
       onDiagnostic: (stream, message) =>
         this.emit({ type: 'diagnostic.log', level: 'info', stream, message }),
       onExit: (code, signal) => {
-        if (this.currentTurnId) {
+        if (this.currentTurnId && !this.nativeCommandAbort) {
           this.emit({
             type: 'turn.failed',
             turnId: this.currentTurnId,
@@ -434,17 +503,19 @@ class AcpSessionHandle implements AdapterSessionHandle {
     let sessRes: AcpSessionNewResult | undefined;
     if (this.config.nativeSessionId) {
       try {
-        sessRes = (await this.rpc.request(
-          'session/load',
-          {
+        const params = {
             sessionId: this.config.nativeSessionId,
             cwd: this.config.cwd,
             mcpServers: [],
-          },
-          25_000,
-        )) as AcpSessionNewResult;
+        };
+        const supportsResume = (initRes.agentCapabilities as {
+          sessionCapabilities?: { resume?: unknown };
+        } | undefined)?.sessionCapabilities?.resume;
+        sessRes = await this.rpc.request<AcpSessionNewResult>(
+          supportsResume ? 'session/resume' : 'session/load', params, 25_000);
         this._nativeSessionId = this.config.nativeSessionId;
-      } catch {
+      } catch (err) {
+        if (this.config.requireNativeResume) throw err;
         sessRes = await createFreshAcpSession();
         this._nativeSessionId = sessRes?.sessionId ?? null;
       }
@@ -607,8 +678,9 @@ class AcpSessionHandle implements AdapterSessionHandle {
             { sessionId: this._nativeSessionId, modeId: acpMode },
             4000,
           );
-        } catch {
-          // ignore if mode switching unsupported by custom ACP server
+        } catch (err) {
+          if (this.agyBinary && patch.permissionMode === 'plan') throw err;
+          // Older custom ACP servers can omit mode switching.
         }
       }
     }
@@ -650,6 +722,43 @@ class AcpSessionHandle implements AdapterSessionHandle {
   ): Promise<{ driverUsed?: import('@harnessmate/protocol').ContextInjectionDriver }> {
     if (!this._nativeSessionId) {
       throw new Error('ACP session is not initialized');
+    }
+    if (input.cliCommand && this.agyBinary) {
+      const binary = this.agyBinary;
+      const command = input.cliCommand;
+      const nativeId = this.config.nativeSessionId || this.hasAcpTurn ? this._nativeSessionId : null;
+      if (command === '/compact' && !nativeId) throw new Error('当前 AGY 会话还没有可以压缩的上下文');
+      const abort = new AbortController();
+      this.nativeCommandAbort = abort;
+      this.currentTurnId = input.turnId;
+      this.emit({ type: 'turn.started', turnId: input.turnId });
+      this.nativeCommandTask = runAgyCommand(binary, {
+        ...this.config,
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+        permissionMode: input.permissionMode ?? this.config.permissionMode,
+      }, command, nativeId, abort.signal).then((result) => {
+        if (this.currentTurnId !== input.turnId) return;
+        if (nativeId && result.conversation_id && result.conversation_id !== nativeId) {
+          throw new Error('AGY 命令返回了不同的原生会话');
+        }
+        if (result.conversation_id && result.conversation_id !== this._nativeSessionId) {
+          this._nativeSessionId = result.conversation_id;
+          this.emit({ type: 'native_session_ready', nativeSessionId: result.conversation_id });
+        }
+        if (result.response) this.emit({ type: 'message.assistant.completed', turnId: input.turnId, text: result.response });
+        this.currentTurnId = null;
+        this.emit({ type: 'turn.completed', turnId: input.turnId, stopReason: 'native_command' });
+      }).catch((err: Error) => {
+        if (this.currentTurnId !== input.turnId) return;
+        this.currentTurnId = null;
+        if (abort.signal.aborted) this.emit({ type: 'turn.cancelled', turnId: input.turnId });
+        else this.emit({ type: 'turn.failed', turnId: input.turnId, message: err.message });
+      }).finally(() => {
+        this.nativeCommandAbort = undefined;
+        this.nativeCommandTask = undefined;
+      });
+      return {};
     }
 
     // Ensure requested model/effort/mode is synced before sending turn
@@ -724,6 +833,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
         15 * 60_000,
       )
       .then((res) => {
+        this.hasAcpTurn = true;
         const turnId = this.currentTurnId;
         if (!turnId) return;
         this.currentTurnId = null;
@@ -753,6 +863,11 @@ class AcpSessionHandle implements AdapterSessionHandle {
   }
 
   async interrupt(): Promise<void> {
+    if (this.nativeCommandAbort) {
+      this.nativeCommandAbort.abort();
+      await this.nativeCommandTask;
+      return;
+    }
     if (!this._nativeSessionId) return;
     this.rpc.notify('session/cancel', { sessionId: this._nativeSessionId });
     if (this.currentTurnId) {
@@ -778,6 +893,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
   }
 
   async dispose(): Promise<void> {
+    this.nativeCommandAbort?.abort();
     this.pendingApprovals.clear();
     await this.rpc.dispose();
   }

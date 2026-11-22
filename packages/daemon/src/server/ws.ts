@@ -8,7 +8,7 @@ import {
 import { WebSocket, WebSocketServer } from 'ws';
 import type { DaemonEventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
-import type { RemoteAuthService } from './auth.js';
+import { isLocalBrowserRequest, type RemoteAuthService } from './auth.js';
 
 export interface WsGatewayDeps {
   desktopId: string;
@@ -43,6 +43,11 @@ export class WsGateway {
 
     if (!principal) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (principal.kind === 'local' && !isLocalBrowserRequest(request.headers)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -117,8 +122,7 @@ export class WsGateway {
           });
           sessionUnsubs.set(sessionId, unsub);
 
-          const missed = this.deps.sessionManager.getSessionEvents(sessionId, afterSeq);
-          for (const ev of missed) {
+          for (const ev of this.deps.sessionManager.iterateSessionEvents(sessionId, afterSeq)) {
             if (ev.seq > maxSentSeq) {
               maxSentSeq = ev.seq;
               this.send(ws, { op: 'event', event: ev });

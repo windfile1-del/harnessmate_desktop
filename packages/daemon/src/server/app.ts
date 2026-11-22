@@ -7,10 +7,13 @@ import {
   CreateWorkspaceRequestSchema,
   CustomAcpHarnessConfigSchema,
   FailoverRequestSchema,
+  GeneratePluginDraftRequestSchema,
+  ImportNativeSessionRequestSchema,
   InstallPluginRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
   ResolveApprovalRequestSchema,
+  RunHarnessCommandRequestSchema,
   SendTurnRequestSchema,
   SwitchHarnessRequestSchema,
   ToggleMcpServerRequestSchema,
@@ -40,6 +43,7 @@ import {
 } from '../core/attachment-service.js';
 import { DaemonEventBus } from '../core/event-bus.js';
 import { getGitStatusSummary } from '../core/git-service.js';
+import { HarnessCommandTools } from '../core/harness-commands.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
@@ -49,7 +53,8 @@ import { scanLocalCliSessions } from '../harnesses/history-scanner.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager } from '../plugins/plugin-manager.js';
-import { RemoteAuthService, isLoopbackAddress } from './auth.js';
+import { PluginAuthoring } from '../plugins/plugin-authoring.js';
+import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
 
 export interface CreateDaemonOptions {
@@ -92,16 +97,18 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     registry,
     () => config.disabledPlugins,
     (ids) => {
+      saveConfig(paths.configPath, { ...config, disabledPlugins: ids });
       config.disabledPlugins = ids;
-      saveConfig(paths.configPath, config);
     },
   );
+  const pluginAuthoring = new PluginAuthoring(registry);
   const attachmentService = new AttachmentService(paths.attachmentsDir);
   const mcpService = new McpService(registry, config.binaryOverrides);
   const usageService = new UsageService(store, registry, config.binaryOverrides);
 
   const eventBus = new DaemonEventBus();
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager);
+  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager,
+    new HarnessCommandTools(usageService, config.binaryOverrides));
   const auth = new RemoteAuthService(store, config.localToken);
   const wsGateway = new WsGateway({
     desktopId: config.desktopId,
@@ -137,6 +144,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (!principal) {
       return reply.code(401).send({ error: 'Unauthorized', code: 'AUTH_REQUIRED' });
     }
+    if (principal.kind === 'local' && !isLocalBrowserRequest(request.headers)) {
+      return reply.code(403).send({ error: 'Local API origin or host is not allowed' });
+    }
+    if (urlPath.startsWith('/api/v1/plugins/') && request.method !== 'GET'
+      && (principal.kind !== 'local' || !isLoopbackAddress(request.socket.remoteAddress))) {
+      return reply.code(403).send({ error: '插件管理仅在本机可用' });
+    }
     (request as unknown as { principal: typeof principal }).principal = principal;
   });
 
@@ -161,8 +175,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     setTimeout(() => {
       void (async () => {
         wsGateway.close();
+        pluginAuthoring.cancel();
         await sessionManager.shutdown();
         await app.close();
+        await pluginManager.close();
         store.close();
         process.exit(0);
       })();
@@ -182,6 +198,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid harness config' });
     }
     const existingIdx = config.customAcpHarnesses.findIndex((h) => h.id === parsed.data.id);
+    if (existingIdx < 0 && registry.get(parsed.data.id)) {
+      return reply.code(409).send({ error: 'Harness ID 已被内置或插件引擎使用' });
+    }
     if (existingIdx >= 0) {
       config.customAcpHarnesses[existingIdx] = parsed.data;
     } else {
@@ -206,8 +225,34 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { harnesses };
   });
 
-  app.get('/api/v1/harnesses/discovered-sessions', async () => {
-    return { sessions: scanLocalCliSessions(20) };
+  app.get('/api/v1/harnesses/discovered-sessions', async (request, reply) => {
+    const { limit: rawLimit } = request.query as { limit?: string };
+    const limit = Number(rawLimit ?? 20);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      return reply.code(400).send({ error: 'Invalid history list limit' });
+    }
+    const found = await scanLocalCliSessions(limit + 1);
+    const counts = new Map<string, number>();
+    const sessions = found.filter((item) => {
+      const source = item.source ?? item.harnessKind;
+      const count = (counts.get(source) ?? 0) + 1;
+      counts.set(source, count);
+      return count <= limit;
+    });
+    return { sessions, hasMore: limit < 1000 && found.length > sessions.length };
+  });
+
+  app.post('/api/v1/harnesses/import-session', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'Native history import is local only' });
+    }
+    const parsed = ImportNativeSessionRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid history import request' });
+    try {
+      return { session: await sessionManager.importNativeSession(parsed.data) };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // ── Modular Plugin Studio (/api/v1/plugins/*) ────────────────────────
@@ -222,17 +267,62 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
 
+  const updatedPlugins = async () => {
+    const harnesses = pluginManager.takeRegistryChanged() ? await registry.probeAll(false) : undefined;
+    return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
+  };
+
+  app.post('/api/v1/plugins/preview', async (request, reply) => {
+    const parsed = InstallPluginRequestSchema.safeParse(request.body);
+    if (!parsed.success || parsed.data.mode === 'catalog') return reply.code(400).send({ error: '插件清单或目录无效' });
+    try {
+      if (parsed.data.mode === 'local_dir') return pluginManager.inspectPackage(parsed.data.dirPath);
+      const { manifest } = parsed.data;
+      if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
+      pluginManager.validateManifest(manifest);
+      return { manifest, installedVersion: pluginManager.listInstalled().find(({ id }) => id === manifest.id)?.version };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/v1/plugins/generate', async (request, reply) => {
+    const parsed = GeneratePluginDraftRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '请输入需求并选择工作区与 Harness' });
+    const workspace = store.getWorkspace(parsed.data.workspaceId);
+    if (!workspace) return reply.code(404).send({ error: '工作区不存在' });
+    const abort = new AbortController();
+    const disconnect = () => abort.abort(new Error('插件生成请求已取消'));
+    reply.raw.once('close', disconnect);
+    try {
+      const manifest = await pluginAuthoring.generate(parsed.data, workspace.rootPath, abort.signal);
+      pluginManager.validateManifest(manifest);
+      return { manifest };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      reply.raw.off('close', disconnect);
+    }
+  });
+
+  app.post('/api/v1/plugins/:id/rollback', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      await pluginManager.rollbackPlugin(id);
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post('/api/v1/plugins/install', async (request, reply) => {
     const parsed = InstallPluginRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid plugin install payload' });
     }
     try {
-      const beforeCount = registry.listAdapters().length;
       await pluginManager.installPlugin(parsed.data);
-      const harnessesChanged = registry.listAdapters().length !== beforeCount;
-      const harnesses = harnessesChanged ? await registry.probeAll(false) : undefined;
-      return reply.code(201).send({ ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) });
+      return reply.code(201).send(await updatedPlugins());
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -245,30 +335,27 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: 'Invalid toggle payload' });
     }
     try {
-      const beforeCount = registry.listAdapters().length;
       await pluginManager.togglePlugin(id, parsed.data.enabled);
-      const harnessesChanged = registry.listAdapters().length !== beforeCount;
-      const harnesses = harnessesChanged ? await registry.probeAll(false) : undefined;
-      return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
+      return await updatedPlugins();
     } catch (err) {
       return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
-  app.post('/api/v1/plugins/reload', async () => {
-    await pluginManager.reloadAll();
-    const harnesses = await registry.probeAll(true);
-    return { ...buildPluginPayload(), harnesses };
+  app.post('/api/v1/plugins/reload', async (request, reply) => {
+    try {
+      await pluginManager.reloadAll();
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.delete('/api/v1/plugins/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
-      const beforeCount = registry.listAdapters().length;
       await pluginManager.uninstallPlugin(id);
-      const harnessesChanged = registry.listAdapters().length !== beforeCount;
-      const harnesses = harnessesChanged ? await registry.probeAll(false) : undefined;
-      return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
+      return await updatedPlugins();
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -408,9 +495,32 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const q = request.query as { afterSeq?: string };
-    const afterSeq = Math.max(0, Number(q.afterSeq ?? 0) || 0);
+    const parsedSeq = Number(q.afterSeq ?? 0);
+    if (!Number.isSafeInteger(parsedSeq) || parsedSeq < 0) return reply.code(400).send({ error: 'Invalid event cursor' });
+    const afterSeq = parsedSeq;
     const events = sessionManager.getSessionEvents(id, afterSeq);
     return { events, lastSeq: session.lastSeq };
+  });
+
+  app.get('/api/v1/sessions/:id/commands', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    return { commands: sessionManager.getHarnessCommands(session) };
+  });
+
+  app.post('/api/v1/sessions/:id/commands', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'Native CLI commands are local only' });
+    }
+    const { id } = request.params as { id: string };
+    const parsed = RunHarnessCommandRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid CLI command input' });
+    try {
+      return await sessionManager.runHarnessCommand(id, parsed.data);
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post('/api/v1/sessions/:id/turns', async (request, reply) => {
@@ -749,6 +859,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     paths,
     async start() {
       await pluginManager.reloadAll();
+      pluginManager.takeRegistryChanged();
       await app.listen({ port: config.port, host: boundHost });
       const addrObj = app.server.address();
       if (addrObj && typeof addrObj === 'object') {
@@ -758,8 +869,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     },
     async stop() {
       wsGateway.close();
+      pluginAuthoring.cancel();
       await sessionManager.shutdown();
       await app.close();
+      await pluginManager.close();
       store.close();
     },
   };

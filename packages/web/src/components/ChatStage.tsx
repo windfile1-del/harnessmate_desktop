@@ -1,11 +1,13 @@
 import type {
   ApprovalRequest,
   Attachment,
+  HarnessCommandInfo,
   PermissionMode,
   ReasoningEffort,
   Session,
   WorkspaceFileEntry,
 } from '@harnessmate/protocol';
+import { HarnessCommandNameSchema } from '@harnessmate/protocol';
 import {
   AlertTriangle,
   ArrowRightLeft,
@@ -89,6 +91,7 @@ export function ChatStage() {
     openModal,
     selectSession,
     sendTurn,
+    runHarnessCommand,
     switchHarness,
     failoverSession,
     interruptSession,
@@ -141,6 +144,8 @@ export function ChatStage() {
   const autoFailoverEnabled = isPluginEnabled('core.auto-failover');
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = isPluginEnabled('core.task-ledger');
+  const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
+  const commandCatalogKey = session ? `${session.id}:${session.harnessId}` : '';
 
   const inputText = session ? draftTextBySession[session.id] ?? '' : '';
   const attachments = session ? draftAttachmentsBySession[session.id] ?? [] : [];
@@ -151,19 +156,37 @@ export function ChatStage() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
+  const [commandCatalog, setCommandCatalog] = useState<{ key: string; commands: HarnessCommandInfo[] }>();
+  const [commandOutputs, setCommandOutputs] = useState<Record<string, { command: string; output: string }>>({});
 
   // @file mention popover
   const [filePickerOpen, setFilePickerOpen] = useState(false);
   const [filePickerQuery, setFilePickerQuery] = useState('');
   const [filePickerItems, setFilePickerItems] = useState<WorkspaceFileEntry[]>([]);
 
-  const scrollEndRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const followBottom = useRef(true);
+  const previousSessionId = useRef<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    scrollEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    if (previousSessionId.current !== selectedSessionId) {
+      followBottom.current = true;
+      previousSessionId.current = selectedSessionId;
+    }
+    const el = scrollRef.current;
+    if (el && followBottom.current) el.scrollTop = el.scrollHeight;
   }, [events.length, selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSessionId || !nativeCommandsEnabled) return;
+    let current = true;
+    void daemonApi.getHarnessCommands(selectedSessionId).then(({ commands }) => {
+      if (current) setCommandCatalog({ key: commandCatalogKey, commands });
+    }).catch(() => {});
+    return () => { current = false; };
+  }, [selectedSessionId, commandCatalogKey, nativeCommandsEnabled]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -184,14 +207,20 @@ export function ChatStage() {
     return () => window.clearTimeout(timer);
   }, [filePickerOpen, filePickerQuery, session]);
 
-  // Slash command autocomplete when input starts with "/"
+  const nativeCommands = nativeCommandsEnabled && commandCatalog?.key === commandCatalogKey
+    ? commandCatalog.commands : [];
+  // The active CLI catalog takes precedence over workflow shortcuts of the same name.
   const slashMatches = useMemo(() => {
     const trimmed = inputText.trimStart();
     if (!trimmed.startsWith('/') || trimmed.includes('\n')) return [];
     const firstToken = trimmed.slice(1).split(/\s/)[0]?.toLowerCase() ?? '';
     if (trimmed.includes(' ')) return [];
-    return slashCommands.filter((c) => c.command.toLowerCase().includes(firstToken));
-  }, [inputText, slashCommands]);
+    const native = nativeCommands.map((command) => ({
+      ...command, pluginId: 'core.harness-commands', pluginName: harness?.displayName ?? '原生命令',
+    }));
+    return [...native, ...slashCommands.filter((c) => !native.some((n) => n.command === c.command))]
+      .filter((c) => c.command.toLowerCase().includes(firstToken));
+  }, [inputText, nativeCommands, slashCommands, harness?.displayName]);
 
   if (!session) {
     return (
@@ -211,6 +240,13 @@ export function ChatStage() {
 
   const isRunning = session.status === 'running' || session.status === 'awaiting_approval';
   const attachmentsEnabled = isPluginEnabled('core.attachments');
+  const commandMatch = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(inputText.trim());
+  const typedCommand = commandMatch?.[1]?.toLowerCase();
+  const commandArgs = commandMatch?.[2]?.trim() ?? '';
+  const nativeCommandName = HarnessCommandNameSchema.safeParse(
+    typedCommand === 'quota' ? 'usage' : typedCommand === 'plugins' ? 'plugin' : typedCommand);
+  const isGoalControl = nativeCommandsEnabled && session.harnessKind === 'codex'
+    && typedCommand === 'goal' && ['', 'status', 'pause', 'clear'].includes(commandArgs);
 
   const selectedModelMeta = harness?.models.find((m) => m.id === session.model) ?? null;
   const availableEfforts: ReasoningEffort[] =
@@ -298,7 +334,31 @@ export function ChatStage() {
 
   const handleSend = async () => {
     const trimmed = inputText.trim();
-    if ((!trimmed && attachments.length === 0) || sending || isRunning) return;
+    if ((!trimmed && attachments.length === 0) || sending || (isRunning && !isGoalControl)) return;
+    const name = nativeCommandName;
+    const isWorkflow = slashCommands.some((command) => command.command === typedCommand);
+    if (nativeCommandsEnabled && name.success && (!isWorkflow || nativeCommands.some((command) => command.command === name.data))) {
+      if (attachments.length > 0) {
+        pushToast({ kind: 'warning', title: '请先移除附件再执行原生命令' });
+        return;
+      }
+      setSending(true);
+      try {
+        const response = await runHarnessCommand(session.id, {
+          command: name.data, args: commandArgs, harnessId: session.harnessId,
+        });
+        if (useAppStore.getState().draftTextBySession[session.id] === inputText) clearDraft(session.id);
+        setCommandOutputs((outputs) => ({ ...outputs,
+          [session.id]: { command: trimmed, output: response.output },
+        }));
+      } catch (err) {
+        pushToast({ kind: 'error', title: '原生命令执行失败', body: err instanceof Error ? err.message : String(err) });
+      } finally {
+        setSending(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
     setSending(true);
     const outgoingText = trimmed || '请结合附带的图片/文件进行分析。';
     const outgoingAtts = [...attachments];
@@ -564,7 +624,14 @@ export function ChatStage() {
         )}
 
         {/* Main Conversation Stream */}
-        <div className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6">
+        <div
+          ref={scrollRef}
+          onScroll={(event) => {
+            const el = event.currentTarget;
+            followBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 72;
+          }}
+          className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6"
+        >
           <div className="mx-auto max-w-[760px] space-y-7">
             {timeline.items.length === 0 ? (
               <SessionReadyPlaceholder
@@ -600,9 +667,25 @@ export function ChatStage() {
                 ),
               )
             )}
-            <div ref={scrollEndRef} className="h-4" />
+            <div className="h-4" />
           </div>
         </div>
+
+        {commandOutputs[session.id]?.output && (
+          <section role="status" className="mx-5 mb-2 flex min-w-0 items-start gap-3 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2 text-[12px]">
+            <Terminal size={14} className="mt-0.5 shrink-0 text-[var(--accent-indigo)]" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-mono-code text-[var(--text-muted)]">{commandOutputs[session.id]?.command}</div>
+              <div className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap break-words text-[var(--text-primary)]">
+                {commandOutputs[session.id]?.output}
+              </div>
+            </div>
+            <button type="button" aria-label="关闭命令输出" className="p-1 text-[var(--text-muted)]"
+              onClick={() => setCommandOutputs((outputs) => ({ ...outputs, [session.id]: { command: '', output: '' } }))}>
+              <X size={14} />
+            </button>
+          </section>
+        )}
 
         {/* Floating Glass Composer Dock (Drag-Drop + Paste Image + @file + /slash + ModelPicker) */}
         <div className="shrink-0 px-4 pb-4 pt-1">
@@ -634,7 +717,7 @@ export function ChatStage() {
                 }}
               >
                 <div className="px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                  插件 Slash 工作流指令
+                  对话命令
                 </div>
                 <div className="max-h-[210px] overflow-y-auto">
                   {slashMatches.map((cmd) => (
@@ -815,7 +898,7 @@ export function ChatStage() {
               onChange={(e) => handleInputChange(e.target.value)}
               onPaste={handlePaste}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   void handleSend();
                 } else if (e.key === 'Escape') {
@@ -827,7 +910,7 @@ export function ChatStage() {
                   ? '松开鼠标即可附带图片或文件...'
                   : isRunning
                     ? 'Agent 正在执行本轮任务，可随时点击右侧停止...'
-                    : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · 输入 / 调用插件指令 · @ 引用文件 · Ctrl+V 贴图`
+                    : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · / 对话命令 · @ 引用文件 · Ctrl+V 贴图`
               }
               className="max-h-[180px] w-full resize-none bg-transparent px-2.5 py-1.5 text-[13.8px] leading-relaxed text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
             />
@@ -874,7 +957,7 @@ export function ChatStage() {
                   </>
                 )}
 
-                {slashCommands.length > 0 && (
+                {(nativeCommands.length > 0 || slashCommands.length > 0) && (
                   <button
                     type="button"
                     disabled={isRunning}
@@ -975,7 +1058,7 @@ export function ChatStage() {
               </div>
 
               <div className="flex items-center gap-2">
-                {isRunning ? (
+                {isRunning && (
                   <button
                     type="button"
                     onClick={() => void interruptSession(session.id)}
@@ -985,7 +1068,8 @@ export function ChatStage() {
                     <Square size={11} fill="currentColor" />
                     <span>停止</span>
                   </button>
-                ) : (
+                )}
+                {(!isRunning || isGoalControl) && (
                   <button
                     type="button"
                     disabled={(!inputText.trim() && attachments.length === 0) || sending}

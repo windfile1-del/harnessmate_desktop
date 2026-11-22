@@ -113,6 +113,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     discoveredSessions,
     loadDiscoveredSessions,
     createSession,
+    importNativeSession,
     addWorkspace,
     pushToast,
   } = useAppStore();
@@ -131,6 +132,10 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   const [createWorktree, setCreateWorktree] = useState(false);
   const [worktreeBranch, setWorktreeBranch] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyLimit, setHistoryLimit] = useState(20);
+  const [moreHistory, setMoreHistory] = useState(false);
 
   const selectedHarness = harnesses.find((h) => h.id === harnessId);
   const selectedWorkspace = workspaces.find((w) => w.id === workspaceId);
@@ -141,10 +146,16 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
       : selectedHarness?.capabilities.reasoningEfforts ?? [];
 
   useEffect(() => {
-    if (tab === 'resume') {
-      void loadDiscoveredSessions();
-    }
-  }, [tab, loadDiscoveredSessions]);
+    if (tab !== 'resume') return;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    let mounted = true;
+    void loadDiscoveredSessions(historyLimit)
+      .then((hasMore) => { if (mounted) setMoreHistory(hasMore); })
+      .catch((err: Error) => { if (mounted) setHistoryError(err.message); })
+      .finally(() => { if (mounted) setHistoryLoading(false); });
+    return () => { mounted = false; };
+  }, [tab, historyLimit, loadDiscoveredSessions]);
 
   const handlePickFolder = async () => {
     const picked = await window.harnessMateBridge?.pickDirectory();
@@ -190,21 +201,11 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   const handleResumeDiscovered = async (item: (typeof discoveredSessions)[number]) => {
     setSubmitting(true);
     try {
-      let targetWsId = workspaceId;
-      if (item.cwd) {
-        const ws = await addWorkspace(item.cwd);
-        targetWsId = ws.id;
-      }
-      if (!targetWsId) {
-        pushToast({ kind: 'warning', title: '请先在左侧添加一个工作区以挂载该历史会话' });
-        return;
-      }
-      await createSession({
-        workspaceId: targetWsId,
-        harnessId: item.harnessKind,
-        title: item.title,
+      if (!item.source) throw new Error('此历史条目缺少来源信息');
+      await importNativeSession({
+        workspaceId: workspaceId || undefined,
+        source: item.source,
         nativeSessionId: item.nativeSessionId,
-        permissionMode: 'accept_edits',
       });
     } catch (err) {
       pushToast({
@@ -232,7 +233,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
         </SegmentBtn>
         <SegmentBtn active={tab === 'resume'} onClick={() => setTab('resume')}>
           <History size={13} />
-          接管本机 CLI 历史
+          导入本机会话
         </SegmentBtn>
       </div>
 
@@ -446,14 +447,26 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
         </div>
       ) : (
         <div className="max-h-[420px] space-y-2 overflow-y-auto p-5">
-          {discoveredSessions.length === 0 ? (
+          <label className="flex flex-wrap items-center gap-2 pb-1 text-[12px] text-[var(--text-secondary)]">
+            原工作目录不可用时
+            <select
+              aria-label="历史会话的备用工作区"
+              value={workspaceId}
+              onChange={(event) => setWorkspaceId(event.target.value)}
+              className="min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2 py-1"
+            >
+              <option value="">选择本地工作区</option>
+              {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+            </select>
+          </label>
+          {historyLoading || historyError || discoveredSessions.length === 0 ? (
             <div className="py-10 text-center text-[12.5px] text-[var(--text-muted)]">
-              暂未在 `~/.codex`、`~/.claude` 或 `~/.gemini/antigravity-cli` 发现可恢复会话。
+              {historyLoading ? '正在查找本机会话…' : historyError || '未发现 Codex、Claude Code 或 Antigravity 的本地会话。'}
             </div>
           ) : (
             discoveredSessions.map((item) => (
               <div
-                key={`${item.harnessKind}-${item.nativeSessionId}`}
+                key={`${item.source}-${item.nativeSessionId}`}
                 className="flex items-center justify-between gap-3 rounded-xl px-3.5 py-2.5"
                 style={{
                   backgroundColor: 'var(--bg-elevated)',
@@ -463,6 +476,9 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <HarnessBadge kind={item.harnessKind} compact />
+                    <span className="shrink-0 text-[10px] text-[var(--text-muted)]">
+                      {item.source?.endsWith('_desktop') ? '桌面端' : 'CLI'}
+                    </span>
                     <span className="truncate text-[12.5px] font-medium text-[var(--text-primary)]">
                       {item.title}
                     </span>
@@ -478,10 +494,20 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
                   className="shrink-0 cursor-pointer rounded-lg px-3 py-1.5 text-[11.5px] font-medium text-[var(--accent-indigo)] transition-colors hover:bg-[var(--bg-active)]"
                   style={{ border: '1px solid var(--border-focus)' }}
                 >
-                  接管恢复
+                  导入对话
                 </button>
               </div>
             ))
+          )}
+          {moreHistory && !historyLoading && !historyError && (
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => setHistoryLimit((limit) => Math.min(1000, limit + 30))}
+              className="w-full rounded-lg py-2 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+            >
+              加载更早的会话
+            </button>
           )}
         </div>
       )}

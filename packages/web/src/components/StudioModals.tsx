@@ -1,4 +1,5 @@
 import type { ContextPreview, ContextSyncMode, HarnessKind, PluginCategory } from '@harnessmate/protocol';
+import { GeneratedPluginManifestSchema, PluginManifestSchema, type PluginManifest } from '@harnessmate/protocol';
 import {
   Activity,
   ArrowRightLeft,
@@ -8,7 +9,6 @@ import {
   Cpu,
   Download,
   Eye,
-  FolderOpen,
   GitBranch,
   Loader2,
   Moon,
@@ -29,6 +29,7 @@ import { formatTokenCount, HARNESS_META } from '../lib/harness-meta';
 import { useAppStore } from '../stores/app-store';
 import { HarnessBadge } from './BrandMark';
 import { ModelPicker } from './ModelPicker';
+import { PluginAuthoringForm } from './PluginAuthoringForm';
 
 function StudioHeader({
   title,
@@ -102,17 +103,23 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     installPlugin,
     uninstallPlugin,
     reloadPlugins,
+    rollbackPlugin,
     pushToast,
   } = useAppStore();
 
   const [tab, setTab] = useState<'installed' | 'catalog' | 'install'>('installed');
   const [busy, setBusy] = useState(false);
-  const [localDir, setLocalDir] = useState('');
-  const [manifestJson, setManifestJson] = useState(MANIFEST_TEMPLATE);
+  const [editing, setEditing] = useState<PluginManifest>();
+  const runPluginAction = async (action: () => Promise<void>) => {
+    setBusy(true);
+    try { await action(); }
+    catch (err) { pushToast({ kind: 'error', title: '插件操作失败', body: err instanceof Error ? err.message : String(err) }); }
+    finally { setBusy(false); }
+  };
 
   useEffect(() => {
-    void refreshPlugins();
-  }, [refreshPlugins]);
+    void refreshPlugins().catch((err: Error) => pushToast({ kind: 'error', title: '无法读取插件', body: err.message }));
+  }, [refreshPlugins, pushToast]);
 
   const handleInstallCatalog = async (catalogId: string) => {
     setBusy(true);
@@ -129,46 +136,10 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const handleInstallLocalDir = async () => {
-    if (!localDir.trim()) return;
-    setBusy(true);
-    try {
-      await installPlugin({ mode: 'local_dir', dirPath: localDir.trim() });
-      setLocalDir('');
-      setTab('installed');
-    } catch (err) {
-      pushToast({
-        kind: 'error',
-        title: '本地插件导入失败',
-        body: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleInstallManifest = async () => {
-    setBusy(true);
-    try {
-      const parsed = JSON.parse(manifestJson);
-      await installPlugin({ mode: 'manifest', manifest: parsed });
-      setTab('installed');
-    } catch (err) {
-      pushToast({
-        kind: 'error',
-        title: '清单 JSON 无效或安装失败',
-        body: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <div>
       <StudioHeader
-        title="微内核插件中心 (Plugin Studio)"
-        subtitle="所有能力均以模块化插件注册运行，可按需启停、热重载或安装新的扩展插件包"
+        title="插件中心"
         onClose={onClose}
       />
 
@@ -180,14 +151,15 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
           <PillTab active={tab === 'catalog'} onClick={() => setTab('catalog')}>
             扩展市场 ({pluginCatalog.length})
           </PillTab>
-          <PillTab active={tab === 'install'} onClick={() => setTab('install')}>
+          <PillTab active={tab === 'install'} onClick={() => { setEditing(undefined); setTab('install'); }}>
             安装 / 创建插件
           </PillTab>
         </div>
 
         <button
           type="button"
-          onClick={() => void reloadPlugins()}
+          disabled={busy}
+          onClick={() => void runPluginAction(reloadPlugins)}
           className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2.5 py-1 text-[11.5px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           style={{ border: '1px solid var(--border-hairline)' }}
         >
@@ -246,6 +218,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                   <p className="mt-1 text-[11.8px] leading-relaxed text-[var(--text-secondary)]">
                     {p.description}
                   </p>
+                  {p.loadError && <p className="mt-1 break-words text-[11.8px] text-[var(--accent-rose)]">{p.loadError}</p>}
 
                   {/* Contributed items preview */}
                   <div className="mt-2 flex flex-wrap gap-1.5">
@@ -280,11 +253,18 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                 </div>
 
                 <div className="flex shrink-0 items-center gap-2">
+                  {p.canRollback && <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
+                    onClick={() => void runPluginAction(() => rollbackPlugin(p.id))}>回退</button>}
+                  {!p.builtin && !p.loadError && GeneratedPluginManifestSchema.safeParse(PluginManifestSchema.parse(p)).success && (
+                    <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
+                      onClick={() => { setEditing(PluginManifestSchema.parse(p)); setTab('install'); }}>AI 改版</button>
+                  )}
                   {!p.builtin && (
                     <button
                       type="button"
                       title="卸载插件"
-                      onClick={() => void uninstallPlugin(p.id)}
+                      disabled={busy}
+                      onClick={() => void runPluginAction(() => uninstallPlugin(p.id))}
                       className="cursor-pointer rounded-lg p-1.5 text-[var(--text-muted)] hover:bg-[var(--accent-rose-soft)] hover:text-[var(--accent-rose)]"
                     >
                       <Trash2 size={13.5} />
@@ -292,7 +272,8 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                   )}
                   <button
                     type="button"
-                    onClick={() => void togglePlugin(p.id, !p.enabled)}
+                    disabled={busy}
+                    onClick={() => void runPluginAction(() => togglePlugin(p.id, !p.enabled))}
                     className="relative h-5 w-10 cursor-pointer rounded-full transition-colors"
                     style={{
                       backgroundColor: p.enabled ? 'var(--accent-emerald)' : 'var(--border-strong)',
@@ -368,87 +349,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
         )}
 
         {tab === 'install' && (
-          <div className="space-y-4">
-            <div
-              className="space-y-2.5 rounded-xl p-3.5"
-              style={{
-                backgroundColor: 'var(--bg-elevated)',
-                border: '1px solid var(--border-hairline)',
-              }}
-            >
-              <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                方式一：从本地插件目录安装（含 harnessmate-plugin.json）
-              </div>
-              <div className="flex gap-2">
-                <input
-                  value={localDir}
-                  onChange={(e) => setLocalDir(e.target.value)}
-                  placeholder="输入插件目录绝对路径，例如 D:\MyPlugins\custom-pack"
-                  className="font-mono-code flex-1 rounded-xl px-3 py-1.5 text-[12px] text-[var(--text-primary)] focus:outline-none"
-                  style={{
-                    backgroundColor: 'var(--bg-surface)',
-                    border: '1px solid var(--border-hairline)',
-                  }}
-                />
-                {window.harnessMateBridge && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const dir = await window.harnessMateBridge?.pickDirectory();
-                      if (dir) setLocalDir(dir);
-                    }}
-                    className="inline-flex cursor-pointer items-center gap-1 rounded-xl px-2.5 py-1.5 text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-                    style={{ border: '1px solid var(--border-hairline)' }}
-                  >
-                    <FolderOpen size={13} />
-                    选择
-                  </button>
-                )}
-                <button
-                  type="button"
-                  disabled={busy || !localDir.trim()}
-                  onClick={() => void handleInstallLocalDir()}
-                  className="cursor-pointer rounded-xl px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-40"
-                  style={{ backgroundColor: 'var(--accent-indigo)' }}
-                >
-                  导入
-                </button>
-              </div>
-            </div>
-
-            <div
-              className="space-y-2.5 rounded-xl p-3.5"
-              style={{
-                backgroundColor: 'var(--bg-elevated)',
-                border: '1px solid var(--border-hairline)',
-              }}
-            >
-              <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                方式二：通过插件清单 JSON 快速创建并安装
-              </div>
-              <textarea
-                rows={11}
-                value={manifestJson}
-                onChange={(e) => setManifestJson(e.target.value)}
-                className="font-mono-code w-full rounded-xl p-3 text-[11.5px] leading-relaxed text-[var(--text-primary)] focus:outline-none"
-                style={{
-                  backgroundColor: 'var(--code-bg)',
-                  border: '1px solid var(--border-hairline)',
-                }}
-              />
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void handleInstallManifest()}
-                  className="cursor-pointer rounded-xl px-4 py-1.5 text-[12px] font-medium text-white disabled:opacity-40"
-                  style={{ backgroundColor: 'var(--accent-indigo)' }}
-                >
-                  安装此插件清单
-                </button>
-              </div>
-            </div>
-          </div>
+          <PluginAuthoringForm key={editing?.id ?? 'new'} previous={editing}
+            initialManifest={editing ? JSON.stringify(editing, null, 2) : MANIFEST_TEMPLATE}
+            onInstalled={() => setTab('installed')} />
         )}
       </div>
     </div>

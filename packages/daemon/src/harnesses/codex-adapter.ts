@@ -13,11 +13,13 @@ import type {
   ToolKind,
 } from '@harnessmate/protocol';
 import { StdioJsonRpcClient, type JsonRpcServerRequest } from './jsonrpc.js';
+import { getCodexRolloutStore } from './history-scanner.js';
 import { execCliQuick, resolveBinary, spawnCliProcess } from './process.js';
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
   HarnessAdapter,
+  NativeSkill,
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
@@ -250,10 +252,18 @@ export class CodexAppServerAdapter implements HarnessAdapter {
       throw new Error('Codex CLI binary not found. Please install codex or configure binary path.');
     }
 
-    const child = spawnCliProcess(binaryPath, this.extraArgs, { cwd: config.cwd });
+    const store = config.nativeHistoryPath ? getCodexRolloutStore(config.nativeHistoryPath) : undefined;
+    const child = spawnCliProcess(binaryPath, this.extraArgs, {
+      cwd: config.cwd, env: store ? { CODEX_HOME: store.home } : undefined,
+    });
     const handle = new CodexSessionHandle(child, config);
-    await handle.initialize();
-    return handle;
+    try {
+      await handle.initialize();
+      return handle;
+    } catch (err) {
+      await handle.dispose();
+      throw err;
+    }
   }
 }
 
@@ -287,6 +297,10 @@ interface PendingCodexApproval {
   method: string;
 }
 
+interface CodexGoalResult {
+  goal?: { objective: string; status: string; tokensUsed?: number; tokenBudget?: number | null };
+}
+
 class CodexSessionHandle implements AdapterSessionHandle {
   private readonly listeners = new Set<(event: NormalizedAdapterEvent) => void>();
   private readonly earlyBuffer: NormalizedAdapterEvent[] = [];
@@ -296,6 +310,8 @@ class CodexSessionHandle implements AdapterSessionHandle {
   private currentTurnId: string | null = null;
   private currentNativeTurnId: string | null = null;
   private activeModel: string | null = null;
+  private confirmedSessionModel: string | null = null;
+  private usedPlanMode = false;
   private activeEffort: ReasoningEffort | null = null;
   private activePermissionMode: PermissionMode;
   private assistantAccum = '';
@@ -346,17 +362,22 @@ class CodexSessionHandle implements AdapterSessionHandle {
         const resumed = (await this.rpc.request('thread/resume', {
           threadId: this.config.nativeSessionId,
           cwd: this.config.cwd,
+          excludeTurns: true,
+          ...(this.config.nativeHistoryPath && getCodexRolloutStore(this.config.nativeHistoryPath)?.archived
+            && fs.existsSync(this.config.nativeHistoryPath) ? { path: this.config.nativeHistoryPath } : {}),
           model: this.activeModel,
           approvalPolicy,
           sandbox,
         })) as { thread?: { id?: string; model?: string }; threadId?: string; model?: string };
         this._nativeSessionId = resumed?.thread?.id ?? resumed?.threadId ?? this.config.nativeSessionId;
         const confirmedModel = resumed?.model ?? resumed?.thread?.model ?? this.activeModel;
+        this.confirmedSessionModel = confirmedModel;
         if (confirmedModel) {
           this.emit({ type: 'model.confirmed', actualModel: confirmedModel });
         }
         resumedOk = true;
       } catch (err) {
+        if (this.config.requireNativeResume) throw err;
         this.emit({
           type: 'diagnostic.log',
           level: 'warn',
@@ -383,6 +404,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
       };
       this._nativeSessionId = started?.thread?.id ?? started?.threadId ?? null;
       const confirmedModel = started?.model ?? started?.thread?.model ?? this.activeModel;
+      this.confirmedSessionModel = confirmedModel;
       if (confirmedModel) {
         this.emit({ type: 'model.confirmed', actualModel: confirmedModel });
       }
@@ -406,21 +428,6 @@ class CodexSessionHandle implements AdapterSessionHandle {
         },
         10_000,
       );
-      if (payload.objective) {
-        try {
-          await this.rpc.request(
-            'thread/goal/set',
-            {
-              threadId: this._nativeSessionId,
-              objective: payload.objective.slice(0, 400),
-              status: 'active',
-            },
-            4_000,
-          );
-        } catch {
-          // thread/goal/set is optional enhancement
-        }
-      }
       this.emit({
         type: 'diagnostic.log',
         level: 'info',
@@ -439,6 +446,32 @@ class CodexSessionHandle implements AdapterSessionHandle {
     }
   }
 
+  async listSkills(): Promise<NativeSkill[]> {
+    const result = await this.rpc.request<{ data?: Array<{ skills?: NativeSkill[] }> }>(
+      'skills/list', { cwds: [this.config.cwd], forceReload: true }, 15_000);
+    return (result.data ?? []).flatMap((entry) => entry.skills ?? []);
+  }
+
+  async runCodexGoal(args: string): Promise<string> {
+    const threadId = this._nativeSessionId;
+    if (!threadId) throw new Error('Codex thread is not initialized');
+    if (args === 'clear') {
+      await this.rpc.request('thread/goal/clear', { threadId }, 15_000);
+      return '已清除 Codex 目标';
+    }
+    const result = !args || args === 'status'
+      ? await this.rpc.request<CodexGoalResult>('thread/goal/get', { threadId }, 15_000)
+      : await this.rpc.request<CodexGoalResult>('thread/goal/set', {
+          threadId,
+          ...(args === 'pause' ? { status: 'paused' }
+            : args === 'resume' ? { status: 'active' }
+              : { objective: args, status: 'active' }),
+        }, 15_000);
+    if (!result.goal) return '当前没有 Codex 目标';
+    const { objective, status, tokensUsed, tokenBudget } = result.goal;
+    return `${objective}\n状态 ${status}${tokensUsed !== undefined ? ` · ${tokensUsed}${tokenBudget ? ` / ${tokenBudget}` : ''} tokens` : ''}`;
+  }
+
   async updateConfig(patch: Partial<AdapterSessionConfig>): Promise<void> {
     if (patch.model !== undefined) this.activeModel = patch.model;
     if (patch.reasoningEffort !== undefined) this.activeEffort = patch.reasoningEffort;
@@ -449,7 +482,20 @@ class CodexSessionHandle implements AdapterSessionHandle {
     if (!this._nativeSessionId) {
       throw new Error('Codex thread is not initialized');
     }
-    this.currentTurnId = input.turnId;
+    if (input.cliCommand === '/compact') {
+      this.currentTurnId = input.turnId;
+      this.currentNativeTurnId = null;
+      this.assistantAccum = '';
+      this.thinkingAccum = '';
+      try {
+        await this.rpc.request('thread/compact/start', { threadId: this._nativeSessionId }, 20_000);
+      } catch (err) {
+        this.currentTurnId = null;
+        this.currentNativeTurnId = null;
+        throw err;
+      }
+      return {};
+    }
     this.currentNativeTurnId = null;
     this.assistantAccum = '';
     this.thinkingAccum = '';
@@ -460,13 +506,16 @@ class CodexSessionHandle implements AdapterSessionHandle {
       input.reasoningEffort !== undefined ? input.reasoningEffort : this.activeEffort;
     const effectiveMode = input.permissionMode ?? this.activePermissionMode;
 
-    const basePromptText = buildPromptWithFileAttachments(input.text, input.attachments);
+    const skillInput = input.nativeSkill;
+    const basePromptText = buildPromptWithFileAttachments(
+      skillInput ? `$${skillInput.name} ${input.text}`.trim() : input.text, input.attachments);
     const promptText = input.contextSync
       ? `${input.contextSync.deltaMarkdown}\n\n---\n\n${basePromptText}`
       : basePromptText;
     const userInput: Array<Record<string, unknown>> = [
       { type: 'text', text: promptText, text_elements: [] },
     ];
+    if (skillInput) userInput.push({ type: 'skill', ...skillInput });
     for (const att of input.attachments ?? []) {
       if (att.kind === 'image' && att.path) {
         userInput.push({ type: 'localImage', path: att.path });
@@ -475,7 +524,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
       }
     }
 
-    const { approvalPolicy } = mapPermissionModeToCodex(effectiveMode);
+    const { approvalPolicy, sandbox } = mapPermissionModeToCodex(effectiveMode);
 
     const turnParams: Record<string, unknown> = {
       threadId: this._nativeSessionId,
@@ -485,12 +534,37 @@ class CodexSessionHandle implements AdapterSessionHandle {
     };
     if (effectiveModel) turnParams.model = effectiveModel;
     if (effectiveEffort && effectiveEffort !== 'disabled') turnParams.effort = effectiveEffort;
+    if (effectiveMode === 'plan' || this.usedPlanMode) {
+      turnParams.sandboxPolicy = { type: sandbox === 'read-only' ? 'readOnly'
+        : sandbox === 'danger-full-access' ? 'dangerFullAccess' : 'workspaceWrite' };
+      const mode = effectiveMode === 'plan' ? 'plan' : 'default';
+      const result = await this.rpc.request<{ data?: Array<{
+        mode: string; model?: string | null; reasoning_effort?: string | null;
+      }> }>('collaborationMode/list', {}, 12_000);
+      const preset = result.data?.find((entry) => entry.mode === mode);
+      const model = effectiveModel || preset?.model || this.confirmedSessionModel;
+      if (!model) throw new Error('无法确定 Codex 模型，请先使用 /model 选择模型');
+      turnParams.collaborationMode = {
+        mode,
+        settings: {
+          model,
+          reasoning_effort: effectiveEffort && effectiveEffort !== 'disabled' ? effectiveEffort : preset?.reasoning_effort ?? null,
+          developer_instructions: null,
+        },
+      };
+    }
 
-    const res = (await this.rpc.request('turn/start', turnParams)) as
-      | { turn?: { id?: string; model?: string }; turnId?: string }
-      | undefined;
-
-    this.currentNativeTurnId = res?.turn?.id ?? res?.turnId ?? null;
+    this.currentTurnId = input.turnId;
+    let res: { turn?: { id?: string; model?: string }; turnId?: string } | undefined;
+    try {
+      res = await this.rpc.request('turn/start', turnParams);
+    } catch (err) {
+      this.currentTurnId = null;
+      this.currentNativeTurnId = null;
+      throw err;
+    }
+    if (this.currentTurnId === input.turnId) this.currentNativeTurnId = res?.turn?.id ?? res?.turnId ?? this.currentNativeTurnId;
+    this.usedPlanMode = effectiveMode === 'plan';
     const confirmed = res?.turn?.model ?? effectiveModel;
     if (confirmed) {
       this.emit({ type: 'model.confirmed', actualModel: confirmed });
@@ -661,6 +735,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
         const fromModel = String(params.fromModel ?? params.from_model ?? '');
         const reason = String(params.reason ?? 'Model rerouted by Codex');
         if (toModel) {
+          this.confirmedSessionModel = toModel;
           this.emit({
             type: 'model.confirmed',
             actualModel: toModel,
@@ -679,7 +754,14 @@ class CodexSessionHandle implements AdapterSessionHandle {
 
       case 'turn/started': {
         const turn = params.turn as { id?: string } | undefined;
-        if (turn?.id) this.currentNativeTurnId = turn.id;
+        if (!turn?.id) break;
+        if (!this.currentTurnId && params.threadId === this._nativeSessionId) {
+          this.currentTurnId = `codex_${turn.id}`;
+          this.assistantAccum = '';
+          this.thinkingAccum = '';
+          this.emit({ type: 'turn.started', turnId: this.currentTurnId, continuation: true });
+        }
+        this.currentNativeTurnId = turn.id;
         break;
       }
 

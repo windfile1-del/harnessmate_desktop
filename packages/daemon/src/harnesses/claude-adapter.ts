@@ -24,6 +24,7 @@ import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
   HarnessAdapter,
+  NativeSkill,
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
@@ -269,6 +270,13 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
   private thinkingAccum = '';
   private streamedDeltaThisTurn = false;
   private disposed = false;
+  private skillsRequest?: {
+    id: string;
+    resolve: (skills: NativeSkill[]) => void;
+    reject: (err: Error) => void;
+    timer: NodeJS.Timeout;
+  };
+  private skillCatalog?: NativeSkill[];
 
   constructor(
     private readonly child: ReturnType<typeof spawnCliProcess>,
@@ -309,6 +317,7 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
 
     child.on('close', (code, signal) => {
       this.parser.flush();
+      this.clearSkillsRequest(new Error('Claude CLI exited before returning its skill catalog'));
       if (this.currentTurnId && !this.disposed) {
         const turnId = this.currentTurnId;
         this.currentTurnId = null;
@@ -325,6 +334,25 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
     return this._nativeSessionId;
   }
 
+  async listSkills(): Promise<NativeSkill[]> {
+    if (this.skillCatalog) return this.skillCatalog;
+    if (this.disposed || this.child.stdin?.destroyed) throw new Error('Claude CLI is closed');
+    const id = `skills_${crypto.randomBytes(5).toString('hex')}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this.clearSkillsRequest(new Error('Claude skill catalog timed out')), 10_000);
+      this.skillsRequest = { id, resolve, reject, timer };
+      this.writeJson({ type: 'control_request', request_id: id, request: { subtype: 'initialize' } });
+    });
+  }
+
+  private clearSkillsRequest(err: Error): void {
+    if (!this.skillsRequest) return;
+    const pending = this.skillsRequest;
+    this.skillsRequest = undefined;
+    clearTimeout(pending.timer);
+    pending.reject(err);
+  }
+
   async sendTurn(
     input: TurnInput,
   ): Promise<{ driverUsed?: import('@harnessmate/protocol').ContextInjectionDriver }> {
@@ -337,7 +365,7 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
     this.streamedDeltaThisTurn = false;
     this.emit({ type: 'turn.started', turnId: input.turnId });
 
-    const basePromptText = buildPromptWithFileAttachments(input.text, input.attachments);
+    const basePromptText = input.cliCommand ?? buildPromptWithFileAttachments(input.text, input.attachments);
     const promptText = input.contextSync
       ? `${input.contextSync.deltaMarkdown}\n\n---\n\n${basePromptText}`
       : basePromptText;
@@ -417,6 +445,7 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearSkillsRequest(new Error('Claude session was closed'));
     this.pendingApprovals.clear();
     try {
       this.child.stdin?.end();
@@ -455,6 +484,24 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
   private handleMessage(msg: Record<string, unknown>): void {
     const type = String(msg.type ?? '');
     const turnId = this.currentTurnId ?? 'turn_bg';
+    if (type === 'control_response') {
+      const pending = this.skillsRequest;
+      const response = msg.response as { request_id?: string; subtype?: string; error?: string; response?: {
+        commands?: Array<{ name?: string; description?: string; builtin?: boolean }>;
+      } } | undefined;
+      if (pending && response?.request_id === pending.id) {
+        if (response.subtype !== 'success') {
+          this.clearSkillsRequest(new Error(response.error ?? 'Claude skill catalog is unavailable'));
+          return;
+        }
+        clearTimeout(pending.timer);
+        this.skillsRequest = undefined;
+        this.skillCatalog = (response.response?.commands ?? []).flatMap((command) =>
+          command.name && !command.builtin ? [{ name: command.name, description: command.description }] : []);
+        pending.resolve(this.skillCatalog);
+      }
+      return;
+    }
 
     if (typeof msg.session_id === 'string' && msg.session_id && this._nativeSessionId !== msg.session_id) {
       this._nativeSessionId = msg.session_id;

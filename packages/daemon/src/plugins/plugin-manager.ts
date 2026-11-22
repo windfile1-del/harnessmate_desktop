@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import {
+  HarnessCommandNameSchema,
   PluginManifestSchema,
   type Attachment,
+  type CanonicalEvent,
   type InstalledPluginInfo,
   type InstallPluginRequest,
   type PluginCatalogItem,
@@ -12,6 +14,10 @@ import {
   type PluginSlashCommand,
 } from '@harnessmate/protocol';
 import type { HarnessRegistry } from '../harnesses/registry.js';
+import type { HarnessAdapter } from '../harnesses/types.js';
+import { MANIFEST_FILE, readPluginPackage, readRevisionPointer, revisionDirectory, writeRevision,
+  writeRevisionPointer, type PluginPackage } from './plugin-package.js';
+import { PluginRuntime } from './plugin-runtime.js';
 
 export interface PluginTurnHookContext {
   sessionId: string;
@@ -102,6 +108,15 @@ const BUILTIN_PLUGINS: PluginManifest[] = [
     contributes: { uiSlots: ['inspector_tab'] },
   },
   {
+    id: 'core.harness-commands',
+    name: '原生 Harness 命令',
+    version: '1.0.0',
+    description: '在对话中调用当前 CLI 的模型、额度、计划、上下文、目标、插件与技能命令。',
+    author: 'HarnessMate Core',
+    category: 'tool',
+    contributes: { uiSlots: ['composer_action'] },
+  },
+  {
     id: 'core.slash-workflows',
     name: '内置工程 Slash 工作流插件',
     version: '1.0.0',
@@ -160,7 +175,7 @@ const BUILTIN_PLUGINS: PluginManifest[] = [
   },
   {
     id: 'core.context-bridge',
-    name: '跨引擎无损上下文桥接插件',
+    name: '跨引擎上下文桥接插件',
     version: '1.0.0',
     description: '基于水位线增量同步与协议原生注入（Codex inject_items / AGY embeddedContext / Claude sysfile），实现单会话内多引擎无缝切换。',
     author: 'HarnessMate Core',
@@ -325,12 +340,16 @@ const CURATED_PLUGIN_CATALOG: Array<PluginManifest & { tags: string[] }> = [
 
 interface LoadedPluginRecord {
   info: InstalledPluginInfo;
-  runtime?: PluginRuntimeModule;
+  runtime?: PluginRuntime;
+  packageRoot?: string;
+  digest?: string;
 }
 
 export class PluginManager {
-  private readonly plugins = new Map<string, LoadedPluginRecord>();
-  private readonly pluginHarnessIds = new Set<string>();
+  private plugins = new Map<string, LoadedPluginRecord>();
+  private readonly pluginHarnesses = new Map<string, { adapter: HarnessAdapter; config: string }>();
+  private mutation = Promise.resolve();
+  private registryChanged = false;
 
   constructor(
     private readonly pluginsDir: string,
@@ -339,22 +358,35 @@ export class PluginManager {
     private readonly setDisabledIds: (ids: string[]) => void,
   ) {
     fs.mkdirSync(this.pluginsDir, { recursive: true });
+    this.pluginsDir = fs.realpathSync(this.pluginsDir);
   }
 
-  async reloadAll(): Promise<InstalledPluginInfo[]> {
-    // Unregister any harnesses previously contributed by plugins
-    for (const hid of this.pluginHarnessIds) {
-      this.registry.unregister(hid);
-    }
-    this.pluginHarnessIds.clear();
-    this.plugins.clear();
+  private serialize<T>(action: () => Promise<T>): Promise<T> {
+    const result = this.mutation.then(action);
+    this.mutation = result.then(() => undefined, () => undefined);
+    return result;
+  }
 
+  takeRegistryChanged(): boolean {
+    const changed = this.registryChanged;
+    this.registryChanged = false;
+    return changed;
+  }
+
+  reloadAll(): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      await this.loadRegistry();
+      return this.listInstalled();
+    });
+  }
+
+  private async loadRegistry(): Promise<void> {
+    const next = new Map<string, LoadedPluginRecord>();
     const disabledSet = new Set(this.getDisabledIds());
 
-    // 1. Register built-in core plugins
     for (const manifest of BUILTIN_PLUGINS) {
       const enabled = !disabledSet.has(manifest.id);
-      this.plugins.set(manifest.id, {
+      next.set(manifest.id, {
         info: {
           ...manifest,
           builtin: true,
@@ -366,77 +398,136 @@ export class PluginManager {
       });
     }
 
-    // 2. Scan external user-installed plugins in pluginsDir/*/harnessmate-plugin.json
-    if (fs.existsSync(this.pluginsDir)) {
-      const dirs = fs.readdirSync(this.pluginsDir, { withFileTypes: true });
-      for (const ent of dirs) {
-        if (!ent.isDirectory()) continue;
-        const pluginDir = path.join(this.pluginsDir, ent.name);
-        const manifestPath = path.join(pluginDir, 'harnessmate-plugin.json');
-        if (!fs.existsSync(manifestPath)) continue;
-
-        try {
-          const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-          const parsed = PluginManifestSchema.parse(raw);
-          const enabled = !disabledSet.has(parsed.id);
-          let runtime: PluginRuntimeModule | undefined;
-          let loadError: string | null = null;
-
-          if (enabled && parsed.entry) {
-            const entryFull = path.resolve(pluginDir, parsed.entry);
-            if (entryFull.startsWith(pluginDir) && fs.existsSync(entryFull)) {
-              try {
-                const mod = (await import(
-                  `${pathToFileURL(entryFull).href}?t=${Date.now()}`
-                )) as PluginRuntimeModule & { default?: PluginRuntimeModule };
-                runtime = mod.default ?? mod;
-              } catch (err) {
-                loadError = err instanceof Error ? err.message : String(err);
-              }
-            }
-          }
-
-          this.plugins.set(parsed.id, {
-            info: {
-              ...parsed,
-              builtin: false,
-              enabled,
-              sourcePath: pluginDir,
-              hasRuntimeHook: Boolean(runtime?.beforeTurn || runtime?.onEvent),
-              loadError,
-            },
-            runtime,
-          });
-        } catch (err) {
-          this.plugins.set(`broken.${ent.name}`, {
-            info: {
-              id: `broken.${ent.name}`,
-              name: ent.name,
-              version: '0.0.0',
-              description: 'Failed to parse harnessmate-plugin.json',
-              category: 'workflow',
-              contributes: {},
-              builtin: false,
-              enabled: false,
-              sourcePath: pluginDir,
-              hasRuntimeHook: false,
-              loadError: err instanceof Error ? err.message : String(err),
-            },
-          });
+    const directories = fs.readdirSync(this.pluginsDir, { withFileTypes: true });
+    for (const entry of directories) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const root = path.join(this.pluginsDir, entry.name);
+      try {
+        const pointer = readRevisionPointer(root);
+        const directory = pointer ? revisionDirectory(root, pointer.current) : root;
+        if (!pointer && !fs.existsSync(path.join(root, MANIFEST_FILE))) continue;
+        const pack = readPluginPackage(directory);
+        if (next.has(pack.manifest.id)) throw new Error('插件 ID 重复');
+        this.validateManifest(pack.manifest, next);
+        const enabled = !disabledSet.has(pack.manifest.id);
+        const record = await this.prepare(pack, directory, root, enabled, Boolean(pointer?.previous));
+        next.set(pack.manifest.id, record);
+      } catch (error) {
+        const previous = [...this.plugins.values()].find((record) => record.info.sourcePath === root);
+        const message = error instanceof Error ? error.message : String(error);
+        if (previous && !next.has(previous.info.id) && !previous.runtime?.failed) {
+          previous.info.loadError = message;
+          next.set(previous.info.id, previous);
+        } else {
+          const id = previous?.info.id ?? `broken.${entry.name}`;
+          next.set(id, { info: {
+            ...previous?.info,
+            id, name: previous?.info.name ?? entry.name, version: previous?.info.version ?? '0.0.0',
+            description: previous?.info.description ?? '插件加载失败', category: previous?.info.category ?? 'workflow',
+            contributes: previous?.info.contributes ?? {}, builtin: false, enabled: false,
+            sourcePath: root, hasRuntimeHook: false, loadError: message,
+            canRollback: Boolean(this.tryPrevious(root)),
+          } });
         }
       }
     }
+    this.activate(next);
+  }
 
-    // 3. Apply enabled plugin harness contributions to HarnessRegistry
-    for (const rec of this.plugins.values()) {
+  private tryPrevious(root: string): string | undefined {
+    try { return readRevisionPointer(root)?.previous; } catch { return undefined; }
+  }
+
+  private activate(next: Map<string, LoadedPluginRecord>): void {
+    const wanted = new Map<string, NonNullable<PluginManifest['contributes']['harnesses']>[number]>();
+    for (const rec of next.values()) {
       if (!rec.info.enabled) continue;
-      for (const hCfg of rec.info.contributes.harnesses ?? []) {
-        this.registry.registerCustomAcp(hCfg);
-        this.pluginHarnessIds.add(hCfg.id);
+      for (const config of rec.info.contributes.harnesses ?? []) wanted.set(config.id, config);
+    }
+    for (const [id, record] of this.pluginHarnesses) {
+      if (!wanted.has(id)) {
+        if (this.registry.get(id) === record.adapter) this.registry.unregister(id);
+        this.pluginHarnesses.delete(id);
+        this.registryChanged = true;
       }
     }
+    for (const [id, config] of wanted) {
+      const old = this.pluginHarnesses.get(id);
+      const current = this.registry.get(id);
+      if (current && current !== old?.adapter) continue;
+      const signature = JSON.stringify(config);
+      if (current && old?.config === signature) continue;
+      this.registry.registerCustomAcp(config);
+      this.pluginHarnesses.set(id, { adapter: this.registry.get(id)!, config: signature });
+      this.registryChanged = true;
+    }
+    for (const [id, record] of this.plugins) {
+      if (record.runtime !== next.get(id)?.runtime) record.runtime?.retire();
+    }
+    this.plugins = next;
+  }
 
-    return this.listInstalled();
+  private async prepare(pack: PluginPackage, directory: string, root: string, enabled: boolean, canRollback: boolean) {
+    const record: LoadedPluginRecord = {
+      info: { ...pack.manifest, builtin: false, enabled, sourcePath: root, canRollback, loadError: null },
+      packageRoot: directory,
+      digest: pack.digest,
+    };
+    if (enabled && pack.manifest.entry) {
+      const old = this.plugins.get(pack.manifest.id);
+      if (old?.packageRoot === directory && old.digest === pack.digest && old.runtime && !old.runtime.failed) {
+        record.runtime = old.runtime;
+      } else {
+        const runtime = new PluginRuntime(path.join(directory, pack.manifest.entry.replace(/\\/g, '/')), (error) => {
+          const active = this.plugins.get(pack.manifest.id);
+          if (active?.runtime === runtime) active.info.loadError = error.message;
+        });
+        try {
+          await runtime.initialize();
+          if (!runtime.hooks.length) throw new Error('入口需导出 beforeTurn 或 onEvent');
+          record.runtime = runtime;
+        } catch (error) {
+          runtime.retire();
+          throw error;
+        }
+      }
+      record.info.hasRuntimeHook = true;
+    }
+    return record;
+  }
+
+  validateManifest(manifest: PluginManifest, occupied = this.plugins): void {
+    if (manifest.id.startsWith('core.') || manifest.id.startsWith('broken.')) throw new Error('插件 ID 使用了保留前缀');
+    const other = [...occupied.values()].filter(({ info }) => info.id !== manifest.id);
+    const commands = new Set<string>([...HarnessCommandNameSchema.options, 'quota', 'plugins']);
+    const contributedHarnesses = new Set<string>();
+    for (const { info } of other) {
+      for (const command of info.contributes.slashCommands ?? []) commands.add(command.command);
+      for (const config of info.contributes.harnesses ?? []) contributedHarnesses.add(config.id);
+    }
+    const owns = new Set((occupied.get(manifest.id)?.info.contributes.harnesses ?? []).map(({ id }) => id));
+    for (const command of manifest.contributes.slashCommands ?? []) {
+      if (commands.has(command.command)) throw new Error(`指令 /${command.command} 已被占用`);
+      commands.add(command.command);
+    }
+    for (const config of manifest.contributes.harnesses ?? []) {
+      const current = this.registry.get(config.id);
+      const owned = (owns.has(config.id) || this.plugins.get(manifest.id)?.info.contributes.harnesses?.some(({ id }) => id === config.id))
+        && this.pluginHarnesses.get(config.id)?.adapter === current;
+      if (contributedHarnesses.has(config.id) || (current && !owned)) {
+        throw new Error(`Harness ID ${config.id} 已被占用`);
+      }
+      contributedHarnesses.add(config.id);
+    }
+    const panelIds = new Set<string>();
+    const ownCommands = new Set(manifest.contributes.slashCommands?.map(({ command }) => command));
+    for (const panel of manifest.contributes.panels ?? []) {
+      if (panelIds.has(panel.id)) throw new Error(`面板 ID ${panel.id} 重复`);
+      panelIds.add(panel.id);
+      for (const action of panel.actions) {
+        if (!ownCommands.has(action.command)) throw new Error(`面板操作必须引用本插件的指令 /${action.command}`);
+      }
+    }
   }
 
   listInstalled(): InstalledPluginInfo[] {
@@ -485,76 +576,154 @@ export class PluginManager {
     return presets;
   }
 
-  async togglePlugin(id: string, enabled: boolean): Promise<InstalledPluginInfo[]> {
-    const rec = this.plugins.get(id);
-    if (!rec) throw new Error(`Plugin not found: ${id}`);
-
-    const disabled = new Set(this.getDisabledIds());
-    if (enabled) {
-      disabled.delete(id);
-    } else {
-      disabled.add(id);
-    }
-    this.setDisabledIds(Array.from(disabled));
-    return this.reloadAll();
+  togglePlugin(id: string, enabled: boolean): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const record = this.plugins.get(id);
+      if (!record) throw new Error(`Plugin not found: ${id}`);
+      let candidate: LoadedPluginRecord = { ...record, info: { ...record.info, enabled }, runtime: undefined };
+      if (enabled && !record.info.builtin) {
+        if (!record.packageRoot) throw new Error('请先修复或回退损坏的插件');
+        const pack = readPluginPackage(record.packageRoot);
+        this.validateManifest(pack.manifest);
+        candidate = await this.prepare(pack, record.packageRoot, record.info.sourcePath!, true, Boolean(record.info.canRollback));
+      }
+      const disabled = new Set(this.getDisabledIds());
+      if (enabled) disabled.delete(id);
+      else disabled.add(id);
+      try {
+        this.setDisabledIds([...disabled]);
+      } catch (error) {
+        if (candidate.runtime !== record.runtime) candidate.runtime?.retire();
+        throw error;
+      }
+      this.activate(new Map(this.plugins).set(id, candidate));
+      return this.listInstalled();
+    });
   }
 
-  async installPlugin(req: InstallPluginRequest): Promise<InstalledPluginInfo[]> {
-    if (req.mode === 'catalog') {
-      const item = CURATED_PLUGIN_CATALOG.find((c) => c.id === req.catalogId);
-      if (!item) throw new Error(`Catalog plugin not found: ${req.catalogId}`);
-      const { tags: _tags, ...manifest } = item;
-      const targetDir = path.join(this.pluginsDir, manifest.id);
-      fs.mkdirSync(targetDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(targetDir, 'harnessmate-plugin.json'),
-        JSON.stringify(manifest, null, 2),
-        'utf8',
-      );
-      return this.reloadAll();
-    }
-
-    if (req.mode === 'manifest') {
-      const manifest = PluginManifestSchema.parse(req.manifest);
-      const targetDir = path.join(this.pluginsDir, manifest.id);
-      fs.mkdirSync(targetDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(targetDir, 'harnessmate-plugin.json'),
-        JSON.stringify(manifest, null, 2),
-        'utf8',
-      );
-      return this.reloadAll();
-    }
-
-    // mode === 'local_dir'
-    const srcDir = path.resolve(req.dirPath);
-    const manifestPath = path.join(srcDir, 'harnessmate-plugin.json');
-    if (!fs.existsSync(manifestPath)) {
-      throw new Error(`No harnessmate-plugin.json found in ${srcDir}`);
-    }
-    const manifest = PluginManifestSchema.parse(
-      JSON.parse(fs.readFileSync(manifestPath, 'utf8')),
-    );
-    const targetDir = path.join(this.pluginsDir, manifest.id);
-    if (path.resolve(targetDir) !== srcDir) {
-      fs.rmSync(targetDir, { recursive: true, force: true });
-      fs.cpSync(srcDir, targetDir, { recursive: true });
-    }
-    return this.reloadAll();
+  inspectPackage(directory: string) {
+    const { manifest, digest, files } = readPluginPackage(directory);
+    this.validateManifest(manifest);
+    return { manifest, digest, fileCount: files.size, installedVersion: this.plugins.get(manifest.id)?.info.version };
   }
 
-  async uninstallPlugin(id: string): Promise<InstalledPluginInfo[]> {
-    const rec = this.plugins.get(id);
-    if (!rec) throw new Error(`Plugin not found: ${id}`);
-    if (rec.info.builtin) throw new Error('Built-in plugins cannot be uninstalled; disable them instead.');
+  installPlugin(req: InstallPluginRequest): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      let pack: PluginPackage;
+      if (req.mode === 'local_dir') {
+        pack = readPluginPackage(req.dirPath);
+        if (req.expectedDigest && req.expectedDigest !== pack.digest) throw new Error('插件文件已更改，请重新预览');
+        if (pack.manifest.entry && (!req.trustCode || !req.expectedDigest)) {
+          throw new Error('请预览本地插件并确认信任其中的 JavaScript');
+        }
+      } else {
+        const source = req.mode === 'manifest' ? req.manifest : CURATED_PLUGIN_CATALOG.find((item) => item.id === req.catalogId);
+        if (!source) throw new Error('找不到目录中的插件');
+        const manifest = PluginManifestSchema.parse(source);
+        if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
+        pack = { manifest, files: new Map([[MANIFEST_FILE, Buffer.from(JSON.stringify(manifest, null, 2))]]), digest: '' };
+      }
+      this.validateManifest(pack.manifest);
+      const id = pack.manifest.id;
+      const old = this.plugins.get(id);
+      const root = old?.info.sourcePath ?? path.join(this.pluginsDir, id);
+      this.checkPluginRoot(root);
+      const pointer = readRevisionPointer(root);
+      const previous = pointer?.current ?? (old?.packageRoot ? writeRevision(root, readPluginPackage(old.packageRoot).files) : undefined);
+      const revision = writeRevision(root, pack.files);
+      const directory = revisionDirectory(root, revision);
+      const enabled = !this.getDisabledIds().includes(id);
+      let candidate: LoadedPluginRecord | undefined;
+      try {
+        candidate = await this.prepare(readPluginPackage(directory), directory, root, true, Boolean(previous));
+        if (!enabled) {
+          candidate.runtime?.retire();
+          candidate = { ...candidate, runtime: undefined, info: { ...candidate.info, enabled, hasRuntimeHook: false } };
+        }
+        writeRevisionPointer(root, { current: revision, previous });
+      } catch (error) {
+        candidate?.runtime?.retire();
+        this.removeRevision(root, revision);
+        if (!pointer && previous) this.removeRevision(root, previous);
+        throw error;
+      }
+      this.activate(new Map(this.plugins).set(id, candidate));
+      if (pointer?.previous) this.removeRevision(root, pointer.previous);
+      return this.listInstalled();
+    });
+  }
 
-    if (rec.info.sourcePath && fs.existsSync(rec.info.sourcePath)) {
-      fs.rmSync(rec.info.sourcePath, { recursive: true, force: true });
+  rollbackPlugin(id: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const root = this.plugins.get(id)?.info.sourcePath;
+      const pointer = root ? readRevisionPointer(root) : undefined;
+      if (!root || !pointer?.previous) throw new Error('没有可回退的版本');
+      this.checkPluginRoot(root);
+      const directory = revisionDirectory(root, pointer.previous);
+      const pack = readPluginPackage(directory);
+      this.validateManifest(pack.manifest);
+      const candidate = await this.prepare(pack, directory, root, !this.getDisabledIds().includes(pack.manifest.id), true);
+      try {
+        writeRevisionPointer(root, { current: pointer.previous, previous: pointer.current });
+      } catch (error) {
+        candidate.runtime?.retire();
+        throw error;
+      }
+      const next = new Map(this.plugins);
+      next.delete(id);
+      next.set(pack.manifest.id, candidate);
+      this.activate(next);
+      return this.listInstalled();
+    });
+  }
+
+  uninstallPlugin(id: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const root = this.plugins.get(id)?.info.sourcePath;
+      if (!root) throw new Error('只能卸载外部插件');
+      this.checkPluginRoot(root);
+      const removed = path.join(this.pluginsDir, `.uninstalled-${randomUUID()}`);
+      fs.renameSync(root, removed);
+      try {
+        this.setDisabledIds(this.getDisabledIds().filter((disabled) => disabled !== id));
+      } catch (error) {
+        fs.renameSync(removed, root);
+        throw error;
+      }
+      const next = new Map(this.plugins);
+      next.delete(id);
+      this.activate(next);
+      try { fs.rmSync(removed, { recursive: true, force: true }); } catch { /* Loaded files may still be open. */ }
+      return this.listInstalled();
+    });
+  }
+
+  private checkPluginRoot(root: string): void {
+    if (path.dirname(root) !== this.pluginsDir || (fs.existsSync(root) && fs.realpathSync(root) !== root)) {
+      throw new Error('插件安装路径无效');
     }
-    const disabled = new Set(this.getDisabledIds());
-    disabled.delete(id);
-    this.setDisabledIds(Array.from(disabled));
-    return this.reloadAll();
+  }
+
+  private removeRevision(root: string, revision: string): void {
+    try { fs.rmSync(revisionDirectory(root, revision), { recursive: true, force: true }); }
+    catch { /* An inactive revision can be removed on the next maintenance pass. */ }
+  }
+
+  notifyEvent(event: CanonicalEvent): void {
+    if (!['turn.completed', 'turn.failed', 'turn.cancelled'].includes(event.type)) return;
+    for (const record of this.plugins.values()) {
+      if (!record.info.enabled || !record.runtime?.hooks.includes('onEvent') || record.runtime.failed) continue;
+      const hooks = record.info.contributes.hooks ?? [];
+      if (!hooks.includes('on_event') && !hooks.includes('after_turn')) continue;
+      void record.runtime.request('onEvent', event).catch((error: Error) => {
+        record.info.loadError = error.message;
+      });
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.mutation;
+    for (const record of this.plugins.values()) record.runtime?.retire();
   }
 
   /**
@@ -581,15 +750,18 @@ export class PluginManager {
       }
     }
 
+    const deadline = Date.now() + 1500;
     for (const rec of this.plugins.values()) {
-      if (!rec.info.enabled || !rec.runtime?.beforeTurn) continue;
+      if (!rec.info.enabled || !rec.runtime?.hooks.includes('beforeTurn') || rec.runtime.failed) continue;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       try {
-        const res = await rec.runtime.beforeTurn({ ...ctx, text });
-        if (res && typeof res.text === 'string' && res.text.trim()) {
+        const res = await rec.runtime.request('beforeTurn', { ...ctx, text }, Math.min(800, remaining)) as { text?: string } | undefined;
+        if (res && typeof res.text === 'string' && res.text.trim() && res.text.length <= Math.max(100_000, text.length)) {
           text = res.text;
         }
-      } catch {
-        // Isolate third-party plugin hook errors
+      } catch (error) {
+        rec.info.loadError = error instanceof Error ? error.message : String(error);
       }
     }
 

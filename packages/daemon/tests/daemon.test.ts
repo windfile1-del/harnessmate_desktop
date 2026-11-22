@@ -63,6 +63,75 @@ function writeMockScript(dir: string, name: string, source: string): string {
   return scriptPath;
 }
 
+it('imports a desktop rollout with large metadata and reads every event page', async () => {
+  const dataDir = makeTempDir('hm-desktop-history-');
+  const wsDir = fs.mkdtempSync(path.join(dataDir, 'workspace-'));
+  const codexHome = path.join(dataDir, 'codex-home');
+  const sessionsDir = path.join(codexHome, 'sessions', '2026', '11', '22');
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const nativeSessionId = '11111111-2222-4333-8444-555555555555';
+  const transcript = [JSON.stringify({
+    type: 'session_meta',
+    payload: { id: nativeSessionId, originator: 'Codex Desktop', cwd: wsDir, base_instructions: 'x'.repeat(30_000) },
+  })];
+  for (let i = 0; i < 1400; i++) {
+    transcript.push(JSON.stringify({ type: 'response_item', payload: {
+      id: `u${i}`, type: 'message', role: 'user', content: [{ type: 'input_text', text: `question ${i}` }],
+    } }));
+    transcript.push(JSON.stringify({ type: 'response_item', payload: {
+      id: `a${i}`, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `answer ${i}` }],
+    } }));
+  }
+  fs.writeFileSync(path.join(sessionsDir, `rollout-2026-11-22T14-00-00-${nativeSessionId}.jsonl`),
+    transcript.join('\n'), 'utf8');
+  const oldCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  const daemon = createDaemon({ dataDir, port: 0, hostOverride: '127.0.0.1' });
+  daemons.push(daemon);
+  try {
+    const { port } = await daemon.start();
+    const base = `http://127.0.0.1:${port}/api/v1`;
+    const discovered = await (await fetch(`${base}/harnesses/discovered-sessions`)).json();
+    expect(discovered.sessions).toContainEqual(expect.objectContaining({
+      nativeSessionId, source: 'codex_desktop', cwd: wsDir,
+    }));
+    const importRequest = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'codex_desktop', nativeSessionId }),
+    };
+    const imported = await fetch(`${base}/harnesses/import-session`, importRequest);
+    expect(imported.status).toBe(200);
+    const { session } = await imported.json();
+    expect(session.lastSeq).toBe(4200);
+    const again = await (await fetch(`${base}/harnesses/import-session`, importRequest)).json();
+    expect(again.session.id).toBe(session.id);
+
+    let seq = 0;
+    const eventUrl = `${base}/sessions/${session.id}/events`;
+    const events = [];
+    while (seq < session.lastSeq) {
+      const page = await (await fetch(`${eventUrl}?afterSeq=${seq}`)).json();
+      expect(page.events[0]?.seq).toBe(seq + 1);
+      events.push(...page.events);
+      seq = page.events.at(-1).seq;
+    }
+    expect(events.at(-2)?.payload.text).toBe('answer 1399');
+    const { markdown } = await (await fetch(`${base}/sessions/${session.id}/export`)).json();
+    expect(markdown).toContain('answer 1399');
+    const context = await daemon.sessionManager.getContextPreview(session.id, 'claude');
+    expect(context.unsyncedTurnCount).toBe(1400);
+
+    const corsBlocked = await fetch(eventUrl, { headers: { Origin: 'https://example.invalid' } });
+    expect(corsBlocked.status).toBe(403);
+    const devAllowed = await fetch(eventUrl, { headers: { Origin: 'http://localhost:5173' } });
+    expect(devAllowed.status).toBe(200);
+  } finally {
+    if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = oldCodexHome;
+  }
+}, 20_000);
+
 describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
   it('runs full Codex App-Server JSON-RPC flow with noisy preamble and cross-device atomic approval', async () => {
     const dataDir = makeTempDir('hm-codex-data-');

@@ -12,14 +12,20 @@ import type {
   FailoverRequest,
   GitStatusSummary,
   HarnessAccountUsage,
+  HarnessCommandInfo,
+  HarnessCommandResult,
   HarnessInfo,
   InstalledPluginInfo,
   InstallPluginRequest,
+  GeneratePluginDraftRequest,
+  PluginManifest,
+  ImportNativeSessionRequest,
   McpServerEntry,
   PluginCatalogItem,
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
+  RunHarnessCommandRequest,
   Session,
   SessionTaskState,
   SwitchHarnessRequest,
@@ -68,6 +74,13 @@ export interface PluginBundleResponse {
   mcpPresets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
   pluginsDir: string;
   harnesses?: HarnessInfo[];
+}
+
+export interface PluginPreview {
+  manifest: PluginManifest;
+  installedVersion?: string;
+  digest?: string;
+  fileCount?: number;
 }
 
 export function getDaemonBaseUrl(): string {
@@ -146,11 +159,25 @@ export const daemonApi = {
       method: 'DELETE',
     }),
 
-  discoverLocalCliSessions: () =>
-    apiFetch<{ sessions: DiscoveredCliSession[] }>('/api/v1/harnesses/discovered-sessions'),
+  discoverLocalCliSessions: (limit = 20) =>
+    apiFetch<{ sessions: DiscoveredCliSession[]; hasMore: boolean }>(`/api/v1/harnesses/discovered-sessions?limit=${limit}`),
+
+  importNativeSession: (req: ImportNativeSessionRequest) =>
+    apiFetch<{ session: Session }>('/api/v1/harnesses/import-session', {
+      method: 'POST', body: JSON.stringify(req),
+    }),
 
   // Plugins
   listPlugins: () => apiFetch<PluginBundleResponse>('/api/v1/plugins'),
+
+  previewPlugin: (req: InstallPluginRequest) =>
+    apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
+
+  generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
+    apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),
+
+  rollbackPlugin: (id: string) =>
+    apiFetch<PluginBundleResponse>(`/api/v1/plugins/${encodeURIComponent(id)}/rollback`, { method: 'POST' }),
 
   installPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginBundleResponse>('/api/v1/plugins/install', {
@@ -260,6 +287,14 @@ export const daemonApi = {
     apiFetch<{ events: CanonicalEvent[]; lastSeq: number }>(
       `/api/v1/sessions/${encodeURIComponent(id)}/events?afterSeq=${afterSeq}`,
     ),
+
+  getHarnessCommands: (id: string) =>
+    apiFetch<{ commands: HarnessCommandInfo[] }>(`/api/v1/sessions/${encodeURIComponent(id)}/commands`),
+
+  runHarnessCommand: (id: string, req: RunHarnessCommandRequest) =>
+    apiFetch<HarnessCommandResult>(`/api/v1/sessions/${encodeURIComponent(id)}/commands`, {
+      method: 'POST', body: JSON.stringify(req),
+    }),
 
   sendTurn: (
     id: string,

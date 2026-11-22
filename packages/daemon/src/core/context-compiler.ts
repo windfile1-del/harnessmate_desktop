@@ -84,7 +84,7 @@ export class ContextCompiler {
       syncMode === 'full_ledger' ? 0 : Math.min(binding?.syncedUpToSeq ?? 0, targetSeq);
     const isWarmBinding = Boolean(syncedUpToSeq > 0);
 
-    const rawEvents = this.store.getEventsInRange(session.id, syncedUpToSeq, targetSeq, 4000);
+    const rawEvents = this.store.iterateEvents(session.id, syncedUpToSeq, targetSeq);
     const turns = groupEventsIntoTurns(rawEvents, session.harnessId, opts.excludeTurnId);
 
     // Filter out turns that were purely executed by targetHarnessId itself when already synced
@@ -342,7 +342,7 @@ async function buildWorkspaceTruthBlock(
 }
 
 function groupEventsIntoTurns(
-  events: CanonicalEvent[],
+  events: Iterable<CanonicalEvent>,
   fallbackHarnessId: string,
   excludeTurnId?: string,
 ): CompiledTurn[] {
@@ -374,7 +374,7 @@ function groupEventsIntoTurns(
   };
 
   for (const ev of events) {
-    if (!ev.turnId) continue;
+    if (!ev.turnId || ev.payload.maintenance === true) continue;
     if (excludeTurnId && ev.turnId === excludeTurnId) continue;
     const p = ev.payload;
     const evHarness = typeof p.harnessId === 'string' && p.harnessId ? p.harnessId : undefined;

@@ -207,14 +207,14 @@ export class TaskLedgerService {
    */
   generateDeterministicDigest(session: Session): SessionTaskState {
     const current = this.getOrCreate(session);
-    const events = this.store.getEventsInRange(session.id, 0, session.lastSeq, 4000);
+    const events = this.store.iterateEvents(session.id, 0, session.lastSeq);
     const lines: string[] = [];
     let turnNum = 0;
 
     const turnOrder: string[] = [];
     const byTurn = new Map<string, CanonicalEvent[]>();
     for (const ev of events) {
-      if (!ev.turnId) continue;
+      if (!ev.turnId || ev.payload.maintenance === true) continue;
       if (!byTurn.has(ev.turnId)) {
         byTurn.set(ev.turnId, []);
         turnOrder.push(ev.turnId);

@@ -12,15 +12,18 @@ import type {
   FailoverRequest,
   GitStatusSummary,
   HarnessAccountUsage,
+  HarnessCommandResult,
   HarnessInfo,
   HarnessKind,
   InstalledPluginInfo,
+  ImportNativeSessionRequest,
   InstallPluginRequest,
   McpServerEntry,
   PluginCatalogItem,
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
+  RunHarnessCommandRequest,
   Session,
   SessionTaskState,
   SwitchHarnessRequest,
@@ -45,7 +48,7 @@ export type ActiveModal =
   | 'command_palette'
   | null;
 
-export type InspectorTab = 'task' | 'git' | 'files' | 'terminal' | 'diagnostics' | 'info';
+export type InspectorTab = 'task' | 'git' | 'files' | 'terminal' | 'diagnostics' | 'info' | 'plugins';
 
 export interface ToastNotice {
   id: string;
@@ -121,6 +124,7 @@ interface AppState {
   installPlugin: (req: InstallPluginRequest) => Promise<void>;
   togglePlugin: (id: string, enabled: boolean) => Promise<void>;
   reloadPlugins: () => Promise<void>;
+  rollbackPlugin: (id: string) => Promise<void>;
   uninstallPlugin: (id: string) => Promise<void>;
 
   refreshMcpServers: () => Promise<void>;
@@ -130,12 +134,14 @@ interface AppState {
 
   refreshAccountUsage: () => Promise<void>;
   refreshRemoteStatus: () => Promise<void>;
-  loadDiscoveredSessions: () => Promise<void>;
+  loadDiscoveredSessions: (limit?: number) => Promise<boolean>;
 
   addWorkspace: (rootPath: string, name?: string) => Promise<Workspace>;
   deleteWorkspace: (id: string) => Promise<void>;
   selectSession: (sessionId: string | null) => Promise<void>;
   createSession: (req: CreateSessionRequest) => Promise<Session>;
+  importNativeSession: (req: ImportNativeSessionRequest) => Promise<Session>;
+  runHarnessCommand: (id: string, req: RunHarnessCommandRequest) => Promise<HarnessCommandResult>;
   updateSession: (id: string, patch: UpdateSessionRequest) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   switchHarness: (sessionId: string, req: SwitchHarnessRequest) => Promise<void>;
@@ -162,6 +168,15 @@ interface AppState {
 }
 
 let wsClient: DaemonWsClient | null = null;
+
+function contiguousCursor(events: CanonicalEvent[]): number {
+  let seq = 0;
+  for (const event of events) {
+    if (event.seq !== seq + 1) break;
+    seq = event.seq;
+  }
+  return seq;
+}
 
 function applyThemeToDocument(theme: 'dark' | 'light'): void {
   if (typeof document !== 'undefined') {
@@ -483,7 +498,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginsDir: pRes.pluginsDir,
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
-      get().pushToast({ kind: 'success', title: '插件已安装并立即生效' });
+      get().pushToast({ kind: 'success', title: '插件已安装' });
     },
 
     togglePlugin: async (id, enabled) => {
@@ -507,9 +522,20 @@ export const useAppStore = create<AppState>((set, get) => {
         mcpPresets: pRes.mcpPresets,
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
-      get().pushToast({ kind: 'success', title: '已热重载所有插件' });
+      const failures = pRes.plugins.filter((plugin) => plugin.loadError);
+      get().pushToast(failures.length
+        ? { kind: 'warning', title: '部分插件加载异常', body: failures.map((plugin) => plugin.name).join('、') }
+        : { kind: 'success', title: '插件已热重载' });
     },
 
+    rollbackPlugin: async (id) => {
+      const pRes = await daemonApi.rollbackPlugin(id);
+      set({
+        plugins: pRes.plugins, pluginCatalog: pRes.catalog, slashCommands: pRes.slashCommands,
+        mcpPresets: pRes.mcpPresets, ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
+      });
+      get().pushToast({ kind: 'success', title: '已切换到上一版插件' });
+    },
     uninstallPlugin: async (id) => {
       const pRes = await daemonApi.uninstallPlugin(id);
       set({
@@ -597,9 +623,10 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ remoteStatus });
     },
 
-    loadDiscoveredSessions: async () => {
-      const { sessions } = await daemonApi.discoverLocalCliSessions();
+    loadDiscoveredSessions: async (limit) => {
+      const { sessions, hasMore } = await daemonApi.discoverLocalCliSessions(limit);
       set({ discoveredSessions: sessions });
+      return hasMore;
     },
 
     addWorkspace: async (rootPath, name) => {
@@ -625,26 +652,41 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!sessionId) return;
 
       const existing = get().eventsBySession[sessionId] ?? [];
-      const afterSeq = existing.length > 0 ? existing[existing.length - 1]!.seq : 0;
-
       try {
-        const [{ events }, detail] = await Promise.all([
-          daemonApi.getSessionEvents(sessionId, afterSeq),
-          daemonApi.getSession(sessionId),
-        ]);
-        for (const ev of events) {
-          ingestEvent(ev);
+        let cursor = contiguousCursor(existing);
+        let snapshot: number | undefined;
+        const history: CanonicalEvent[] = [];
+        do {
+          const page = await daemonApi.getSessionEvents(sessionId, cursor);
+          snapshot ??= page.lastSeq;
+          if (page.events.length === 0) {
+            if (cursor < snapshot) throw new Error('历史分页未到达会话末尾');
+            break;
+          }
+          history.push(...page.events);
+          cursor = page.events.at(-1)!.seq;
+        } while (cursor < snapshot);
+        if (get().selectedSessionId !== sessionId) return;
+        const detail = await daemonApi.getSession(sessionId);
+        if (get().selectedSessionId !== sessionId) return;
+        if (history.length) {
+          set((state) => {
+            const bySeq = new Map([...history, ...(state.eventsBySession[sessionId] ?? [])]
+              .map((event) => [event.seq, event]));
+            return { eventsBySession: { ...state.eventsBySession,
+              [sessionId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq),
+            } };
+          });
         }
         set((state) => ({
-          sessions: state.sessions.map((s) => (s.id === sessionId ? detail.session : s)),
+          sessions: state.sessions.map((s) => (s.id === sessionId && s.lastSeq <= detail.session.lastSeq ? detail.session : s)),
           ...(detail.taskState
             ? { taskStateBySession: { ...state.taskStateBySession, [sessionId]: detail.taskState } }
             : {}),
         }));
 
         const latestList = get().eventsBySession[sessionId] ?? [];
-        const latestSeq = latestList.length > 0 ? latestList[latestList.length - 1]!.seq : 0;
-        wsClient?.subscribeSession(sessionId, latestSeq);
+        wsClient?.subscribeSession(sessionId, contiguousCursor(latestList));
 
         void get().refreshContextPreview(sessionId);
         if (get().inspectorOpen) {
@@ -668,6 +710,29 @@ export const useAppStore = create<AppState>((set, get) => {
       }));
       await get().selectSession(session.id);
       return session;
+    },
+
+    importNativeSession: async (req) => {
+      const { session } = await daemonApi.importNativeSession(req);
+      const { workspaces } = await daemonApi.listWorkspaces();
+      set((state) => ({
+        workspaces,
+        sessions: [session, ...state.sessions.filter((item) => item.id !== session.id)],
+        selectedWorkspaceId: session.workspaceId,
+        activeModal: null,
+        newSessionPresetHarnessId: null,
+      }));
+      await get().selectSession(session.id);
+      return session;
+    },
+
+    runHarnessCommand: async (id, req) => {
+      const result = await daemonApi.runHarnessCommand(id, req);
+      set((state) => ({
+        sessions: state.sessions.map((session) => session.id === id && session.lastSeq <= result.session.lastSeq
+          ? result.session : session),
+      }));
+      return result;
     },
 
     updateSession: async (id, patch) => {

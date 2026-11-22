@@ -16,6 +16,7 @@ import {
   Pin,
   Play,
   Plus,
+  Puzzle,
   RefreshCw,
   ScrollText,
   Search,
@@ -25,6 +26,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { PluginPanels } from './PluginPanels';
 import {
   daemonApi,
   type ProjectInstructionInfo,
@@ -47,6 +49,7 @@ export function InspectorDrawer({
     setInspectorOpen,
     gitBySession,
     taskStateBySession,
+    plugins,
     refreshGitStatus,
     refreshTaskState,
     updateTaskState,
@@ -59,6 +62,7 @@ export function InspectorDrawer({
 
   const git = gitBySession[session.id] ?? null;
   const taskState = taskStateBySession[session.id] ?? null;
+  const panelPlugins = plugins.filter((plugin) => plugin.enabled && plugin.contributes.panels?.length);
 
   // Task Board local draft inputs
   const [objectiveDraft, setObjectiveDraft] = useState(taskState?.objective ?? '');
@@ -71,7 +75,7 @@ export function InspectorDrawer({
   }, [taskState?.objective, session.id]);
 
   useEffect(() => {
-    if (inspectorTab === 'task' && !taskState) {
+    if ((inspectorTab === 'task' || inspectorTab === 'plugins') && !taskState) {
       void refreshTaskState(session.id);
     }
   }, [inspectorTab, session.id, taskState, refreshTaskState]);
@@ -219,6 +223,9 @@ export function InspectorDrawer({
             label="详情"
             onClick={() => setInspectorTab('info')}
           />
+          {(panelPlugins.length > 0 || inspectorTab === 'plugins') && <TabBtn
+            active={inspectorTab === 'plugins'} icon={<Puzzle size={12.5} />}
+            label="插件" onClick={() => setInspectorTab('plugins')} />}
         </div>
         <button
           type="button"
@@ -231,6 +238,9 @@ export function InspectorDrawer({
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-3.5">
+        {inspectorTab === 'plugins' && (panelPlugins.length > 0
+          ? <PluginPanels sessionId={session.id} plugins={panelPlugins} />
+          : <p className="text-[12px] text-[var(--text-muted)]">暂无已启用的插件面板</p>)}
         {inspectorTab === 'task' && (
           <div className="space-y-3.5">
             {/* Top Action Row */}

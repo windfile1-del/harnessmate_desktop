@@ -29,6 +29,10 @@ export class UsageService {
     return [codex, agy, claude];
   }
 
+  collectCodexUsage(): Promise<HarnessAccountUsage> {
+    return this.probeCodexUsage(this.store.getUsageAggregatesByHarness().get('codex'));
+  }
+
   private async probeCodexUsage(
     local?: ReturnType<HarnessMateStore['getUsageAggregatesByHarness']> extends Map<string, infer V>
       ? V

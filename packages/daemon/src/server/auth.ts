@@ -101,6 +101,25 @@ export function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+export function isLocalBrowserRequest(headers: {
+  host?: string;
+  origin?: string;
+  'sec-fetch-site'?: string | string[];
+}): boolean {
+  if (!headers.host) return false;
+  try {
+    const host = new URL(`http://${headers.host}`);
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(host.hostname)) return false;
+    if (!headers.origin) return headers['sec-fetch-site'] !== 'cross-site';
+    if (headers.origin === host.origin) return true;
+    const devOrigin = process.env.HARNESSMATE_DEV_URL;
+    return headers.origin === (devOrigin ? new URL(devOrigin).origin : 'http://127.0.0.1:5173')
+      || (!devOrigin && headers.origin === 'http://localhost:5173');
+  } catch {
+    return false;
+  }
+}
+
 export function isLoopbackAddress(addr: string | undefined): boolean {
   if (!addr) return false;
   return (

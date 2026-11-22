@@ -4,14 +4,46 @@ import {
   AttachmentSchema,
   CanonicalEventSchema,
   ContextSyncModeSchema,
+  NativeHistorySourceSchema,
   PermissionModeSchema,
   PluginManifestSchema,
   ReasoningEffortSchema,
   TaskStepSchema,
   TaskVerificationSchema,
+  type Session,
 } from './canonical.js';
 
 export const PROTOCOL_VERSION = 'hm-remote-v1';
+
+export const ImportNativeSessionRequestSchema = z.object({
+  source: NativeHistorySourceSchema,
+  nativeSessionId: z.string().min(1).max(200),
+  workspaceId: z.string().optional(),
+});
+export type ImportNativeSessionRequest = z.infer<typeof ImportNativeSessionRequestSchema>;
+
+export const HarnessCommandNameSchema = z.enum([
+  'compact', 'usage', 'goal', 'plan', 'model', 'plugin', 'skills', 'skill',
+]);
+export type HarnessCommandName = z.infer<typeof HarnessCommandNameSchema>;
+export const RunHarnessCommandRequestSchema = z.object({
+  command: HarnessCommandNameSchema,
+  args: z.string().trim().max(12_000).default(''),
+  harnessId: z.string().min(1),
+});
+export type RunHarnessCommandRequest = z.infer<typeof RunHarnessCommandRequestSchema>;
+
+export interface HarnessCommandInfo {
+  command: HarnessCommandName;
+  description: string;
+  argumentHint?: string;
+}
+
+export interface HarnessCommandResult {
+  session: Session;
+  output: string;
+  turnId?: string;
+}
 
 // ── REST Request Schemas ───────────────────────────────────────────────
 
@@ -121,6 +153,8 @@ export const InstallPluginRequestSchema = z.union([
   z.object({
     mode: z.literal('local_dir'),
     dirPath: z.string().min(1),
+    expectedDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    trustCode: z.boolean().optional(),
   }),
   z.object({
     mode: z.literal('manifest'),
@@ -128,6 +162,15 @@ export const InstallPluginRequestSchema = z.union([
   }),
 ]);
 export type InstallPluginRequest = z.infer<typeof InstallPluginRequestSchema>;
+
+export const GeneratePluginDraftRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  harnessId: z.string().min(1),
+  description: z.string().trim().min(3).max(6000),
+  model: z.string().min(1).optional(),
+  previous: PluginManifestSchema.optional(),
+});
+export type GeneratePluginDraftRequest = z.infer<typeof GeneratePluginDraftRequestSchema>;
 
 export const AddMcpServerRequestSchema = z.object({
   targetHarnesses: z.array(z.enum(['codex', 'agy', 'claude'])).min(1),

@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   Attachment,
   ContextInjectionDriver,
+  DiscoveredCliSession,
   HarnessCapabilities,
   HarnessHealth,
   HarnessInfo,
@@ -40,6 +41,9 @@ export interface AdapterSessionConfig {
   reasoningEffort?: ReasoningEffort | null;
   permissionMode: PermissionMode;
   nativeSessionId?: string | null;
+  nativeHistorySource?: DiscoveredCliSession['source'];
+  nativeHistoryPath?: string;
+  requireNativeResume?: boolean;
   systemContextPrompt?: string | null;
   contextFilePath?: string | null;
 }
@@ -52,12 +56,21 @@ export interface TurnInput {
   reasoningEffort?: ReasoningEffort | null;
   permissionMode?: PermissionMode;
   contextSync?: ContextSyncPayload | null;
+  cliCommand?: string;
+  nativeSkill?: { name: string; path: string };
+}
+
+export interface NativeSkill {
+  name: string;
+  path?: string;
+  description?: string;
+  enabled?: boolean;
 }
 
 export type NormalizedAdapterEvent =
   | { type: 'native_session_ready'; nativeSessionId: string }
   | { type: 'model.confirmed'; actualModel: string; reroutedFrom?: string; reason?: string }
-  | { type: 'turn.started'; turnId: string }
+  | { type: 'turn.started'; turnId: string; continuation?: boolean }
   | { type: 'turn.completed'; turnId: string; stopReason?: string }
   | { type: 'turn.failed'; turnId: string; message: string; code?: string }
   | { type: 'turn.cancelled'; turnId: string }
@@ -108,6 +121,8 @@ export type NormalizedAdapterEvent =
 export interface AdapterSessionHandle {
   readonly nativeSessionId: string | null;
   sendTurn(input: TurnInput): Promise<{ driverUsed?: ContextInjectionDriver } | void>;
+  listSkills?(): Promise<NativeSkill[]>;
+  runCodexGoal?(args: string): Promise<string>;
   injectContext?(payload: ContextSyncPayload): Promise<ContextInjectionDriver>;
   interrupt(): Promise<void>;
   resolveApproval(nativeRequestId: string, decision: ApprovalDecision, comment?: string): Promise<void>;

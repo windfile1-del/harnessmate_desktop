@@ -321,8 +321,13 @@ export const GitStatusSummarySchema = z.object({
 });
 export type GitStatusSummary = z.infer<typeof GitStatusSummarySchema>;
 
+export const NativeHistorySourceSchema = z.enum([
+  'codex_cli', 'codex_desktop', 'claude_cli', 'agy_cli', 'agy_desktop',
+]);
+
 export const DiscoveredCliSessionSchema = z.object({
   harnessKind: HarnessKindSchema,
+  source: NativeHistorySourceSchema.optional(),
   nativeSessionId: z.string(),
   title: z.string(),
   cwd: z.string().nullable(),
@@ -371,10 +376,23 @@ export const PluginMcpPresetSchema = z.object({
 });
 export type PluginMcpPreset = z.infer<typeof PluginMcpPresetSchema>;
 
+export const PluginPanelSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/),
+  title: z.string().trim().min(1).max(64),
+  description: z.string().max(240).optional(),
+  sections: z.array(z.enum(['turns', 'changed_files', 'verifications', 'recent_activity'])).max(4).default([]),
+  actions: z.array(z.object({
+    label: z.string().trim().min(1).max(48),
+    command: PluginSlashCommandSchema.shape.command,
+    args: z.string().max(240).optional(),
+  })).max(6).default([]),
+}).strict();
+
 export const PluginContributesSchema = z.object({
   harnesses: z.array(CustomAcpHarnessConfigSchema).optional(),
   slashCommands: z.array(PluginSlashCommandSchema).optional(),
   mcpPresets: z.array(PluginMcpPresetSchema).optional(),
+  panels: z.array(PluginPanelSchema).max(6).optional(),
   uiSlots: z
     .array(z.enum(['sidebar_tool', 'inspector_tab', 'composer_action', 'modal']))
     .optional(),
@@ -390,9 +408,15 @@ export const PluginManifestSchema = z.object({
   author: z.string().max(80).optional(),
   category: PluginCategorySchema.default('workflow'),
   entry: z.string().optional(),
+  apiVersion: z.literal(1).optional(),
   contributes: PluginContributesSchema.default({}),
 });
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
+
+export const GeneratedPluginManifestSchema = PluginManifestSchema
+  .omit({ entry: true, contributes: true }).extend({
+    contributes: PluginContributesSchema.pick({ slashCommands: true, panels: true }).strict(),
+  }).strict();
 
 export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   builtin: z.boolean(),
@@ -400,6 +424,7 @@ export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   sourcePath: z.string().nullable().optional(),
   hasRuntimeHook: z.boolean().optional(),
   loadError: z.string().nullable().optional(),
+  canRollback: z.boolean().optional(),
 });
 export type InstalledPluginInfo = z.infer<typeof InstalledPluginInfoSchema>;
 

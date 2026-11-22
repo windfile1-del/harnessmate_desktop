@@ -1,6 +1,7 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -138,31 +139,44 @@ export async function execCliQuick(
   binaryPath: string,
   args: string[],
   timeoutMs = 8000,
+  opts: { cwd?: string; input?: string; signal?: AbortSignal } = {},
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve) => {
-    const child = spawnCliProcess(binaryPath, args, { cwd: process.cwd() });
+    if (opts.signal?.aborted) {
+      resolve({ stdout: '', stderr: 'Cancelled', exitCode: -1 });
+      return;
+    }
+    const child = spawnCliProcess(binaryPath, args, { cwd: opts.cwd ?? process.cwd() });
     let stdout = '';
     let stderr = '';
     let settled = false;
+    const abort = () => { void killProcessTree(child); };
+    opts.signal?.addEventListener('abort', abort, { once: true });
+    if (opts.input !== undefined) {
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(opts.input, 'utf8');
+    }
 
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
+        opts.signal?.removeEventListener('abort', abort);
         void killProcessTree(child);
         resolve({ stdout, stderr: `${stderr}\n[timeout after ${timeoutMs}ms]`.trim(), exitCode: -1 });
       }
     }, timeoutMs);
 
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+    child.stdout?.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
     });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
+    child.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
+      stderr += chunk;
     });
     child.on('error', (err) => {
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', abort);
         resolve({ stdout, stderr: err.message, exitCode: -1 });
       }
     });
@@ -170,6 +184,7 @@ export async function execCliQuick(
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', abort);
         resolve({ stdout, stderr, exitCode: code ?? 0 });
       }
     });
@@ -206,6 +221,7 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
  */
 export class ResilientJsonLineParser {
   private buffer = '';
+  private readonly decoder = new StringDecoder('utf8');
 
   constructor(
     private readonly onJson: (obj: Record<string, unknown>) => void,
@@ -213,7 +229,7 @@ export class ResilientJsonLineParser {
   ) {}
 
   feed(chunk: string | Buffer): void {
-    this.buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
     let newlineIdx = this.buffer.indexOf('\n');
     while (newlineIdx !== -1) {
       const rawLine = this.buffer.slice(0, newlineIdx).replace(/\r$/, '');
@@ -224,6 +240,7 @@ export class ResilientJsonLineParser {
   }
 
   flush(): void {
+    this.buffer += this.decoder.end();
     if (this.buffer.trim()) {
       this.processLine(this.buffer.replace(/\r$/, ''));
       this.buffer = '';

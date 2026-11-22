@@ -10,8 +10,13 @@ import type {
   ContextPreview,
   ContextSyncMode,
   CreateSessionRequest,
+  DiscoveredCliSession,
   FailoverRequest,
   HarnessKind,
+  HarnessCommandInfo,
+  HarnessCommandResult,
+  ImportNativeSessionRequest,
+  RunHarnessCommandRequest,
   Session,
   SessionStatus,
   SessionTaskState,
@@ -21,16 +26,20 @@ import type {
   Workspace,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
+import { AcpAdapter } from '../harnesses/acp-adapter.js';
+import { findLocalSession, readJsonlHistory } from '../harnesses/history-scanner.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type {
   AdapterSessionHandle,
   ContextSyncPayload,
   NormalizedAdapterEvent,
+  TurnInput,
 } from '../harnesses/types.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
 import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from './git-service.js';
+import { listHarnessCommands, type HarnessCommandTools } from './harness-commands.js';
 import { TaskLedgerService } from './task-ledger-service.js';
 
 interface LiveHandleEntry {
@@ -50,6 +59,9 @@ interface ActiveTurnMeta {
   harnessKind: HarnessKind;
   model: string | null;
   actualModel: string | null;
+  advanceWatermark?: boolean;
+  reloadHandle?: boolean;
+  maintenance?: boolean;
 }
 
 const MAX_WARM_HANDLES = 6;
@@ -57,6 +69,8 @@ const MAX_WARM_HANDLES = 6;
 export class SessionManager {
   private readonly liveHandles = new Map<string, LiveHandleEntry>();
   private readonly activeTurnMeta = new Map<string, ActiveTurnMeta>();
+  private readonly startingSessions = new Set<string>();
+  private readonly importingSessions = new Map<string, Promise<Session>>();
   readonly taskLedger: TaskLedgerService;
   readonly contextCompiler: ContextCompiler;
 
@@ -65,6 +79,7 @@ export class SessionManager {
     private readonly registry: HarnessRegistry,
     private readonly eventBus: DaemonEventBus,
     private readonly pluginManager?: PluginManager,
+    private readonly commandTools?: HarnessCommandTools,
   ) {
     this.taskLedger = new TaskLedgerService(store);
     this.contextCompiler = new ContextCompiler(store, this.taskLedger);
@@ -73,6 +88,16 @@ export class SessionManager {
 
   private handleKey(sessionId: string, harnessId: string): string {
     return `${sessionId}::${harnessId}`;
+  }
+
+  private async withSessionStartup<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    if (this.startingSessions.has(sessionId)) throw new Error('此会话正在启动另一项操作');
+    this.startingSessions.add(sessionId);
+    try {
+      return await operation();
+    } finally {
+      this.startingSessions.delete(sessionId);
+    }
   }
 
   private recoverStaleSessions(): void {
@@ -107,6 +132,8 @@ export class SessionManager {
     }
 
     const git = await inspectGitRepo(resolved);
+    const registeredWhileInspecting = this.store.getWorkspaceByPath(resolved);
+    if (registeredWhileInspecting) return registeredWhileInspecting;
     const ws: Workspace = {
       id: `ws_${crypto.randomBytes(6).toString('hex')}`,
       name: name?.trim() || path.basename(resolved) || resolved,
@@ -144,11 +171,114 @@ export class SessionManager {
     return this.store.getEventsAfter(sessionId, afterSeq);
   }
 
+  iterateSessionEvents(sessionId: string, afterSeq = 0): Iterable<CanonicalEvent> {
+    return this.store.iterateEvents(sessionId, afterSeq);
+  }
+
   listPendingApprovals(sessionId?: string): ApprovalRequest[] {
     return this.store.listPendingApprovals(sessionId);
   }
 
   async createSession(req: CreateSessionRequest): Promise<Session> {
+    const session = await this.buildSession(req);
+    const created = this.store.createSession(session);
+    this.emitCanonical(created.id, 'session.status', { status: 'idle' });
+
+    // Initialize workspace ledger mirror when task-ledger plugin is active
+    if (this.isPluginActive('core.task-ledger')) {
+      const state = this.taskLedger.getOrCreate(created);
+      const ledgerPath = this.taskLedger.syncWorkspaceLedgerFile(created, state);
+      if (ledgerPath) {
+        this.store.upsertTaskState({ ...state, ledgerFilePath: ledgerPath });
+      }
+    }
+
+    return this.store.getSession(created.id)!;
+  }
+
+  async importNativeSession(req: ImportNativeSessionRequest): Promise<Session> {
+    const existing = this.store.getImportedSession(req.source, req.nativeSessionId);
+    if (existing) return existing;
+    const importKey = `${req.source}:${req.nativeSessionId}`;
+    const pending = this.importingSessions.get(importKey);
+    if (pending) return pending;
+    const importing = this.loadNativeHistory(req);
+    this.importingSessions.set(importKey, importing);
+    try {
+      return await importing;
+    } finally {
+      this.importingSessions.delete(importKey);
+    }
+  }
+
+  private async loadNativeHistory(req: ImportNativeSessionRequest): Promise<Session> {
+    const kind = req.source.startsWith('codex_') ? 'codex' : req.source.startsWith('agy_') ? 'agy' : 'claude';
+    const native = await findLocalSession(kind, req.nativeSessionId, req.source);
+    if (!native || native.source !== req.source) throw new Error('找不到此原生会话');
+    return this.importHistory(native, req.workspaceId);
+  }
+
+  private async importHistory(native: DiscoveredCliSession, workspaceId?: string): Promise<Session> {
+    const fallback = workspaceId ? this.store.getWorkspace(workspaceId) : null;
+    let hasLocalCwd = false;
+    if (native.cwd && path.isAbsolute(native.cwd)) {
+      try { hasLocalCwd = fs.statSync(native.cwd, { throwIfNoEntry: false })?.isDirectory() ?? false; }
+      catch { /* the original root may no longer be accessible */ }
+    }
+    const cwd = hasLocalCwd ? native.cwd! : fallback?.rootPath;
+    if (!cwd) throw new Error('原工作目录不可用，请选择一个本地工作区');
+    const adapter = this.registry.get(native.harnessKind);
+    if (!adapter) throw new Error('原生会话对应的 Harness 尚未注册');
+    const messages = native.harnessKind === 'agy' && adapter instanceof AcpAdapter
+      ? await adapter.readHistory(native, cwd)
+      : await readJsonlHistory(native);
+    if (!messages.some((message) => message.text.trim())) throw new Error('此会话没有可导入的文本消息');
+
+    const workspace = hasLocalCwd ? await this.addWorkspace(cwd) : fallback!;
+    const session = await this.buildSession({
+      workspaceId: workspace.id, harnessId: adapter.id, title: native.title,
+      nativeSessionId: native.nativeSessionId, permissionMode: 'manual',
+    });
+    const attribution = { harnessId: adapter.id, harnessKind: adapter.kind, imported: true };
+    const events: Array<Omit<CanonicalEvent, 'sessionId' | 'seq'>> = [];
+    let user: { text: string; timestamp?: number } | undefined;
+    let assistant: string[] = [];
+    let assistantTimestamp: number | undefined;
+    let turn = 0;
+    const flush = () => {
+      if (!user && !assistant.length) return;
+      const turnId = `import_${++turn}`;
+      const createdAt = user?.timestamp || assistantTimestamp || native.updatedAt || session.createdAt;
+      if (user) events.push({
+        type: 'message.user', turnId, createdAt, payload: { ...attribution, text: user.text },
+      });
+      if (assistant.length) events.push({
+        type: 'message.assistant.completed', turnId, createdAt: assistantTimestamp || createdAt,
+        payload: { ...attribution, text: assistant.join('\n\n') },
+      });
+      events.push({
+        type: 'turn.completed', turnId, createdAt: assistantTimestamp || createdAt,
+        payload: { ...attribution, stopReason: 'imported_history' },
+      });
+      user = undefined;
+      assistant = [];
+      assistantTimestamp = undefined;
+    };
+    for (const message of messages) {
+      if (!message.text.trim()) continue;
+      if (message.role === 'user') {
+        flush();
+        user = message;
+      } else {
+        assistant.push(message.text);
+        assistantTimestamp = message.timestamp || assistantTimestamp;
+      }
+    }
+    flush();
+    return this.store.importSession(session, native.source!, native.sourcePath, events);
+  }
+
+  private async buildSession(req: CreateSessionRequest): Promise<Session> {
     const ws = this.store.getWorkspace(req.workspaceId);
     if (!ws) throw new Error(`Workspace not found: ${req.workspaceId}`);
 
@@ -172,7 +302,7 @@ export class SessionManager {
     }
 
     const now = Date.now();
-    const session: Session = {
+    return {
       id: `sess_${crypto.randomBytes(6).toString('hex')}`,
       workspaceId: ws.id,
       harnessId: adapter.id,
@@ -196,19 +326,6 @@ export class SessionManager {
       updatedAt: now,
     };
 
-    const created = this.store.createSession(session);
-    this.emitCanonical(created.id, 'session.status', { status: 'idle' });
-
-    // Initialize workspace ledger mirror when task-ledger plugin is active
-    if (this.isPluginActive('core.task-ledger')) {
-      const state = this.taskLedger.getOrCreate(created);
-      const ledgerPath = this.taskLedger.syncWorkspaceLedgerFile(created, state);
-      if (ledgerPath) {
-        this.store.upsertTaskState({ ...state, ledgerFilePath: ledgerPath });
-      }
-    }
-
-    return this.store.getSession(created.id)!;
   }
 
   async updateSession(id: string, req: UpdateSessionRequest): Promise<Session> {
@@ -311,6 +428,13 @@ export class SessionManager {
    * in the LRU pool for fast round-trip switching.
    */
   async switchHarness(
+    sessionId: string,
+    req: SwitchHarnessRequest,
+  ): Promise<{ session: Session; contextPreview: ContextPreview }> {
+    return this.withSessionStartup(sessionId, () => this.switchHarnessInternal(sessionId, req));
+  }
+
+  private async switchHarnessInternal(
     sessionId: string,
     req: SwitchHarnessRequest,
   ): Promise<{ session: Session; contextPreview: ContextPreview }> {
@@ -599,7 +723,7 @@ export class SessionManager {
     const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    const events = this.store.getEventsAfter(sessionId, 0, 5000);
+    const events = this.store.iterateEvents(sessionId, 0, session.lastSeq);
     const ledger = this.taskLedger.getOrCreate(session);
     const lines: string[] = [
       `# ${session.title}`,
@@ -670,11 +794,126 @@ export class SessionManager {
 
   // ── Turn Execution (Unified Multi-Harness + Context Bridge) ──────────
 
+  getHarnessCommands(session: Session): HarnessCommandInfo[] {
+    if (!this.isPluginActive('core.harness-commands')) return [];
+    const source = session.nativeSessionId && this.store.getNativeHistory(session.id, session.nativeSessionId)?.source;
+    return listHarnessCommands(session.harnessKind, source === 'agy_desktop');
+  }
+
+  async runHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
+    return this.withSessionStartup(sessionId, async () => {
+      const session = this.store.getSession(sessionId);
+      if (!session) throw new Error(`Session not found: ${sessionId}`);
+      if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
+      if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
+        throw new Error('当前 Harness 或会话来源未开放此命令');
+      }
+      const busy = session.status === 'running' || session.status === 'awaiting_approval';
+      const goalControl = session.harnessKind === 'codex' && req.command === 'goal'
+        && ['', 'status', 'pause', 'clear'].includes(req.args);
+      if ((busy && !goalControl) || session.status === 'archived') {
+        throw new Error('请在会话空闲时运行原生命令');
+      }
+      const adapter = this.registry.get(session.harnessId);
+      if (!adapter || !this.commandTools) throw new Error('当前 Harness 命令服务不可用');
+
+      const result = (output: string, turnId?: string): HarnessCommandResult => ({
+        output, turnId, session: this.store.getSession(sessionId)!,
+      });
+      const rawCommand = async (text: string) => {
+        const { turnId } = await this.startTurn(sessionId, text, undefined, undefined, { cliCommand: text });
+        return result('', turnId);
+      };
+      const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, null)).handle;
+      const { command, args } = req;
+      switch (command) {
+        case 'model': {
+          if (!args) {
+            const info = (await this.registry.probeAll()).find((h) => h.id === session.harnessId);
+            const models = info?.models.map((model) => `${model.id} · ${model.displayName}`) ?? [];
+            return result([`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'));
+          }
+          if (!/^[a-z0-9][a-z0-9_.:/\[\]-]*$/i.test(args)) throw new Error('请输入一个有效的模型 ID');
+          await this.updateSession(sessionId, { model: args === 'default' ? null : args, reasoningEffort: null });
+          return result(`已选择 ${args === 'default' ? 'CLI 默认模型' : args}`);
+        }
+        case 'plan': {
+          if (args === 'off') {
+            if (session.permissionMode === 'plan') await this.updateSession(sessionId, { permissionMode: 'manual' });
+            return result('已退出计划模式');
+          }
+          await this.updateSession(sessionId, { permissionMode: 'plan' });
+          const turn = args ? await this.startTurn(sessionId, args) : undefined;
+          return result('已启用计划模式', turn?.turnId);
+        }
+        case 'compact': {
+          if (args && session.harnessKind !== 'claude') throw new Error('请使用 /compact');
+          if (!session.nativeSessionId && session.harnessKind !== 'claude') throw new Error('此会话尚无可压缩的原生上下文');
+          return rawCommand(args ? `/compact ${args}` : '/compact');
+        }
+        case 'usage': {
+          if (args) throw new Error('用法 /usage');
+          return session.harnessKind === 'claude' ? rawCommand('/usage')
+            : result(await this.commandTools.getUsage(session));
+        }
+        case 'goal': {
+          if (session.harnessKind === 'codex') {
+            const handle = await getHandle();
+            if (!handle.runCodexGoal) throw new Error('此 Codex 适配器未提供目标接口');
+            const output = await handle.runCodexGoal(args);
+            return result(output);
+          }
+          if (session.harnessKind === 'agy' && !args) throw new Error('用法 /goal <目标>');
+          return rawCommand(args ? `/goal ${args}` : '/goal');
+        }
+        case 'plugin': {
+          if (args === 'reload' && session.harnessKind === 'claude') return rawCommand('/reload-plugins');
+          const output = await this.commandTools.runPluginCommand(session, args);
+          if (args.startsWith('install ')) await this.disposeLiveHandle(sessionId, session.harnessId);
+          return result(output);
+        }
+        case 'skills':
+        case 'skill': {
+          const skills = session.harnessKind === 'agy' ? await this.commandTools.listAgySkills(session.cwd)
+            : await (await getHandle()).listSkills?.() ?? [];
+          const availableSkills = skills.filter((skill) => skill.enabled !== false);
+          if (command === 'skills') {
+            if (args) throw new Error('用法 /skills');
+            return result(availableSkills.map((skill) =>
+              `${skill.name}${skill.description ? ` · ${skill.description}` : ''}`).join('\n') || '未发现可调用技能');
+          }
+          const [name = '', ...words] = args.split(/\s+/);
+          if (!/^[a-z0-9][a-z0-9_.:-]*$/i.test(name)) throw new Error('用法 /skill <名称> [参数]');
+          const skill = availableSkills.find((entry) => entry.name === name);
+          if (!skill) throw new Error(`未找到技能 ${name}，可用 /skills 查看列表`);
+          const skillArgs = words.join(' ');
+          if (session.harnessKind === 'codex') {
+            if (!skill.path) throw new Error('Codex 未返回技能路径');
+            const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, undefined,
+              { nativeSkill: { name, path: skill.path } });
+            return result('', turnId);
+          }
+          return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
+        }
+      }
+    });
+  }
+
   async sendTurn(
     sessionId: string,
     text: string,
     attachments?: Attachment[],
     turnOpts?: { harnessId?: string; model?: string | null },
+  ): Promise<{ turnId: string }> {
+    return this.withSessionStartup(sessionId, () => this.startTurn(sessionId, text, attachments, turnOpts));
+  }
+
+  private async startTurn(
+    sessionId: string,
+    text: string,
+    attachments?: Attachment[],
+    turnOpts?: { harnessId?: string; model?: string | null },
+    native?: Pick<TurnInput, 'cliCommand' | 'nativeSkill'>,
   ): Promise<{ turnId: string }> {
     let session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
@@ -684,7 +923,7 @@ export class SessionManager {
 
     // Optional per-turn seamless harness/model override (e.g. from Mobile or API)
     if (turnOpts?.harnessId && turnOpts.harnessId !== session.harnessId) {
-      const switched = await this.switchHarness(sessionId, {
+      const switched = await this.switchHarnessInternal(sessionId, {
         targetHarnessId: turnOpts.harnessId,
         targetModel: turnOpts.model,
       });
@@ -699,7 +938,7 @@ export class SessionManager {
     // Run active plugin slash-command expansion & beforeTurn hooks
     let effectiveText = text;
     let expandedCommand: string | undefined;
-    if (this.pluginManager) {
+    if (this.pluginManager && !native) {
       const hooked = await this.pluginManager.processBeforeTurn({
         sessionId,
         harnessId: session.harnessId,
@@ -712,7 +951,7 @@ export class SessionManager {
     }
 
     // Auto-title session from first user prompt if still default
-    if (session.lastSeq <= 2 && session.title.includes('·')) {
+    if (!native && session.lastSeq <= 2 && session.title.includes('·')) {
       const compactTitle = text.replace(/\s+/g, ' ').trim().slice(0, 64);
       if (compactTitle) {
         session = this.store.updateSession(sessionId, { title: compactTitle }) ?? session;
@@ -726,6 +965,9 @@ export class SessionManager {
       harnessKind: session.harnessKind,
       model: session.model,
       actualModel: session.actualModel ?? null,
+      advanceWatermark: !native?.cliCommand,
+      reloadHandle: session.harnessKind === 'agy' && Boolean(native?.cliCommand),
+      maintenance: ['/compact', '/usage', '/reload-plugins'].includes(native?.cliCommand?.split(/\s+/)[0] ?? ''),
     });
 
     this.emitCanonical(
@@ -756,7 +998,7 @@ export class SessionManager {
       // Compile incremental context delta if Context Bridge plugin is active
       const contextBridgeEnabled = this.isPluginActive('core.context-bridge');
       const binding = this.store.getSessionBinding(sessionId, session.harnessId);
-      const compiled = contextBridgeEnabled
+      let compiled = contextBridgeEnabled
         ? await this.contextCompiler.compile({
             session,
             targetHarnessId: session.harnessId,
@@ -772,11 +1014,23 @@ export class SessionManager {
         session.harnessId,
         compiled?.syncNeeded ? compiled.systemLedgerPrompt : null,
       );
+      const currentBinding = this.store.getSessionBinding(sessionId, session.harnessId);
+      if (contextBridgeEnabled && binding?.nativeSessionId &&
+        currentBinding?.nativeSessionId !== binding.nativeSessionId) {
+        compiled = await this.contextCompiler.compile({
+          session, targetHarnessId: session.harnessId, targetHarnessKind: session.harnessKind,
+          binding: currentBinding, upToSeq: preTurnSeq, excludeTurnId: turnId,
+        });
+      }
+      if (native?.cliCommand && binding?.nativeSessionId && binding.nativeSessionId === currentBinding?.nativeSessionId) {
+        const meta = this.activeTurnMeta.get(sessionId);
+        if (meta) meta.advanceWatermark = !compiled?.syncNeeded;
+      }
 
       let contextPayloadForTurn: ContextSyncPayload | null = null;
       let driverUsed: ContextInjectionDriver | null = null;
 
-      if (compiled?.syncNeeded) {
+      if (compiled?.syncNeeded && !native?.cliCommand) {
         const syncPayload: ContextSyncPayload = {
           systemLedgerPrompt: compiled.systemLedgerPrompt,
           deltaMarkdown: compiled.deltaMarkdown,
@@ -808,6 +1062,7 @@ export class SessionManager {
         reasoningEffort: session.reasoningEffort,
         permissionMode: session.permissionMode,
         contextSync: contextPayloadForTurn,
+        ...native,
       });
 
       const finalDriver =
@@ -816,7 +1071,7 @@ export class SessionManager {
         (compiled?.syncNeeded ? 'prompt_envelope' : 'native_warm');
 
       // Record that target harness has now received context up to preTurnSeq
-      if (compiled?.syncNeeded) {
+      if (compiled?.syncNeeded && !native?.cliCommand) {
         this.store.upsertSessionBinding({
           sessionId,
           harnessId: session.harnessId,
@@ -825,7 +1080,8 @@ export class SessionManager {
           lastModel: session.model,
           lastActualModel: session.actualModel ?? null,
           lastEffort: session.reasoningEffort,
-          syncedUpToSeq: preTurnSeq,
+          syncedUpToSeq: Math.max(preTurnSeq,
+            this.store.getSessionBinding(sessionId, session.harnessId)?.syncedUpToSeq ?? 0),
           driverUsed: finalDriver,
           updatedAt: Date.now(),
         });
@@ -962,6 +1218,7 @@ export class SessionManager {
     const nativeSessionId =
       binding?.nativeSessionId ??
       (session.harnessId === harnessId ? session.nativeSessionId : null);
+    const nativeHistory = nativeSessionId ? this.store.getNativeHistory(sessionId, nativeSessionId) : undefined;
 
     // Evict oldest idle handle if warm pool is full
     await this.evictWarmPoolIfNeeded(sessionId);
@@ -972,6 +1229,9 @@ export class SessionManager {
       reasoningEffort: session.reasoningEffort,
       permissionMode: session.permissionMode,
       nativeSessionId,
+      nativeHistorySource: nativeHistory?.source,
+      nativeHistoryPath: nativeHistory?.sourcePath,
+      requireNativeResume: Boolean(nativeHistory),
       systemContextPrompt,
     });
 
@@ -985,8 +1245,8 @@ export class SessionManager {
         lastModel: session.model,
         lastActualModel: session.actualModel ?? null,
         lastEffort: session.reasoningEffort,
-        syncedUpToSeq: binding?.syncedUpToSeq ?? 0,
-        driverUsed: binding?.driverUsed ?? null,
+        syncedUpToSeq: resolvedNativeId === nativeSessionId ? binding?.syncedUpToSeq ?? 0 : 0,
+        driverUsed: resolvedNativeId === nativeSessionId ? binding?.driverUsed ?? null : null,
         updatedAt: Date.now(),
       });
       if (session.harnessId === harnessId && resolvedNativeId !== session.nativeSessionId) {
@@ -1064,6 +1324,7 @@ export class SessionManager {
     switch (ev.type) {
       case 'native_session_ready': {
         const existingBinding = this.store.getSessionBinding(sessionId, eventHarnessId);
+        const sameBinding = existingBinding?.nativeSessionId === ev.nativeSessionId;
         this.store.upsertSessionBinding({
           sessionId,
           harnessId: eventHarnessId,
@@ -1072,8 +1333,8 @@ export class SessionManager {
           lastModel: existingBinding?.lastModel ?? session.model,
           lastActualModel: existingBinding?.lastActualModel ?? session.actualModel ?? null,
           lastEffort: existingBinding?.lastEffort ?? session.reasoningEffort,
-          syncedUpToSeq: existingBinding?.syncedUpToSeq ?? 0,
-          driverUsed: existingBinding?.driverUsed ?? null,
+          syncedUpToSeq: sameBinding ? existingBinding?.syncedUpToSeq ?? 0 : 0,
+          driverUsed: sameBinding ? existingBinding?.driverUsed ?? null : null,
           updatedAt: Date.now(),
         });
         if (session.harnessId === eventHarnessId) {
@@ -1123,6 +1384,13 @@ export class SessionManager {
       }
 
       case 'turn.started': {
+        if (ev.continuation && !meta) {
+          this.activeTurnMeta.set(sessionId, {
+            turnId: ev.turnId, harnessId: eventHarnessId, harnessKind: eventHarnessKind,
+            model: activeTurnModel, actualModel: activeTurnActualModel,
+            advanceWatermark: false,
+          });
+        }
         this.emitCanonical(
           sessionId,
           'turn.started',
@@ -1163,15 +1431,16 @@ export class SessionManager {
           lastModel: activeTurnModel,
           lastActualModel: activeTurnActualModel,
           lastEffort: session.reasoningEffort,
-          syncedUpToSeq: completedEv.seq,
+          syncedUpToSeq: meta?.advanceWatermark !== false ? completedEv.seq : existingBinding?.syncedUpToSeq ?? 0,
           driverUsed: existingBinding?.driverUsed ?? null,
           updatedAt: Date.now(),
         });
 
         this.setSessionStatus(sessionId, 'idle');
+        if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
 
         // Deterministically extract Task State Ledger + mirror to `.harnessmate/task-ledger.md`
-        if (this.isPluginActive('core.task-ledger')) {
+        if (!meta?.maintenance && this.isPluginActive('core.task-ledger')) {
           void this.refreshTaskLedgerAfterTurn(sessionId, ev.turnId, eventHarnessId);
         }
 
@@ -1195,6 +1464,7 @@ export class SessionManager {
         );
         this.activeTurnMeta.delete(sessionId);
         this.setSessionStatus(sessionId, 'idle');
+        if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
         break;
       }
 
@@ -1214,8 +1484,9 @@ export class SessionManager {
         );
         this.activeTurnMeta.delete(sessionId);
         this.setSessionStatus(sessionId, 'error');
+        if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
 
-        if (this.isPluginActive('core.task-ledger')) {
+        if (!meta?.maintenance && this.isPluginActive('core.task-ledger')) {
           void this.refreshTaskLedgerAfterTurn(sessionId, ev.turnId, eventHarnessId);
         }
 
@@ -1433,8 +1704,11 @@ export class SessionManager {
     payload: Record<string, unknown>,
     turnId: string | null = null,
   ): CanonicalEvent {
-    const event = this.store.appendEvent(sessionId, type, payload, turnId);
+    const meta = this.activeTurnMeta.get(sessionId);
+    const body = meta?.maintenance && turnId === meta.turnId ? { ...payload, maintenance: true } : payload;
+    const event = this.store.appendEvent(sessionId, type, body, turnId);
     this.eventBus.publishEvent(event);
+    this.pluginManager?.notifyEvent(event);
     return event;
   }
 }

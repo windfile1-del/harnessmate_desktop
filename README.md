@@ -1,13 +1,40 @@
 # HarnessMate Desktop
 
-**Modular Multi-Harness Atelier & Mobile Remote Hub** — 统一管理本机 `Codex CLI`、`Antigravity CLI (agy)`、`Claude Code CLI` 及任意 ACP 兼容 CLI 的桌面控制台，支持单一共享会话内的跨引擎无损上下文接力，并为移动端 HarnessMate 提供 `HM-Remote v1` 远程会话管理与跨端审批底座。
+统一管理本机 `Codex CLI`、`Antigravity CLI (agy)`、`Claude Code CLI` 及 ACP 兼容 CLI 的桌面控制台。支持共享会话中的跨引擎接力，并通过 `HM-Remote v1` 提供远程会话和跨端审批。
 
 ## 核心特性
 
-- **统一共享会话 & 跨引擎无损接力**：不按 Harness 割裂会话；基于 `session_harness_bindings` 增量水位线与四层上下文编译器，优先调用 `codex thread/inject_items`、`agy embeddedContext`、`claude stream-json` 原生通道实现往返零失忆接力。
+- **共享会话与上下文接力**。统一保存已接收的会话事件和任务账本。切换引擎时，按上下文预算传入任务状态、近期对话和更早的摘要。历史可在对话里查看或导出。
 - **结构化任务状态账本**：自动沉淀任务目标、步骤清单、修改文件、验证结果与钉选铁律，并同步落盘 `.harnessmate/task-ledger.md`。
 - **模块化插件微内核**：内置引擎插件、图片/文件上下文、跨 CLI MCP 统一管理中心、多账号配额看板、Git Diff/Worktree 检视、限额一键 Failover 等模块，支持目录安装与自定义扩展。
 - **Star Loom Atelier 界面 & `HM-Remote v1`**：夜织深空 / 暖宣浅色双主题、扫码配对移动端、局域网/Tailscale 远程控制与原子跨端审批。
+
+## 对话命令与历史导入
+
+在会话输入框输入 `/`，菜单会跟随当前 Harness。原生命令由内置的「原生 Harness 命令」插件提供，可在插件中心启停。
+
+| 指令 | 用法 |
+| --- | --- |
+| `/model` | 查看模型，或用 `/model <ID>` 选择模型。用 `/model default` 恢复 CLI 默认。 |
+| `/plan` | 进入计划模式，可附任务直接启动一轮。用 `/plan off` 回到手动权限模式。 |
+| `/usage` | 查看 Codex 订阅额度、AGY 模型额度或 Claude 原生用量输出。 |
+| `/compact` | 压缩当前原生会话的模型上下文。Claude 支持附加摘要重点。 |
+| `/goal` | 使用底层引擎的目标模式。Codex 支持 `status`、`pause`、`resume`、`clear`。AGY CLI 需要提供目标。 |
+| `/plugin` | 查看原生插件，或用 `/plugin install <插件[@市场]>` 安装。Claude 支持 `/plugin reload`。 |
+| `/skills` 和 `/skill <名称> [参数]` | 查看或调用当前环境提供的技能。 |
+
+AGY 的额度、压缩和目标等命令通过其 CLI 入口执行。导入的 AGY 桌面会话使用桌面数据目录，经 ACP 续接，对话菜单提供该会话可用的模型、计划和额度命令。原生命令随 CLI 版本和账号能力变化。
+
+打开「新建会话 → 导入本机会话」，选择 Codex 桌面端或 CLI、AGY 桌面端或 CLI、Claude Code 的本地记录。原工作目录失效时可以选择备用工作区。导入保存用户和助手的文本历史及原生会话绑定，同一个来源和原生 ID 的重复导入会打开已有会话。AGY 优先读取 ACP 历史，必要时使用本地全文索引中的文本。原生附件、工具执行详情和仅存云端的记录保留在原客户端。
+
+## 插件中心
+
+在「插件中心 → 安装 / 创建插件」选择工作区、Harness 和模型，描述想要的扩展。AI 在单独的计划模式会话中生成草稿。你可以修改清单，校验后选择「安装并热加载」。已安装的声明式插件可通过「AI 改版」生成升级草稿。
+
+- 生成器支持斜杠命令及右侧检视器的插件面板。面板可显示轮次统计、已记录的改动文件、验证结果和近期轮次。面板按钮会把本插件的命令填入输入框，发送仍由你操作。
+- 插件也可通过内置目录、JSON 清单或包含 `harnessmate-plugin.json` 的本地目录安装。清单支持 `apiVersion: 1`、`contributes.slashCommands`、`contributes.panels`、ACP Harness 和 MCP 预设。面板的 `sections` 可选 `turns`、`changed_files`、`verifications`、`recent_activity`，`actions` 中的 `{ label, command, args? }` 引用本插件的命令。
+- 本地插件可以带 JavaScript 入口，预览后需确认信任。入口在独立 Worker 中以本机用户权限运行。导出 `beforeTurn(context)` 可返回 `{ text }`，在清单声明 `on_event` 或 `after_turn` 后可通过 `onEvent(event)` 接收轮次完成、失败、取消事件。Worker 用于隔离异常和限制阻塞时间。已有目录继续按原授权加载。
+- 安装先校验候选版本，再切换有效版本。初始化失败时保留当前版本。已安装列表提供启停、热重载和回退，版本记录在应用重启后保留。
 
 ## 架构概览
 

@@ -200,7 +200,9 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
           process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
         } else if (msg.method === 'thread/goal/set') {
           log({ harness: 'codex', method: 'thread/goal/set', params: msg.params });
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {
+            goal: { objective: msg.params.objective, status: 'active' }
+          } }) + '\\n');
         } else if (msg.method === 'turn/start') {
           log({ harness: 'codex', method: 'turn/start', input: msg.params.input });
           process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'codex_trn_1', model: 'gpt-6.2-sol' } } }) + '\\n');
@@ -376,6 +378,14 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
     });
     await waitForSessionIdle(baseUrl, sessionId, 2);
 
+    const goalResponse = await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/commands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'goal', args: 'Finish the verified bridge', harnessId: 'codex' }),
+    });
+    expect(goalResponse.status).toBe(200);
+    expect((await goalResponse.json()).output).toContain('Finish the verified bridge');
+
     // 5. Switch SAME session to Claude & run Turn 3
     await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/switch-harness`, {
       method: 'POST',
@@ -426,8 +436,9 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
     expect(codexInject).toBeDefined();
     expect(JSON.stringify(codexInject!.items)).toContain('STAR-LOOM-77');
 
-    const codexGoal = captures.find((c) => c.harness === 'codex' && c.method === 'thread/goal/set');
-    expect((codexGoal?.params as { status?: string })?.status).toBe('active');
+    const codexGoals = captures.filter((c) => c.harness === 'codex' && c.method === 'thread/goal/set');
+    expect(codexGoals).toHaveLength(1);
+    expect(codexGoals[0]?.params).toMatchObject({ status: 'active', objective: 'Finish the verified bridge' });
 
     const codexTurn = captures.find((c) => c.harness === 'codex' && c.method === 'turn/start');
     expect(JSON.stringify(codexTurn!.input)).not.toContain('<harnessmate_context_sync'); // Native injection kept user turn clean!

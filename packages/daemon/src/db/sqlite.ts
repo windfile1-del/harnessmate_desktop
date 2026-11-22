@@ -7,6 +7,7 @@ import type {
   CanonicalEventType,
   ContextInjectionDriver,
   ContextSyncMode,
+  DiscoveredCliSession,
   HarnessKind,
   PairedDevice,
   PermissionMode,
@@ -176,6 +177,14 @@ export class HarnessMateStore {
 
       CREATE INDEX IF NOT EXISTS idx_sessions_workspace_updated
         ON sessions(workspace_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS native_history_imports (
+        source TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_path TEXT,
+        PRIMARY KEY (source, native_session_id)
+      );
 
       CREATE TABLE IF NOT EXISTS session_events (
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -506,6 +515,55 @@ export class HarnessMateStore {
     return this.getSession(session.id)!;
   }
 
+  getImportedSession(
+    source: NonNullable<DiscoveredCliSession['source']>, nativeSessionId: string,
+  ): Session | null {
+    const row = this.db.prepare(
+      'SELECT session_id FROM native_history_imports WHERE source = ? AND native_session_id = ?',
+    ).get(source, nativeSessionId);
+    return typeof row?.session_id === 'string' ? this.getSession(row.session_id) : null;
+  }
+
+  getNativeHistory(sessionId: string, nativeSessionId: string): {
+    source: DiscoveredCliSession['source']; sourcePath?: string;
+  } | undefined {
+    const row = this.db.prepare(
+      'SELECT source, source_path FROM native_history_imports WHERE session_id = ? AND native_session_id = ?',
+    ).get(sessionId, nativeSessionId);
+    if (!row) return undefined;
+    return { source: row.source as DiscoveredCliSession['source'],
+      sourcePath: typeof row.source_path === 'string' ? row.source_path : undefined };
+  }
+
+  importSession(
+    session: Session,
+    source: NonNullable<DiscoveredCliSession['source']>,
+    sourcePath: string | undefined,
+    events: Array<Omit<CanonicalEvent, 'sessionId' | 'seq'>>,
+  ): Session {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.getImportedSession(source, session.nativeSessionId!);
+      if (existing) {
+        this.db.exec('COMMIT');
+        return existing;
+      }
+      const imported = this.createSession({ ...session, lastSeq: events.length });
+      const insert = this.db.prepare(`INSERT INTO session_events
+        (session_id, seq, type, turn_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`);
+      for (const [index, event] of events.entries()) {
+        insert.run(session.id, index + 1, event.type, event.turnId, JSON.stringify(event.payload), event.createdAt);
+      }
+      this.db.prepare(`INSERT INTO native_history_imports (source, native_session_id, session_id, source_path)
+        VALUES (?, ?, ?, ?)`).run(source, session.nativeSessionId, session.id, sourcePath ?? null);
+      this.db.exec('COMMIT');
+      return imported;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
   updateSession(
     id: string,
     patch: Partial<{
@@ -711,6 +769,16 @@ export class HarnessMateStore {
       createdAt: r.created_at,
       payload: safeJsonParse<Record<string, unknown>>(r.payload_json, {}),
     }));
+  }
+
+  *iterateEvents(sessionId: string, afterSeq = 0, upToSeq = Number.MAX_SAFE_INTEGER): Generator<CanonicalEvent> {
+    const pageSize = 1000;
+    while (afterSeq < upToSeq) {
+      const page = this.getEventsInRange(sessionId, afterSeq, upToSeq, pageSize);
+      yield* page;
+      if (page.length < pageSize) return;
+      afterSeq = page.at(-1)!.seq;
+    }
   }
 
   // ── Session Harness Bindings (Per-Harness Sync Watermarks) ───────────
