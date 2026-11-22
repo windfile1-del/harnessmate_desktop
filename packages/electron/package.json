@@ -1,0 +1,26 @@
+{
+  "name": "@harnessmate/electron",
+  "version": "0.3.0",
+  "private": true,
+  "description": "HarnessMate Desktop — Unified Multi-Harness Manager & Mobile Remote Hub",
+  "author": "HarnessMate",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsc -p tsconfig.json && electron .",
+    "stage": "node scripts/stage-bundle.mjs",
+    "pack:exe": "node scripts/stage-bundle.mjs && electron-builder --win portable --x64",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@harnessmate/daemon": "workspace:*",
+    "@types/node": "^22.13.10",
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}

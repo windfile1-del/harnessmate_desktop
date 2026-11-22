@@ -1,0 +1,507 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
+import { AcpAdapter } from '../src/harnesses/acp-adapter.js';
+import { ClaudeStreamJsonAdapter } from '../src/harnesses/claude-adapter.js';
+import { CodexAppServerAdapter } from '../src/harnesses/codex-adapter.js';
+import { ResilientJsonLineParser } from '../src/harnesses/process.js';
+import { createDaemon, type DaemonInstance } from '../src/server/app.js';
+
+const tempDirs: string[] = [];
+const daemons: DaemonInstance[] = [];
+
+function makeTempDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(async () => {
+  while (daemons.length > 0) {
+    const d = daemons.pop()!;
+    await d.stop();
+  }
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop()!;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore windows locked file cleanup race
+    }
+  }
+});
+
+describe('ResilientJsonLineParser', () => {
+  it('skips non-JSON preamble noise lines like opencodex warnings while parsing fragmented JSON', () => {
+    const parsed: Record<string, unknown>[] = [];
+    const noise: string[] = [];
+    const parser = new ResilientJsonLineParser(
+      (obj) => parsed.push(obj),
+      (line) => noise.push(line),
+    );
+
+    parser.feed('opencodex: proxy autostart failed; launching Codex anyway.\r\n');
+    parser.feed('{"jsonrpc":"2.0","id":1,');
+    parser.feed('"result":{"ok":true}}\nnot-json-line\n{"type":"delta","text":"hi"}\n');
+
+    expect(noise).toEqual([
+      'opencodex: proxy autostart failed; launching Codex anyway.',
+      'not-json-line',
+    ]);
+    expect(parsed).toEqual([
+      { jsonrpc: '2.0', id: 1, result: { ok: true } },
+      { type: 'delta', text: 'hi' },
+    ]);
+  });
+});
+
+function writeMockScript(dir: string, name: string, source: string): string {
+  const scriptPath = path.join(dir, name);
+  fs.writeFileSync(scriptPath, source, 'utf8');
+  return scriptPath;
+}
+
+describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
+  it('runs full Codex App-Server JSON-RPC flow with noisy preamble and cross-device atomic approval', async () => {
+    const dataDir = makeTempDir('hm-codex-data-');
+    const wsDir = makeTempDir('hm-codex-ws-');
+
+    const mockCodexScript = writeMockScript(
+      dataDir,
+      'mock-codex.mjs',
+      `
+      import readline from 'node:readline';
+      // Emit noisy opencodex preamble before any JSON-RPC traffic
+      process.stdout.write('opencodex: proxy autostart failed; launching Codex anyway.\\n');
+      const rl = readline.createInterface({ input: process.stdin });
+      let pendingApprovalResolve = null;
+      rl.on('line', (line) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        if (msg.method === 'initialize') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { serverInfo: { name: 'mock-codex' } } }) + '\\n');
+        } else if (msg.method === 'thread/start') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thr_mock_1' } } }) + '\\n');
+        } else if (msg.method === 'turn/start') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'trn_1' } } }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/reasoning/textDelta', params: { delta: 'Planning check...' } }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/started', params: { item: { id: 'cmd_1', type: 'commandExecution', command: 'npm test' } } }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 9001, method: 'item/commandExecution/requestApproval', params: { command: 'npm test' } }) + '\\n');
+          pendingApprovalResolve = (decision) => {
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { itemId: 'cmd_1', delta: 'PASS 12/12\\n' } }) + '\\n');
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/completed', params: { item: { id: 'cmd_1', type: 'commandExecution', status: 'completed', aggregatedOutput: 'PASS 12/12' } } }) + '\\n');
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { itemId: 'msg_1', delta: 'Decision was ' + decision } }) + '\\n');
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'item/completed', params: { item: { id: 'msg_1', type: 'agentMessage', text: 'Decision was ' + decision } } }) + '\\n');
+            process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { id: 'trn_1', status: 'completed' } } }) + '\\n');
+          };
+        } else if (msg.id === 9001 && msg.result) {
+          pendingApprovalResolve?.(msg.result.decision);
+        }
+      });
+      `,
+    );
+
+    const mockAdapter = new CodexAppServerAdapter(process.execPath, [mockCodexScript]);
+    const daemon = createDaemon({
+      dataDir,
+      port: 0,
+      hostOverride: '127.0.0.1',
+      customAdapters: [mockAdapter],
+    });
+    daemons.push(daemon);
+    const { port } = await daemon.start();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // Pair a mobile device via HM-Remote v1
+    const pairCreated = await (await fetch(`${baseUrl}/api/v1/pair/create`, { method: 'POST' })).json();
+    const pairingCode = pairCreated.activePairing.code as string;
+    const exchanged = await (
+      await fetch(`${baseUrl}/api/v1/pair/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pairingCode, deviceName: 'Honor Test Phone', platform: 'android' }),
+      })
+    ).json();
+    const mobileToken = exchanged.token as string;
+    expect(mobileToken).toMatch(/^hmd_/);
+
+    // Create workspace & session
+    const wsRes = await (
+      await fetch(`${baseUrl}/api/v1/workspaces`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootPath: wsDir, name: 'TestRepo' }),
+      })
+    ).json();
+    const sessRes = await (
+      await fetch(`${baseUrl}/api/v1/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId: wsRes.workspace.id,
+          harnessId: 'codex',
+          permissionMode: 'accept_edits',
+        }),
+      })
+    ).json();
+    const sessionId = sessRes.session.id as string;
+
+    // Start turn
+    await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/turns`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Run tests please' }),
+    });
+
+    // Wait for pending approval to appear
+    let approvalId = '';
+    for (let i = 0; i < 40; i++) {
+      const apprRes = await (await fetch(`${baseUrl}/api/v1/approvals?sessionId=${sessionId}`)).json();
+      if (apprRes.approvals.length > 0) {
+        approvalId = apprRes.approvals[0].id;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(approvalId).toBeTruthy();
+
+    // Simulate concurrent approval race: Mobile approves while Desktop denies simultaneously
+    const [mobileApprovalRes, desktopApprovalRes] = await Promise.all([
+      fetch(`${baseUrl}/api/v1/approvals/${approvalId}/resolve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${mobileToken}`,
+        },
+        body: JSON.stringify({ decision: 'allow_once', resolvedBy: 'mobile' }),
+      }).then((r) => r.json()),
+      fetch(`${baseUrl}/api/v1/approvals/${approvalId}/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'deny', resolvedBy: 'desktop' }),
+      }).then((r) => r.json()),
+    ]);
+
+    // Both responses must agree on the single atomic winner
+    expect(mobileApprovalRes.approval.decision).toBe(desktopApprovalRes.approval.decision);
+    expect(mobileApprovalRes.approval.resolvedBy).toBe(desktopApprovalRes.approval.resolvedBy);
+
+    // Wait for turn completion
+    let events: Array<{ seq: number; type: string; payload: Record<string, unknown> }> = [];
+    for (let i = 0; i < 40; i++) {
+      const evRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/events`)).json();
+      events = evRes.events;
+      if (events.some((e) => e.type === 'turn.completed')) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(events.some((e) => e.type === 'diagnostic.log' && String(e.payload.message).includes('opencodex'))).toBe(true);
+    expect(events.some((e) => e.type === 'tool.call.completed')).toBe(true);
+    expect(events.some((e) => e.type === 'turn.completed')).toBe(true);
+
+    // Verify HM-Remote v1 WebSocket cursor replay (afterSeq)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?token=${encodeURIComponent(mobileToken)}`);
+    const frames: Array<Record<string, unknown>> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ op: 'subscribe', sessionId, afterSeq: 2 }));
+      });
+      ws.on('message', (data) => {
+        const frame = JSON.parse(data.toString('utf8')) as Record<string, unknown>;
+        frames.push(frame);
+        if (frame.op === 'replay_complete') {
+          ws.close();
+          resolve();
+        }
+      });
+      ws.on('error', reject);
+    });
+
+    expect(frames[0]?.op).toBe('hello');
+    const replayedEvents = frames.filter((f) => f.op === 'event');
+    expect(replayedEvents.length).toBe(events.filter((e) => e.seq > 2).length);
+  });
+
+  it('runs ACP (AGY) and Claude stream-json mock adapters into identical canonical events', async () => {
+    const dataDir = makeTempDir('hm-multi-data-');
+    const wsDir = makeTempDir('hm-multi-ws-');
+
+    const mockAcpScript = writeMockScript(
+      dataDir,
+      'mock-acp.mjs',
+      `
+      import readline from 'node:readline';
+      const rl = readline.createInterface({ input: process.stdin });
+      let promptReqId = null;
+      rl.on('line', (line) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        if (msg.method === 'initialize') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } }) + '\\n');
+        } else if (msg.method === 'session/new') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_sess_1' } }) + '\\n');
+        } else if (msg.method === 'session/prompt') {
+          promptReqId = msg.id;
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello from AGY ACP' } } } }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { toolCall: { title: 'Edit README.md', kind: 'edit' }, options: [{ optionId: 'opt_allow', kind: 'allow_once' }, { optionId: 'opt_deny', kind: 'reject_once' }] } }) + '\\n');
+        } else if (msg.id === 77 && msg.result) {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: promptReqId, result: { stopReason: 'end_turn' } }) + '\\n');
+        }
+      });
+      `,
+    );
+
+    const mockClaudeScript = writeMockScript(
+      dataDir,
+      'mock-claude.mjs',
+      `
+      import readline from 'node:readline';
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.on('line', (line) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        if (msg.type === 'user') {
+          process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude_sess_99' }) + '\\n');
+          process.stdout.write(JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello from Claude Stream' } } }) + '\\n');
+          process.stdout.write(JSON.stringify({ type: 'control_request', request_id: 'creq_1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'echo ok' } } }) + '\\n');
+        } else if (msg.type === 'control_response') {
+          process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Hello from Claude Stream', usage: { input_tokens: 120, output_tokens: 45 }, total_cost_usd: 0.002 }) + '\\n');
+        }
+      });
+      `,
+    );
+
+    // Override claude binary with a tiny wrapper cmd/script? For direct node spawn, instantiate ACP & Claude directly via adapters
+    const agyAdapter = new AcpAdapter({
+      id: 'agy',
+      kind: 'agy',
+      displayName: 'Mock AGY',
+      description: 'Mock ACP',
+      command: process.execPath,
+      args: [mockAcpScript],
+    });
+
+    const agyHandle = await agyAdapter.createSession({ cwd: wsDir, permissionMode: 'accept_edits' });
+    const agyEvents: string[] = [];
+    agyHandle.onEvent((ev) => {
+      agyEvents.push(ev.type);
+      if (ev.type === 'approval.requested') {
+        void agyHandle.resolveApproval(ev.nativeRequestId, 'allow_once');
+      }
+    });
+    await agyHandle.sendTurn({ turnId: 't1', text: 'hi' });
+    for (let i = 0; i < 30 && !agyEvents.includes('turn.completed'); i++) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    await agyHandle.dispose();
+    expect(agyEvents).toContain('message.assistant.delta');
+    expect(agyEvents).toContain('approval.requested');
+    expect(agyEvents).toContain('turn.completed');
+
+    // Test ClaudeStreamJsonAdapter with a runnable wrapper script
+    const claudeWrapper =
+      process.platform === 'win32'
+        ? writeMockScript(
+            dataDir,
+            'mock-claude.cmd',
+            `@echo off\r\n"${process.execPath}" "${mockClaudeScript}" %*\r\n`,
+          )
+        : (() => {
+            const p = writeMockScript(
+              dataDir,
+              'mock-claude.sh',
+              `#!/bin/sh\nexec "${process.execPath}" "${mockClaudeScript}" "$@"\n`,
+            );
+            fs.chmodSync(p, 0o755);
+            return p;
+          })();
+
+    const claudeAdapter = new ClaudeStreamJsonAdapter(claudeWrapper);
+    const claudeHandle = await claudeAdapter.createSession({ cwd: wsDir, permissionMode: 'accept_edits' });
+    const claudeEvents: string[] = [];
+    claudeHandle.onEvent((ev) => {
+      claudeEvents.push(ev.type);
+      if (ev.type === 'approval.requested') {
+        void claudeHandle.resolveApproval(ev.nativeRequestId, 'allow_once');
+      }
+    });
+    await claudeHandle.sendTurn({ turnId: 't2', text: 'hi claude' });
+    for (let i = 0; i < 40 && !claudeEvents.includes('turn.completed'); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await claudeHandle.dispose();
+    expect(claudeEvents).toContain('native_session_ready');
+    expect(claudeEvents).toContain('message.assistant.delta');
+    expect(claudeEvents).toContain('approval.requested');
+    expect(claudeEvents).toContain('usage.updated');
+    expect(claudeEvents).toContain('turn.completed');
+  });
+
+  it('verifies AGY ACP session/set_config_option model switching, plugin lifecycle, attachments, and cross-harness handoff', async () => {
+    const dataDir = makeTempDir('hm-v2-data-');
+    const wsDir = makeTempDir('hm-v2-ws-');
+    fs.writeFileSync(path.join(wsDir, 'AGENTS.md'), '# Project Rules\nBe concise.', 'utf8');
+    fs.writeFileSync(path.join(wsDir, 'hello.ts'), 'export const hi = 42;\n', 'utf8');
+
+    const mockAgyModelScript = writeMockScript(
+      dataDir,
+      'mock-agy-model.mjs',
+      `
+      import readline from 'node:readline';
+      const rl = readline.createInterface({ input: process.stdin });
+      let currentModel = 'gemini-4-neon';
+      const opts = [
+        { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+        { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+      ];
+      rl.on('line', (line) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        if (msg.method === 'initialize') {
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } }) + '\\n');
+        } else if (msg.method === 'session/new') {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id, result: {
+              sessionId: 'agy_m1',
+              models: { currentModelId: 'gemini-4-neon-high', availableModels: [{ modelId: 'gemini-4-neon-high' }, { modelId: 'gpt-oss-120b-medium' }] },
+              configOptions: [{ id: 'model', category: 'model', currentValue: currentModel, options: opts }]
+            }
+          }) + '\\n');
+        } else if (msg.method === 'session/set_config_option') {
+          currentModel = msg.params.value;
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id, result: {
+              configOptions: [{ id: 'model', category: 'model', currentValue: currentModel, options: opts }]
+            }
+          }) + '\\n');
+        } else if (msg.method === 'session/prompt') {
+          const textBlock = (msg.params.prompt || []).find((b) => b.type === 'text')?.text || '';
+          const hasImage = (msg.params.prompt || []).some((b) => b.type === 'image');
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0', method: 'session/update', params: {
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'MODEL=' + currentModel + ';IMG=' + hasImage + ';PROMPT=' + textBlock.slice(0, 40) } }
+            }
+          }) + '\\n');
+          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } }) + '\\n');
+        }
+      });
+      `,
+    );
+
+    const mockAgy = new AcpAdapter({
+      id: 'agy',
+      kind: 'agy',
+      displayName: 'Mock AGY',
+      description: 'Mock ACP',
+      command: process.execPath,
+      args: [mockAgyModelScript],
+    });
+
+    const daemon = createDaemon({
+      dataDir,
+      port: 0,
+      hostOverride: '127.0.0.1',
+      customAdapters: [mockAgy],
+    });
+    daemons.push(daemon);
+    const { port } = await daemon.start();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // 1. Plugin Studio: install ext.git-pr-studio from catalog, verify /commit command appears
+    const installRes = await (
+      await fetch(`${baseUrl}/api/v1/plugins/install`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'catalog', catalogId: 'ext.git-pr-studio' }),
+      })
+    ).json();
+    expect(installRes.slashCommands.some((c: { command: string }) => c.command === 'commit')).toBe(true);
+
+    // 2. Create workspace & AGY session explicitly choosing gpt-oss-120b-medium (NOT default gemini-4-neon!)
+    const wsRes = await (
+      await fetch(`${baseUrl}/api/v1/workspaces`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootPath: wsDir, name: 'V2Repo' }),
+      })
+    ).json();
+    const sessRes = await (
+      await fetch(`${baseUrl}/api/v1/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId: wsRes.workspace.id,
+          harnessId: 'agy',
+          model: 'gpt-oss-120b-medium',
+          permissionMode: 'accept_edits',
+        }),
+      })
+    ).json();
+    const sessionId = sessRes.session.id as string;
+
+    // 3. Upload a 1x1 PNG image attachment & verify workspace file search + rules discovery
+    const tinyPngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const attRes = await (
+      await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/attachments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'screen.png',
+          kind: 'image',
+          mimeType: 'image/png',
+          dataBase64: tinyPngBase64,
+        }),
+      })
+    ).json();
+    expect(attRes.attachment.previewUrl).toContain('/api/v1/attachments/');
+
+    const rulesRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/rules`)).json();
+    expect(rulesRes.instructions.some((i: { name: string }) => i.name === 'AGENTS.md')).toBe(true);
+
+    const filesRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/files?q=hello`)).json();
+    expect(filesRes.files.some((f: { name: string }) => f.name === 'hello.ts')).toBe(true);
+
+    // 4. Send /commit slash command with image attachment; verify actual model is gpt-oss-120b-medium & image passed!
+    await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/turns`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: '/commit test msg', attachments: [attRes.attachment] }),
+    });
+
+    let events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    for (let i = 0; i < 40; i++) {
+      const evRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/events`)).json();
+      events = evRes.events;
+      if (events.some((e) => e.type === 'turn.completed')) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+
+    const assistantText = events
+      .filter((e) => e.type === 'message.assistant.delta')
+      .map((e) => String(e.payload.text ?? ''))
+      .join('');
+    expect(assistantText).toContain('MODEL=gpt-oss-120b-medium');
+    expect(assistantText).toContain('IMG=true');
+    expect(assistantText).toContain('git status');
+
+    const sessAfter = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}`)).json();
+    expect(sessAfter.session.actualModel).toBe('gpt-oss-120b-medium');
+
+    // 5. Cross-Harness Handoff + Markdown Export
+    const handoffRes = await (
+      await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/handoff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetHarnessId: 'codex' }),
+      })
+    ).json();
+    expect(handoffRes.session.harnessId).toBe('codex');
+    expect(handoffRes.handoffPrompt).toContain('Cross-Harness Handoff');
+
+    const exportRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/export`)).json();
+    expect(exportRes.markdown).toContain('MODEL=gpt-oss-120b-medium');
+  }, 15_000);
+});

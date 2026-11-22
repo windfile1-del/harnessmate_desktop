@@ -1,0 +1,29 @@
+appId: dev.wind.harnessmate.desktop
+productName: HarnessMate Desktop
+copyright: Copyright © 2026 HarnessMate
+directories:
+  output: release
+  buildResources: build
+asar: true
+npmRebuild: false
+nodeGypRebuild: false
+buildDependenciesFromSource: false
+files:
+  - dist/**
+  - package.json
+  - "!node_modules/**"
+extraResources:
+  - from: resources/daemon
+    to: daemon
+  - from: resources/web-dist
+    to: web-dist
+  - from: build/icon.png
+    to: build/icon.png
+win:
+  icon: build/icon.ico
+  target:
+    - target: portable
+      arch:
+        - x64
+portable:
+  artifactName: HarnessMate-Desktop-${version}-portable.exe

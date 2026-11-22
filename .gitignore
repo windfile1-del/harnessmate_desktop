@@ -1,0 +1,17 @@
+node_modules/
+dist/
+dist-electron/
+resources/
+release/
+*.tsbuildinfo
+.env
+.env.local
+data/
+.harnessmate/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log

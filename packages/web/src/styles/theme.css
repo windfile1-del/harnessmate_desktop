@@ -1,0 +1,293 @@
+@import "tailwindcss";
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  /* Star Loom Atelier — Night Loom Dark Palette */
+  --bg-canvas: #080a10;
+  --bg-rail: #0c0f18;
+  --bg-surface: #121623;
+  --bg-elevated: #181d2e;
+  --bg-glass: rgba(16, 20, 32, 0.82);
+  --bg-hover: rgba(255, 255, 255, 0.042);
+  --bg-active: rgba(124, 140, 255, 0.12);
+
+  --border-hairline: rgba(255, 255, 255, 0.072);
+  --border-strong: rgba(255, 255, 255, 0.13);
+  --border-focus: rgba(124, 140, 255, 0.55);
+
+  --text-primary: #f2f4fb;
+  --text-secondary: #98a1ba;
+  --text-muted: #5d6680;
+
+  --accent-indigo: #7c8cff;
+  --accent-indigo-soft: rgba(124, 140, 255, 0.14);
+  --accent-star: #f3c158;
+  --accent-star-soft: rgba(243, 193, 88, 0.14);
+  --accent-emerald: #36d399;
+  --accent-emerald-soft: rgba(54, 211, 153, 0.14);
+  --accent-clay: #f29468;
+  --accent-clay-soft: rgba(242, 148, 104, 0.14);
+  --accent-rose: #f87171;
+  --accent-rose-soft: rgba(248, 113, 113, 0.14);
+
+  --ambient-top: radial-gradient(60% 42% at 50% -8%, rgba(124, 140, 255, 0.11), transparent 70%);
+  --ambient-corner: radial-gradient(36% 32% at 92% 6%, rgba(243, 193, 88, 0.065), transparent 72%);
+  --shadow-float: 0 18px 48px -12px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --shadow-card: 0 4px 20px -4px rgba(0, 0, 0, 0.35);
+
+  --code-bg: #0b0e17;
+  --diff-add-bg: rgba(54, 211, 153, 0.11);
+  --diff-del-bg: rgba(248, 113, 113, 0.11);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  /* Star Loom Atelier — Warm Alabaster / Xuan Paper Light Palette */
+  --bg-canvas: #f6f4ef;
+  --bg-rail: #efece4;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f3f0e8;
+  --bg-glass: rgba(255, 255, 255, 0.86);
+  --bg-hover: rgba(21, 24, 33, 0.045);
+  --bg-active: rgba(74, 92, 232, 0.1);
+
+  --border-hairline: rgba(21, 24, 33, 0.085);
+  --border-strong: rgba(21, 24, 33, 0.15);
+  --border-focus: rgba(74, 92, 232, 0.45);
+
+  --text-primary: #171a24;
+  --text-secondary: #5a6275;
+  --text-muted: #8b93a7;
+
+  --accent-indigo: #4a5ce8;
+  --accent-indigo-soft: rgba(74, 92, 232, 0.11);
+  --accent-star: #c48512;
+  --accent-star-soft: rgba(196, 133, 18, 0.12);
+  --accent-emerald: #0f9f6e;
+  --accent-emerald-soft: rgba(15, 159, 110, 0.11);
+  --accent-clay: #d46537;
+  --accent-clay-soft: rgba(212, 101, 55, 0.12);
+  --accent-rose: #dc2626;
+  --accent-rose-soft: rgba(220, 38, 38, 0.1);
+
+  --ambient-top: radial-gradient(60% 42% at 50% -10%, rgba(74, 92, 232, 0.075), transparent 72%);
+  --ambient-corner: radial-gradient(36% 32% at 92% 6%, rgba(196, 133, 18, 0.06), transparent 72%);
+  --shadow-float: 0 18px 42px -12px rgba(20, 24, 38, 0.14), 0 0 0 1px rgba(21, 24, 33, 0.06);
+  --shadow-card: 0 2px 12px -2px rgba(20, 24, 38, 0.06);
+
+  --code-bg: #f3f1ea;
+  --diff-add-bg: rgba(15, 159, 110, 0.11);
+  --diff-del-bg: rgba(220, 38, 38, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family:
+    "Inter",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+.font-mono-code {
+  font-family: "JetBrains Mono", "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Celestial Atelier Ambient Canvas */
+.atelier-canvas {
+  background-color: var(--bg-canvas);
+  background-image: var(--ambient-top), var(--ambient-corner);
+}
+
+/* Custom Hairline Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* Editorial Markdown Prose Styling */
+.hm-prose {
+  font-size: 14.5px;
+  line-height: 1.72;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.hm-prose > *:first-child {
+  margin-top: 0;
+}
+.hm-prose > *:last-child {
+  margin-bottom: 0;
+}
+.hm-prose p {
+  margin: 0.65em 0;
+}
+.hm-prose h1,
+.hm-prose h2,
+.hm-prose h3 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 1.15em 0 0.5em;
+  color: var(--text-primary);
+}
+.hm-prose h1 {
+  font-size: 1.25em;
+}
+.hm-prose h2 {
+  font-size: 1.12em;
+}
+.hm-prose h3 {
+  font-size: 1.02em;
+}
+.hm-prose ul,
+.hm-prose ol {
+  margin: 0.55em 0;
+  padding-left: 1.45em;
+}
+.hm-prose li {
+  margin: 0.25em 0;
+}
+.hm-prose blockquote {
+  margin: 0.75em 0;
+  padding: 0.35em 0.9em;
+  border-left: 2px solid var(--accent-indigo);
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+  border-radius: 0 8px 8px 0;
+}
+.hm-prose code:not(pre code) {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 0.87em;
+  padding: 0.14em 0.42em;
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hairline);
+  color: var(--accent-indigo);
+}
+.hm-prose pre {
+  margin: 0.85em 0;
+  border-radius: 12px;
+  border: 1px solid var(--border-hairline);
+  background: var(--code-bg);
+  overflow-x: auto;
+  padding: 14px 16px;
+  font-size: 12.8px;
+  line-height: 1.6;
+}
+.hm-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.85em 0;
+  font-size: 13px;
+}
+.hm-prose th,
+.hm-prose td {
+  padding: 7px 10px;
+  border: 1px solid var(--border-hairline);
+  text-align: left;
+}
+.hm-prose th {
+  background: var(--bg-elevated);
+  font-weight: 600;
+}
+.hm-prose a {
+  color: var(--accent-indigo);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Highlight.js Minimal Harmonized Tokens */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-title.function_ {
+  color: var(--accent-indigo);
+}
+.hljs-string,
+.hljs-addition {
+  color: var(--accent-emerald);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-attr {
+  color: var(--accent-star);
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.hljs-deletion,
+.hljs-built_in {
+  color: var(--accent-clay);
+}
+
+/* Subtle Animations */
+@keyframes pulse-halo {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(1.22);
+  }
+}
+
+.animate-pulse-halo {
+  animation: pulse-halo 2.1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Electron drag regions */
+.app-drag {
+  -webkit-app-region: drag;
+}
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}

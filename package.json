@@ -1,0 +1,23 @@
+{
+  "name": "harnessmate-desktop",
+  "version": "0.3.0",
+  "private": true,
+  "description": "HarnessMate Desktop — Unified Multi-Harness Manager & Mobile Remote Hub",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev:daemon": "pnpm --filter @harnessmate/daemon dev",
+    "dev:web": "pnpm --filter @harnessmate/web dev",
+    "dev:electron": "pnpm --filter @harnessmate/electron dev",
+    "build": "pnpm --filter @harnessmate/protocol build && pnpm --filter @harnessmate/daemon build && pnpm --filter @harnessmate/web build && pnpm --filter @harnessmate/electron build",
+    "pack:exe": "pnpm build && pnpm --filter @harnessmate/electron pack:exe",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  }
+}
