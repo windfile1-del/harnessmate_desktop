@@ -10,6 +10,9 @@ import type {
   DiscoveredCliSession,
   HarnessKind,
   PairedDevice,
+  PluginPanelQuery,
+  PluginProjection,
+  PluginTurnRow,
   PermissionMode,
   ReasoningEffort,
   RiskLevel,
@@ -195,6 +198,11 @@ export class HarnessMateStore {
         created_at INTEGER NOT NULL,
         PRIMARY KEY (session_id, seq)
       );
+
+      CREATE INDEX IF NOT EXISTS idx_plugin_turn_events ON session_events(session_id, turn_id, seq)
+        WHERE type IN ('turn.completed', 'turn.failed', 'turn.cancelled');
+      CREATE INDEX IF NOT EXISTS idx_plugin_tool_events ON session_events(session_id, turn_id, seq)
+        WHERE type IN ('tool.call.started', 'tool.call.completed');
 
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
@@ -779,6 +787,51 @@ export class HarnessMateStore {
       if (page.length < pageSize) return;
       afterSeq = page.at(-1)!.seq;
     }
+  }
+
+  readPluginTurns(session: Session, projection: PluginProjection, query: PluginPanelQuery, pageSize: number) {
+    const scopeColumn = projection.scope === 'workspace' ? 's.workspace_id' : 's.id';
+    const scopeId = projection.scope === 'workspace' ? session.workspaceId : session.id;
+    const placeholders = projection.events.map(() => '?').join(', ');
+    const source = `WITH ranked AS (
+      SELECT e.seq, e.session_id AS sessionId, s.title AS sessionTitle, e.turn_id AS turnId,
+             json_extract(e.payload_json, '$.harnessId') AS harnessId,
+             COALESCE(json_extract(e.payload_json, '$.imported'), 0) AS imported,
+             e.type AS event, e.created_at AS timestamp,
+             ROW_NUMBER() OVER (PARTITION BY e.session_id, e.turn_id ORDER BY e.seq DESC) AS rank
+        FROM sessions s JOIN session_events e ON e.session_id = s.id
+       WHERE ${scopeColumn} = ? AND e.turn_id IS NOT NULL
+         AND e.type IN ('turn.completed', 'turn.failed', 'turn.cancelled')
+         AND COALESCE(json_extract(e.payload_json, '$.maintenance'), 0) != 1
+    ), matching AS (
+      SELECT * FROM ranked WHERE rank = 1 AND event IN (${placeholders})
+    )`;
+    const params = [scopeId, ...projection.events];
+    const counts = this.db.prepare(`${source}
+      SELECT event, harnessId, COUNT(*) AS count FROM matching GROUP BY event, harnessId
+    `).all(...params) as unknown as Array<Pick<PluginTurnRow, 'event' | 'harnessId'> & { count: number }>;
+    const total = counts.reduce((sum, row) => {
+      const included = (!query.event || row.event === query.event) && (!query.harnessId || row.harnessId === query.harnessId);
+      return sum + (included ? row.count : 0);
+    }, 0);
+    const rows = query.offset < total ? this.db.prepare(`${source}
+      SELECT seq, sessionId, sessionTitle, turnId, harnessId, imported, event, timestamp FROM matching
+      WHERE (? IS NULL OR event = ?) AND (? IS NULL OR harnessId = ?)
+      ORDER BY timestamp DESC, sessionId DESC, seq DESC LIMIT ? OFFSET ?
+    `).all(...params, query.event ?? null, query.event ?? null, query.harnessId ?? null, query.harnessId ?? null,
+      pageSize, query.offset) as unknown as Array<Omit<PluginTurnRow, 'imported'> & { imported: number }> : [];
+    return { counts, total, rows };
+  }
+
+  getPluginTurnToolEvents(sessionId: string, turnId: string, upToSeq: number): CanonicalEvent[] {
+    const rows = this.db.prepare(`SELECT * FROM session_events
+      WHERE session_id = ? AND turn_id = ? AND seq <= ? AND type IN ('tool.call.started', 'tool.call.completed')
+      ORDER BY seq
+    `).all(sessionId, turnId, upToSeq) as unknown as EventRow[];
+    return rows.map((row) => ({
+      sessionId, turnId, seq: row.seq, type: row.type as CanonicalEventType, createdAt: row.created_at,
+      payload: safeJsonParse<Record<string, unknown>>(row.payload_json, {}),
+    }));
   }
 
   // ── Session Harness Bindings (Per-Harness Sync Watermarks) ───────────

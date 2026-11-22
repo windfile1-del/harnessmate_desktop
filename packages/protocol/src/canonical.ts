@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { PluginDataPanelSchema, PluginProjectionSchema } from './plugin-sdk.js';
 
 export const HarnessKindSchema = z.enum(['codex', 'agy', 'claude', 'acp']);
 export type HarnessKind = z.infer<typeof HarnessKindSchema>;
@@ -393,6 +394,8 @@ export const PluginContributesSchema = z.object({
   slashCommands: z.array(PluginSlashCommandSchema).optional(),
   mcpPresets: z.array(PluginMcpPresetSchema).optional(),
   panels: z.array(PluginPanelSchema).max(6).optional(),
+  projections: z.array(PluginProjectionSchema).max(6).optional(),
+  dataPanels: z.array(PluginDataPanelSchema).max(6).optional(),
   uiSlots: z
     .array(z.enum(['sidebar_tool', 'inspector_tab', 'composer_action', 'modal']))
     .optional(),
@@ -408,14 +411,14 @@ export const PluginManifestSchema = z.object({
   author: z.string().max(80).optional(),
   category: PluginCategorySchema.default('workflow'),
   entry: z.string().optional(),
-  apiVersion: z.literal(1).optional(),
+  apiVersion: z.union([z.literal(1), z.literal(2)]).optional(),
   contributes: PluginContributesSchema.default({}),
 });
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
 
 export const GeneratedPluginManifestSchema = PluginManifestSchema
   .omit({ entry: true, contributes: true }).extend({
-    contributes: PluginContributesSchema.pick({ slashCommands: true, panels: true }).strict(),
+    contributes: PluginContributesSchema.pick({ slashCommands: true, panels: true, projections: true, dataPanels: true }).strict(),
   }).strict();
 
 export const InstalledPluginInfoSchema = PluginManifestSchema.extend({

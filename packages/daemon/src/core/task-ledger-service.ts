@@ -123,11 +123,7 @@ export class TaskLedgerService {
           extractShellCommand(matchingStart?.payload.input, String(matchingStart?.payload.summary ?? '')) ||
           toolName;
 
-        if (
-          matchingStart?.payload.toolKind === 'shell' &&
-          cmdCandidate &&
-          VERIFICATION_CMD_RE.test(cmdCandidate)
-        ) {
+        if (isVerificationCommand(matchingStart, cmdCandidate)) {
           verifications.push({
             command: cmdCandidate.slice(0, 160),
             status: status === 'success' ? 'pass' : status === 'error' ? 'fail' : 'unknown',
@@ -418,6 +414,48 @@ function dedupeStrings(items: string[]): string[] {
     out.push(trimmed);
   }
   return out;
+}
+
+function isVerificationCommand(start: CanonicalEvent | undefined, command: string): boolean {
+  return start?.payload.toolKind === 'shell' && VERIFICATION_CMD_RE.test(command);
+}
+
+export function readRecordedTurnEvidence(events: CanonicalEvent[], cwd: string) {
+  const starts = new Map<string, CanonicalEvent>();
+  const files = new Set<string>();
+  const verifications: Array<{ command: string; status: 'pass' | 'fail' | 'unknown' }> = [];
+  for (const event of events) {
+    const payload = event.payload;
+    if (typeof payload.toolCallId !== 'string') continue;
+    if (event.type === 'tool.call.started') {
+      starts.set(payload.toolCallId, event);
+      continue;
+    }
+    const start = starts.get(payload.toolCallId);
+    starts.delete(payload.toolCallId);
+    if (event.type !== 'tool.call.completed') continue;
+
+    const status = payload.status;
+    const tool = start?.payload;
+    const command = extractShellCommand(tool?.input, String(tool?.summary ?? ''));
+    if (verifications.length < 12 && isVerificationCommand(start, command)) {
+      verifications.push({ command: compactSingleLine(command, 160),
+        status: status === 'success' ? 'pass' : status === 'error' ? 'fail' : 'unknown' });
+    }
+    if (files.size >= 24 || status !== 'success') continue;
+    const paths = extractFilePathsFromDiff(typeof payload.diff === 'string' ? payload.diff : '');
+    if (tool) paths.push(...extractFilePathsFromTool(String(tool.toolKind ?? ''), String(tool.toolName ?? ''),
+      String(tool.summary ?? ''), tool.input, cwd));
+    for (const candidate of paths) {
+      const relative = path.relative(cwd, path.resolve(cwd, candidate));
+      if (relative && relative.length <= 260 && !path.isAbsolute(relative)
+        && relative !== '..' && !relative.startsWith(`..${path.sep}`)) {
+        files.add(relative.replace(/\\/g, '/'));
+      }
+      if (files.size >= 24) break;
+    }
+  }
+  return { files: [...files], verifications };
 }
 
 function extractShellCommand(input: unknown, summary: string): string {

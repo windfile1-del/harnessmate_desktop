@@ -45,6 +45,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { daemonApi, resolveAttachmentUrl } from '../api/client';
+import { formatPluginSummary, listPluginPanels } from '../lib/plugin-panels';
 import {
   formatTokenCount,
   HARNESS_META,
@@ -77,6 +78,10 @@ export function ChatStage() {
     harnesses,
     workspaces,
     slashCommands,
+    plugins,
+    focusedTurn,
+    focusTurn,
+    openPluginPanel,
     selectedSessionId,
     eventsBySession,
     taskStateBySession,
@@ -180,6 +185,16 @@ export function ChatStage() {
   }, [events.length, selectedSessionId]);
 
   useEffect(() => {
+    if (!focusedTurn || focusedTurn.sessionId !== selectedSessionId) return;
+    const target = document.getElementById(`chat-turn-${focusedTurn.turnId}`);
+    if (!target) return;
+    followBottom.current = false;
+    target.scrollIntoView({ block: 'start' });
+    target.focus({ preventScroll: true });
+    focusTurn(null);
+  }, [focusedTurn, selectedSessionId, timeline, focusTurn]);
+
+  useEffect(() => {
     if (!selectedSessionId || !nativeCommandsEnabled) return;
     let current = true;
     void daemonApi.getHarnessCommands(selectedSessionId).then(({ commands }) => {
@@ -209,6 +224,13 @@ export function ChatStage() {
 
   const nativeCommands = nativeCommandsEnabled && commandCatalog?.key === commandCatalogKey
     ? commandCatalog.commands : [];
+  const pluginPanels = useMemo(() => listPluginPanels(plugins), [plugins]);
+  const panelCommands = useMemo(() => pluginPanels.flatMap((entry) => {
+    const action = entry.panel.copySummary;
+    return action?.command ? [{ ...entry, command: action.command, description: action.label,
+      argumentHint: undefined, pluginName: entry.panel.title }] : [];
+  }), [pluginPanels]);
+  const composerPanels = pluginPanels.filter(({ panel }) => panel.placements?.includes('composer_action'));
   // The active CLI catalog takes precedence over workflow shortcuts of the same name.
   const slashMatches = useMemo(() => {
     const trimmed = inputText.trimStart();
@@ -218,9 +240,10 @@ export function ChatStage() {
     const native = nativeCommands.map((command) => ({
       ...command, pluginId: 'core.harness-commands', pluginName: harness?.displayName ?? '原生命令',
     }));
-    return [...native, ...slashCommands.filter((c) => !native.some((n) => n.command === c.command))]
+    const nativeNames = new Set<string>(native.map(({ command }) => command));
+    return [...native, ...[...panelCommands, ...slashCommands].filter(({ command }) => !nativeNames.has(command))]
       .filter((c) => c.command.toLowerCase().includes(firstToken));
-  }, [inputText, nativeCommands, slashCommands, harness?.displayName]);
+  }, [inputText, nativeCommands, slashCommands, panelCommands, harness?.displayName]);
 
   if (!session) {
     return (
@@ -335,6 +358,28 @@ export function ChatStage() {
   const handleSend = async () => {
     const trimmed = inputText.trim();
     if ((!trimmed && attachments.length === 0) || sending || (isRunning && !isGoalControl)) return;
+    const panelCommand = nativeCommands.some(({ command }) => command === typedCommand) ? undefined
+      : panelCommands.find(({ command }) => command === typedCommand);
+    if (panelCommand) {
+      if (commandArgs || attachments.length > 0) {
+        pushToast({ kind: 'warning', title: `请单独发送 /${panelCommand.command}` });
+        return;
+      }
+      setSending(true);
+      try {
+        const { panel, pluginId } = panelCommand;
+        const snapshot = await daemonApi.getPluginPanel(session.id, pluginId, panel.id);
+        await navigator.clipboard.writeText(formatPluginSummary(panel.title, snapshot));
+        if (useAppStore.getState().draftTextBySession[session.id] === inputText) clearDraft(session.id);
+        pushToast({ kind: 'success', title: '已复制轮次摘要' });
+      } catch (err) {
+        pushToast({ kind: 'error', title: '插件命令执行失败', body: err instanceof Error ? err.message : String(err) });
+      } finally {
+        setSending(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
     const name = nativeCommandName;
     const isWorkflow = slashCommands.some((command) => command.command === typedCommand);
     if (nativeCommandsEnabled && name.success && (!isWorkflow || nativeCommands.some((command) => command.command === name.data))) {
@@ -957,7 +1002,7 @@ export function ChatStage() {
                   </>
                 )}
 
-                {(nativeCommands.length > 0 || slashCommands.length > 0) && (
+                {(nativeCommands.length > 0 || slashCommands.length > 0 || panelCommands.length > 0) && (
                   <button
                     type="button"
                     disabled={isRunning}
@@ -975,6 +1020,13 @@ export function ChatStage() {
                     <Slash size={12} />
                   </button>
                 )}
+
+                {composerPanels.length > 0 && <select aria-label="在输入区打开插件面板" value=""
+                  onChange={(event) => { if (event.target.value) openPluginPanel(event.target.value); }}
+                  className="h-7 max-w-32 rounded-lg bg-[var(--bg-elevated)] px-1.5 text-[11px] text-[var(--text-secondary)]">
+                  <option value="">插件面板</option>
+                  {composerPanels.map(({ key, panel }) => <option key={key} value={key}>{panel.title}</option>)}
+                </select>}
 
                 {/* Inline Unified Harness Switcher */}
                 <HarnessSwitcher
@@ -1194,7 +1246,7 @@ function TurnBlock({
   const turnModelLabel = turn.actualModel || turn.model;
 
   return (
-    <div className="animate-fade-up space-y-4">
+    <div id={`chat-turn-${turn.turnId}`} tabIndex={-1} className="animate-fade-up space-y-4 rounded-xl focus-visible:outline">
       {/* User Prompt + Attachments */}
       {(turn.userText || turn.userAttachments.length > 0) && (
         <div className="flex flex-col items-end gap-2">

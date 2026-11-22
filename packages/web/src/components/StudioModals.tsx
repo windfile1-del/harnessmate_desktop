@@ -222,6 +222,11 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
 
                   {/* Contributed items preview */}
                   <div className="mt-2 flex flex-wrap gap-1.5">
+                    {p.contributes.dataPanels?.map(({ id, title, copySummary }) => (
+                      <span key={id} className="rounded px-1.5 py-0.5 text-[10px] text-[var(--accent-indigo)]">
+                        {title}{copySummary?.command && ` · /${copySummary.command}`}
+                      </span>
+                    ))}
                     {(p.contributes.slashCommands ?? []).map((c) => (
                       <span
                         key={c.command}

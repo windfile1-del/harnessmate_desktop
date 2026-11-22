@@ -204,6 +204,28 @@ const BUILTIN_PLUGINS: PluginManifest[] = [
 
 const CURATED_PLUGIN_CATALOG: Array<PluginManifest & { tags: string[] }> = [
   {
+    id: 'user.project-acceptance',
+    name: '项目验收台',
+    description: '按工作区查看三个 Harness 的轮次、已记录的改动文件和验证结果，支持筛选和定位到原轮次。',
+    version: '1.0.0',
+    apiVersion: 2,
+    category: 'ui',
+    tags: ['验收', '工作区'],
+    contributes: {
+      projections: [{ id: 'turns', scope: 'workspace', events: ['turn.completed', 'turn.failed', 'turn.cancelled'] }],
+      dataPanels: [{
+        id: 'acceptance', title: '项目验收台', projection: 'turns', counts: true,
+        filters: ['harness', 'status'], openTurn: true, placements: ['sidebar_tool', 'composer_action'],
+        columns: [
+          { field: 'time', label: '时间' }, { field: 'session', label: '会话' },
+          { field: 'harness', label: 'Harness' }, { field: 'status', label: '轮次' },
+          { field: 'changed_files', label: '改动文件' }, { field: 'verifications', label: '验证结果' },
+        ],
+        copySummary: { label: '复制验收摘要', command: 'acceptance' },
+      }],
+    },
+  },
+  {
     id: 'ext.git-pr-studio',
     name: 'Git 提交与 PR 写作套件',
     version: '1.0.0',
@@ -501,14 +523,18 @@ export class PluginManager {
     const other = [...occupied.values()].filter(({ info }) => info.id !== manifest.id);
     const commands = new Set<string>([...HarnessCommandNameSchema.options, 'quota', 'plugins']);
     const contributedHarnesses = new Set<string>();
+    const commandNames = (plugin: PluginManifest) => [
+      ...(plugin.contributes.slashCommands ?? []).map(({ command }) => command),
+      ...(plugin.contributes.dataPanels ?? []).flatMap(({ copySummary }) => copySummary?.command ? [copySummary.command] : []),
+    ];
     for (const { info } of other) {
-      for (const command of info.contributes.slashCommands ?? []) commands.add(command.command);
+      for (const name of commandNames(info)) commands.add(name);
       for (const config of info.contributes.harnesses ?? []) contributedHarnesses.add(config.id);
     }
     const owns = new Set((occupied.get(manifest.id)?.info.contributes.harnesses ?? []).map(({ id }) => id));
-    for (const command of manifest.contributes.slashCommands ?? []) {
-      if (commands.has(command.command)) throw new Error(`指令 /${command.command} 已被占用`);
-      commands.add(command.command);
+    for (const name of commandNames(manifest)) {
+      if (commands.has(name)) throw new Error(`指令 /${name} 已被占用`);
+      commands.add(name);
     }
     for (const config of manifest.contributes.harnesses ?? []) {
       const current = this.registry.get(config.id);
@@ -528,6 +554,33 @@ export class PluginManager {
         if (!ownCommands.has(action.command)) throw new Error(`面板操作必须引用本插件的指令 /${action.command}`);
       }
     }
+    const { projections, dataPanels, harnesses, mcpPresets, hooks, uiSlots } = manifest.contributes;
+    if (manifest.apiVersion !== 2 && (projections || dataPanels)) {
+      throw new Error('事件投影和数据面板需要 apiVersion: 2');
+    }
+    if (manifest.apiVersion === 2 && (manifest.entry || harnesses?.length || mcpPresets?.length || hooks?.length || uiSlots?.length)) {
+      throw new Error('V2 插件使用声明式扩展接口');
+    }
+    const projectionIds = new Set<string>();
+    for (const projection of projections ?? []) {
+      if (projectionIds.has(projection.id)) throw new Error(`事件投影 ID ${projection.id} 重复`);
+      if (new Set(projection.events).size !== projection.events.length) throw new Error(`事件投影 ${projection.id} 含有重复事件`);
+      projectionIds.add(projection.id);
+    }
+    for (const panel of dataPanels ?? []) {
+      if (panelIds.has(panel.id)) throw new Error(`面板 ID ${panel.id} 重复`);
+      if (!projectionIds.has(panel.projection)) throw new Error(`面板 ${panel.id} 引用了不存在的事件投影 ${panel.projection}`);
+      if (new Set(panel.columns.map(({ field }) => field)).size !== panel.columns.length) throw new Error(`面板 ${panel.id} 含有重复列`);
+      panelIds.add(panel.id);
+    }
+  }
+
+  getDataPanel(pluginId: string, panelId: string) {
+    const plugin = this.plugins.get(pluginId)?.info;
+    if (!plugin?.enabled) return undefined;
+    const panel = plugin.contributes.dataPanels?.find(({ id }) => id === panelId);
+    const projection = plugin.contributes.projections?.find(({ id }) => id === panel?.projection);
+    return panel && projection ? { panel, projection } : undefined;
   }
 
   listInstalled(): InstalledPluginInfo[] {
@@ -741,6 +794,10 @@ export class PluginManager {
       const match = trimmed.match(/^\/([a-z0-9][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i);
       if (match?.[1]) {
         const cmdName = match[1].toLowerCase();
+        if ([...this.plugins.values()].some(({ info }) => info.enabled &&
+          info.contributes.dataPanels?.some(({ copySummary }) => copySummary?.command === cmdName))) {
+          throw new Error(`/${cmdName} 是桌面插件面板命令，请在桌面聊天中使用`);
+        }
         const args = (match[2] ?? '').trim();
         const found = this.listActiveSlashCommands().find((c) => c.command === cmdName);
         if (found) {

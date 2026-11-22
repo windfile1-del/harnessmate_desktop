@@ -21,6 +21,7 @@ import {
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
   UpdateTaskStateRequestSchema,
+  PluginPanelQuerySchema,
   UploadAttachmentRequestSchema,
   type ContextSyncMode,
   type RemoteAccessStatus,
@@ -54,6 +55,7 @@ import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
+import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
 
@@ -500,6 +502,16 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const afterSeq = parsedSeq;
     const events = sessionManager.getSessionEvents(id, afterSeq);
     return { events, lastSeq: session.lastSeq };
+  });
+
+  app.get('/api/v1/sessions/:id/plugin-panels/:pluginId/:panelId', async (request, reply) => {
+    const { id, pluginId, panelId } = request.params as { id: string; pluginId: string; panelId: string };
+    const session = sessionManager.getSession(id);
+    const contribution = pluginManager.getDataPanel(pluginId, panelId);
+    if (!session || !contribution) return reply.code(404).send({ error: '会话或插件面板不存在' });
+    const query = PluginPanelQuerySchema.safeParse(request.query);
+    if (!query.success) return reply.code(400).send({ error: '面板筛选条件无效' });
+    return readPluginPanel(store, session, contribution.panel, contribution.projection, query.data);
   });
 
   app.get('/api/v1/sessions/:id/commands', async (request, reply) => {

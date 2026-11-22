@@ -9,10 +9,12 @@ import type { AdapterSessionHandle } from '../harnesses/types.js';
 
 const schemaGuide = `Return exactly one JSON object, with no Markdown, implementation plan, tools, or file operations.
 The JSON defines a data-only HarnessMate plugin. Use labels and prompts in the user's language.
-Top level: id (user.<lowercase slug>), name, description, version, apiVersion (1), category ("workflow" or "ui"), contributes.
+Top level: id (user.<lowercase slug>), name, description, version, apiVersion (2, or 1 for legacy manifests), category ("workflow" or "ui"), contributes.
 contributes supports:
 - slashCommands: [{command, description, argumentHint?, template}]. Use lowercase command names distinct from built-in commands and {{args}} for the user input.
 - panels: [{id,title,description?,sections,actions}]. Sections are turns, changed_files, verifications, recent_activity. Actions are [{label,command,args?}] and refer to this plugin's slashCommands.
+- V2 projections: [{id,scope,events}]. Scope is "session" or "workspace". Events are "turn.completed", "turn.failed", "turn.cancelled".
+- V2 dataPanels: [{id,title,description?,projection,columns,filters?,counts?,openTurn?,placements?,copySummary?}]. Projection is the ID of a projection in this plugin. Columns are [{field,label}]; fields are time, session, harness, status, changed_files, verifications. Filters are harness or status. Counts and openTurn are booleans. Placements are sidebar_tool or composer_action. copySummary is {label,command?}, a clipboard action and optional local slash command.
 Include only supported data. No JavaScript, MCP, native harnesses, arbitrary UI code, background execution, or shell commands. Use at least one command or panel.
 For an existing plugin, keep its ID and increment the version.`;
 
@@ -75,7 +77,7 @@ export class PluginAuthoring {
       catch { throw new Error('模型未返回有效的 JSON 插件清单'); }
       const manifest = GeneratedPluginManifestSchema.parse(parsed);
       if (previous && manifest.id !== previous.id) throw new Error('更新草稿必须保留原插件 ID');
-      if (!manifest.contributes.slashCommands?.length && !manifest.contributes.panels?.length) {
+      if (!manifest.contributes.slashCommands?.length && !manifest.contributes.panels?.length && !manifest.contributes.dataPanels?.length) {
         throw new Error('草稿至少需要一个指令或面板');
       }
       return manifest;

@@ -75,6 +75,10 @@ interface AppState {
 
   // Modular Plugin System
   plugins: InstalledPluginInfo[];
+  selectedPluginPanel: string | null;
+  focusedTurn: { sessionId: string; turnId: string } | null;
+  openPluginPanel: (key: string) => void;
+  focusTurn: (target: AppState['focusedTurn']) => void;
   pluginCatalog: PluginCatalogItem[];
   slashCommands: Array<PluginSlashCommand & { pluginId: string; pluginName: string }>;
   mcpPresets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
@@ -341,6 +345,10 @@ export const useAppStore = create<AppState>((set, get) => {
     remoteStatus: null,
 
     plugins: [],
+    selectedPluginPanel: null,
+    focusedTurn: null,
+    openPluginPanel: (key) => set({ selectedPluginPanel: key, inspectorTab: 'plugins', inspectorOpen: true }),
+    focusTurn: (focusedTurn) => set({ focusedTurn }),
     pluginCatalog: [],
     slashCommands: [],
     mcpPresets: [],
@@ -648,7 +656,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     selectSession: async (sessionId) => {
-      set({ selectedSessionId: sessionId });
+      set({ selectedSessionId: sessionId, focusedTurn: null });
       if (!sessionId) return;
 
       const existing = get().eventsBySession[sessionId] ?? [];
@@ -679,7 +687,9 @@ export const useAppStore = create<AppState>((set, get) => {
           });
         }
         set((state) => ({
-          sessions: state.sessions.map((s) => (s.id === sessionId && s.lastSeq <= detail.session.lastSeq ? detail.session : s)),
+          sessions: state.sessions.some((s) => s.id === sessionId)
+            ? state.sessions.map((s) => (s.id === sessionId && s.lastSeq <= detail.session.lastSeq ? detail.session : s))
+            : [detail.session, ...state.sessions],
           ...(detail.taskState
             ? { taskStateBySession: { ...state.taskStateBySession, [sessionId]: detail.taskState } }
             : {}),

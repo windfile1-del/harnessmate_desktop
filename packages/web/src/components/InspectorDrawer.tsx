@@ -27,6 +27,8 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { PluginPanels } from './PluginPanels';
+import { PluginDataPanel } from './PluginDataPanel';
+import { listPluginPanels } from '../lib/plugin-panels';
 import {
   daemonApi,
   type ProjectInstructionInfo,
@@ -50,6 +52,8 @@ export function InspectorDrawer({
     gitBySession,
     taskStateBySession,
     plugins,
+    selectedPluginPanel,
+    openPluginPanel,
     refreshGitStatus,
     refreshTaskState,
     updateTaskState,
@@ -63,6 +67,8 @@ export function InspectorDrawer({
   const git = gitBySession[session.id] ?? null;
   const taskState = taskStateBySession[session.id] ?? null;
   const panelPlugins = plugins.filter((plugin) => plugin.enabled && plugin.contributes.panels?.length);
+  const dataPanels = listPluginPanels(plugins);
+  const selectedPanel = dataPanels.find(({ key }) => key === selectedPluginPanel) ?? dataPanels[0];
 
   // Task Board local draft inputs
   const [objectiveDraft, setObjectiveDraft] = useState(taskState?.objective ?? '');
@@ -75,10 +81,10 @@ export function InspectorDrawer({
   }, [taskState?.objective, session.id]);
 
   useEffect(() => {
-    if ((inspectorTab === 'task' || inspectorTab === 'plugins') && !taskState) {
+    if ((inspectorTab === 'task' || (inspectorTab === 'plugins' && panelPlugins.length > 0)) && !taskState) {
       void refreshTaskState(session.id);
     }
-  }, [inspectorTab, session.id, taskState, refreshTaskState]);
+  }, [inspectorTab, session.id, taskState, refreshTaskState, panelPlugins.length]);
 
   // Files tab state
   const [fileQuery, setFileQuery] = useState('');
@@ -223,7 +229,7 @@ export function InspectorDrawer({
             label="详情"
             onClick={() => setInspectorTab('info')}
           />
-          {(panelPlugins.length > 0 || inspectorTab === 'plugins') && <TabBtn
+          {(panelPlugins.length > 0 || dataPanels.length > 0 || inspectorTab === 'plugins') && <TabBtn
             active={inspectorTab === 'plugins'} icon={<Puzzle size={12.5} />}
             label="插件" onClick={() => setInspectorTab('plugins')} />}
         </div>
@@ -238,9 +244,18 @@ export function InspectorDrawer({
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-3.5">
-        {inspectorTab === 'plugins' && (panelPlugins.length > 0
-          ? <PluginPanels sessionId={session.id} plugins={panelPlugins} />
-          : <p className="text-[12px] text-[var(--text-muted)]">暂无已启用的插件面板</p>)}
+        {inspectorTab === 'plugins' && <div className="space-y-4">
+          {selectedPanel && <section className="space-y-3">
+            <select aria-label="选择插件面板" value={selectedPanel.key} onChange={(event) => openPluginPanel(event.target.value)}
+              className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-2 text-[12px]">
+              {dataPanels.map(({ key, panel }) => <option key={key} value={key}>{panel.title}</option>)}
+            </select>
+            <PluginDataPanel key={`${session.id}:${selectedPanel.key}:${selectedPanel.version}`}
+              sessionId={session.id} contribution={selectedPanel} />
+          </section>}
+          {panelPlugins.length > 0 && <PluginPanels sessionId={session.id} plugins={panelPlugins} />}
+          {!selectedPanel && panelPlugins.length === 0 && <p className="text-[12px] text-[var(--text-muted)]">暂无已启用的插件面板</p>}
+        </div>}
         {inspectorTab === 'task' && (
           <div className="space-y-3.5">
             {/* Top Action Row */}

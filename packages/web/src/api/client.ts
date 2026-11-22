@@ -28,6 +28,8 @@ import type {
   RunHarnessCommandRequest,
   Session,
   SessionTaskState,
+  PluginPanelQuery,
+  PluginPanelSnapshot,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
   UpdateSessionRequest,
@@ -169,6 +171,17 @@ export const daemonApi = {
 
   // Plugins
   listPlugins: () => apiFetch<PluginBundleResponse>('/api/v1/plugins'),
+
+  getPluginPanel: (sessionId: string, pluginId: string, panelId: string, query: Partial<PluginPanelQuery> = {}, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (query.harnessId) params.set('harnessId', query.harnessId);
+    if (query.event) params.set('event', query.event);
+    if (query.offset) params.set('offset', String(query.offset));
+    return apiFetch<PluginPanelSnapshot>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/plugin-panels/${encodeURIComponent(pluginId)}/${encodeURIComponent(panelId)}?${params}`,
+      { signal },
+    );
+  },
 
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),

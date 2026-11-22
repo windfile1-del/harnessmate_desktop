@@ -122,6 +122,10 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
           <div className="flex flex-wrap gap-x-3">
             {preview.result.manifest.contributes.slashCommands?.map(({ command }) => <code key={command}>/{command}</code>)}
             {preview.result.manifest.contributes.panels?.map(({ id, title }) => <span key={id}>面板 {title}</span>)}
+            {preview.result.manifest.contributes.dataPanels?.map(({ id, title, copySummary }) =>
+              <span key={id}>数据面板 {title}{copySummary?.command && <> · /{copySummary.command}</>}</span>)}
+            {preview.result.manifest.contributes.projections?.map(({ id, scope, events }) =>
+              <span key={id}>{scope === 'workspace' ? '当前工作区' : '当前会话'} · {events.join(' / ')}</span>)}
             {preview.result.manifest.contributes.harnesses?.map(({ id, command }) => <span key={id}>ACP {id} · {command}</span>)}
             {preview.result.manifest.contributes.mcpPresets?.map(({ name, command, url }) => <span key={name}>MCP {name} · {command || url}</span>)}
             {preview.result.manifest.contributes.hooks?.map((hook) => <code key={hook}>{hook}</code>)}
