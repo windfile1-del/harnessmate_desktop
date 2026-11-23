@@ -16,5 +16,5 @@
 | `session.closing` | parallel | `session:read` | core/session-manager.ts | — |
 | `plugin.state` | emit | — | plugin-host/runtime/lifecycle.ts | — |
 | `handoff.compose` | waterfall | `handoff:section` | core/context-compiler.ts | — |
-| `handoff.shouldOffer` | bail | `session:read` | 契约预留 | — |
-| `approval.annotate` | waterfall | `approvals:annotate` | 契约预留 | — |
+| `handoff.shouldOffer` | bail | `session:read` | core/session-manager.ts | — |
+| `approval.annotate` | waterfall | `approvals:annotate` | core/session-manager.ts | — |

@@ -1,6 +1,6 @@
 import semver from 'semver';
 import { PLUGIN_API_VERSION, PLUGIN_MANIFEST_VERSION, PluginApiError, PluginManifestV4Schema,
-  type PluginManifest, type PluginManifestV4 } from '@harnessmate/plugin-api';
+  normalizePluginSlotKey, type PluginManifest, type PluginManifestV4 } from '@harnessmate/plugin-api';
 import { upgradeV1 } from './upgrade-v1.js';
 import { upgradeV2 } from './upgrade-v2.js';
 import { upgradeV3 } from './upgrade-v3.js';
@@ -18,8 +18,10 @@ export function normalizePluginManifest(manifest: PluginManifest): PluginManifes
   if ((generation === 2 || generation === 3) && (manifest.entry || harnesses?.length || mcpPresets?.length || hooks?.length || uiSlots?.length)) {
     throw new PluginApiError('E_INVALID_INPUT', 'V2/V3 清单使用声明式扩展接口');
   }
-  if (generation < PLUGIN_MANIFEST_VERSION && (manifest.main || manifest.engines || manifest.inject || manifest.optional || manifest.provides)) {
-    throw new PluginApiError('E_INVALID_INPUT', 'main、engines 与服务声明需要 V4 清单');
+  if (generation < PLUGIN_MANIFEST_VERSION && (manifest.main || manifest.engines || manifest.inject || manifest.optional
+    || manifest.provides || manifest.permissions || manifest.activationEvents || manifest.contributes.commands?.length
+    || manifest.contributes.slots?.length || manifest.contributes.settings)) {
+    throw new PluginApiError('E_INVALID_INPUT', 'main、engines、插槽、权限与服务声明需要 V4 清单');
   }
   if (generation === PLUGIN_MANIFEST_VERSION && manifest.entry) {
     throw new PluginApiError('E_INVALID_INPUT', 'V4 清单使用 main 声明代码入口');
@@ -37,6 +39,12 @@ export function normalizePluginManifest(manifest: PluginManifest): PluginManifes
   if (!semver.validRange(range)) throw new PluginApiError('E_INVALID_INPUT', `无效的插件 API 版本范围 ${range}`);
   if (!semver.satisfies(PLUGIN_API_VERSION, range)) {
     throw new PluginApiError('E_NOT_SUPPORTED', `插件需要 API ${range}，当前 API 为 ${PLUGIN_API_VERSION}`);
+  }
+  if (parsed.data.contributes.slots?.length) {
+    parsed.data.contributes.slots = parsed.data.contributes.slots.map((entry) => ({
+      ...entry,
+      slot: normalizePluginSlotKey(entry.slot),
+    }));
   }
   return parsed.data;
 }

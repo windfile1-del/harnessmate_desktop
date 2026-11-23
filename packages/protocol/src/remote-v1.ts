@@ -173,6 +173,13 @@ export const InstallPluginRequestSchema = z.union([
     manifest: PluginManifestSchema,
     ...pluginInstallConfirmation,
   }),
+  z.object({
+    mode: z.literal('remote_index'),
+    pluginId: z.string().min(1),
+    version: z.string().optional(),
+    allowUntrusted: z.boolean().optional(),
+    ...pluginInstallConfirmation,
+  }),
 ]);
 export type InstallPluginRequest = z.infer<typeof InstallPluginRequestSchema>;
 

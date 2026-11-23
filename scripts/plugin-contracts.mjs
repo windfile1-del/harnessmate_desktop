@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { zodToJsonSchema } from 'zod-to-json-schema';
-import { PLUGIN_API_VERSION, PluginManifestV4Schema, pluginErrorCodes, pluginEventContracts } from '../packages/plugin-api/dist/index.js';
+import { PLUGIN_API_VERSION, PLUGIN_UI_SLOTS, PluginManifestV4Schema, pluginErrorCodes, pluginEventContracts } from '../packages/plugin-api/dist/index.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const check = process.argv.includes('--check');
@@ -34,6 +34,8 @@ const producers = {
   'session.created': 'core/session-manager.ts', 'session.closing': 'core/session-manager.ts',
   'plugin.state': 'plugin-host/runtime/lifecycle.ts',
   'handoff.compose': 'core/context-compiler.ts',
+  'handoff.shouldOffer': 'core/session-manager.ts',
+  'approval.annotate': 'core/session-manager.ts',
 };
 const mapper = read(`${daemon}/plugin-host/runtime/map-event.ts`);
 const builtin = read(`${daemon}/plugin-host/builtin/services.ts`);
@@ -51,11 +53,17 @@ const serviceNames = [
 ].sort();
 const handoffConfig = builtin.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
-  '当前由第一方提供。外部 V4 声明式插件可将服务列为依赖。\n\n' +
+  '第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。\n\n' +
   serviceNames.map((name) => `- \`${name}\`\n`).join('') +
   '\n## 交接配置\n\n```ts\n' + (handoffConfig?.[1] ?? '') + '\n```\n');
 
-const surface = ['context', 'events'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
+const slotRows = Object.entries(PLUGIN_UI_SLOTS).map(([key, { cardinality, scope, description }]) =>
+  `| \`${key}\` | \`${cardinality}\` | \`${scope}\` | ${description} |`);
+output.set('slots.md', heading('公共 UI 插槽') +
+  '第一方与内核级插件可直接注册 React 组件；第三方插件在 `contributes.slots` 或 `ctx.slots.register()` 中声明包内 HTML 入口，由宿主在 `sandbox="allow-scripts"` 沙箱 iframe 中渲染。\n\n' +
+  '| 插槽 | 基数 | 作用域 | 说明 |\n| --- | --- | --- | --- |\n' + slotRows.join('\n') + '\n');
+
+const surface = ['context', 'events', 'rpc', 'slots'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
   .split('\n').filter((line) => !line.startsWith('//# sourceMappingURL')).join('\n').trim()).join('\n\n');
 output.set('plugin-api.api.md', heading('插件 API 报告') +
   '清单与声明式贡献点见同目录 JSON Schema。公共错误码见类型声明。\n\n' +

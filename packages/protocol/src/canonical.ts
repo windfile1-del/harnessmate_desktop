@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { PluginContributesSchema, PluginManifestSchema } from '@harnessmate/plugin-api';
+import { PluginContributesSchema, PluginManifestSchema, PluginSlotContributionSchema } from '@harnessmate/plugin-api';
 
 export const HarnessKindSchema = z.enum(['codex', 'agy', 'claude', 'acp']);
 export type HarnessKind = z.infer<typeof HarnessKindSchema>;
@@ -227,6 +227,14 @@ export const SessionSchema = z.object({
 });
 export type Session = z.infer<typeof SessionSchema>;
 
+export const ApprovalAnnotationSchema = z.object({
+  pluginId: z.string(),
+  risk: RiskLevelSchema.optional(),
+  label: z.string(),
+  detail: z.string().optional(),
+});
+export type ApprovalAnnotationDto = z.infer<typeof ApprovalAnnotationSchema>;
+
 export const ApprovalRequestSchema = z.object({
   id: z.string(),
   sessionId: z.string(),
@@ -241,6 +249,7 @@ export const ApprovalRequestSchema = z.object({
   resolvedBy: z.enum(['desktop', 'mobile', 'auto']).nullable().optional(),
   decision: ApprovalDecisionSchema.nullable().optional(),
   comment: z.string().nullable().optional(),
+  annotations: z.array(ApprovalAnnotationSchema).optional(),
   createdAt: z.number(),
   resolvedAt: z.number().nullable().optional(),
 });
@@ -341,7 +350,7 @@ export type WorkspaceFileEntry = z.infer<typeof WorkspaceFileEntrySchema>;
 // ── Modular Plugin System Schemas ──────────────────────────────────────
 
 export const GeneratedPluginManifestSchema = PluginManifestSchema
-  .omit({ entry: true, main: true, provides: true, contributes: true }).extend({
+  .omit({ entry: true, main: true, provides: true, permissions: true, activationEvents: true, contributes: true }).extend({
     contributes: PluginContributesSchema.pick({ slashCommands: true, panels: true, projections: true, dataPanels: true,
       programs: true, actions: true }).strict(),
   }).strict();
@@ -356,12 +365,25 @@ export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   packageDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   runtimeState: z.enum(['PENDING', 'LOADING', 'ACTIVE', 'UNLOADING', 'DISPOSED', 'FAILED']).optional(),
   missingServices: z.array(z.string()).optional(),
+  runId: z.string().optional(),
+  runtimeMode: z.enum(['kernel', 'isolated', 'declarative']).optional(),
+  runtimeSlots: z.array(PluginSlotContributionSchema).optional(),
+  devMode: z.boolean().optional(),
+  devSourceDir: z.string().nullable().optional(),
 });
 export type InstalledPluginInfo = z.infer<typeof InstalledPluginInfoSchema>;
 
 export const PluginCatalogItemSchema = PluginManifestSchema.extend({
   installed: z.boolean(),
   tags: z.array(z.string()).default([]),
+  source: z.enum(['builtin', 'remote']).optional(),
+  registryUrl: z.string().optional(),
+  publisherId: z.string().optional(),
+  publisherName: z.string().optional(),
+  packageDigest: z.string().optional(),
+  signatureStatus: z.enum(['verified', 'untrusted_publisher', 'invalid', 'unsigned']).optional(),
+  compatible: z.boolean().optional(),
+  incompatibleReason: z.string().nullable().optional(),
 });
 export type PluginCatalogItem = z.infer<typeof PluginCatalogItemSchema>;
 

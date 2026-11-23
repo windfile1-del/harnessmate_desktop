@@ -60,6 +60,7 @@ import {
   type ProjectedTurn,
 } from '../lib/projector';
 import { useAppStore } from '../stores/app-store';
+import { Slot, SlotTurnProvider } from '../slots';
 import { HarnessBadge, StarLoomCrest } from './BrandMark';
 import { HarnessSwitcher } from './HarnessSwitcher';
 import { InspectorDrawer } from './InspectorDrawer';
@@ -84,7 +85,6 @@ export function ChatStage() {
     pluginPermissionRevision,
     focusedTurn,
     focusTurn,
-    openPluginPanel,
     selectedSessionId,
     eventsBySession,
     taskStateBySession,
@@ -242,7 +242,6 @@ export function ChatStage() {
     return action?.command ? [{ ...entry, command: action.command, description: action.label,
       argumentHint: undefined, pluginName: entry.panel.title }] : [];
   }), [pluginPanels]);
-  const composerPanels = pluginPanels.filter(({ panel }) => panel.placements?.includes('composer_action'));
   // The active CLI catalog takes precedence over workflow shortcuts of the same name.
   const slashMatches = useMemo(() => {
     const trimmed = inputText.trimStart();
@@ -536,17 +535,30 @@ export function ChatStage() {
                 }}
               />
             ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  setTitleDraft(session.title);
-                  setEditingTitle(true);
+              <Slot
+                name="session.header.title"
+                slotProps={{
+                  session,
+                  onRename: () => {
+                    setTitleDraft(session.title);
+                    setEditingTitle(true);
+                  },
                 }}
-                title="点击重命名会话"
-                className="cursor-pointer truncate text-[13.5px] font-medium tracking-tight text-[var(--text-primary)] hover:underline"
-              >
-                {session.title}
-              </button>
+                compactErrors
+                fallback={
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTitleDraft(session.title);
+                      setEditingTitle(true);
+                    }}
+                    title="点击重命名会话"
+                    className="cursor-pointer truncate text-[13.5px] font-medium tracking-tight text-[var(--text-primary)] hover:underline"
+                  >
+                    {session.title}
+                  </button>
+                }
+              />
             )}
 
             {/* Verified Active Model Badge (prevents silent model mismatch!) */}
@@ -701,6 +713,7 @@ export function ChatStage() {
               {timeline.pendingApprovals.map((appr) => (
                 <ApprovalCard
                   key={appr.id}
+                  session={session}
                   approval={appr}
                   pinned
                   onResolve={(decision) => void resolveApproval(appr.id, decision)}
@@ -736,6 +749,7 @@ export function ChatStage() {
                 ) : (
                   <TurnBlock
                     key={item.turnId}
+                    session={session}
                     turn={item}
                     fallbackHarnessKind={session.harnessKind}
                     fallbackHarnessId={session.harnessId}
@@ -1085,12 +1099,11 @@ export function ChatStage() {
                   {modelTools.count} 个模型工具{modelTools.status === 'unsupported' ? '不可用' : modelTools.status === 'next_turn' ? '待接入' : ''}
                 </span>}
 
-                {composerPanels.length > 0 && <select aria-label="在输入区打开插件面板" value=""
-                  onChange={(event) => { if (event.target.value) openPluginPanel(event.target.value); }}
-                  className="h-7 max-w-32 rounded-lg bg-[var(--bg-elevated)] px-1.5 text-[11px] text-[var(--text-secondary)]">
-                  <option value="">插件面板</option>
-                  {composerPanels.map(({ key, panel }) => <option key={key} value={key}>{panel.title}</option>)}
-                </select>}
+                <Slot
+                  name="composer.actions"
+                  slotProps={{ session, isRunning }}
+                  compactErrors
+                />
 
                 {/* Inline Unified Harness Switcher */}
                 <HarnessSwitcher
@@ -1288,6 +1301,7 @@ function HarnessSwitchDivider({
 }
 
 function TurnBlock({
+  session,
   turn,
   fallbackHarnessKind,
   fallbackHarnessId,
@@ -1296,6 +1310,7 @@ function TurnBlock({
   onPreviewImage,
   onResolveApproval,
 }: {
+  session: Session;
   turn: ProjectedTurn;
   fallbackHarnessKind: Session['harnessKind'];
   fallbackHarnessId: string;
@@ -1310,6 +1325,7 @@ function TurnBlock({
   const turnModelLabel = turn.actualModel || turn.model;
 
   return (
+    <SlotTurnProvider turn={turn}>
     <div id={`chat-turn-${turn.turnId}`} tabIndex={-1} className="animate-fade-up space-y-4 rounded-xl focus-visible:outline">
       {/* User Prompt + Attachments */}
       {(turn.userText || turn.userAttachments.length > 0) && (
@@ -1417,7 +1433,7 @@ function TurnBlock({
         {turn.tools.length > 0 && (
           <div className="space-y-2">
             {turn.tools.map((tool) => (
-              <ToolCallCard key={tool.toolCallId} tool={tool} />
+              <ToolCallCard key={tool.toolCallId} session={session} tool={tool} />
             ))}
           </div>
         )}
@@ -1427,6 +1443,7 @@ function TurnBlock({
           .map((appr) => (
             <ApprovalCard
               key={appr.id}
+              session={session}
               approval={appr}
               onResolve={(decision) => onResolveApproval(appr.id, decision)}
             />
@@ -1434,9 +1451,24 @@ function TurnBlock({
 
         {turn.assistantText && (
           <div className="pl-0.5">
-            <MarkdownView content={turn.assistantText} />
+            <Slot
+              name="chat.message.wrapper"
+              slotProps={{ session, turn, children: null }}
+            >
+              <MarkdownView content={turn.assistantText} />
+            </Slot>
           </div>
         )}
+
+        <Slot
+          name="chat.node"
+          matchKey={`turn.${turn.status}`}
+          slotProps={{
+            session,
+            turn,
+            eventType: `turn.${turn.status}`,
+          }}
+        />
 
         {turn.status === 'failed' && turn.errorMessage && (
           <div
@@ -1488,6 +1520,7 @@ function TurnBlock({
         )}
       </div>
     </div>
+    </SlotTurnProvider>
   );
 }
 
@@ -1525,7 +1558,7 @@ function ThinkingAccordion({ text, running }: { text: string; running: boolean }
   );
 }
 
-function ToolCallCard({ tool }: { tool: ProjectedToolCall }) {
+function ToolCallCard({ session, tool }: { session: Session; tool: ProjectedToolCall }) {
   const [expanded, setExpanded] = useState(tool.status === 'error');
 
   const Icon =
@@ -1582,21 +1615,30 @@ function ToolCallCard({ tool }: { tool: ProjectedToolCall }) {
             backgroundColor: 'var(--code-bg)',
           }}
         >
-          {tool.diff && (
-            <pre className="m-0 max-h-[220px] overflow-auto whitespace-pre-wrap text-[var(--accent-emerald)]">
-              {tool.diff}
-            </pre>
-          )}
-          {tool.output && (
-            <pre className="m-0 max-h-[240px] overflow-auto whitespace-pre-wrap text-[var(--text-secondary)]">
-              {tool.output}
-            </pre>
-          )}
-          {!tool.output && !tool.diff && tool.input != null && (
-            <pre className="m-0 max-h-[180px] overflow-auto whitespace-pre-wrap text-[var(--text-muted)]">
-              {JSON.stringify(tool.input, null, 2)}
-            </pre>
-          )}
+          <Slot
+            name="tool.result"
+            matchKey={tool.toolName}
+            slotProps={{ session, tool }}
+            fallback={
+              <>
+                {tool.diff && (
+                  <pre className="m-0 max-h-[220px] overflow-auto whitespace-pre-wrap text-[var(--accent-emerald)]">
+                    {tool.diff}
+                  </pre>
+                )}
+                {tool.output && (
+                  <pre className="m-0 max-h-[240px] overflow-auto whitespace-pre-wrap text-[var(--text-secondary)]">
+                    {tool.output}
+                  </pre>
+                )}
+                {!tool.output && !tool.diff && tool.input != null && (
+                  <pre className="m-0 max-h-[180px] overflow-auto whitespace-pre-wrap text-[var(--text-muted)]">
+                    {JSON.stringify(tool.input, null, 2)}
+                  </pre>
+                )}
+              </>
+            }
+          />
         </div>
       )}
     </div>
@@ -1604,10 +1646,12 @@ function ToolCallCard({ tool }: { tool: ProjectedToolCall }) {
 }
 
 function ApprovalCard({
+  session,
   approval,
   pinned = false,
   onResolve,
 }: {
+  session: Session;
   approval: ApprovalRequest;
   pinned?: boolean;
   onResolve: (decision: 'allow_once' | 'allow_session' | 'deny') => void;
@@ -1666,6 +1710,7 @@ function ApprovalCard({
             <p className="mt-1 font-mono-code text-[12px] break-all text-[var(--text-secondary)]">
               {approval.summary}
             </p>
+            <Slot name="approval.detail" slotProps={{ session, approval }} />
           </div>
         </div>
 

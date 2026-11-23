@@ -1,13 +1,38 @@
 import { X } from 'lucide-react';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { ChatStage } from './components/ChatStage';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
+import {
+  PluginSlotSync,
+  Slot,
+  SlotRegistryProvider,
+  SlotSessionProvider,
+  useSlotItems,
+} from './slots';
 import { useAppStore } from './stores/app-store';
+
+function StatusbarSlotStrip({ session }: { session: import('@harnessmate/protocol').Session | null }) {
+  const items = useSlotItems('statusbar.items');
+  if (items.length === 0) return null;
+  return (
+    <div
+      className="flex shrink-0 items-center gap-2 px-3 py-1 text-[11px] text-[var(--text-secondary)]"
+      style={{
+        backgroundColor: 'var(--bg-rail)',
+        borderTop: '1px solid var(--border-hairline)',
+      }}
+    >
+      <Slot name="statusbar.items" slotProps={{ session }} compactErrors className="flex flex-wrap items-center gap-2" />
+    </div>
+  );
+}
 
 export function App() {
   const {
     init,
+    sessions,
+    selectedSessionId,
     sidebarCollapsed,
     setSidebarCollapsed,
     inspectorOpen,
@@ -17,6 +42,11 @@ export function App() {
     toasts,
     dismissToast,
   } = useAppStore();
+
+  const selectedSession = useMemo(
+    () => sessions.find((s) => s.id === selectedSessionId) ?? null,
+    [sessions, selectedSessionId],
+  );
 
   useEffect(() => {
     void init();
@@ -46,12 +76,18 @@ export function App() {
   }, [sidebarCollapsed, inspectorOpen, activeModal, setSidebarCollapsed, setInspectorOpen, openModal]);
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden">
-      {!sidebarCollapsed && <Sidebar />}
-      <ChatStage />
-      <ModalHost />
+    <SlotRegistryProvider>
+      <SlotSessionProvider session={selectedSession}>
+        <PluginSlotSync />
+        <div className="flex h-screen w-screen flex-col overflow-hidden">
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            {!sidebarCollapsed && <Sidebar />}
+            <ChatStage />
+            <ModalHost />
+          </div>
+          <StatusbarSlotStrip session={selectedSession} />
 
-      {/* Refined Floating Toast Stack */}
+          {/* Refined Floating Toast Stack */}
       {toasts.length > 0 && (
         <div className="pointer-events-none fixed right-4 bottom-4 z-50 flex w-[320px] flex-col gap-2">
           {toasts.map((t) => (
@@ -92,6 +128,8 @@ export function App() {
           ))}
         </div>
       )}
-    </div>
+        </div>
+      </SlotSessionProvider>
+    </SlotRegistryProvider>
   );
 }

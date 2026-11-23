@@ -12,7 +12,7 @@ import type { getGitStatusSummary } from './git-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
 import { composeSnapshot, type HandoffSnapshot } from './handoff-snapshot.js';
 import type { PluginEvents } from '../plugin-host/runtime/events.js';
-import { PluginApiError, type Disposer } from '@harnessmate/plugin-api';
+import { PluginApiError, type Disposer, type HandoffComposeEvent } from '@harnessmate/plugin-api';
 
 export interface CodexInjectMessageItem {
   type: 'message';
@@ -64,6 +64,7 @@ export class ContextCompiler {
     readonly options: { budgetTokens: number; autoAttach: boolean },
     private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
     private readonly events: PluginEvents,
+    private readonly collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
   ) {}
 
   registerSection(source: string, section: { id: string; order?: number; text: string }): Disposer {
@@ -109,8 +110,35 @@ export class ContextCompiler {
 
     const unsyncedTurns = turns.filter((turn) => (turn.userText || turn.assistantText || turn.tools.length > 0) &&
       (!isWarmBinding || turn.harnessId !== targetHarnessId));
-    const taskState = this.taskLedger.getOrCreate(session);
-    const ledgerMarkdown = this.taskLedger.renderLedgerMarkdown(taskState, session, referenceOnly ? 'reference' : 'directive');
+    const taskState = typeof (this.taskLedger as { getOrCreate?: unknown }).getOrCreate === 'function'
+      ? this.taskLedger.getOrCreate(session)
+      : await (async () => {
+          const thirdParty = this.taskLedger as unknown as { get?: (sessionId: string) => Promise<Record<string, unknown> | null> };
+          const remote = typeof thirdParty.get === 'function' ? await thirdParty.get(session.id) : null;
+          return {
+            sessionId: session.id,
+            objective: typeof remote?.objective === 'string' ? remote.objective : '',
+            steps: Array.isArray(remote?.steps) ? remote.steps : [],
+            decisions: Array.isArray(remote?.decisions) ? remote.decisions : [],
+            touchedFiles: Array.isArray(remote?.touchedFiles) ? remote.touchedFiles : [],
+            verifications: [],
+            blockers: Array.isArray(remote?.blockers) ? remote.blockers : [],
+            pinnedFacts: Array.isArray(remote?.pinnedFacts) ? remote.pinnedFacts : [],
+            rollingSummary: '',
+            summarizedUpToSeq: 0,
+            version: typeof remote?.version === 'number' ? remote.version : 1,
+            ledgerFilePath: null,
+            updatedAt: typeof remote?.updatedAt === 'number' ? remote.updatedAt : Date.now(),
+          };
+        })();
+    const ledgerMarkdown = typeof (this.taskLedger as { renderLedgerMarkdown?: unknown }).renderLedgerMarkdown === 'function'
+      ? this.taskLedger.renderLedgerMarkdown(taskState, session, referenceOnly ? 'reference' : 'directive')
+      : [
+          '## Task State Ledger',
+          taskState.objective ? `- Objective: ${taskState.objective}` : '',
+          taskState.decisions.length ? `- Decisions: ${taskState.decisions.join('; ')}` : '',
+          taskState.blockers.length ? `- Blockers: ${taskState.blockers.join('; ')}` : '',
+        ].filter(Boolean).join('\n');
 
     // Sync needed if there are un-synced turns OR a cold binding on a session with pre-seeded task ledger
     const hasLedgerFacts =
@@ -190,7 +218,22 @@ export class ContextCompiler {
     }
     const extraSections: typeof coreSections = [];
     let remainingChars = referenceOnly ? 2_500 : Math.min(8_000, budgetTokens);
-    const registrations = [...this.sections].sort(([, first], [, second]) => first.order - second.order);
+    const isolatedSections = this.collectIsolatedSections
+      ? await this.collectIsolatedSections({
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          targetHarnessId,
+          targetHarnessKind,
+          referenceOnly,
+        })
+      : [];
+    const registrations: Array<[string, { source: string; order: number; text: string }]> = [
+      ...this.sections.entries(),
+      ...isolatedSections.map((sec): [string, { source: string; order: number; text: string }] => [
+        sec.id,
+        { source: sec.source, order: sec.order, text: sec.text },
+      ]),
+    ].sort(([, first], [, second]) => first.order - second.order);
     this.events.waterfall('handoff.compose', Object.freeze({ append: (id: string, source: string, text: string) => {
       if (remainingChars < 200 || !text.trim()) return;
       const formatted = `## ${id}\n\n${trimMiddle(text, Math.min(remainingChars - 120, 2_000))}`;

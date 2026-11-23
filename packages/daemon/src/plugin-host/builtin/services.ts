@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
 import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
-import type { PluginEventV4 } from '@harnessmate/plugin-api';
+import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
@@ -30,7 +30,8 @@ export const handoffConfigSchema = z.object({
 export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessRegistry, config: DaemonPersistedConfig,
   ledgerUpdated: (state: SessionTaskState) => void,
   events: () => PluginEvents,
-  overrides: readonly HarnessAdapter[] = []) {
+  overrides: readonly HarnessAdapter[] = [],
+  collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>) {
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
   const adapterPlugin = (id: string, create: () => HarnessAdapter) => {
     const service = `harness.${id}`;
@@ -99,7 +100,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     apply(ctx, settings) {
       const ledger = ctx.get<TaskLedgerService>('ledger')!;
       const options = handoffConfigSchema.parse(settings);
-      ctx.provide('handoff', new ContextCompiler(store, ledger, options, (cwd) => ctx.get<GitService>('git')?.status(cwd), events()));
+      ctx.provide('handoff', new ContextCompiler(store, ledger, options, (cwd) => ctx.get<GitService>('git')?.status(cwd), events(), collectIsolatedSections));
     },
   });
   plugins.set('core.account-usage', {

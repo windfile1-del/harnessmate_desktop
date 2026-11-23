@@ -16,7 +16,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm contracts:check && pnpm -r test",
     "contracts:generate": "pnpm --filter @harnessmate/plugin-api build && node scripts/plugin-contracts.mjs",
-    "contracts:check": "pnpm --filter @harnessmate/plugin-api build && node scripts/plugin-contracts.mjs --check"
+    "contracts:check": "pnpm --filter @harnessmate/plugin-api build && node scripts/plugin-contracts.mjs --check",
+    "create:plugin": "node scripts/create-plugin.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.2",

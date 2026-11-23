@@ -192,7 +192,7 @@ export class SessionManager {
     const created = this.store.createSession(session);
     this.emitCanonical(created.id, 'session.status', { status: 'idle' });
 
-    await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.created', created));
+    await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.created', created), created.workspaceId);
 
     return this.store.getSession(created.id)!;
   }
@@ -395,7 +395,7 @@ export class SessionManager {
 
   async deleteSession(id: string): Promise<boolean> {
     const session = this.store.getSession(id);
-    if (session) await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.closing', session));
+    if (session) await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
     await this.disposeSessionHandles(id);
     return this.store.deleteSession(id);
   }
@@ -818,14 +818,27 @@ export class SessionManager {
       if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
       if (session.status === 'archived') throw new Error('会话已归档');
       const entry = capabilities.listActions(session).find(({ action }) => action.command === req.command);
-      if (!entry) throw new Error('找不到已启用的插件动作');
-      if (!entry.granted) throw new Error('请在插件中心授权当前工作区');
-      const { action, plugin } = entry;
-      if (action.kind === 'program') return { output: capabilities.executeProgramAction(plugin, action, req.args), session };
-      const unavailable = this.nativeActionReason(session, action.nativeCommand);
-      if (unavailable) throw new Error(unavailable);
-      if (action.args !== undefined && req.args.trim()) throw new Error(`请单独发送 /${action.command}，该动作使用插件配置的参数`);
-      return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId });
+      if (entry) {
+        if (!entry.granted) throw new Error('请在插件中心授权当前工作区');
+        const { action, plugin } = entry;
+        if (action.kind === 'program') return { output: capabilities.executeProgramAction(plugin, action, req.args), session };
+        const unavailable = this.nativeActionReason(session, action.nativeCommand);
+        if (unavailable) throw new Error(unavailable);
+        if (action.args !== undefined && req.args.trim()) throw new Error(`请单独发送 /${action.command}，该动作使用插件配置的参数`);
+        return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId });
+      }
+      const isolatedCmd = this.pluginManager.isolated?.listCommands().find(({ command }) => command === req.command);
+      if (!isolatedCmd) throw new Error('找不到已启用的插件动作');
+      const result = await this.pluginManager.isolated!.runCommand(session, req.command, req.args, isolatedCmd.runId);
+      if (result.kind === 'message') return { output: result.text, session };
+      if (result.kind === 'compose') return { output: result.text, session };
+      if (result.kind === 'native') {
+        const nativeCmd = result.command as RunHarnessCommandRequest['command'];
+        const unavailable = this.nativeActionReason(session, nativeCmd);
+        if (unavailable) throw new Error(unavailable);
+        return this.executeHarnessCommand(sessionId, { command: nativeCmd, args: (result.args ?? '').trim(), harnessId: req.harnessId });
+      }
+      return { output: '', session };
     });
   }
 
@@ -1187,7 +1200,7 @@ export class SessionManager {
     this.liveHandles.clear();
     await Promise.all([...new Set(entries.map(({ sessionId }) => sessionId))].map(async (sessionId) => {
       const session = this.store.getSession(sessionId);
-      if (session) await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.closing', session));
+      if (session) await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
     }));
     await Promise.all(
       entries.map(async (entry) => {
@@ -1201,7 +1214,9 @@ export class SessionManager {
   // ── Warm Multi-Handle Runtime Pool ───────────────────────────────────
 
   private pluginToolKey(tools: ReturnType<PluginCapabilities['getTools']>): string {
-    return tools.map(({ name, permission }) => `${name}:${permission.digest}`).join(',');
+    return tools.map((tool) => tool.kind === 'isolated'
+      ? `${tool.name}:${tool.permission.digest}:${tool.runId}`
+      : `${tool.name}:${tool.permission.digest}`).join(',');
   }
 
   private async ensureLiveHandle(
@@ -1521,6 +1536,7 @@ export class SessionManager {
           summary: ev.message.slice(0, 140),
           timestamp: Date.now(),
         });
+        void this.evaluateHandoffOffer(session, eventHarnessId, ev.message);
         break;
       }
 
@@ -1638,6 +1654,7 @@ export class SessionManager {
         this.store.createApproval(approval);
         this.setSessionStatus(sessionId, 'awaiting_approval');
         this.emitCanonical(sessionId, 'approval.requested', { approval }, ev.turnId);
+        void this.annotatePendingApproval(session, approval);
         this.eventBus.publishAttention({
           kind: 'approval_needed',
           sessionId,
@@ -1693,6 +1710,35 @@ export class SessionManager {
     this.emitCanonical(sessionId, 'session.status', { status });
   }
 
+  async annotatePendingApproval(session: Session, approval: ApprovalRequest) {
+    const collected = await this.pluginManager.isolated?.annotateApproval({
+      approvalId: approval.id,
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+      toolName: approval.toolName,
+      toolKind: approval.toolKind,
+      summary: approval.summary,
+      riskLevel: approval.riskLevel,
+    }) ?? [];
+    for (const note of collected) {
+      this.store.addApprovalAnnotation(approval.id, note);
+    }
+    return this.store.getApproval(approval.id);
+  }
+
+  async evaluateHandoffOffer(session: Session, harnessId: string, message?: string | null) {
+    const reason = message && /rate.?limit|quota|429/i.test(message) ? 'rate_limit' as const : 'turn_failed' as const;
+    const hostDecision = this.pluginManager.host.events.bail('handoff.shouldOffer', []);
+    if (hostDecision !== undefined) return hostDecision;
+    return this.pluginManager.isolated?.shouldOfferHandoff({
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+      harnessId,
+      reason,
+      message: message ?? null,
+    });
+  }
+
   private emitCanonical(
     sessionId: string,
     type: CanonicalEvent['type'],
@@ -1703,7 +1749,8 @@ export class SessionManager {
     const body = meta?.maintenance && turnId === meta.turnId ? { ...payload, maintenance: true } : payload;
     const event = this.store.appendEvent(sessionId, type, body, turnId);
     this.eventBus.publishEvent(event);
-    this.pluginManager?.notifyEvent(event);
+    const workspaceId = this.store.getSession(sessionId)?.workspaceId;
+    this.pluginManager?.notifyEvent(event, workspaceId);
     return event;
   }
 }

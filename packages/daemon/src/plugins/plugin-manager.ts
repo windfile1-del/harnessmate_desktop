@@ -1,7 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { PluginApiError } from '@harnessmate/plugin-api';
+import {
+  PluginApiError,
+  isBuiltinPublicService,
+  isReservedServiceName,
+  isThirdPartyCustomServiceName,
+  normalizePluginSlotKey,
+  type PluginEventV4,
+} from '@harnessmate/plugin-api';
 import {
   HarnessCommandNameSchema,
   GeneratedPluginManifestSchema,
@@ -11,10 +18,13 @@ import {
   type InstalledPluginInfo,
   type InstallPluginRequest,
   type PluginCatalogItem,
+  type PluginLogEntryDto,
   type PluginManifest,
   type PluginMcpPreset,
   type PluginSlashCommand,
+  type ScaffoldPluginRequest,
 } from '@harnessmate/protocol';
+import type { HarnessMateStore } from '../db/sqlite.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { MANIFEST_FILE, manifestPluginPackage, readPluginPackage, readRevisionPointer, requiresPluginTrust, revisionDirectory, writeRevision,
@@ -25,7 +35,13 @@ import { PluginHost, type HostPlugin } from '../plugin-host/runtime/lifecycle.js
 import { toPluginEvent } from '../plugin-host/runtime/map-event.js';
 import { PluginComposition } from '../plugin-host/composition/profile.js';
 import { BUILTIN_PLUGINS } from '../plugin-host/builtin/manifests.js';
+import { IsolatedPluginManager } from '../plugin-host/isolation/isolated-manager.js';
+import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
+import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
 import { CURATED_PLUGIN_CATALOG } from './plugin-catalog.js';
+import { PluginDevWatcher } from './plugin-dev-mode.js';
+import { PluginRegistryService } from './plugin-registry.js';
+import { buildScaffoldFiles, writeScaffoldToDirectory } from './plugin-scaffold.js';
 
 export interface PluginTurnHookContext {
   sessionId: string;
@@ -48,6 +64,12 @@ export class PluginRevisionConflictError extends PluginApiError {
   }
 }
 
+export interface PluginManagerOptions {
+  store?: HarnessMateStore;
+  permissions?: PluginPermissionService;
+  crashPolicy?: CrashPolicy;
+}
+
 export class PluginManager {
   private plugins = new Map<string, LoadedPluginRecord>();
   private readonly pluginHarnesses = new Map<string, { adapter: HarnessAdapter; config: string }>();
@@ -55,17 +77,107 @@ export class PluginManager {
   private registryChanged = false;
   private readonly composition: PluginComposition;
   private compositionError?: string;
+  private readonly restartGeneration = new Map<string, number>();
+  private readonly permissionRevision = new Map<string, number>();
+  private readonly hostLogs = new Map<string, PluginLogEntryDto[]>();
+  private readonly dataDir: string;
   readonly host = new PluginHost((error) => console.error('插件生命周期错误', error));
+  readonly permissions?: PluginPermissionService;
+  readonly isolated?: IsolatedPluginManager;
+  readonly registryService: PluginRegistryService;
+  readonly devWatcher: PluginDevWatcher;
 
   constructor(
     private readonly pluginsDir: string,
     private readonly registry: HarnessRegistry,
     private readonly getDisabledIds: () => string[],
     private readonly firstParty: ReadonlyMap<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>> = new Map(),
+    options?: PluginManagerOptions,
   ) {
     fs.mkdirSync(this.pluginsDir, { recursive: true });
     this.pluginsDir = fs.realpathSync(this.pluginsDir);
-    this.composition = new PluginComposition(path.dirname(this.pluginsDir), BUILTIN_PLUGINS.map(({ id }) => id));
+    this.dataDir = path.dirname(this.pluginsDir);
+    this.composition = new PluginComposition(this.dataDir, BUILTIN_PLUGINS.map(({ id }) => id));
+    this.registryService = new PluginRegistryService(this.dataDir);
+    this.devWatcher = new PluginDevWatcher(this.dataDir, (pluginId, filename) => {
+      this.appendHostLog(pluginId, 'info', `检测到源码变更${filename ? ` (${filename})` : ''}，正在热重载…`);
+      void this.reloadDevPlugin(pluginId).catch((err: unknown) => {
+        this.appendHostLog(pluginId, 'error', `开发模式热重载失败: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    });
+    if (options?.store) {
+      this.permissions = options.permissions ?? new PluginPermissionService(options.store);
+      this.isolated = new IsolatedPluginManager({
+        store: options.store,
+        host: this.host,
+        permissions: this.permissions,
+        getPluginInfo: (pluginId) => this.plugins.get(pluginId)?.info,
+        requestRestart: (pluginId) => this.restartIsolatedPlugin(pluginId),
+        crashPolicy: options.crashPolicy,
+      });
+    }
+  }
+
+  appendHostLog(
+    pluginId: string,
+    level: PluginLogEntryDto['level'],
+    message: string,
+    meta?: Record<string, unknown>,
+  ): void {
+    const list = this.hostLogs.get(pluginId) ?? [];
+    list.push({
+      timestamp: Date.now(),
+      pluginId,
+      runId: this.isolated?.getRunId(pluginId) ?? 'host',
+      level,
+      source: 'host',
+      message: message.slice(0, 2000),
+      meta,
+    });
+    if (list.length > 200) list.splice(0, list.length - 200);
+    this.hostLogs.set(pluginId, list);
+  }
+
+  getLogs(pluginId: string): PluginLogEntryDto[] {
+    const hostEntries = this.hostLogs.get(pluginId) ?? [];
+    const pluginEntries: PluginLogEntryDto[] = (this.isolated?.getLogs(pluginId) ?? []).map((entry) => ({
+      ...entry,
+      source: 'plugin',
+    }));
+    return [...hostEntries, ...pluginEntries].sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  getAllLogs(): PluginLogEntryDto[] {
+    const hostEntries = [...this.hostLogs.values()].flat();
+    const pluginEntries: PluginLogEntryDto[] = (this.isolated?.getAllLogs() ?? []).map((entry) => ({
+      ...entry,
+      source: 'plugin',
+    }));
+    return [...hostEntries, ...pluginEntries].sort((a, b) => a.timestamp - b.timestamp).slice(-400);
+  }
+
+  clearLogs(pluginId?: string): void {
+    if (pluginId) this.hostLogs.delete(pluginId);
+    else this.hostLogs.clear();
+    this.isolated?.clearLogs(pluginId);
+  }
+
+  private restartIsolatedPlugin(pluginId: string): Promise<void> {
+    return this.serialize(async () => {
+      if (!this.plugins.has(pluginId)) return;
+      this.restartGeneration.set(pluginId, (this.restartGeneration.get(pluginId) ?? 0) + 1);
+      await this.activate(this.plugins);
+    });
+  }
+
+  reconcilePermissionsChange(pluginId: string): Promise<void> {
+    return this.serialize(async () => {
+      const record = this.plugins.get(pluginId);
+      if (!record?.info.main) return;
+      this.isolated?.clearCrashHistory(pluginId);
+      this.permissionRevision.set(pluginId, (this.permissionRevision.get(pluginId) ?? 0) + 1);
+      await this.activate(this.plugins);
+    });
   }
 
   private installedNames(records = this.plugins): string[] {
@@ -161,14 +273,57 @@ export class PluginManager {
         }
       }
     }
-    this.activate(next);
+
+    // Load locally linked dev-mode plugins directly from source directories (auto-reloaded on file save)
+    for (const devLink of this.devWatcher.list()) {
+      try {
+        if (!fs.existsSync(devLink.dirPath)) {
+          throw new Error(`开发目录不存在: ${devLink.dirPath}`);
+        }
+        const pack = readPluginPackage(devLink.dirPath);
+        if (pack.manifest.id !== devLink.id) {
+          throw new Error(`开发目录清单 ID (${pack.manifest.id}) 与已关联 ID (${devLink.id}) 不一致`);
+        }
+        const occupied = new Map(next);
+        occupied.delete(pack.manifest.id);
+        this.validateManifest(pack.manifest, occupied);
+        const enabled = this.desiredEnabled(pack.manifest.id, false);
+        const record = await this.prepare(pack, devLink.dirPath, devLink.dirPath, enabled, false);
+        record.info.devMode = true;
+        record.info.devSourceDir = devLink.dirPath;
+        next.set(pack.manifest.id, record);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendHostLog(devLink.id, 'error', `开发插件加载失败: ${message}`);
+        next.set(devLink.id, {
+          info: {
+            id: devLink.id,
+            name: devLink.id,
+            version: '0.0.0-dev',
+            description: '开发模式插件加载失败',
+            category: 'workflow',
+            contributes: {},
+            builtin: false,
+            enabled: false,
+            sourcePath: devLink.dirPath,
+            devMode: true,
+            devSourceDir: devLink.dirPath,
+            hasRuntimeHook: false,
+            loadError: message,
+          },
+        });
+      }
+    }
+    this.devWatcher.startAllWatchers();
+
+    await this.activate(next);
   }
 
   private tryPrevious(root: string): string | undefined {
     try { return readRevisionPointer(root)?.previous; } catch { return undefined; }
   }
 
-  private activate(next: Map<string, LoadedPluginRecord>): void {
+  private async activate(next: Map<string, LoadedPluginRecord>): Promise<void> {
     const previousAdapters = this.registry.listAdapters();
     const composition = this.composition.resolve(this.installedNames(next));
     const entries = new Map(composition.entries.map((entry) => [entry.name, entry]));
@@ -178,12 +333,31 @@ export class PluginManager {
     const definitions: HostPlugin[] = ranked.map(({ info, digest, packageRoot }) => {
       const entry = entries.get(info.id);
       const core = this.firstParty.get(info.id);
-      return { id: info.id, enabled: info.enabled, revision: JSON.stringify([digest, entry?.config, info.inject]),
+      const revision = JSON.stringify([
+        digest,
+        entry?.config,
+        info.inject,
+        info.provides,
+        this.restartGeneration.get(info.id) ?? 0,
+        this.permissionRevision.get(info.id) ?? 0,
+      ]);
+      if (!info.builtin && info.main && packageRoot && digest && this.isolated) {
+        return this.isolated.createHostPlugin({
+          info,
+          packageRoot,
+          entryRelativePath: info.main,
+          digest,
+          enabled: info.enabled,
+          config: entry?.config,
+          revision,
+        });
+      }
+      return { id: info.id, enabled: info.enabled, revision,
         error: info.loadError && !packageRoot && !info.builtin ? info.loadError : undefined,
         inject: core?.inject ?? info.inject, provides: core?.provides, apply: core?.apply ?? (() => {}),
         config: entry?.config };
     });
-    this.host.reconcile(definitions);
+    await this.host.reconcileAsync(definitions);
     const wanted = new Map<string, NonNullable<PluginManifest['contributes']['harnesses']>[number]>();
     for (const rec of next.values()) {
       if (!rec.info.enabled || this.host.status(rec.info.id)?.state !== 'ACTIVE' || !this.host.get('harness.acp')) continue;
@@ -253,15 +427,28 @@ export class PluginManager {
 
   validateManifest(manifest: PluginManifest, occupied = this.plugins): void {
     const normalized = normalizePluginManifest(manifest);
-    if ((!manifest.entry && normalized.main) || normalized.provides?.length) {
-      throw new PluginApiError('E_NOT_SUPPORTED', 'V4 代码入口与第三方服务提供方将在隔离运行时开放');
-    }
     if (manifest.id.startsWith('core.') || manifest.id.startsWith('broken.')) throw new Error('插件 ID 使用了保留前缀');
+    for (const service of normalized.provides ?? []) {
+      if (isReservedServiceName(service)) {
+        throw new PluginApiError('E_PERMISSION_DENIED', `服务 ${service} 为内置核心服务，不允许第三方提供`);
+      }
+      if (isBuiltinPublicService(service)) {
+        if (!normalized.permissions?.includes(`service:provide:${service}`)) {
+          throw new PluginApiError('E_PERMISSION_DENIED', `替换公共服务 ${service} 必须在 permissions 中声明 service:provide:${service}`);
+        }
+      } else if (!isThirdPartyCustomServiceName(service)) {
+        throw new PluginApiError('E_INVALID_INPUT', `第三方服务 ${service} 必须带命名空间前缀，例如 acme.service`);
+      }
+    }
+    if (normalized.provides?.length && !normalized.main) {
+      throw new PluginApiError('E_INVALID_INPUT', '提供服务的插件必须声明 main 代码入口');
+    }
     const other = [...occupied.values()].filter(({ info }) => info.id !== manifest.id);
     const commands = new Set<string>([...HarnessCommandNameSchema.options, 'quota', 'plugins']);
     const contributedHarnesses = new Set<string>();
     const commandNames = (plugin: PluginManifest) => [
       ...(plugin.contributes.slashCommands ?? []).map(({ command }) => command),
+      ...(plugin.contributes.commands ?? []).map(({ command }) => command),
       ...(plugin.contributes.actions ?? []).map(({ command }) => command),
       ...(plugin.contributes.dataPanels ?? []).flatMap(({ copySummary }) => copySummary?.command ? [copySummary.command] : []),
     ];
@@ -316,6 +503,22 @@ export class PluginManager {
       if (new Set(panel.columns.map(({ field }) => field)).size !== panel.columns.length) throw new Error(`面板 ${panel.id} 含有重复列`);
       panelIds.add(panel.id);
     }
+    const slotKeys = new Set<string>();
+    for (const slot of normalized.contributes.slots ?? []) {
+      const slotKey = `${normalizePluginSlotKey(slot.slot)}:${slot.id}`;
+      if (slotKeys.has(slotKey)) throw new Error(`UI 插槽项 ${slotKey} 重复`);
+      slotKeys.add(slotKey);
+    }
+  }
+
+  getPluginPackageRoot(pluginId: string): { packageRoot: string; digest?: string; runId?: string } | undefined {
+    const rec = this.plugins.get(pluginId);
+    if (!rec || !rec.packageRoot || !this.isPluginEnabled(pluginId)) return undefined;
+    return {
+      packageRoot: rec.packageRoot,
+      digest: rec.digest,
+      runId: this.isolated?.getRunId(pluginId),
+    };
   }
 
   getDataPanel(pluginId: string, panelId: string) {
@@ -329,16 +532,50 @@ export class PluginManager {
   listInstalled(): InstalledPluginInfo[] {
     return [...this.plugins.values()].map(({ info, runtime }) => {
       const status = this.host.status(info.id);
-      return { ...info, runtimeState: runtime?.failed ? 'FAILED' : status?.state,
-        missingServices: status?.missingServices, loadError: status?.error ?? info.loadError };
+      const runId = this.isolated?.getRunId(info.id);
+      const runtimeSlots = this.isolated?.listSlots(info.id);
+      const runtimeMode = info.builtin ? 'kernel' : (info.main || info.entry) ? 'isolated' : 'declarative';
+      return {
+        ...info,
+        runtimeState: runtime?.failed ? 'FAILED' : status?.state,
+        missingServices: status?.missingServices,
+        loadError: status?.error ?? info.loadError,
+        ...(runId ? { runId } : {}),
+        ...(runtimeSlots?.length ? { runtimeSlots } : {}),
+        runtimeMode,
+      };
     });
   }
 
   listCatalog(): PluginCatalogItem[] {
-    return CURATED_PLUGIN_CATALOG.map((item) => ({
+    const builtinItems: PluginCatalogItem[] = CURATED_PLUGIN_CATALOG.map((item) => ({
       ...item,
       installed: this.plugins.has(item.id),
+      source: 'builtin',
+      compatible: true,
+      incompatibleReason: null,
     }));
+    const remoteItems: PluginCatalogItem[] = this.registryService.listEntries().map((item) => ({
+      id: item.entry.id,
+      name: item.entry.name,
+      version: item.entry.version,
+      description: item.entry.description,
+      author: item.entry.author ?? item.publisherName,
+      category: item.entry.category,
+      engines: item.entry.engines,
+      contributes: {},
+      installed: this.plugins.has(item.entry.id),
+      tags: item.entry.tags,
+      source: 'remote',
+      registryUrl: item.registryUrl,
+      publisherId: item.entry.publisherId,
+      publisherName: item.publisherName,
+      packageDigest: item.entry.packageDigest,
+      signatureStatus: item.signatureStatus,
+      compatible: item.compatible,
+      incompatibleReason: item.incompatibleReason,
+    }));
+    return [...remoteItems, ...builtinItems];
   }
 
   isPluginEnabled(id: string): boolean {
@@ -384,9 +621,15 @@ export class PluginManager {
       if (enabled && !record.info.builtin) {
         if (!record.packageRoot) throw new Error('请先修复或回退损坏的插件');
         const pack = readPluginPackage(record.packageRoot);
-        if (record.digest !== pack.digest) throw new Error('插件文件已变更，请重新预览并安装');
-        this.validateManifest(pack.manifest);
+        if (!record.info.devMode && record.digest !== pack.digest) throw new Error('插件文件已变更，请重新预览并安装');
+        const occupied = new Map(this.plugins);
+        occupied.delete(id);
+        this.validateManifest(pack.manifest, occupied);
         candidate = await this.prepare(pack, record.packageRoot, record.info.sourcePath!, true, Boolean(record.info.canRollback));
+        if (record.info.devMode) {
+          candidate.info.devMode = true;
+          candidate.info.devSourceDir = record.info.devSourceDir;
+        }
       }
       try {
         if (this.compositionError) throw new PluginApiError('E_INVALID_INPUT', this.compositionError);
@@ -395,7 +638,8 @@ export class PluginManager {
         if (candidate.runtime !== record.runtime) candidate.runtime?.retire();
         throw error;
       }
-      this.activate(new Map(this.plugins).set(id, candidate));
+      if (enabled) this.isolated?.clearCrashHistory(id);
+      await this.activate(new Map(this.plugins).set(id, candidate));
       return this.listInstalled();
     });
   }
@@ -439,12 +683,25 @@ export class PluginManager {
   }
 
   private resolveInstallPackage(req: InstallPluginRequest): PluginPackage {
+    if (req.mode === 'remote_index') {
+      throw new PluginApiError('E_INVALID_INPUT', '远程索引插件请使用异步预览或安装接口');
+    }
     if (req.mode === 'local_dir') return readPluginPackage(req.dirPath);
     const source = req.mode === 'manifest' ? req.manifest : CURATED_PLUGIN_CATALOG.find(({ id }) => id === req.catalogId);
     if (!source) throw new Error('找不到目录中的插件');
     const manifest = PluginManifestSchema.parse(source);
-    if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
+    if (manifest.entry || manifest.main) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
     return manifestPluginPackage(manifest);
+  }
+
+  private async resolveInstallPackageAsync(req: InstallPluginRequest): Promise<PluginPackage> {
+    if (req.mode === 'remote_index') {
+      const { pack } = await this.registryService.resolveRemotePackage(req.pluginId, req.version, {
+        allowUntrusted: req.allowUntrusted,
+      });
+      return pack;
+    }
+    return this.resolveInstallPackage(req);
   }
 
   previewInstall(req: InstallPluginRequest) {
@@ -453,14 +710,21 @@ export class PluginManager {
       requiresTrust: requiresPluginTrust(manifest) };
   }
 
+  async previewInstallAsync(req: InstallPluginRequest) {
+    const { manifest, files, digest } = await this.resolveInstallPackageAsync(req);
+    return { ...this.reviewManifest(manifest, req.expectedInstalledDigest), digest, fileCount: files.size,
+      requiresTrust: requiresPluginTrust(manifest) };
+  }
+
   installPlugin(req: InstallPluginRequest): Promise<InstalledPluginInfo[]> {
     return this.serialize(async () => {
-      const pack = this.resolveInstallPackage(req);
+      const pack = await this.resolveInstallPackageAsync(req);
       if (req.expectedDigest && req.expectedDigest !== pack.digest) throw new Error('插件文件已更改，请重新预览');
       const trusted = requiresPluginTrust(pack.manifest);
       if (trusted && (!req.trustCode || !req.expectedDigest)) throw new Error('请预览并确认信任此插件包');
       this.validateManifest(pack.manifest);
       const id = pack.manifest.id;
+      this.appendHostLog(id, 'info', `正在安装插件 v${pack.manifest.version} (${req.mode})`);
       const old = this.checkInstalledDigest(id, req.expectedInstalledDigest);
       const broken = [...this.plugins.values()].find(({ info }) => info.id === `broken.${id}`);
       const root = old?.info.sourcePath ?? broken?.info.sourcePath ?? path.join(this.pluginsDir, id);
@@ -489,11 +753,35 @@ export class PluginManager {
         if (!pointer && previous) this.removeRevision(root, previous);
         throw error;
       }
+      this.isolated?.clearCrashHistory(id);
       const next = new Map(this.plugins);
       for (const [otherId, record] of next) {
         if (otherId !== id && otherId.startsWith('broken.') && record.info.sourcePath === root) next.delete(otherId);
       }
-      this.activate(next.set(id, candidate));
+      await this.activate(next.set(id, candidate));
+      // Transactional check for V4 main plugins: if activation failed for non-permission/non-conflict reason, rollback!
+      const status = this.host.status(id);
+      const awaitingProvidePermission = (candidate.info.provides ?? []).some(
+        (service) => isBuiltinPublicService(service) && !this.permissions?.isGranted(candidate.info, `service:provide:${service}`, GLOBAL_WORKSPACE_SCOPE),
+      );
+      const provideConflict = (candidate.info.provides ?? []).some((service) => Boolean(this.host.get(service)));
+      if (enabled && candidate.info.main && status?.state === 'FAILED' && !awaitingProvidePermission && !provideConflict) {
+        const failMessage = status.error ?? '隔离插件激活失败';
+        await this.isolated?.awaitPendingDisposals();
+        if (pointer) {
+          writeRevisionPointer(root, pointer);
+        } else if (previous) {
+          writeRevisionPointer(root, { current: previous, currentDigest: previousDigest, currentTrusted: Boolean(old && requiresPluginTrust(old.info)) });
+        } else {
+          try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* best-effort cleanup */ }
+        }
+        this.removeRevision(root, revision);
+        const restored = new Map(this.plugins);
+        if (old) restored.set(id, old);
+        else restored.delete(id);
+        await this.activate(restored);
+        throw new Error(failMessage);
+      }
       if (pointer?.previous) this.removeRevision(root, pointer.previous);
       return this.listInstalled();
     });
@@ -522,33 +810,137 @@ export class PluginManager {
         candidate.runtime?.retire();
         throw error;
       }
+      this.isolated?.clearCrashHistory(id);
       const next = new Map(this.plugins);
       next.delete(id);
       next.set(pack.manifest.id, candidate);
-      this.activate(next);
+      await this.activate(next);
       return this.listInstalled();
     });
   }
 
   uninstallPlugin(id: string): Promise<InstalledPluginInfo[]> {
+    if (this.devWatcher.has(id) || this.plugins.get(id)?.info.devMode) {
+      return this.unlinkDevPlugin(id);
+    }
     return this.serialize(async () => {
       const root = this.plugins.get(id)?.info.sourcePath;
       if (!root) throw new Error('只能卸载外部插件');
       this.checkPluginRoot(root);
-      const removed = path.join(this.pluginsDir, `.uninstalled-${randomUUID()}`);
-      fs.renameSync(root, removed);
-      try {
-        if (!this.compositionError) this.composition.removePlugin(id);
-      } catch (error) {
-        fs.renameSync(removed, root);
-        throw error;
-      }
+      this.isolated?.clearCrashHistory(id);
+      const previous = new Map(this.plugins);
       const next = new Map(this.plugins);
       next.delete(id);
-      this.activate(next);
-      try { fs.rmSync(removed, { recursive: true, force: true }); } catch { /* Loaded files may still be open. */ }
+      // Stop any isolated child process holding a CWD handle inside `root` before renaming/deleting on Windows.
+      await this.activate(next);
+      await this.isolated?.awaitPendingDisposals();
+      const removed = path.join(this.pluginsDir, `.uninstalled-${randomUUID()}`);
+      try {
+        fs.renameSync(root, removed);
+        try {
+          if (!this.compositionError) this.composition.removePlugin(id);
+        } catch (error) {
+          fs.renameSync(removed, root);
+          throw error;
+        }
+      } catch (error) {
+        await this.activate(previous);
+        throw error;
+      }
+      try { fs.rmSync(removed, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* Loaded files may still be open. */ }
+      this.appendHostLog(id, 'info', '插件已卸载');
       return this.listInstalled();
     });
+  }
+
+  linkDevPlugin(dirPath: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const resolvedDir = fs.realpathSync(dirPath);
+      const pack = readPluginPackage(resolvedDir);
+      const occupied = new Map(this.plugins);
+      occupied.delete(pack.manifest.id);
+      this.validateManifest(pack.manifest, occupied);
+      this.devWatcher.link(pack.manifest.id, resolvedDir);
+      this.isolated?.clearCrashHistory(pack.manifest.id);
+      const enabled = this.desiredEnabled(pack.manifest.id, false);
+      const candidate = await this.prepare(pack, resolvedDir, resolvedDir, enabled, false);
+      candidate.info.devMode = true;
+      candidate.info.devSourceDir = resolvedDir;
+      const next = new Map(this.plugins);
+      next.set(pack.manifest.id, candidate);
+      await this.activate(next);
+      this.appendHostLog(pack.manifest.id, 'info', `已关联开发目录: ${resolvedDir}`);
+      return this.listInstalled();
+    });
+  }
+
+  reloadDevPlugin(id: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const link = this.devWatcher.get(id);
+      if (!link) throw new PluginApiError('E_INVALID_INPUT', `插件 ${id} 未处于开发模式`);
+      const next = new Map(this.plugins);
+      try {
+        const pack = readPluginPackage(link.dirPath);
+        if (pack.manifest.id !== id) {
+          throw new PluginApiError('E_CONFLICT', `开发目录清单 ID (${pack.manifest.id}) 与已关联 ID (${id}) 不一致`);
+        }
+        const occupied = new Map(next);
+        occupied.delete(id);
+        this.validateManifest(pack.manifest, occupied);
+        this.isolated?.clearCrashHistory(id);
+        const enabled = this.plugins.get(id)?.info.enabled ?? this.desiredEnabled(id, false);
+        const candidate = await this.prepare(pack, link.dirPath, link.dirPath, enabled, false);
+        candidate.info.devMode = true;
+        candidate.info.devSourceDir = link.dirPath;
+        this.restartGeneration.set(id, (this.restartGeneration.get(id) ?? 0) + 1);
+        next.set(id, candidate);
+        await this.activate(next);
+        this.appendHostLog(id, 'info', `开发模式热重载完成 (v${pack.manifest.version}, digest ${pack.digest.slice(0, 8)})`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendHostLog(id, 'error', `开发模式热重载失败: ${message}`);
+        const existing = next.get(id);
+        if (existing) {
+          next.set(id, { ...existing, info: { ...existing.info, loadError: message } });
+          this.plugins = next;
+        }
+        throw error;
+      }
+      return this.listInstalled();
+    });
+  }
+
+  unlinkDevPlugin(id: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      const existed = this.devWatcher.unlink(id);
+      if (!existed && !this.plugins.get(id)?.info.devMode) {
+        throw new PluginApiError('E_INVALID_INPUT', `插件 ${id} 未处于开发模式`);
+      }
+      this.isolated?.clearCrashHistory(id);
+      const next = new Map(this.plugins);
+      next.delete(id);
+      await this.activate(next);
+      await this.isolated?.awaitPendingDisposals();
+      this.appendHostLog(id, 'info', '已取消关联开发模式插件（源码目录已保留）');
+      return this.listInstalled();
+    });
+  }
+
+  async scaffoldPlugin(req: ScaffoldPluginRequest): Promise<{
+    dirPath: string;
+    files: string[];
+    plugins: InstalledPluginInfo[];
+  }> {
+    const { files } = buildScaffoldFiles(req);
+    const defaultDir = path.join(this.dataDir, 'dev-plugins', req.id);
+    const targetDir = req.targetDir?.trim() ? path.resolve(req.targetDir.trim()) : defaultDir;
+    const writtenDir = writeScaffoldToDirectory(targetDir, files);
+    const plugins = req.linkDevMode ? await this.linkDevPlugin(writtenDir) : this.listInstalled();
+    return {
+      dirPath: writtenDir,
+      files: Object.keys(files),
+      plugins,
+    };
   }
 
   private checkPluginRoot(root: string): void {
@@ -562,10 +954,16 @@ export class PluginManager {
     catch { /* An inactive revision can be removed on the next maintenance pass. */ }
   }
 
-  notifyEvent(event: CanonicalEvent): void {
+  async dispatchLifecycleEvent(event: PluginEventV4, workspaceId?: string): Promise<void> {
+    await this.host.events.dispatch(event);
+    await this.isolated?.dispatchEvent(event, workspaceId);
+  }
+
+  notifyEvent(event: CanonicalEvent, workspaceId?: string): void {
     const mapped = toPluginEvent(event);
     if (!mapped) return;
     void this.host.events.dispatch(mapped);
+    void this.isolated?.dispatchEvent(mapped, workspaceId);
     if (mapped.type !== 'turn.completed' && mapped.type !== 'turn.failed' && mapped.type !== 'turn.cancelled') return;
     const { harnessKind, model, actualModel, code, maintenance } = event.payload;
     const legacy = { sessionId: event.sessionId, seq: event.seq, type: mapped.type, turnId: event.turnId,
@@ -587,8 +985,10 @@ export class PluginManager {
   }
 
   async close(): Promise<void> {
+    this.devWatcher.close();
     await this.mutation;
     for (const record of this.plugins.values()) record.runtime?.retire();
+    await this.isolated?.close();
     this.host.reconcile([]);
   }
 

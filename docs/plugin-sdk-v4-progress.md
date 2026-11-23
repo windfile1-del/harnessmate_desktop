@@ -7,9 +7,9 @@
 | P0 | AGY/ACP 用户侧交接、参考式文本、安装包摘要确认、斜杠字面替换、单次超时隔离 | 已实现 |
 | P1 | 独立 API 和 SDK、逐级清单迁移、服务依赖与生命周期、公共事件映射及契约检查、V1–V4 回归 | 已实现 |
 | P2 | 组合与覆盖层、插件中心组合视图、第一方服务和 adapter、交接段落与可审计快照 | 已实现 |
-| P3 | 隔离级进程、RPC、第三方服务提供方、公共服务权限与授权迁移、实例标识跨进程校验 | 待开发 |
-| P4 | 类型化 UI 插槽、面板迁移、第三方 iframe | 待开发 |
-| P5 | 开发模式、脚手架、日志面板及远程索引和签名 | 待开发 |
+| P3 | 隔离级进程、RPC、第三方服务提供方、公共服务权限与授权迁移、实例标识跨进程校验 | 已实现 |
+| P4 | 类型化 UI 插槽、面板迁移、第三方 iframe | 已实现 |
+| P5 | 开发模式、脚手架、日志面板及远程索引和签名 | 已实现 |
 
 ## P0 交接与安装边界
 
@@ -32,11 +32,31 @@
 - 交接模块将工作区状态、账本、早期摘要和近期对话分别渲染。额外段落经追加接口进入用户通道。账本和交接服务可独立启停，交接项支持 `budgetTokens` 和 `autoAttach`。
 - `handoff.snapshot` 在发送前记录实际通道和内容。`handoff.snapshot_delivered` 记录传输路径提交结果，失败或取消的轮次不用于后续去重。聊天支持展开历史和移除本轮待发送交接，Markdown 导出保留发送记录。
 
+## P3 隔离与权限
+
+- 第三方 V4 `main` 代码插件通过独立子进程启动（`--permission --allow-fs-read=<插件包目录> --max-old-space-size=128`），环境变量白名单剥离 daemon token 与 CLI 凭据，禁止越权读盘、写盘、派生子进程及接触系统提示词通道。
+- 双向 JSON-RPC over stdio 握手校验 `pluginApi` 与 `requires` 特性；每次启动分配唯一 `runId`，宿主与子进程双方校验实例标识，重启或升级后旧 `runId` 调用与回调均返回 `E_STALE_RUN`。
+- 单次调用按类型设超时（命令/服务 10s、事件/钩子 2s、模型工具 30s），单次超时只返回 `E_TIMEOUT` 不终止进程；进程异常退出按指数退避重启，10 分钟内崩溃 5 次进入 `FAILED`。
+- 第三方插件可通过 `provides` 注册带命名空间前缀的服务并在多进程间通过宿主代理互相调用；替换内置公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`）需声明并获全局授权 `service:provide:<name>`，`harness.*`、`mcpHub`、`remote` 禁止第三方提供。
+- 公共服务（`sessions`、`ledger`、`handoff`、`composer`、`approvals`、`tools`、`storage`、`fs`、`net`、`notify`、`clipboard`、`events`）统一按 V4 权限表校验，未授权返回 `E_PERMISSION_DENIED`。授权支持「覆盖后续版本」（权限未增加时升级自动沿用，新增权限需重新授权），并支持 V3 `tool:*` / `action:*` 向 `tools:model` / `session:command` 迁移。
+- `approval.annotate` 风险标注与 `handoff.shouldOffer` 接力建议已接入 `SessionManager`，隔离插件的 `tools.register` 接入官方 MCP 工具租约并支持任意 JSON Schema。
+
+## P4 类型化 UI 插槽
+
+- `@harnessmate/plugin-api` 定义公共 UI 插槽目录（`session.header.title`、`sidebar.tools`、`composer.actions`、`inspector.tabs`、`statusbar.items`、`chat.node`、`tool.result`、`approval.detail`、`chat.message.wrapper`），支持 `single` / `list` / `keyed` / `chain` / `hoc` 五种基数和 `root` / `session` / `session-maybe` 三种作用域，`pnpm contracts:generate` 同步生成 [UI 插槽目录](plugin-api/slots.md)。
+- 清单 `contributes.slots`（兼容 `inspector.tab` 别名）与隔离插件 `ctx.slots.register()` 统一接入类型化插槽注册表；组件不接触 `ctx`，仅接收 owner props 与标准 hooks（`useSession`、`useTurn`、`useSlotTheme`），卸载或停用时按 effect 自动撤销。
+- 现有 V1 `panels` 与 V2 `dataPanels`（含 `sidebar_tool`、`composer_action`、`inspector_tab` 位置）全部经由 `PluginSlotSync` 迁入 `inspector.tabs`、`sidebar.tools`、`composer.actions` 插槽，审批风险标注迁入 `approval.detail` 链式插槽；每一项插槽内容独立包裹 `SlotErrorBoundary`，单点渲染异常隔离并通过 `reportRenderFailure` 上报至插件中心。
+- 第三方 HTML 视图通过守护进程 `GET /api/v1/plugins/:id/ui-doc` 安全读取并内联包内相对 CSS/JS（拦截路径穿越、符号链接逃逸与外链资源），在严格 CSP 与 `sandbox="allow-scripts"`（无 `allow-same-origin`）沙箱 iframe 中渲染，自动注入并同步浅/深色主题 CSS 变量，经 `postMessage` 与 `POST /api/v1/plugins/:id/ui-message`（带 `runId` 过期校验）通信。
+
+## P5 开发模式、脚手架、日志面板与签名索引
+
+- **开发模式热重载**：`PluginDevWatcher` 仅在本机监听关联的本地源码目录（`POST /api/v1/plugins/dev/link`、`POST /api/v1/plugins/dev/:id/reload`、`DELETE /api/v1/plugins/dev/:id`），文件保存后自动按单插件粒度回滚旧实例 effect 并重启新 `runId`；插件中心标注「开发中」并支持手动重载与安全取消关联（不删除源码目录）。
+- **插件脚手架**：`@harnessmate/plugin-sdk` 导出 `scaffoldPluginFiles`，提供 CLI `pnpm create:plugin`（支持 `isolated`、`ui-slot`、`service`、`declarative` 四种 V4 模板，以及 `keygen` / `sign` 发布者密钥生成与包签名）和守护进程 `POST /api/v1/plugins/scaffold`（可在插件中心一键生成并自动关联开发模式）。
+- **插件日志面板**：守护进程合并宿主生命周期/热重载日志与隔离进程 `ctx.logger` 日志，提供 `GET/DELETE /api/v1/plugins/logs` 与 `GET/DELETE /api/v1/plugins/:id/logs`；插件中心新增「日志」标签页，支持按插件/级别/关键词过滤、自动刷新、复制与清空。
+- **远程插件索引与发布者签名**：`PluginRegistryService` 支持多远程索引 URL（`https`/`http`/`file`）与受信任 Ed25519 发布者公钥环持久化，自动校验 `engines.pluginApi` 兼容性（标出「不兼容」并阻止安装）与 Ed25519 规范化摘要签名（拦截篡改包、无效签名及未信任发布者），支持 `mode: 'remote_index'` 事务性预览与安装。
+
 ## 0.5.0 验收记录
 
-- `pnpm build`、`pnpm typecheck`、`pnpm test` 通过。共 22 项测试，含 19 项 daemon 测试。
+- `pnpm build`、`pnpm typecheck`、`pnpm test` 通过。共 34 项测试，含 1 项 protocol 测试、6 项 web 测试（含 P4 类型化 UI 插槽、错误隔离与沙箱 iframe 校验）及 27 项 daemon 测试（含 P3 隔离沙箱/权限、P4 沙箱 UI 资产与跨进程插槽消息桥接、P5 脚手架/开发模式热重载/统一日志/远程 Ed25519 签名索引）。
 - 真实 stdio 传输配合模拟 CLI 覆盖 Codex、Claude 与 AGY 的交接、回退和发送记录。
-- Chromium 验证组合来源、依赖等待以及依赖恢复后启用。
-- Windows x64 便携包构建通过。包内 Electron 守护进程通过 V4 安装、依赖停用与恢复和前端资源加载检查。
-
-第三方 V4 代码入口 `main`、公共服务替换权限与跨进程调用属于 P3。审批注解与接力建议的事件契约已保留，业务生产方将在相应服务开放时接入。
+- 契约检查 `pnpm contracts:check` 通过，`docs/plugin-api/*` 与公共包边界一致。

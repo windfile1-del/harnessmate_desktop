@@ -14,7 +14,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { formatRelativeTime, HARNESS_META } from '../lib/harness-meta';
-import { listPluginPanels } from '../lib/plugin-panels';
+import { Slot, useSlotItems } from '../slots';
 import { useAppStore } from '../stores/app-store';
 import { StarLoomCrest } from './BrandMark';
 
@@ -34,7 +34,6 @@ export function Sidebar() {
     setSelectedWorkspaceId,
     setSearchQuery,
     selectSession,
-    openPluginPanel,
     deleteSession,
     openModal,
     isPluginEnabled,
@@ -61,7 +60,7 @@ export function Sidebar() {
   });
 
   const harnessById = new Map(harnesses.map((h) => [h.id, h]));
-  const sidebarPanels = listPluginPanels(plugins).filter(({ panel }) => panel.placements?.includes('sidebar_tool'));
+  const sidebarToolSlots = useSlotItems('sidebar.tools');
   const panelSession = filteredSessions.find(({ id }) => id === selectedSessionId)
     ?? sessions.find(({ workspaceId }) => !selectedWorkspaceId || workspaceId === selectedWorkspaceId);
 
@@ -158,14 +157,16 @@ export function Sidebar() {
         </button>
       </div>
 
-      {sidebarPanels.length > 0 && panelSession && <div className="max-h-24 space-y-1 overflow-y-auto px-3.5 pb-2">
-        {sidebarPanels.map(({ key, panel }) => <button key={key} type="button"
-          className="block w-full truncate rounded-lg px-2 py-1.5 text-left text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-          onClick={() => {
-            if (panelSession.id !== selectedSessionId) void selectSession(panelSession.id);
-            openPluginPanel(key);
-          }}>{panel.title}</button>)}
-      </div>}
+      {sidebarToolSlots.length > 0 && (
+        <div className="max-h-36 space-y-1 overflow-y-auto px-3.5 pb-2">
+          <Slot
+            name="sidebar.tools"
+            slotProps={{ session: panelSession ?? null }}
+            compactErrors
+            className="space-y-1"
+          />
+        </div>
+      )}
 
       {/* Workspaces Strip */}
       <div className="px-3.5 pb-2.5">

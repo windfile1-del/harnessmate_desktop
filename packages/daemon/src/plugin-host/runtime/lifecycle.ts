@@ -16,7 +16,7 @@ export interface HostPlugin {
   enabled: boolean;
   error?: string;
   config?: Readonly<Record<string, unknown>>;
-  apply(ctx: HostPluginContext, config: Readonly<Record<string, unknown>>): void;
+  apply(ctx: HostPluginContext, config: Readonly<Record<string, unknown>>): void | Promise<void>;
 }
 
 export interface PluginStatus {
@@ -35,6 +35,7 @@ interface Instance {
 export class PluginHost {
   private readonly instances = new Map<string, Instance>();
   private readonly services = new Map<string, { owner: Instance; value: object }>();
+  private readonly serviceListeners = new Set<(services: string[]) => void>();
   readonly events: PluginEvents;
 
   constructor(private readonly report: (error: unknown) => void = () => {}) {
@@ -45,11 +46,68 @@ export class PluginHost {
     return this.services.get(name)?.value as Service | undefined;
   }
 
+  listServices(): string[] {
+    return [...this.services.keys()].sort();
+  }
+
+  onServicesChanged(listener: (services: string[]) => void): Disposer {
+    this.serviceListeners.add(listener);
+    return () => { this.serviceListeners.delete(listener); };
+  }
+
+  private notifyServicesChanged(): void {
+    const names = this.listServices();
+    for (const listener of this.serviceListeners) {
+      try { listener(names); } catch (error) { this.report(error); }
+    }
+  }
+
   status(id: string): PluginStatus | undefined {
     return this.instances.get(id)?.status;
   }
 
+  fail(id: string, error: string): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    if (instance.status.state === 'ACTIVE' || instance.status.state === 'LOADING') {
+      this.transition(instance, 'UNLOADING');
+      instance.run = undefined;
+      const names = [...this.services.entries()].filter(([, service]) => service.owner === instance).map(([name]) => name);
+      this.stopDependents(names);
+      this.disposeEffects(instance);
+    }
+    this.transition(instance, 'FAILED', [], error);
+  }
+
   reconcile(definitions: readonly HostPlugin[]): void {
+    this.prepareDefinitions(definitions);
+    let activated: boolean;
+    do {
+      activated = false;
+      for (const instance of this.instances.values()) {
+        if (instance.status.state !== 'PENDING') continue;
+        const missing = this.missing(instance);
+        if (missing.length) this.transition(instance, 'PENDING', missing);
+        else if (this.startSync(instance)) activated = true;
+      }
+    } while (activated);
+  }
+
+  async reconcileAsync(definitions: readonly HostPlugin[]): Promise<void> {
+    this.prepareDefinitions(definitions);
+    let activated: boolean;
+    do {
+      activated = false;
+      for (const instance of [...this.instances.values()]) {
+        if (instance.status.state !== 'PENDING') continue;
+        const missing = this.missing(instance);
+        if (missing.length) this.transition(instance, 'PENDING', missing);
+        else if (await this.startAsync(instance)) activated = true;
+      }
+    } while (activated);
+  }
+
+  private prepareDefinitions(definitions: readonly HostPlugin[]): void {
     const desired = new Map(definitions.map((definition) => [definition.id, definition]));
     for (const [id, instance] of this.instances) {
       const next = desired.get(id);
@@ -66,18 +124,6 @@ export class PluginHost {
       if (definition.error) this.transition(instance, 'FAILED', [], definition.error);
       else if (definition.enabled) this.transition(instance, 'PENDING', this.missing(instance));
     }
-    let activated: boolean;
-    do {
-      activated = false;
-      for (const instance of this.instances.values()) {
-        if (instance.status.state !== 'PENDING') continue;
-        const missing = this.missing(instance);
-        if (missing.length) this.transition(instance, 'PENDING', missing);
-        else {
-          if (this.start(instance)) activated = true;
-        }
-      }
-    } while (activated);
   }
 
   private missing(instance: Instance): string[] {
@@ -93,10 +139,7 @@ export class PluginHost {
       data: { pluginId: instance.definition.id, state, missingServices } });
   }
 
-  private start(instance: Instance): boolean {
-    const run = Symbol(instance.definition.id);
-    instance.run = run;
-    this.transition(instance, 'LOADING');
+  private createContext(instance: Instance, run: symbol): HostPluginContext {
     const assertCurrent = () => {
       if (instance.run !== run || (instance.status.state !== 'LOADING' && instance.status.state !== 'ACTIVE')) {
         throw new PluginApiError('E_STALE_RUN', '插件实例已停止');
@@ -109,31 +152,62 @@ export class PluginHost {
       instance.effects.add(undo);
       return undo;
     };
-    try {
-      instance.definition.apply({
-        api: { version: PLUGIN_API_VERSION, has: (name) => { assertCurrent(); return this.services.has(name); } },
-        effect,
-        get: (name) => { assertCurrent(); return this.get(name); },
-        on: (name, listener) => effect(() => this.events.on(name, listener)),
-        provide: (name, value) => {
-          assertCurrent();
-          if (instance.status.state !== 'LOADING' || !instance.definition.provides?.includes(name)) {
-            throw new PluginApiError('E_PERMISSION_DENIED', `无法注册服务 ${name}`);
-          }
-          if (this.services.has(name)) throw new PluginApiError('E_CONFLICT', `服务 ${name} 已经注册`);
-          return effect(() => {
-            this.services.set(name, { owner: instance, value });
-            return () => {
+    return {
+      api: { version: PLUGIN_API_VERSION, has: (name) => { assertCurrent(); return this.services.has(name); } },
+      effect,
+      get: (name) => { assertCurrent(); return this.get(name); },
+      on: (name, listener) => effect(() => this.events.on(name, listener)),
+      provide: (name, value) => {
+        assertCurrent();
+        if (instance.status.state !== 'LOADING' || !instance.definition.provides?.includes(name)) {
+          throw new PluginApiError('E_PERMISSION_DENIED', `无法注册服务 ${name}`);
+        }
+        if (this.services.has(name)) throw new PluginApiError('E_CONFLICT', `服务 ${name} 已经注册`);
+        return effect(() => {
+          this.services.set(name, { owner: instance, value });
+          this.notifyServicesChanged();
+          return () => {
+            if (this.services.get(name)?.owner === instance) {
               this.services.delete(name);
+              this.notifyServicesChanged();
               this.stopDependents([name]);
-            };
-          });
-        },
-      }, instance.definition.config ?? {});
+            }
+          };
+        });
+      },
+    };
+  }
+
+  private startSync(instance: Instance): boolean {
+    const run = Symbol(instance.definition.id);
+    instance.run = run;
+    this.transition(instance, 'LOADING');
+    try {
+      const ctx = this.createContext(instance, run);
+      instance.definition.apply(ctx, instance.definition.config ?? {});
       this.transition(instance, 'ACTIVE');
       return true;
     } catch (error) {
       instance.run = undefined;
+      this.disposeEffects(instance);
+      this.transition(instance, 'FAILED', [], error instanceof Error ? error.message : String(error));
+      this.report(error);
+      return false;
+    }
+  }
+
+  private async startAsync(instance: Instance): Promise<boolean> {
+    const run = Symbol(instance.definition.id);
+    instance.run = run;
+    this.transition(instance, 'LOADING');
+    try {
+      const ctx = this.createContext(instance, run);
+      await instance.definition.apply(ctx, instance.definition.config ?? {});
+      if (instance.run !== run) return false;
+      this.transition(instance, 'ACTIVE');
+      return true;
+    } catch (error) {
+      if (instance.run === run) instance.run = undefined;
       this.disposeEffects(instance);
       this.transition(instance, 'FAILED', [], error instanceof Error ? error.message : String(error));
       this.report(error);
@@ -149,7 +223,7 @@ export class PluginHost {
   }
 
   private stop(instance: Instance, next: 'PENDING' | 'DISPOSED'): void {
-    if (instance.status.state === 'ACTIVE') {
+    if (instance.status.state === 'ACTIVE' || instance.status.state === 'LOADING') {
       this.transition(instance, 'UNLOADING');
       instance.run = undefined;
       const names = [...this.services.entries()].filter(([, service]) => service.owner === instance).map(([name]) => name);

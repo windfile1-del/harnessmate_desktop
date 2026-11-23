@@ -1,0 +1,225 @@
+import type { ReactNode } from 'react';
+import {
+  PLUGIN_UI_SLOTS,
+  normalizePluginSlotKey,
+  type ApprovalRequest,
+  type Disposer,
+  type PluginSlotKey,
+  type PluginSlotRenderFailure,
+  type Session,
+} from '@harnessmate/protocol';
+import type { ProjectedToolCall, ProjectedTurn } from '../lib/projector';
+
+export interface SlotPropsMap {
+  'session.header.title': {
+    session: Session;
+    onRename: () => void;
+  };
+  'sidebar.tools': {
+    session: Session | null;
+  };
+  'composer.actions': {
+    session: Session;
+    isRunning: boolean;
+  };
+  'inspector.tabs': {
+    session: Session;
+  };
+  'statusbar.items': {
+    session: Session | null;
+  };
+  'chat.node': {
+    session: Session;
+    turn?: ProjectedTurn;
+    eventType: string;
+    payload?: Record<string, unknown>;
+  };
+  'tool.result': {
+    session: Session;
+    tool: ProjectedToolCall;
+  };
+  'approval.detail': {
+    session: Session;
+    approval: ApprovalRequest;
+  };
+  'chat.message.wrapper': {
+    session: Session;
+    turn: ProjectedTurn;
+    children: ReactNode;
+  };
+}
+
+export type SlotSourceKind = 'builtin' | 'v1-panel' | 'v2-data-panel' | 'iframe';
+
+export interface SlotItemRegistration<K extends PluginSlotKey = PluginSlotKey> {
+  slot: K;
+  id: string;
+  pluginId: string;
+  pluginName: string;
+  title?: string;
+  order?: number;
+  key?: string;
+  sourceKind?: SlotSourceKind;
+  render: (props: SlotPropsMap[K]) => ReactNode;
+}
+
+export interface RegisteredSlotItem<K extends PluginSlotKey = PluginSlotKey> extends SlotItemRegistration<K> {
+  readonly registrationKey: string;
+  readonly seq: number;
+}
+
+export interface SlotQueryOptions {
+  hasSession: boolean;
+  matchKey?: string;
+}
+
+const MAX_RENDER_FAILURES = 40;
+
+export class SlotRegistry {
+  private readonly itemsBySlot = new Map<PluginSlotKey, Map<string, RegisteredSlotItem>>();
+  private readonly listeners = new Set<() => void>();
+  private failures: PluginSlotRenderFailure[] = [];
+  private seqCounter = 0;
+  private version = 0;
+  private cachedVersion = -1;
+  private cachedFailures: readonly PluginSlotRenderFailure[] = [];
+  private readonly queryCache = new Map<string, { version: number; items: readonly RegisteredSlotItem[] }>();
+
+  register<K extends PluginSlotKey>(registration: SlotItemRegistration<K>): Disposer {
+    const slot = normalizePluginSlotKey(registration.slot) as K;
+    const registrationKey = `${registration.pluginId}:${registration.id}`;
+    const bucket = this.itemsBySlot.get(slot) ?? new Map<string, RegisteredSlotItem>();
+    this.itemsBySlot.set(slot, bucket);
+
+    const record: RegisteredSlotItem<K> = {
+      ...registration,
+      slot,
+      registrationKey,
+      seq: ++this.seqCounter,
+    };
+    bucket.set(registrationKey, record as unknown as RegisteredSlotItem);
+    this.bump();
+
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      const currentBucket = this.itemsBySlot.get(slot);
+      if (currentBucket?.get(registrationKey) === (record as unknown as RegisteredSlotItem)) {
+        currentBucket.delete(registrationKey);
+        if (currentBucket.size === 0) this.itemsBySlot.delete(slot);
+        this.bump();
+      }
+    };
+  }
+
+  getItems<K extends PluginSlotKey>(slot: K, options: SlotQueryOptions): readonly RegisteredSlotItem<K>[] {
+    const canonical = normalizePluginSlotKey(slot) as K;
+    const contract = PLUGIN_UI_SLOTS[canonical];
+    if (contract.scope === 'session' && !options.hasSession) {
+      return [];
+    }
+    const cacheKey = `${canonical}|${options.hasSession ? '1' : '0'}|${options.matchKey ?? ''}`;
+    const cached = this.queryCache.get(cacheKey);
+    if (cached && cached.version === this.version) {
+      return cached.items as unknown as readonly RegisteredSlotItem<K>[];
+    }
+
+    const bucket = this.itemsBySlot.get(canonical);
+    let list = bucket ? [...bucket.values()] : [];
+    if (contract.cardinality === 'keyed') {
+      list = options.matchKey ? list.filter((item) => item.key === options.matchKey) : [];
+    }
+    list.sort((a, b) => (a.order ?? 500) - (b.order ?? 500) || a.seq - b.seq);
+    this.queryCache.set(cacheKey, { version: this.version, items: list });
+    return list as unknown as readonly RegisteredSlotItem<K>[];
+  }
+
+  reportRenderFailure(input: Omit<PluginSlotRenderFailure, 'id' | 'timestamp'>): PluginSlotRenderFailure {
+    const now = Date.now();
+    const existingIdx = this.failures.findIndex(
+      (item) =>
+        item.pluginId === input.pluginId &&
+        item.slot === input.slot &&
+        item.slotItemId === input.slotItemId &&
+        item.message === input.message,
+    );
+    const entry: PluginSlotRenderFailure = {
+      ...input,
+      id: `${input.pluginId}:${input.slot}:${input.slotItemId}:${now}`,
+      timestamp: now,
+    };
+    if (existingIdx >= 0) {
+      const next = [...this.failures];
+      next[existingIdx] = entry;
+      this.failures = next;
+    } else {
+      this.failures = [entry, ...this.failures].slice(0, MAX_RENDER_FAILURES);
+    }
+    this.bump();
+    return entry;
+  }
+
+  getRenderFailures(): readonly PluginSlotRenderFailure[] {
+    if (this.cachedVersion !== this.version) {
+      this.cachedFailures = this.failures;
+      this.cachedVersion = this.version;
+    }
+    return this.cachedFailures;
+  }
+
+  clearRenderFailure(id: string): void {
+    const next = this.failures.filter((item) => item.id !== id);
+    if (next.length !== this.failures.length) {
+      this.failures = next;
+      this.bump();
+    }
+  }
+
+  clearPluginRenderFailures(pluginId: string): void {
+    const next = this.failures.filter((item) => item.pluginId !== pluginId);
+    if (next.length !== this.failures.length) {
+      this.failures = next;
+      this.bump();
+    }
+  }
+
+  clearAllRenderFailures(): void {
+    if (this.failures.length > 0) {
+      this.failures = [];
+      this.bump();
+    }
+  }
+
+  getVersion(): number {
+    return this.version;
+  }
+
+  subscribe(listener: () => void): Disposer {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  reset(): void {
+    this.itemsBySlot.clear();
+    this.failures = [];
+    this.queryCache.clear();
+    this.bump();
+  }
+
+  private bump(): void {
+    this.version += 1;
+    this.queryCache.clear();
+    for (const listener of [...this.listeners]) {
+      try {
+        listener();
+      } catch {
+        // Listener errors must not break registry notifications
+      }
+    }
+  }
+}
+
+export const slotRegistry = new SlotRegistry();

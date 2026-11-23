@@ -1,0 +1,474 @@
+/**
+ * Self-contained Node child-process runner for isolated V4 plugins.
+ * Launched with `--permission --allow-fs-read=<packageRoot> --max-old-space-size=128 -e <source> -- <entryUrl>`.
+ * Stdout is strictly reserved for newline-delimited JSON-RPC 2.0 frames; console methods redirect to RPC log / stderr.
+ */
+export const ISOLATED_RUNNER_SOURCE = `'use strict';
+const readline = require('node:readline');
+const entryUrl = process.argv[1];
+const VALID_CODES = new Set([
+  'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
+  'E_INVALID_INPUT', 'E_LIMIT_EXCEEDED', 'E_CONFLICT', 'E_STALE_RUN',
+]);
+
+class PluginApiError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'PluginApiError';
+    this.code = code;
+  }
+}
+globalThis.PluginApiError = PluginApiError;
+
+const rawWrite = process.stdout.write.bind(process.stdout);
+function sendFrame(frame) {
+  try {
+    rawWrite(JSON.stringify(frame) + '\\n');
+  } catch {
+    // Broken pipe during teardown
+  }
+}
+
+let activeRunId = '';
+let disposed = false;
+let seq = 0;
+const pending = new Map();
+const effects = new Set();
+const eventListeners = new Map();
+const commandHandlers = new Map();
+const toolHandlers = new Map();
+const slotHandlers = new Map();
+const providedServices = new Map();
+const sections = new Map();
+const composeListeners = new Set();
+const offerListeners = new Set();
+const annotateListeners = new Set();
+const configListeners = new Set();
+let availableServices = new Set();
+let hostFeatures = new Set();
+
+function rpcNotify(method, params) {
+  if (disposed || !activeRunId) return;
+  sendFrame({ jsonrpc: '2.0', runId: activeRunId, method, params });
+}
+
+for (const level of ['debug', 'info', 'warn', 'error']) {
+  const fn = (...args) => {
+    const message = args.map((item) => (typeof item === 'string' ? item : JSON.stringify(item))).join(' ');
+    if (activeRunId && !disposed) rpcNotify('log', { level, message });
+    else process.stderr.write('[' + level + '] ' + message + '\\n');
+  };
+  console[level] = fn;
+}
+console.log = console.info;
+
+function assertActive() {
+  if (disposed || !activeRunId) throw new PluginApiError('E_STALE_RUN', '插件实例已停止');
+}
+
+function rpcCall(method, params, overrideRunId) {
+  assertActive();
+  const id = ++seq;
+  const runId = overrideRunId ?? activeRunId;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    sendFrame({ jsonrpc: '2.0', id, runId, method, params });
+  });
+}
+
+function registerEffect(activate) {
+  assertActive();
+  const dispose = activate();
+  const undo = () => {
+    if (effects.delete(undo) && typeof dispose === 'function') dispose();
+  };
+  effects.add(undo);
+  return undo;
+}
+
+function createServiceProxy(serviceName) {
+  return new Proxy(Object.create(null), {
+    get(_target, prop) {
+      if (typeof prop !== 'string' || prop === 'then') return undefined;
+      return (...args) => rpcCall('service.call', { service: serviceName, method: prop, args });
+    },
+  });
+}
+
+function buildContext(handshake) {
+  const subscribe = (name, listener) => registerEffect(() => {
+    const set = eventListeners.get(name) || new Set();
+    eventListeners.set(name, set);
+    set.add(listener);
+    rpcNotify('events.subscribe', { event: name });
+    return () => {
+      set.delete(listener);
+      if (set.size === 0) {
+        eventListeners.delete(name);
+        rpcNotify('events.unsubscribe', { event: name });
+      }
+    };
+  });
+
+  return {
+    runId: handshake.runId,
+    pluginId: handshake.pluginId,
+    api: {
+      version: handshake.pluginApi,
+      has(feature) {
+        assertActive();
+        return hostFeatures.has(feature) || availableServices.has(feature);
+      },
+    },
+    logger: {
+      debug: (message, meta) => rpcNotify('log', { level: 'debug', message, meta }),
+      info: (message, meta) => rpcNotify('log', { level: 'info', message, meta }),
+      warn: (message, meta) => rpcNotify('log', { level: 'warn', message, meta }),
+      error: (message, meta) => rpcNotify('log', { level: 'error', message, meta }),
+    },
+    effect: registerEffect,
+    get(name) {
+      assertActive();
+      if (!availableServices.has(name)) return undefined;
+      return createServiceProxy(name);
+    },
+    provide(name, service) {
+      return registerEffect(() => {
+        if (providedServices.has(name)) throw new PluginApiError('E_CONFLICT', '服务 ' + name + ' 已注册');
+        providedServices.set(name, service);
+        return () => {
+          providedServices.delete(name);
+          rpcNotify('service.unprovide', { name });
+        };
+      });
+    },
+    on: subscribe,
+    commands: {
+      register(command, handler) {
+        return registerEffect(() => {
+          if (commandHandlers.has(command)) throw new PluginApiError('E_CONFLICT', '命令 /' + command + ' 已注册');
+          commandHandlers.set(command, handler);
+          return () => {
+            commandHandlers.delete(command);
+            rpcNotify('commands.unregister', { command });
+          };
+        });
+      },
+    },
+    events: {
+      on: subscribe,
+      query: (filter) => rpcCall('events.query', filter || {}),
+    },
+    sessions: {
+      list: (filter) => rpcCall('sessions.list', filter || {}),
+      get: (sessionId) => rpcCall('sessions.get', { sessionId }),
+      capabilities: (sessionId) => rpcCall('sessions.capabilities', { sessionId }),
+      prepareTurn: (sessionId, input) => rpcCall('sessions.prepareTurn', { sessionId, ...(input || {}) }),
+      runNative: (sessionId, command, args) => rpcCall('sessions.runNative', { sessionId, command, args }),
+    },
+    ledger: {
+      get: (sessionId) => rpcCall('ledger.get', { sessionId }),
+      append: (sessionId, entry) => rpcCall('ledger.append', { sessionId, entry }),
+    },
+    handoff: {
+      section(def) {
+        return registerEffect(() => {
+          sections.set(def.id, def);
+          return () => {
+            sections.delete(def.id);
+            rpcNotify('handoff.section.unregister', { id: def.id });
+          };
+        });
+      },
+      onCompose(listener) {
+        return registerEffect(() => {
+          composeListeners.add(listener);
+          return () => { composeListeners.delete(listener); };
+        });
+      },
+      onShouldOffer(listener) {
+        return registerEffect(() => {
+          offerListeners.add(listener);
+          return () => { offerListeners.delete(listener); };
+        });
+      },
+    },
+    composer: {
+      suggest: (sessionId, suggestion) => rpcCall('composer.suggest', { sessionId, suggestion }),
+    },
+    approvals: {
+      annotate: (approvalId, note) => rpcCall('approvals.annotate', { approvalId, note }),
+      onAnnotate(listener) {
+        return registerEffect(() => {
+          annotateListeners.add(listener);
+          return () => { annotateListeners.delete(listener); };
+        });
+      },
+    },
+    tools: {
+      register(tool) {
+        return registerEffect(() => {
+          if (toolHandlers.has(tool.name)) throw new PluginApiError('E_CONFLICT', '工具 ' + tool.name + ' 已注册');
+          toolHandlers.set(tool.name, {
+            meta: {
+              name: tool.name,
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+              readOnly: tool.readOnly,
+            },
+            handler: tool.handler,
+          });
+          return () => {
+            toolHandlers.delete(tool.name);
+            rpcNotify('tools.unregister', { name: tool.name });
+          };
+        });
+      },
+    },
+    slots: {
+      register(def) {
+        return registerEffect(() => {
+          const rawSlot = String(def && def.slot ? def.slot : '');
+          const slot = rawSlot === 'inspector.tab' ? 'inspector.tabs' : rawSlot;
+          const id = String(def && def.id ? def.id : '');
+          const title = String(def && def.title ? def.title : '');
+          const ui = String(def && def.ui ? def.ui : '');
+          if (!slot || !id || !title || !ui) {
+            throw new PluginApiError('E_INVALID_INPUT', '插槽注册缺少 slot、id、title 或 ui');
+          }
+          const key = slot + ':' + id;
+          if (slotHandlers.has(key)) throw new PluginApiError('E_CONFLICT', '插槽项 ' + key + ' 已注册');
+          slotHandlers.set(key, {
+            meta: {
+              slot,
+              id,
+              title,
+              ui,
+              ...(typeof def.order === 'number' ? { order: def.order } : {}),
+              ...(typeof def.key === 'string' ? { key: def.key } : {}),
+              ...(typeof def.height === 'number' ? { height: def.height } : {}),
+            },
+            onMessage: typeof def.onMessage === 'function' ? def.onMessage : undefined,
+          });
+          return () => {
+            slotHandlers.delete(key);
+            rpcNotify('slots.unregister', { slot, id });
+          };
+        });
+      },
+    },
+    storage: {
+      plugin: {
+        get: (key) => rpcCall('storage.plugin.get', { key }),
+        set: (key, value) => rpcCall('storage.plugin.set', { key, value }),
+        delete: (key) => rpcCall('storage.plugin.delete', { key }),
+        keys: () => rpcCall('storage.plugin.keys', {}),
+      },
+      workspace: {
+        get: (workspaceId, key) => rpcCall('storage.workspace.get', { workspaceId, key }),
+        set: (workspaceId, key, value) => rpcCall('storage.workspace.set', { workspaceId, key, value }),
+        delete: (workspaceId, key) => rpcCall('storage.workspace.delete', { workspaceId, key }),
+        keys: (workspaceId) => rpcCall('storage.workspace.keys', { workspaceId }),
+      },
+    },
+    fs: {
+      read: (workspaceId, relativePath) => rpcCall('fs.read', { workspaceId, relativePath }),
+      list: (workspaceId, relativePath) => rpcCall('fs.list', { workspaceId, relativePath }),
+      stat: (workspaceId, relativePath) => rpcCall('fs.stat', { workspaceId, relativePath }),
+      write: (workspaceId, relativePath, content) => rpcCall('fs.write', { workspaceId, relativePath, content }),
+    },
+    net: {
+      fetch: (url, init) => rpcCall('net.fetch', { url, init }),
+    },
+    notify: {
+      send: (input) => rpcCall('notify.send', input || {}),
+    },
+    clipboard: {
+      writeText: (text, workspaceId) => rpcCall('clipboard.writeText', { text, workspaceId }),
+    },
+    onConfigUpdated(listener) {
+      return registerEffect(() => {
+        configListeners.add(listener);
+        return () => { configListeners.delete(listener); };
+      });
+    },
+    __rawRpcCall: rpcCall,
+  };
+}
+
+function disposeAll() {
+  disposed = true;
+  for (const undo of [...effects].reverse()) {
+    try { undo(); } catch {}
+  }
+  effects.clear();
+  for (const req of pending.values()) {
+    req.reject(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
+  }
+  pending.clear();
+}
+
+function respond(id, runId, result, error) {
+  if (error) sendFrame({ jsonrpc: '2.0', id, runId, error });
+  else sendFrame({ jsonrpc: '2.0', id, runId, result });
+}
+
+async function handleMessage(message) {
+  if (!('method' in message)) {
+    const req = pending.get(message.id);
+    if (!req) return;
+    pending.delete(message.id);
+    if (message.error) {
+      const code = VALID_CODES.has(message.error.code) ? message.error.code : null;
+      req.reject(code ? new PluginApiError(code, message.error.message) : new Error(message.error.message));
+    } else {
+      req.resolve(message.result);
+    }
+    return;
+  }
+
+  const id = message.id;
+  const method = message.method;
+  const params = message.params || {};
+
+  if (method !== 'host.handshake' && message.runId !== activeRunId) {
+    if (id !== undefined) respond(id, message.runId, undefined, { code: 'E_STALE_RUN', message: '实例标识不匹配' });
+    return;
+  }
+
+  try {
+    let result;
+    if (method === 'host.handshake') {
+      activeRunId = params.runId;
+      hostFeatures = new Set(params.features || []);
+      availableServices = new Set(params.services || []);
+      const loaded = await import(entryUrl);
+      const mod = loaded.default && typeof loaded.default.apply === 'function' ? loaded.default : loaded;
+      if (typeof mod.apply !== 'function') {
+        throw new PluginApiError('E_INVALID_INPUT', 'V4 插件入口必须导出 apply(ctx, config)');
+      }
+      const unsupported = (mod.requires || []).filter((feature) => !hostFeatures.has(feature));
+      if (unsupported.length) {
+        throw new PluginApiError('E_NOT_SUPPORTED', '宿主不支持插件要求的特性: ' + unsupported.join(', '));
+      }
+      const ctx = buildContext(params);
+      await mod.apply(ctx, params.config || {});
+      const serviceMethods = {};
+      for (const [serviceName, impl] of providedServices) {
+        serviceMethods[serviceName] = Object.keys(impl).filter((k) => typeof impl[k] === 'function');
+      }
+      result = {
+        sdkVersion: typeof mod.sdkVersion === 'string' ? mod.sdkVersion : '4.0.0',
+        name: mod.name,
+        requires: mod.requires,
+        inject: mod.inject,
+        optional: mod.optional,
+        provides: [...providedServices.keys()],
+        serviceMethods,
+        commands: [...commandHandlers.keys()],
+        tools: [...toolHandlers.values()].map(({ meta }) => meta),
+        slots: [...slotHandlers.values()].map(({ meta }) => meta),
+        sections: [...sections.values()],
+        subscribedEvents: [...eventListeners.keys()],
+        hasHandoffCompose: composeListeners.size > 0,
+        hasHandoffShouldOffer: offerListeners.size > 0,
+        hasApprovalAnnotate: annotateListeners.size > 0,
+      };
+    } else if (method === 'host.services.sync') {
+      availableServices = new Set(Array.isArray(params.services) ? params.services : []);
+      result = { ok: true };
+    } else if (method === 'host.dispose') {
+      disposeAll();
+      result = { ok: true };
+    } else if (method === 'host.event') {
+      const listeners = [...(eventListeners.get(params.event.type) || [])];
+      for (const listener of listeners) await listener(params.event);
+      result = { ok: true };
+    } else if (method === 'host.command') {
+      const handler = commandHandlers.get(String(params.command));
+      if (!handler) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '未注册命令 /' + String(params.command));
+      result = await handler(params.input);
+    } else if (method === 'host.tool') {
+      const tool = toolHandlers.get(String(params.name));
+      if (!tool) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '未注册工具 ' + String(params.name));
+      result = await tool.handler(params.input || {}, params.meta || { sessionId: '', workspaceId: '' });
+    } else if (method === 'host.service.call') {
+      const impl = providedServices.get(String(params.service));
+      const fn = impl && impl[String(params.method)];
+      if (typeof fn !== 'function') {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '服务 ' + String(params.service) + '.' + String(params.method) + ' 不可用');
+      }
+      result = await fn(...(Array.isArray(params.args) ? params.args : []));
+    } else if (method === 'host.handoff.compose') {
+      const collected = [];
+      for (const listener of [...composeListeners]) {
+        const out = await listener(params.event);
+        if (Array.isArray(out)) collected.push(...out);
+        else if (out) collected.push(out);
+      }
+      result = { sections: collected };
+    } else if (method === 'host.handoff.shouldOffer') {
+      let decision;
+      for (const listener of [...offerListeners]) {
+        const out = await listener(params.event);
+        if (out !== undefined) {
+          decision = out;
+          break;
+        }
+      }
+      result = { decision };
+    } else if (method === 'host.approval.annotate') {
+      const annotations = [];
+      for (const listener of [...annotateListeners]) {
+        const out = await listener(params.event);
+        if (out) annotations.push(out);
+      }
+      result = { annotations };
+    } else if (method === 'host.slot.message') {
+      const slotId = String(params.slotId || '');
+      const rawSlot = params.slot ? String(params.slot) : '';
+      const slotName = rawSlot === 'inspector.tab' ? 'inspector.tabs' : rawSlot;
+      const entry = (slotName ? slotHandlers.get(slotName + ':' + slotId) : undefined)
+        || [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
+      if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '未注册插槽项 ' + slotId);
+      if (!entry.onMessage) {
+        result = { handled: false };
+      } else {
+        result = await entry.onMessage(params.payload, {
+          sessionId: typeof params.sessionId === 'string' ? params.sessionId : null,
+          slotId,
+        });
+      }
+    } else if (method === 'host.config.updated') {
+      for (const listener of [...configListeners]) await listener(params.config || {});
+      result = { ok: true };
+    } else {
+      throw new PluginApiError('E_NOT_SUPPORTED', '未知 RPC 方法 ' + method);
+    }
+
+    if (id !== undefined) respond(id, message.runId, result);
+  } catch (error) {
+    if (id !== undefined) {
+      const code = error && VALID_CODES.has(error.code) ? error.code : 'E_INTERNAL';
+      const errMessage = String(error && error.message ? error.message : error).slice(0, 1000);
+      respond(id, message.runId, undefined, { code, message: errMessage });
+    }
+  }
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return;
+  }
+  void handleMessage(parsed);
+});
+rl.on('close', () => {
+  disposeAll();
+  process.exit(0);
+});
+`;

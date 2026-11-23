@@ -76,6 +76,24 @@
         "provides": {
           "$ref": "#/definitions/PluginManifestV4/properties/inject"
         },
+        "activationEvents": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "maxItems": 32
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 260
+          },
+          "maxItems": 64
+        },
         "contributes": {
           "type": "object",
           "properties": {
@@ -160,6 +178,34 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "commands": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 40,
+                    "pattern": "^[a-z0-9][a-z0-9_-]*$"
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 160
+                  },
+                  "argumentHint": {
+                    "type": "string",
+                    "maxLength": 80
+                  }
+                },
+                "required": [
+                  "command",
+                  "description"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 24
             },
             "mcpPresets": {
               "type": "array",
@@ -647,6 +693,100 @@
                 ]
               },
               "maxItems": 12
+            },
+            "slots": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "slot": {
+                    "type": "string",
+                    "enum": [
+                      "session.header.title",
+                      "sidebar.tools",
+                      "composer.actions",
+                      "inspector.tabs",
+                      "inspector.tab",
+                      "statusbar.items",
+                      "chat.node",
+                      "tool.result",
+                      "approval.detail",
+                      "chat.message.wrapper"
+                    ]
+                  },
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$"
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "ui": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "order": {
+                    "type": "integer",
+                    "minimum": -1000,
+                    "maximum": 1000
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "height": {
+                    "type": "integer",
+                    "minimum": 48,
+                    "maximum": 1200
+                  }
+                },
+                "required": [
+                  "slot",
+                  "id",
+                  "title",
+                  "ui"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 12
+            },
+            "settings": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "string",
+                      "number",
+                      "boolean"
+                    ]
+                  },
+                  "default": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean"
+                    ]
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 240
+                  },
+                  "volatile": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false
+              }
             },
             "uiSlots": {
               "type": "array",

@@ -1,5 +1,6 @@
 import type {
   AddMcpServerRequest,
+  AddTrustedPublisherRequest,
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
@@ -22,14 +23,17 @@ import type {
   ImportNativeSessionRequest,
   McpServerEntry,
   PluginCatalogItem,
+  PluginLogEntryDto,
   PluginMcpPreset,
   PluginPermission,
+  PluginRegistryStateDto,
   PreviewPluginProgramRequest,
   PluginSlashCommand,
   RemoteAccessStatus,
   ReplayPluginDraftRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
+  ScaffoldPluginRequest,
   Session,
   SessionModelPluginTools,
   SessionPluginAction,
@@ -37,8 +41,10 @@ import type {
   SessionTaskState,
   PluginPanelQuery,
   PluginPanelSnapshot,
+  PluginUiMessageRequest,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
+  UpdatePluginRegistryConfigRequest,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
   UploadAttachmentRequest,
@@ -224,6 +230,25 @@ export const daemonApi = {
     apiFetch<HarnessCommandResult>(`/api/v1/plugins/actions/${encodeURIComponent(sessionId)}`,
       { method: 'POST', body: JSON.stringify(request) }),
 
+  getPluginUiDoc: (pluginId: string, uiPath: string, signal?: AbortSignal) =>
+    apiFetch<{
+      pluginId: string;
+      digest: string | null;
+      runId: string;
+      path: string;
+      csp: string;
+      html: string;
+    }>(
+      `/api/v1/plugins/${encodeURIComponent(pluginId)}/ui-doc?path=${encodeURIComponent(uiPath)}`,
+      { signal },
+    ),
+
+  sendPluginUiMessage: (pluginId: string, request: PluginUiMessageRequest) =>
+    apiFetch<{ result: unknown }>(
+      `/api/v1/plugins/${encodeURIComponent(pluginId)}/ui-message`,
+      { method: 'POST', body: JSON.stringify(request) },
+    ),
+
   generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
     apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),
 
@@ -252,6 +277,67 @@ export const daemonApi = {
     apiFetch<PluginBundleResponse>(`/api/v1/plugins/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+
+  getPluginLogs: (pluginId?: string) =>
+    apiFetch<{ logs: PluginLogEntryDto[] }>(
+      pluginId ? `/api/v1/plugins/${encodeURIComponent(pluginId)}/logs` : '/api/v1/plugins/logs',
+    ),
+
+  clearPluginLogs: (pluginId?: string) =>
+    apiFetch<{ ok: boolean }>(
+      pluginId ? `/api/v1/plugins/${encodeURIComponent(pluginId)}/logs` : '/api/v1/plugins/logs',
+      { method: 'DELETE' },
+    ),
+
+  linkDevPlugin: (dirPath: string) =>
+    apiFetch<PluginBundleResponse>('/api/v1/plugins/dev/link', {
+      method: 'POST',
+      body: JSON.stringify({ dirPath }),
+    }),
+
+  reloadDevPlugin: (id: string) =>
+    apiFetch<PluginBundleResponse>(`/api/v1/plugins/dev/${encodeURIComponent(id)}/reload`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  unlinkDevPlugin: (id: string) =>
+    apiFetch<PluginBundleResponse>(`/api/v1/plugins/dev/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  scaffoldPlugin: (req: ScaffoldPluginRequest) =>
+    apiFetch<PluginBundleResponse & { dirPath: string; files: string[] }>('/api/v1/plugins/scaffold', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  getPluginRegistry: () =>
+    apiFetch<{ registry: PluginRegistryStateDto; catalog: PluginCatalogItem[] }>('/api/v1/plugins/registry'),
+
+  refreshPluginRegistry: () =>
+    apiFetch<PluginBundleResponse & { registry: PluginRegistryStateDto }>('/api/v1/plugins/registry/refresh', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  updatePluginRegistryConfig: (req: UpdatePluginRegistryConfigRequest) =>
+    apiFetch<PluginBundleResponse & { registry: PluginRegistryStateDto }>('/api/v1/plugins/registry/config', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+
+  addTrustedPublisher: (req: AddTrustedPublisherRequest) =>
+    apiFetch<PluginBundleResponse & { registry: PluginRegistryStateDto }>('/api/v1/plugins/registry/publishers', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  removeTrustedPublisher: (id: string) =>
+    apiFetch<PluginBundleResponse & { registry: PluginRegistryStateDto }>(
+      `/api/v1/plugins/registry/publishers/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
 
   // MCP Hub
   listMcpServers: () =>

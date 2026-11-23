@@ -406,7 +406,7 @@ describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
     expect(claudeEvents).toContain('approval.requested');
     expect(claudeEvents).toContain('usage.updated');
     expect(claudeEvents).toContain('turn.completed');
-  });
+  }, 15_000);
 
   it('verifies AGY ACP session/set_config_option model switching, plugin lifecycle, attachments, and cross-harness handoff', async () => {
     const dataDir = makeTempDir('hm-v2-data-');

@@ -112,8 +112,17 @@ interface ApprovalRow {
   resolved_by: string | null;
   decision: string | null;
   comment: string | null;
+  annotations_json?: string | null;
   created_at: number;
   resolved_at: number | null;
+}
+
+export interface StoredPluginPermission {
+  pluginId: string;
+  digest: string;
+  capability: string;
+  coverFuture: boolean;
+  declaredPermissions: string[];
 }
 
 interface DeviceRow {
@@ -209,7 +218,27 @@ export class HarnessMateStore {
         plugin_id TEXT NOT NULL,
         digest TEXT NOT NULL,
         capability TEXT NOT NULL,
+        cover_future INTEGER NOT NULL DEFAULT 0,
+        declared_permissions_json TEXT,
         PRIMARY KEY (workspace_id, plugin_id, capability)
+      );
+
+      CREATE TABLE IF NOT EXISTS plugin_global_permissions (
+        plugin_id TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        cover_future INTEGER NOT NULL DEFAULT 0,
+        declared_permissions_json TEXT,
+        PRIMARY KEY (plugin_id, capability)
+      );
+
+      CREATE TABLE IF NOT EXISTS plugin_kv_storage (
+        scope TEXT NOT NULL,
+        plugin_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (scope, plugin_id, key)
       );
 
       CREATE TABLE IF NOT EXISTS approvals (
@@ -291,6 +320,18 @@ export class HarnessMateStore {
     }
     if (!colNames.has('context_sync_mode')) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN context_sync_mode TEXT NOT NULL DEFAULT 'auto';");
+    }
+
+    const permCols = new Set((this.db.prepare('PRAGMA table_info(plugin_permissions)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
+    if (!permCols.has('cover_future')) {
+      this.db.exec('ALTER TABLE plugin_permissions ADD COLUMN cover_future INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!permCols.has('declared_permissions_json')) {
+      this.db.exec('ALTER TABLE plugin_permissions ADD COLUMN declared_permissions_json TEXT;');
+    }
+    const approvalCols = new Set((this.db.prepare('PRAGMA table_info(approvals)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
+    if (!approvalCols.has('annotations_json')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN annotations_json TEXT;');
     }
 
     // Idempotent backfill for existing v0.1/v0.2 sessions -> unified multi-harness bindings + task ledger
@@ -856,24 +897,116 @@ export class HarnessMateStore {
     }));
   }
 
-  getPluginPermissions(workspaceId: string) {
-    return this.db.prepare(`SELECT plugin_id AS pluginId, digest, capability FROM plugin_permissions WHERE workspace_id = ?`)
-      .all(workspaceId) as Array<{ pluginId: string; digest: string; capability: string }>;
+  getPluginPermissions(workspaceId: string): StoredPluginPermission[] {
+    const rows = this.db.prepare(
+      `SELECT plugin_id AS pluginId, digest, capability, cover_future AS coverFuture, declared_permissions_json AS declaredPermissionsJson
+       FROM plugin_permissions WHERE workspace_id = ?`,
+    ).all(workspaceId) as Array<{ pluginId: string; digest: string; capability: string; coverFuture?: number; declaredPermissionsJson?: string | null }>;
+    return rows.map((row) => ({
+      pluginId: row.pluginId,
+      digest: row.digest,
+      capability: row.capability,
+      coverFuture: Boolean(row.coverFuture),
+      declaredPermissions: safeJsonParse<string[]>(row.declaredPermissionsJson ?? null, []),
+    }));
   }
 
-  setPluginPermission(workspaceId: string, pluginId: string, digest: string, capability: string, granted: boolean): void {
+  getGlobalPluginPermissions(): StoredPluginPermission[] {
+    const rows = this.db.prepare(
+      `SELECT plugin_id AS pluginId, digest, capability, cover_future AS coverFuture, declared_permissions_json AS declaredPermissionsJson
+       FROM plugin_global_permissions`,
+    ).all() as Array<{ pluginId: string; digest: string; capability: string; coverFuture?: number; declaredPermissionsJson?: string | null }>;
+    return rows.map((row) => ({
+      pluginId: row.pluginId,
+      digest: row.digest,
+      capability: row.capability,
+      coverFuture: Boolean(row.coverFuture),
+      declaredPermissions: safeJsonParse<string[]>(row.declaredPermissionsJson ?? null, []),
+    }));
+  }
+
+  setPluginPermission(
+    workspaceId: string,
+    pluginId: string,
+    digest: string,
+    capability: string,
+    granted: boolean,
+    opts?: { coverFuture?: boolean; declaredPermissions?: readonly string[] },
+  ): void {
+    const coverFuture = opts?.coverFuture ? 1 : 0;
+    const declaredJson = opts?.declaredPermissions ? JSON.stringify([...new Set(opts.declaredPermissions)].sort()) : null;
     if (granted) {
-      this.db.prepare(`INSERT INTO plugin_permissions (workspace_id, plugin_id, digest, capability) VALUES (?, ?, ?, ?)
-        ON CONFLICT (workspace_id, plugin_id, capability) DO UPDATE SET digest = excluded.digest`)
-        .run(workspaceId, pluginId, digest, capability);
+      this.db.prepare(`INSERT INTO plugin_permissions (workspace_id, plugin_id, digest, capability, cover_future, declared_permissions_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (workspace_id, plugin_id, capability) DO UPDATE SET
+          digest = excluded.digest,
+          cover_future = excluded.cover_future,
+          declared_permissions_json = excluded.declared_permissions_json`)
+        .run(workspaceId, pluginId, digest, capability, coverFuture, declaredJson);
     } else {
       this.db.prepare(`DELETE FROM plugin_permissions WHERE workspace_id = ? AND plugin_id = ? AND capability = ?`)
         .run(workspaceId, pluginId, capability);
     }
   }
 
+  setGlobalPluginPermission(
+    pluginId: string,
+    digest: string,
+    capability: string,
+    granted: boolean,
+    opts?: { coverFuture?: boolean; declaredPermissions?: readonly string[] },
+  ): void {
+    const coverFuture = opts?.coverFuture ? 1 : 0;
+    const declaredJson = opts?.declaredPermissions ? JSON.stringify([...new Set(opts.declaredPermissions)].sort()) : null;
+    if (granted) {
+      this.db.prepare(`INSERT INTO plugin_global_permissions (plugin_id, digest, capability, cover_future, declared_permissions_json)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (plugin_id, capability) DO UPDATE SET
+          digest = excluded.digest,
+          cover_future = excluded.cover_future,
+          declared_permissions_json = excluded.declared_permissions_json`)
+        .run(pluginId, digest, capability, coverFuture, declaredJson);
+    } else {
+      this.db.prepare(`DELETE FROM plugin_global_permissions WHERE plugin_id = ? AND capability = ?`)
+        .run(pluginId, capability);
+    }
+  }
+
   clearPluginPermissions(pluginId: string): void {
     this.db.prepare('DELETE FROM plugin_permissions WHERE plugin_id = ?').run(pluginId);
+    this.db.prepare('DELETE FROM plugin_global_permissions WHERE plugin_id = ?').run(pluginId);
+    this.db.prepare('DELETE FROM plugin_kv_storage WHERE plugin_id = ?').run(pluginId);
+  }
+
+  // ── Plugin Key-Value Storage ─────────────────────────────────────────
+
+  getPluginStorageValue(scope: string, pluginId: string, key: string): unknown {
+    const row = this.db.prepare(
+      'SELECT value_json FROM plugin_kv_storage WHERE scope = ? AND plugin_id = ? AND key = ?',
+    ).get(scope, pluginId, key) as { value_json: string } | undefined;
+    return row ? safeJsonParse<unknown>(row.value_json, undefined) : undefined;
+  }
+
+  setPluginStorageValue(scope: string, pluginId: string, key: string, value: unknown): void {
+    this.db.prepare(
+      `INSERT INTO plugin_kv_storage (scope, plugin_id, key, value_json, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (scope, plugin_id, key) DO UPDATE SET
+         value_json = excluded.value_json,
+         updated_at = excluded.updated_at`,
+    ).run(scope, pluginId, key, JSON.stringify(value), Date.now());
+  }
+
+  deletePluginStorageValue(scope: string, pluginId: string, key: string): void {
+    this.db.prepare('DELETE FROM plugin_kv_storage WHERE scope = ? AND plugin_id = ? AND key = ?')
+      .run(scope, pluginId, key);
+  }
+
+  listPluginStorageKeys(scope: string, pluginId: string): string[] {
+    const rows = this.db.prepare(
+      'SELECT key FROM plugin_kv_storage WHERE scope = ? AND plugin_id = ? ORDER BY key ASC',
+    ).all(scope, pluginId) as Array<{ key: string }>;
+    return rows.map(({ key }) => key);
   }
 
   // ── Session Harness Bindings (Per-Harness Sync Watermarks) ───────────
@@ -1076,6 +1209,19 @@ export class HarnessMateStore {
     return rows.map(mapApproval);
   }
 
+  addApprovalAnnotation(
+    approvalId: string,
+    annotation: { pluginId: string; risk?: RiskLevel; label: string; detail?: string },
+  ): ApprovalRequest | null {
+    const existing = this.getApproval(approvalId);
+    if (!existing) return null;
+    const current = existing.annotations ?? [];
+    const next = [...current.filter((item) => item.pluginId !== annotation.pluginId || item.label !== annotation.label), annotation].slice(0, 16);
+    this.db.prepare('UPDATE approvals SET annotations_json = ? WHERE id = ?')
+      .run(JSON.stringify(next), approvalId);
+    return this.getApproval(approvalId);
+  }
+
   resolveApprovalIfPending(
     id: string,
     decision: ApprovalDecision,
@@ -1252,6 +1398,7 @@ function mapTaskState(row: TaskStateRow): SessionTaskState {
 }
 
 function mapApproval(row: ApprovalRow): ApprovalRequest {
+  const annotations = safeJsonParse<ApprovalRequest['annotations']>(row.annotations_json ?? null, undefined);
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -1266,6 +1413,7 @@ function mapApproval(row: ApprovalRow): ApprovalRequest {
     resolvedBy: row.resolved_by as 'desktop' | 'mobile' | 'auto' | null,
     decision: row.decision as ApprovalDecision | null,
     comment: row.comment,
+    ...(annotations?.length ? { annotations } : {}),
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
   };

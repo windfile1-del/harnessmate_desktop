@@ -2,7 +2,7 @@
 
 由 `pnpm contracts:generate` 生成。插件 API 4.0.0。
 
-当前由第一方提供。外部 V4 声明式插件可将服务列为依赖。
+第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。
 
 - `failover`
 - `git`

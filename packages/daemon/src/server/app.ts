@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import {
   AddMcpServerRequestSchema,
+  AddTrustedPublisherRequestSchema,
   CreateSessionRequestSchema,
   CreateWorkspaceRequestSchema,
   CustomAcpHarnessConfigSchema,
@@ -10,18 +11,22 @@ import {
   GeneratePluginDraftRequestSchema,
   ImportNativeSessionRequestSchema,
   InstallPluginRequestSchema,
+  LinkDevPluginRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
   ResolveApprovalRequestSchema,
   RunHarnessCommandRequestSchema,
+  ScaffoldPluginRequestSchema,
   SendTurnRequestSchema,
   SwitchHarnessRequestSchema,
   ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
+  UpdatePluginRegistryConfigRequestSchema,
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
   UpdateTaskStateRequestSchema,
   PluginPanelQuerySchema,
+  PluginUiMessageRequestSchema,
   PreviewPluginProgramRequestSchema,
   ReplayPluginDraftRequestSchema,
   RunPluginActionRequestSchema,
@@ -63,6 +68,9 @@ import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { PluginCapabilities } from '../plugins/plugin-capabilities.js';
 import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
 import { runPluginProgram } from '../plugins/plugin-program.js';
+import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
+import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
+import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
 
@@ -72,6 +80,7 @@ export interface CreateDaemonOptions {
   hostOverride?: string;
   customAdapters?: HarnessAdapter[];
   webDistDir?: string | null;
+  pluginCrashPolicy?: CrashPolicy;
 }
 
 export interface DaemonInstance {
@@ -102,26 +111,46 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   }
 
+  const pluginPermissions = new PluginPermissionService(store);
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
     () => config.disabledPlugins,
-    createBuiltinPlugins(store, registry, config, (state) => {
-      if (!store.getSession(state.sessionId)) return;
-      eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
-        version: state.version, objective: state.objective, stepsCount: state.steps.length,
-        doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
-        touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
-      }));
-    }, () => pluginManager.host.events, opts.customAdapters),
+    createBuiltinPlugins(
+      store,
+      registry,
+      config,
+      (state) => {
+        if (!store.getSession(state.sessionId)) return;
+        eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
+          version: state.version, objective: state.objective, stepsCount: state.steps.length,
+          doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
+          touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
+        }));
+      },
+      () => pluginManager.host.events,
+      opts.customAdapters,
+      async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
+    ),
+    { store, permissions: pluginPermissions, crashPolicy: opts.pluginCrashPolicy },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const attachmentService = new AttachmentService(paths.attachmentsDir);
   const mcpService = new McpService(registry, config.binaryOverrides);
 
   let boundPort = config.port;
-  const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`);
+  const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
   const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities);
+  pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
+    const session = store.getSession(sessionId);
+    if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
+    const result = await sessionManager.runHarnessCommand(sessionId, {
+      command: command as Parameters<SessionManager['runHarnessCommand']>[1]['command'],
+      args: args ?? '',
+      harnessId: session.harnessId,
+    });
+    return { output: result.output, notice: result.turnId ? `已触发轮次 ${result.turnId}` : undefined };
+  });
   const auth = new RemoteAuthService(store, config.localToken);
   const wsGateway = new WsGateway({
     desktopId: config.desktopId,
@@ -286,7 +315,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.get('/api/v1/plugins/:id/permissions', async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId } = request.query as { workspaceId?: string };
-    if (typeof workspaceId !== 'string' || !store.getWorkspace(workspaceId)) return reply.code(404).send({ error: '工作区不存在' });
+    if (typeof workspaceId !== 'string' || (workspaceId !== GLOBAL_WORKSPACE_SCOPE && !store.getWorkspace(workspaceId))) {
+      return reply.code(404).send({ error: '工作区不存在' });
+    }
     return { permissions: pluginCapabilities.listPermissions(workspaceId, id) };
   });
 
@@ -294,8 +325,230 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     const parsed = SetPluginPermissionRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: '插件授权参数无效' });
-    try { return { permissions: pluginCapabilities.setPermission(id, parsed.data) }; }
-    catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+    try { return { permissions: await pluginCapabilities.setPermission(id, parsed.data) }; }
+    catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.get('/api/v1/plugins/logs', async () => ({
+    logs: pluginManager.getAllLogs(),
+  }));
+
+  app.delete('/api/v1/plugins/logs', async () => {
+    pluginManager.clearLogs();
+    return { ok: true };
+  });
+
+  app.get('/api/v1/plugins/:id/logs', async (request) => {
+    const { id } = request.params as { id: string };
+    return { logs: pluginManager.getLogs(id) };
+  });
+
+  app.delete('/api/v1/plugins/:id/logs', async (request) => {
+    const { id } = request.params as { id: string };
+    pluginManager.clearLogs(id);
+    return { ok: true };
+  });
+
+  app.post('/api/v1/plugins/dev/link', async (request, reply) => {
+    const parsed = LinkDevPluginRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: '请提供有效的本地插件源码目录', code: 'E_INVALID_INPUT' });
+    }
+    try {
+      await pluginManager.linkDevPlugin(parsed.data.dirPath);
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.post('/api/v1/plugins/dev/:id/reload', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      await pluginManager.reloadDevPlugin(id);
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.delete('/api/v1/plugins/dev/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      await pluginManager.unlinkDevPlugin(id);
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.post('/api/v1/plugins/scaffold', async (request, reply) => {
+    const parsed = ScaffoldPluginRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: parsed.error.issues[0]?.message ?? '插件脚手架参数无效',
+        code: 'E_INVALID_INPUT',
+      });
+    }
+    try {
+      const result = await pluginManager.scaffoldPlugin(parsed.data);
+      return reply.code(201).send({
+        dirPath: result.dirPath,
+        files: result.files,
+        ...(await updatedPlugins()),
+      });
+    } catch (error) {
+      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
+      return reply.code(code === 'E_CONFLICT' ? 409 : 400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code,
+      });
+    }
+  });
+
+  app.get('/api/v1/plugins/registry', async () => ({
+    registry: pluginManager.registryService.getState(),
+    catalog: pluginManager.listCatalog(),
+  }));
+
+  app.post('/api/v1/plugins/registry/refresh', async () => {
+    const { state } = await pluginManager.registryService.refresh();
+    return { registry: state, ...buildPluginPayload() };
+  });
+
+  app.put('/api/v1/plugins/registry/config', async (request, reply) => {
+    const parsed = UpdatePluginRegistryConfigRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: '远程插件索引配置无效', code: 'E_INVALID_INPUT' });
+    }
+    try {
+      pluginManager.registryService.updateConfig(parsed.data);
+      const { state } = await pluginManager.registryService.refresh();
+      return { registry: state, ...buildPluginPayload() };
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.post('/api/v1/plugins/registry/publishers', async (request, reply) => {
+    const parsed = AddTrustedPublisherRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: '发布者公钥参数无效', code: 'E_INVALID_INPUT' });
+    }
+    try {
+      const state = pluginManager.registryService.addTrustedPublisher(parsed.data);
+      return reply.code(201).send({ registry: state, ...buildPluginPayload() });
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
+  app.delete('/api/v1/plugins/registry/publishers/:id', async (request) => {
+    const { id } = request.params as { id: string };
+    const state = pluginManager.registryService.removeTrustedPublisher(id);
+    return { registry: state, ...buildPluginPayload() };
+  });
+
+  app.get('/api/v1/plugins/:id/ui-doc', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { path: uiPath } = request.query as { path?: string };
+    if (typeof uiPath !== 'string' || !uiPath.trim()) {
+      return reply.code(400).send({ error: '缺少 UI 入口路径 path', code: 'E_INVALID_INPUT' });
+    }
+    const pkg = pluginManager.getPluginPackageRoot(id);
+    if (!pkg) {
+      return reply.code(404).send({ error: '插件不存在或未启用', code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    try {
+      const doc = buildSandboxedPluginHtml(pkg.packageRoot, uiPath);
+      return {
+        pluginId: id,
+        digest: pkg.digest ?? null,
+        runId: pkg.runId ?? pkg.digest ?? 'declarative',
+        path: doc.normalizedPath,
+        csp: doc.csp,
+        html: doc.html,
+      };
+    } catch (error) {
+      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
+      const status = code === 'E_PERMISSION_DENIED' ? 403 : code === 'E_LIMIT_EXCEEDED' ? 413 : 400;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : String(error),
+        code,
+      });
+    }
+  });
+
+  app.get('/api/v1/plugins/:id/ui/*', async (request, reply) => {
+    const { id, '*': wildcardPath } = request.params as { id: string; '*': string };
+    const pkg = pluginManager.getPluginPackageRoot(id);
+    if (!pkg) {
+      return reply.code(404).send({ error: '插件不存在或未启用', code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    try {
+      const asset = resolvePluginUiAsset(pkg.packageRoot, wildcardPath);
+      reply.header('Content-Type', asset.contentType);
+      reply.header('Content-Security-Policy', SANDBOX_IFRAME_CSP);
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.header('Cache-Control', 'no-store');
+      return reply.send(asset.buffer);
+    } catch (error) {
+      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
+      const status = code === 'E_PERMISSION_DENIED' ? 403 : code === 'E_LIMIT_EXCEEDED' ? 413 : 404;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : String(error),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/plugins/:id/ui-message', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = PluginUiMessageRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: '插件 UI 消息参数无效', code: 'E_INVALID_INPUT' });
+    }
+    if (!pluginManager.isolated) {
+      return reply.code(400).send({ error: '当前宿主未启用隔离插件运行时', code: 'E_NOT_SUPPORTED' });
+    }
+    try {
+      const result = await pluginManager.isolated.sendSlotMessage(
+        id,
+        parsed.data.slotId,
+        parsed.data.runId,
+        parsed.data.payload,
+        parsed.data.sessionId ?? null,
+        parsed.data.slot,
+      );
+      return { result };
+    } catch (error) {
+      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
+      const status = code === 'E_STALE_RUN' ? 409 : code === 'E_TIMEOUT' ? 504 : 400;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : String(error),
+        code,
+      });
+    }
   });
 
   app.post('/api/v1/plugins/actions/:sessionId', async (request, reply) => {
@@ -315,11 +568,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const parsed = InstallPluginRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: '插件清单或目录无效' });
     try {
-      return pluginManager.previewInstall(parsed.data);
+      return await pluginManager.previewInstallAsync(parsed.data);
     } catch (error) {
-      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({
+      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
+      return reply.code(error instanceof PluginRevisionConflictError ? 409 : code === 'E_PERMISSION_DENIED' ? 403 : 400).send({
         error: error instanceof Error ? error.message : String(error),
-        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+        code,
       });
     }
   });

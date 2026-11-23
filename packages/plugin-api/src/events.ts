@@ -28,6 +28,53 @@ export type PluginEventV4<Name extends PluginEventName = PluginEventName> = {
   }
 }[Name];
 
+export type PluginHookEventName = 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate';
+
+export interface HandoffComposeEvent {
+  sessionId: string;
+  workspaceId: string;
+  targetHarnessId: string;
+  targetHarnessKind: string;
+  referenceOnly: boolean;
+}
+
+export interface HandoffComposeSection {
+  id: string;
+  text: string;
+  order?: number;
+}
+
+export interface ApprovalAnnotateEvent {
+  approvalId: string;
+  sessionId: string;
+  workspaceId: string;
+  toolName: string;
+  toolKind: string;
+  summary: string;
+  riskLevel: 'low' | 'medium' | 'high';
+}
+
+export interface ApprovalAnnotation {
+  pluginId: string;
+  risk?: 'low' | 'medium' | 'high';
+  label: string;
+  detail?: string;
+}
+
+export interface HandoffShouldOfferEvent {
+  sessionId: string;
+  workspaceId: string;
+  harnessId: string;
+  reason: 'rate_limit' | 'turn_failed' | 'manual_check';
+  message?: string | null;
+}
+
+export interface HandoffOfferDecision {
+  offer: boolean;
+  targetHarnessId?: string;
+  reason?: string;
+}
+
 export const pluginEventContracts = {
   'turn.started': { mode: 'emit', permission: 'events:turn' },
   'turn.completed': { mode: 'emit', permission: 'events:turn' },
@@ -43,5 +90,5 @@ export const pluginEventContracts = {
   'handoff.compose': { mode: 'waterfall', permission: 'handoff:section' },
   'handoff.shouldOffer': { mode: 'bail', permission: 'session:read' },
   'approval.annotate': { mode: 'waterfall', permission: 'approvals:annotate' },
-} as const satisfies Record<PluginEventName | 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate',
+} as const satisfies Record<PluginEventName | PluginHookEventName,
   { mode: 'emit' | 'serial' | 'parallel' | 'waterfall' | 'bail'; permission: string | null }>;

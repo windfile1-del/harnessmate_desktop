@@ -2,7 +2,6 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { isLoopbackAddress } from '../server/auth.js';
 import type { PluginCapabilities } from './plugin-capabilities.js';
-import { pluginTextLimit } from './plugin-program.js';
 
 export const pluginMcpPath = '/api/v1/plugin-tools';
 const versions = ['2025-11-25', '2025-06-18', '2025-03-26'];
@@ -10,7 +9,7 @@ const messageSchema = z.object({
   jsonrpc: z.literal('2.0'), id: z.union([z.string(), z.number().int()]).optional(),
   method: z.string(), params: z.record(z.unknown()).optional(),
 });
-const callSchema = z.object({ name: z.string(), arguments: z.object({ text: z.string().max(pluginTextLimit) }).strict() });
+const callSchema = z.object({ name: z.string(), arguments: z.record(z.unknown()).default({}) });
 
 export function registerPluginMcp(app: FastifyInstance, capabilities: PluginCapabilities) {
   app.route({ method: ['GET', 'DELETE'], url: pluginMcpPath, handler: async (_request, reply) =>
@@ -34,17 +33,18 @@ export function registerPluginMcp(app: FastifyInstance, capabilities: PluginCapa
       case 'ping': return respond({});
       case 'tools/list': {
         lease.discovered = true;
-        return respond({ tools: capabilities.listLeaseTools(lease).map(({ name, program }) => ({
-          name, description: program.description, annotations: { readOnlyHint: true },
-          inputSchema: { type: 'object', properties: { text: { type: 'string', maxLength: pluginTextLimit } },
-            required: ['text'], additionalProperties: false },
+        return respond({ tools: capabilities.listLeaseTools(lease).map(({ name, description, readOnly, inputSchema }) => ({
+          name,
+          description,
+          annotations: { readOnlyHint: readOnly },
+          inputSchema,
         })) });
       }
       case 'tools/call': {
         const call = callSchema.safeParse(params);
         if (!call.success) return failure(-32602, 'Invalid tool arguments');
         try {
-          const text = capabilities.invokeTool(lease, call.data.name, call.data.arguments.text);
+          const text = await capabilities.invokeTool(lease, call.data.name, call.data.arguments);
           return respond({ content: [{ type: 'text', text }] });
         } catch (error) {
           return respond({ content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }], isError: true });
