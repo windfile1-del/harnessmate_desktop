@@ -1,6 +1,6 @@
 {
   "name": "@harnessmate/electron",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "HarnessMate Desktop — Unified Multi-Harness Manager & Mobile Remote Hub",
   "author": "HarnessMate",

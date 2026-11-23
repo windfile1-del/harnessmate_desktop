@@ -250,7 +250,7 @@ export function InspectorDrawer({
               className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-2 text-[12px]">
               {dataPanels.map(({ key, panel }) => <option key={key} value={key}>{panel.title}</option>)}
             </select>
-            <PluginDataPanel key={`${session.id}:${selectedPanel.key}:${selectedPanel.version}`}
+            <PluginDataPanel key={`${session.id}:${selectedPanel.key}:${selectedPanel.revision}`}
               sessionId={session.id} contribution={selectedPanel} />
           </section>}
           {panelPlugins.length > 0 && <PluginPanels sessionId={session.id} plugins={panelPlugins} />}

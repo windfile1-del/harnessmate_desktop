@@ -109,7 +109,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
 
   const [tab, setTab] = useState<'installed' | 'catalog' | 'install'>('installed');
   const [busy, setBusy] = useState(false);
-  const [editing, setEditing] = useState<PluginManifest>();
+  const [editing, setEditing] = useState<{ manifest: PluginManifest; digest: string }>();
   const runPluginAction = async (action: () => Promise<void>) => {
     setBusy(true);
     try { await action(); }
@@ -260,9 +260,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                 <div className="flex shrink-0 items-center gap-2">
                   {p.canRollback && <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
                     onClick={() => void runPluginAction(() => rollbackPlugin(p.id))}>回退</button>}
-                  {!p.builtin && !p.loadError && GeneratedPluginManifestSchema.safeParse(PluginManifestSchema.parse(p)).success && (
+                  {!p.builtin && !p.loadError && p.packageDigest && GeneratedPluginManifestSchema.safeParse(PluginManifestSchema.parse(p)).success && (
                     <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
-                      onClick={() => { setEditing(PluginManifestSchema.parse(p)); setTab('install'); }}>AI 改版</button>
+                      onClick={() => { setEditing({ manifest: PluginManifestSchema.parse(p), digest: p.packageDigest! }); setTab('install'); }}>AI 改版</button>
                   )}
                   {!p.builtin && (
                     <button
@@ -354,9 +354,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
         )}
 
         {tab === 'install' && (
-          <PluginAuthoringForm key={editing?.id ?? 'new'} previous={editing}
-            initialManifest={editing ? JSON.stringify(editing, null, 2) : MANIFEST_TEMPLATE}
-            onInstalled={() => setTab('installed')} />
+          <PluginAuthoringForm key={editing?.manifest.id ?? 'new'} editing={editing}
+            initialManifest={editing ? JSON.stringify(editing.manifest, null, 2) : MANIFEST_TEMPLATE}
+            onInstalled={() => { setEditing(undefined); setTab('installed'); }} />
         )}
       </div>
     </div>

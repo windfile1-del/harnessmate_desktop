@@ -6,7 +6,7 @@ export const pluginEventLabels: Record<PluginTurnEvent, string> = {
 
 export function listPluginPanels(plugins: InstalledPluginInfo[]) {
   return plugins.flatMap((plugin) => plugin.enabled ? (plugin.contributes.dataPanels ?? []).map((panel) => ({
-    key: `${plugin.id}:${panel.id}`, pluginId: plugin.id, version: plugin.version, panel,
+    key: `${plugin.id}:${panel.id}`, pluginId: plugin.id, revision: plugin.packageDigest ?? plugin.version, panel,
   })) : []);
 }
 

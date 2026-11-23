@@ -25,6 +25,7 @@ import type {
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
+  ReplayPluginDraftRequest,
   RunHarnessCommandRequest,
   Session,
   SessionTaskState,
@@ -81,6 +82,9 @@ export interface PluginBundleResponse {
 export interface PluginPreview {
   manifest: PluginManifest;
   installedVersion?: string;
+  installedManifest?: PluginManifest;
+  installedDigest: string | null;
+  installedEnabled?: boolean;
   digest?: string;
   fileCount?: number;
 }
@@ -109,12 +113,11 @@ export function resolveAttachmentUrl(previewUrl?: string): string | undefined {
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${getDaemonBaseUrl()}${path}`;
+  const headers = new Headers(init?.headers);
+  if (init?.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const res = await fetch(url, {
     ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
+    headers,
   });
   const text = await res.text();
   let data: unknown = {};
@@ -185,6 +188,9 @@ export const daemonApi = {
 
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
+
+  replayPluginDraft: (req: ReplayPluginDraftRequest, signal?: AbortSignal) =>
+    apiFetch<PluginPanelSnapshot>('/api/v1/plugins/preview/replay', { method: 'POST', body: JSON.stringify(req), signal }),
 
   generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
     apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),

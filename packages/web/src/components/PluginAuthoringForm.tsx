@@ -3,13 +3,16 @@ import { FolderOpen, Sparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { daemonApi, type PluginPreview } from '../api/client';
 import { useAppStore } from '../stores/app-store';
+import { PluginDraftReview } from './PluginDraftReview';
 
 const field = 'min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[var(--text-primary)]';
 const button = 'cursor-pointer rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 hover:bg-[var(--bg-hover)] disabled:opacity-40';
 
-export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: {
+type DraftInstallRequest = Exclude<InstallPluginRequest, { mode: 'catalog' }>;
+
+export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
   initialManifest: string;
-  previous?: PluginManifest;
+  editing?: { manifest: PluginManifest; digest: string };
   onInstalled: () => void;
 }) {
   const { workspaces, harnesses, sessions, selectedSessionId, selectedWorkspaceId, installPlugin } = useAppStore();
@@ -20,7 +23,8 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
   const [description, setDescription] = useState('');
   const [manifestJson, setManifestJson] = useState(initialManifest);
   const [directory, setDirectory] = useState('');
-  const [preview, setPreview] = useState<{ result: PluginPreview; request: InstallPluginRequest }>();
+  const [preview, setPreview] = useState<{ result: PluginPreview; request: DraftInstallRequest }>();
+  const [editingDigest, setEditingDigest] = useState<string | null>(editing?.digest ?? null);
   const [trustCode, setTrustCode] = useState(false);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -45,16 +49,27 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
     } finally { setBusy(''); }
   };
 
+  const readDraft = () => {
+    let manifest: PluginManifest;
+    try { manifest = JSON.parse(manifestJson); }
+    catch { throw new Error('插件清单的 JSON 格式无效'); }
+    if (editing && manifest?.id !== editing.manifest.id) throw new Error('修改插件时必须保留原插件 ID');
+    return manifest;
+  };
+
   const generate = () => run('正在生成草稿…', async () => {
+    const previous = manifestJson.trim() && manifestJson !== initialManifest ? readDraft() : undefined;
     const controller = new AbortController();
     generation.current = controller;
     resetPreview();
     try {
       const { manifest } = await daemonApi.generatePlugin({
         description: description.trim(), harnessId, workspaceId, model: model || undefined, previous,
+        editing: editing && editingDigest ? { id: editing.manifest.id, digest: editingDigest } : undefined,
       }, controller.signal);
       setManifestJson(JSON.stringify(manifest, null, 2));
-      const request = { mode: 'manifest', manifest } as const;
+      const request = { mode: 'manifest', manifest,
+        expectedInstalledDigest: editing ? editingDigest : undefined } as const;
       const result = await daemonApi.previewPlugin(request);
       setPreview({ request, result });
     } finally { generation.current = null; }
@@ -62,17 +77,18 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
 
   const review = (origin: 'directory' | 'manifest') => run('正在校验插件…', async () => {
     resetPreview();
-    const request: InstallPluginRequest = origin === 'directory'
+    const request: DraftInstallRequest = origin === 'directory'
       ? { mode: 'local_dir', dirPath: directory.trim() }
-      : { mode: 'manifest', manifest: JSON.parse(manifestJson) };
+      : { mode: 'manifest', manifest: readDraft() };
     const result = await daemonApi.previewPlugin(request);
+    if (editing) setEditingDigest(result.installedDigest);
     setPreview({ request, result });
   });
 
   return (
     <div className="space-y-4 text-[12px] text-[var(--text-secondary)]">
       <section className="space-y-2 rounded-xl border border-[var(--border-hairline)] p-3">
-        <h4 className="flex items-center gap-1.5 font-medium text-[var(--text-primary)]"><Sparkles size={14} /> {previous ? `用 AI 修改 ${previous.name}` : '用 AI 制作插件'}</h4>
+        <h4 className="flex items-center gap-1.5 font-medium text-[var(--text-primary)]"><Sparkles size={14} /> {editing ? `用 AI 修改 ${editing.manifest.name}` : '用 AI 制作插件'}</h4>
         <div className="grid gap-2 sm:grid-cols-3">
           <select aria-label="工作区" className={field} value={workspaceId} disabled={!!busy} onChange={(event) => setWorkspaceId(event.target.value)}>
             <option value="">选择工作区</option>
@@ -92,7 +108,7 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
           onChange={(event) => setDescription(event.target.value)} className={`${field} w-full`}
           placeholder="例如，添加一个面板展示当前任务的改动文件和测试结果，再加一个指令生成交付摘要。" />
         <button type="button" className={button} disabled={!!busy || !workspaceId || !harnessId || description.trim().length < 3}
-          onClick={() => void generate()}>生成草稿</button>
+          onClick={() => void generate()}>{manifestJson.trim() && manifestJson !== initialManifest ? '继续修改草稿' : '生成草稿'}</button>
         {busy === '正在生成草稿…' && <button type="button" className={`${button} ml-2`} onClick={() => generation.current?.abort()}>取消生成</button>}
       </section>
       <section className="space-y-2">
@@ -102,7 +118,7 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
           onChange={(event) => { setManifestJson(event.target.value); resetPreview(); }} />
         <button type="button" className={button} disabled={!!busy || !manifestJson.trim()} onClick={() => void review('manifest')}>校验并预览清单</button>
       </section>
-      <section className="space-y-2">
+      {!editing && <section className="space-y-2">
         <label htmlFor="plugin-directory" className="font-medium text-[var(--text-primary)]">从本地目录导入</label>
         <div className="flex flex-wrap gap-2">
           <input id="plugin-directory" className={`${field} flex-1`} value={directory} disabled={!!busy} placeholder="包含 harnessmate-plugin.json 的目录"
@@ -113,23 +129,14 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
           })}><FolderOpen size={13} aria-label="选择目录" /></button>}
           <button type="button" className={button} disabled={!!busy || !directory.trim()} onClick={() => void review('directory')}>预览目录</button>
         </div>
-      </section>
+      </section>}
       {preview && (
         <section className="space-y-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-elevated)] p-3">
           <h4 className="font-medium text-[var(--text-primary)]">{preview.result.manifest.name} · {preview.result.manifest.version}</h4>
           <p>{preview.result.manifest.description}</p>
-          {preview.result.installedVersion && <p>已安装 {preview.result.installedVersion}。替换后可回退至此版本。</p>}
-          <div className="flex flex-wrap gap-x-3">
-            {preview.result.manifest.contributes.slashCommands?.map(({ command }) => <code key={command}>/{command}</code>)}
-            {preview.result.manifest.contributes.panels?.map(({ id, title }) => <span key={id}>面板 {title}</span>)}
-            {preview.result.manifest.contributes.dataPanels?.map(({ id, title, copySummary }) =>
-              <span key={id}>数据面板 {title}{copySummary?.command && <> · /{copySummary.command}</>}</span>)}
-            {preview.result.manifest.contributes.projections?.map(({ id, scope, events }) =>
-              <span key={id}>{scope === 'workspace' ? '当前工作区' : '当前会话'} · {events.join(' / ')}</span>)}
-            {preview.result.manifest.contributes.harnesses?.map(({ id, command }) => <span key={id}>ACP {id} · {command}</span>)}
-            {preview.result.manifest.contributes.mcpPresets?.map(({ name, command, url }) => <span key={name}>MCP {name} · {command || url}</span>)}
-            {preview.result.manifest.contributes.hooks?.map((hook) => <code key={hook}>{hook}</code>)}
-          </div>
+          {preview.result.installedVersion && <p>已安装 {preview.result.installedVersion} → 草稿 {preview.result.manifest.version}。替换后可回退至已安装版本。</p>}
+          {preview.result.installedEnabled === false && <p>该插件当前停用。安装后可在已安装列表启用。</p>}
+          <PluginDraftReview preview={preview.result} workspaceId={workspaceId} />
           {preview.result.manifest.entry && <label className="flex items-start gap-2">
             <input type="checkbox" checked={trustCode} onChange={(event) => setTrustCode(event.target.checked)} />
             <span>我信任此目录中的 JavaScript。入口 {preview.result.manifest.entry} 以本机用户权限运行。</span>
@@ -138,11 +145,11 @@ export function PluginAuthoringForm({ initialManifest, previous, onInstalled }: 
             disabled={!!busy || (Boolean(preview.result.manifest.entry) && !trustCode)}
             onClick={() => void run('正在安装插件…', async () => {
               const request = preview.request.mode === 'local_dir'
-                ? { ...preview.request, expectedDigest: preview.result.digest, trustCode }
-                : preview.request;
+                ? { ...preview.request, expectedDigest: preview.result.digest, trustCode, expectedInstalledDigest: preview.result.installedDigest }
+                : { ...preview.request, manifest: preview.result.manifest, expectedInstalledDigest: preview.result.installedDigest };
               await installPlugin(request);
               onInstalled();
-            })}>{preview.result.installedVersion ? '替换并热加载' : '安装并热加载'}</button>
+            })}>{preview.result.installedEnabled === false ? '保存版本' : preview.result.installedVersion ? '替换并热加载' : '安装并热加载'}</button>
         </section>
       )}
       {(busy || error) && <p role={error ? 'alert' : 'status'} className={error ? 'text-[var(--accent-rose)]' : undefined}>{error || busy}</p>}

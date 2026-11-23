@@ -59,7 +59,7 @@ pnpm dev:electron
 ### 方式二：打包独立 Windows `.exe` 启动程序
 ```bash
 pnpm pack:exe
-# 输出位于 packages/electron/release/HarnessMate-Desktop-0.3.0-portable.exe
+# 输出位于 packages/electron/release/HarnessMate-Desktop-0.3.1-portable.exe
 ```
 
 ### 方式三：独立 Daemon + 浏览器开发模式

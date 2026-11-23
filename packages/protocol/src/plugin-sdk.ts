@@ -25,6 +25,7 @@ export const PluginDataPanelSchema = z.object({
   projection: id,
   columns: z.array(z.object({ field: PluginPanelFieldSchema, label }).strict()).min(1).max(6),
   filters: z.array(z.enum(['harness', 'status'])).max(2).optional(),
+  defaultEvent: PluginTurnEventSchema.optional(),
   counts: z.boolean().optional(),
   openTurn: z.boolean().optional(),
   placements: z.array(z.enum(['sidebar_tool', 'composer_action'])).max(2).optional(),

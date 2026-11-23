@@ -428,6 +428,7 @@ export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   hasRuntimeHook: z.boolean().optional(),
   loadError: z.string().nullable().optional(),
   canRollback: z.boolean().optional(),
+  packageDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 });
 export type InstalledPluginInfo = z.infer<typeof InstalledPluginInfoSchema>;
 

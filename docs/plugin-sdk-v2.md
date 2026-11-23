@@ -39,9 +39,14 @@
 | `projections[].events` | 支持 `turn.completed`、`turn.failed` 和 `turn.cancelled`。同一会话、同一轮次以最新的终态为准。维护命令轮次会从统计中排除。 |
 | `dataPanels[].columns` | 可配置顺序和标题，字段为 `time`、`session`、`harness`、`status`、`changed_files` 和 `verifications`。 |
 | `dataPanels[].filters` | `harness` 或 `status`。筛选在 Daemon 分页前应用。 |
+| `dataPanels[].defaultEvent` | 面板首次打开时的轮次筛选。需要声明 `status` 筛选器，并在面板引用的投影中包含该事件。 |
 | `dataPanels[].placements` | `sidebar_tool` 或 `composer_action`。已启用面板也会出现在右侧「插件」标签页。 |
 | `counts`、`openTurn`、`copySummary` | 展示全范围分组计数、定位原轮次、复制全范围摘要。`copySummary.command` 可为复制动作注册本地斜杠命令。 |
 
 投影查询使用 Daemon 中的已持久化事件，独立于聊天页的事件分页。打开的面板每四秒刷新。导入的轮次会显示「已导入」。改动文件来自记录中的成功编辑或 diff，验证状态来自带匹配工具结果的测试、构建或检查命令。缺少验证记录时显示「待确认」。
 
 面板 ID 在插件内唯一，投影引用必须指向同一插件。复制命令和已有插件命令、原生命令共用名称空间。更新清单时保留插件 ID，递增版本并重新预览安装。启停、热更新、失败保留与回退沿用插件中心的版本管理。
+
+在已安装插件旁选择「AI 改版」，可以先描述一次调整，再基于当前草稿继续提要求。审核区对照已安装版本列出功能变更和数据范围。选一段会话并点击「预演面板」，可以用历史记录检查草稿的筛选、分页和显示效果。预演读取本地会话数据，复制和跳转动作在安装后生效。
+
+如果在预览后有其他操作更新了已安装版本，保留当前草稿并使用「校验并预览清单」重新比较。安装时沿用原有启用状态，停用的插件保存新版本后可按需启用。

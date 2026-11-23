@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { PluginPanelQuerySchema } from './plugin-sdk.js';
 import {
   ApprovalDecisionSchema,
   AttachmentSchema,
@@ -7,6 +8,7 @@ import {
   NativeHistorySourceSchema,
   PermissionModeSchema,
   PluginManifestSchema,
+  GeneratedPluginManifestSchema,
   ReasoningEffortSchema,
   TaskStepSchema,
   TaskVerificationSchema,
@@ -145,6 +147,8 @@ export const TogglePluginRequestSchema = z.object({
 });
 export type TogglePluginRequest = z.infer<typeof TogglePluginRequestSchema>;
 
+const installedPluginDigest = z.string().regex(/^[a-f0-9]{64}$/).nullable().optional();
+
 export const InstallPluginRequestSchema = z.union([
   z.object({
     mode: z.literal('catalog'),
@@ -154,11 +158,13 @@ export const InstallPluginRequestSchema = z.union([
     mode: z.literal('local_dir'),
     dirPath: z.string().min(1),
     expectedDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    expectedInstalledDigest: installedPluginDigest,
     trustCode: z.boolean().optional(),
   }),
   z.object({
     mode: z.literal('manifest'),
     manifest: PluginManifestSchema,
+    expectedInstalledDigest: installedPluginDigest,
   }),
 ]);
 export type InstallPluginRequest = z.infer<typeof InstallPluginRequestSchema>;
@@ -169,8 +175,17 @@ export const GeneratePluginDraftRequestSchema = z.object({
   description: z.string().trim().min(3).max(6000),
   model: z.string().min(1).optional(),
   previous: PluginManifestSchema.optional(),
+  editing: z.object({ id: PluginManifestSchema.shape.id, digest: z.string().regex(/^[a-f0-9]{64}$/) }).optional(),
 });
 export type GeneratePluginDraftRequest = z.infer<typeof GeneratePluginDraftRequestSchema>;
+
+export const ReplayPluginDraftRequestSchema = z.object({
+  manifest: GeneratedPluginManifestSchema,
+  sessionId: z.string().min(1),
+  panelId: z.string().min(1).max(40),
+  query: PluginPanelQuerySchema,
+}).strict();
+export type ReplayPluginDraftRequest = z.infer<typeof ReplayPluginDraftRequestSchema>;
 
 export const AddMcpServerRequestSchema = z.object({
   targetHarnesses: z.array(z.enum(['codex', 'agy', 'claude'])).min(1),

@@ -1,5 +1,5 @@
-import { useEffect, useState, type ReactNode } from 'react';
-import type { PluginPanelField, PluginPanelQuery, PluginPanelSnapshot, PluginTurnEvent, PluginTurnRow } from '@harnessmate/protocol';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import type { PluginDataPanel as PanelDefinition, PluginPanelField, PluginPanelQuery, PluginPanelSnapshot, PluginTurnEvent, PluginTurnRow } from '@harnessmate/protocol';
 import { daemonApi } from '../api/client';
 import { formatPluginSummary, pluginEventLabels, type ActivePluginPanel } from '../lib/plugin-panels';
 import { useAppStore } from '../stores/app-store';
@@ -22,13 +22,38 @@ function renderField(field: PluginPanelField, row: PluginTurnRow) {
 }
 
 export function PluginDataPanel({ sessionId, contribution }: { sessionId: string; contribution: ActivePluginPanel }) {
-  const { pluginId, panel, version } = contribution;
+  const { pluginId, panel } = contribution;
+  const { selectSession, focusTurn, pushToast } = useAppStore();
+  const loadSnapshot = useCallback((query: PluginPanelQuery, signal: AbortSignal) =>
+    daemonApi.getPluginPanel(sessionId, pluginId, panel.id, query, signal), [sessionId, pluginId, panel.id]);
+  const onOpenTurn = async (row: PluginTurnRow) => {
+    if (row.sessionId !== sessionId) await selectSession(row.sessionId);
+    if (useAppStore.getState().selectedSessionId === row.sessionId) focusTurn(row);
+  };
+  const copySummary = async (data: PluginPanelSnapshot) => {
+    try {
+      await navigator.clipboard.writeText(formatPluginSummary(panel.title, data));
+      pushToast({ kind: 'success', title: '已复制轮次摘要' });
+    } catch (err) {
+      pushToast({ kind: 'error', title: '复制失败', body: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  return <PluginPanelView panel={panel} loadSnapshot={loadSnapshot} refreshInterval={4_000}
+    onOpenTurn={onOpenTurn} onCopySummary={copySummary} />;
+}
+
+export function PluginPanelView({ panel, loadSnapshot, refreshInterval, onOpenTurn, onCopySummary }: {
+  panel: PanelDefinition;
+  loadSnapshot: (query: PluginPanelQuery, signal: AbortSignal) => Promise<PluginPanelSnapshot>;
+  refreshInterval?: number;
+  onOpenTurn?: (row: PluginTurnRow) => Promise<void>;
+  onCopySummary?: (data: PluginPanelSnapshot) => Promise<void>;
+}) {
   const [harnessId, setHarnessId] = useState('');
-  const [event, setEvent] = useState<PluginTurnEvent | ''>('');
+  const [event, setEvent] = useState<PluginTurnEvent | ''>(panel.defaultEvent ?? '');
   const [offset, setOffset] = useState(0);
   const [data, setData] = useState<PluginPanelSnapshot>();
   const [error, setError] = useState('');
-  const { selectSession, focusTurn, pushToast } = useAppStore();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -38,7 +63,7 @@ export function PluginDataPanel({ sessionId, contribution }: { sessionId: string
     const query: PluginPanelQuery = { harnessId: harnessId || undefined, event: event || undefined, offset };
     const refresh = async () => {
       try {
-        const result = await daemonApi.getPluginPanel(sessionId, pluginId, panel.id, query, controller.signal);
+        const result = await loadSnapshot(query, controller.signal);
         if (controller.signal.aborted) return;
         if (query.offset > 0 && query.offset >= result.total) setOffset(0);
         setData(result);
@@ -46,28 +71,15 @@ export function PluginDataPanel({ sessionId, contribution }: { sessionId: string
       } catch (err) {
         if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (!controller.signal.aborted) timer = setTimeout(() => void refresh(), 4_000);
+        if (!controller.signal.aborted && refreshInterval) timer = setTimeout(() => void refresh(), refreshInterval);
       }
     };
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [sessionId, pluginId, panel.id, version, harnessId, event, offset]);
+  }, [loadSnapshot, refreshInterval, harnessId, event, offset]);
 
   const harnesses = [...new Set(data?.counts.flatMap((row) => row.harnessId ? [row.harnessId] : []))].sort();
   if (harnessId && !harnesses.includes(harnessId)) harnesses.push(harnessId);
-  const onOpenTurn = async (row: PluginTurnRow) => {
-    if (row.sessionId !== sessionId) await selectSession(row.sessionId);
-    if (useAppStore.getState().selectedSessionId === row.sessionId) focusTurn(row);
-  };
-  const copySummary = async () => {
-    if (!data) return;
-    try {
-      await navigator.clipboard.writeText(formatPluginSummary(panel.title, data));
-      pushToast({ kind: 'success', title: '已复制轮次摘要' });
-    } catch (err) {
-      pushToast({ kind: 'error', title: '复制失败', body: err instanceof Error ? err.message : String(err) });
-    }
-  };
 
   return (
     <section className="space-y-3 text-[12px] text-[var(--text-primary)]">
@@ -83,7 +95,8 @@ export function PluginDataPanel({ sessionId, contribution }: { sessionId: string
           <option value="">所有状态</option>
           {Object.entries(pluginEventLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
         </select>}
-        {panel.copySummary && <button type="button" className={buttonClass} disabled={!data} onClick={() => void copySummary()}>{panel.copySummary.label}</button>}
+        {panel.copySummary && <button type="button" className={buttonClass} disabled={!data || !onCopySummary}
+          onClick={() => { if (data) void onCopySummary?.(data); }}>{panel.copySummary.label}</button>}
       </div>
       {panel.counts && data && <p className="whitespace-pre-line text-[var(--text-secondary)]">
         {formatPluginSummary(data.scope === 'workspace' ? '工作区轮次统计' : '会话轮次统计', data)}
@@ -96,7 +109,8 @@ export function PluginDataPanel({ sessionId, contribution }: { sessionId: string
           <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
             {panel.columns.map(({ field, label }) => <Field key={field} label={label}>{renderField(field, row)}</Field>)}
           </dl>
-          {panel.openTurn && <button type="button" className={buttonClass} onClick={() => void onOpenTurn(row)}>定位到轮次</button>}
+          {panel.openTurn && <button type="button" className={buttonClass} disabled={!onOpenTurn}
+            onClick={() => void onOpenTurn?.(row)}>定位到轮次</button>}
         </article>
       ))}
       {data && data.total > data.pageSize && <div className="flex items-center justify-between gap-2" aria-label="插件数据分页">

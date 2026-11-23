@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   HarnessCommandNameSchema,
+  GeneratedPluginManifestSchema,
   PluginManifestSchema,
   type Attachment,
   type CanonicalEvent,
@@ -367,6 +368,12 @@ interface LoadedPluginRecord {
   digest?: string;
 }
 
+export class PluginRevisionConflictError extends Error {
+  constructor() {
+    super('已安装的插件版本已变更，请重新预览后再安装');
+  }
+}
+
 export class PluginManager {
   private plugins = new Map<string, LoadedPluginRecord>();
   private readonly pluginHarnesses = new Map<string, { adapter: HarnessAdapter; config: string }>();
@@ -491,7 +498,7 @@ export class PluginManager {
 
   private async prepare(pack: PluginPackage, directory: string, root: string, enabled: boolean, canRollback: boolean) {
     const record: LoadedPluginRecord = {
-      info: { ...pack.manifest, builtin: false, enabled, sourcePath: root, canRollback, loadError: null },
+      info: { ...pack.manifest, builtin: false, enabled, sourcePath: root, canRollback, loadError: null, packageDigest: pack.digest },
       packageRoot: directory,
       digest: pack.digest,
     };
@@ -570,6 +577,10 @@ export class PluginManager {
     for (const panel of dataPanels ?? []) {
       if (panelIds.has(panel.id)) throw new Error(`面板 ID ${panel.id} 重复`);
       if (!projectionIds.has(panel.projection)) throw new Error(`面板 ${panel.id} 引用了不存在的事件投影 ${panel.projection}`);
+      if (panel.defaultEvent && (!panel.filters?.includes('status') ||
+        !projections?.find(({ id }) => id === panel.projection)?.events.includes(panel.defaultEvent))) {
+        throw new Error(`面板 ${panel.id} 的默认事件需要状态筛选器与对应的投影事件`);
+      }
       if (new Set(panel.columns.map(({ field }) => field)).size !== panel.columns.length) throw new Error(`面板 ${panel.id} 含有重复列`);
       panelIds.add(panel.id);
     }
@@ -654,10 +665,33 @@ export class PluginManager {
     });
   }
 
-  inspectPackage(directory: string) {
-    const { manifest, digest, files } = readPluginPackage(directory);
+  private checkInstalledDigest(id: string, expected: string | null | undefined) {
+    const current = this.plugins.get(id);
+    if (expected !== undefined && expected !== (current?.digest ?? null)) throw new PluginRevisionConflictError();
+    return current;
+  }
+
+  getAuthoringBase(id: string, digest: string): PluginManifest {
+    const current = this.checkInstalledDigest(id, digest);
+    if (!current || current.info.builtin) throw new Error('找不到可修改的插件');
+    return GeneratedPluginManifestSchema.parse(PluginManifestSchema.parse(current.info));
+  }
+
+  reviewManifest(manifest: PluginManifest, expectedInstalledDigest?: string | null) {
+    const current = this.checkInstalledDigest(manifest.id, expectedInstalledDigest);
     this.validateManifest(manifest);
-    return { manifest, digest, fileCount: files.size, installedVersion: this.plugins.get(manifest.id)?.info.version };
+    return {
+      manifest,
+      installedVersion: current?.info.version,
+      installedManifest: current?.packageRoot ? PluginManifestSchema.parse(current.info) : undefined,
+      installedDigest: current?.digest ?? null,
+      installedEnabled: current?.info.enabled,
+    };
+  }
+
+  inspectPackage(directory: string, expectedInstalledDigest?: string | null) {
+    const { manifest, digest, files } = readPluginPackage(directory);
+    return { ...this.reviewManifest(manifest, expectedInstalledDigest), digest, fileCount: files.size };
   }
 
   installPlugin(req: InstallPluginRequest): Promise<InstalledPluginInfo[]> {
@@ -678,7 +712,7 @@ export class PluginManager {
       }
       this.validateManifest(pack.manifest);
       const id = pack.manifest.id;
-      const old = this.plugins.get(id);
+      const old = this.checkInstalledDigest(id, req.mode === 'catalog' ? undefined : req.expectedInstalledDigest);
       const root = old?.info.sourcePath ?? path.join(this.pluginsDir, id);
       this.checkPluginRoot(root);
       const pointer = readRevisionPointer(root);

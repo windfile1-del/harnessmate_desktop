@@ -22,6 +22,7 @@ import {
   UpdateSessionRequestSchema,
   UpdateTaskStateRequestSchema,
   PluginPanelQuerySchema,
+  ReplayPluginDraftRequestSchema,
   UploadAttachmentRequestSchema,
   type ContextSyncMode,
   type RemoteAccessStatus,
@@ -53,7 +54,7 @@ import { HarnessMateStore } from '../db/sqlite.js';
 import { scanLocalCliSessions } from '../harnesses/history-scanner.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
-import { PluginManager } from '../plugins/plugin-manager.js';
+import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
 import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
@@ -278,13 +279,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const parsed = InstallPluginRequestSchema.safeParse(request.body);
     if (!parsed.success || parsed.data.mode === 'catalog') return reply.code(400).send({ error: '插件清单或目录无效' });
     try {
-      if (parsed.data.mode === 'local_dir') return pluginManager.inspectPackage(parsed.data.dirPath);
+      if (parsed.data.mode === 'local_dir') return pluginManager.inspectPackage(parsed.data.dirPath, parsed.data.expectedInstalledDigest);
       const { manifest } = parsed.data;
       if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
-      pluginManager.validateManifest(manifest);
-      return { manifest, installedVersion: pluginManager.listInstalled().find(({ id }) => id === manifest.id)?.version };
+      return pluginManager.reviewManifest(manifest, parsed.data.expectedInstalledDigest);
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
@@ -297,13 +297,33 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const disconnect = () => abort.abort(new Error('插件生成请求已取消'));
     reply.raw.once('close', disconnect);
     try {
-      const manifest = await pluginAuthoring.generate(parsed.data, workspace.rootPath, abort.signal);
+      const editing = parsed.data.editing;
+      const base = editing && pluginManager.getAuthoringBase(editing.id, editing.digest);
+      const manifest = await pluginAuthoring.generate(parsed.data, workspace.rootPath, abort.signal, base);
+      if (editing) pluginManager.getAuthoringBase(editing.id, editing.digest);
       pluginManager.validateManifest(manifest);
       return { manifest };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({ error: error instanceof Error ? error.message : String(error) });
     } finally {
       reply.raw.off('close', disconnect);
+    }
+  });
+
+  app.post('/api/v1/plugins/preview/replay', async (request, reply) => {
+    const parsed = ReplayPluginDraftRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '仅支持符合 SDK 的声明式面板草稿' });
+    const { manifest, sessionId, panelId, query } = parsed.data;
+    const session = sessionManager.getSession(sessionId);
+    if (!session) return reply.code(404).send({ error: '历史会话不存在' });
+    try {
+      pluginManager.validateManifest(manifest);
+      const panel = manifest.contributes.dataPanels?.find(({ id }) => id === panelId);
+      const projection = manifest.contributes.projections?.find(({ id }) => id === panel?.projection);
+      if (!panel || !projection) return reply.code(404).send({ error: '找不到草稿面板' });
+      return readPluginPanel(store, session, panel, projection, query);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
@@ -326,7 +346,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       await pluginManager.installPlugin(parsed.data);
       return reply.code(201).send(await updatedPlugins());
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return reply.code(err instanceof PluginRevisionConflictError ? 409 : 400).send({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
