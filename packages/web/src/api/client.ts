@@ -93,6 +93,8 @@ export interface PluginPreview {
   installedEnabled?: boolean;
   digest?: string;
   fileCount?: number;
+  requiresTrust?: boolean;
+  missingServices?: string[];
 }
 
 export function getDaemonBaseUrl(): string {
@@ -194,6 +196,16 @@ export const daemonApi = {
 
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
+
+  getPluginComposition: () => apiFetch<{ bundles: string[]; error?: string;
+    entries: Array<{ id: string; name: string; disabled: boolean; config: Record<string, unknown>; sources: string[] }>;
+  }>('/api/v1/plugins/composition'),
+
+  previewTurnSuggestion: (id: string, text: string, attachments?: Attachment[]) =>
+    apiFetch<{ suggestion: { text: string; pluginNames: string[] } | null }>(
+      `/api/v1/sessions/${encodeURIComponent(id)}/turn-suggestion`,
+      { method: 'POST', body: JSON.stringify({ text, attachments }) },
+    ),
 
   replayPluginDraft: (req: ReplayPluginDraftRequest, signal?: AbortSignal) =>
     apiFetch<PluginPanelSnapshot>('/api/v1/plugins/preview/replay', { method: 'POST', body: JSON.stringify(req), signal }),
@@ -340,7 +352,7 @@ export const daemonApi = {
     id: string,
     text: string,
     attachments?: Attachment[],
-    opts?: { harnessId?: string; model?: string | null },
+    opts?: { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean },
   ) =>
     apiFetch<{ turnId: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/turns`, {
       method: 'POST',
@@ -349,6 +361,8 @@ export const daemonApi = {
         attachments,
         ...(opts?.harnessId ? { harnessId: opts.harnessId } : {}),
         ...(opts?.model !== undefined ? { model: opts.model } : {}),
+        omitHandoff: opts?.omitHandoff,
+        literalText: opts?.literalText,
       }),
     }),
 

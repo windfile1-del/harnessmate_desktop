@@ -762,6 +762,20 @@ export class HarnessMateStore {
     }));
   }
 
+  getLastHandoffReceipt(sessionId: string, harnessId: string, nativeSessionId: string) {
+    const row = this.db.prepare(`SELECT receipt.payload_json FROM session_events AS receipt
+      WHERE receipt.session_id = ? AND receipt.type = 'handoff.snapshot_delivered'
+        AND json_extract(receipt.payload_json, '$.targetHarnessId') = ?
+        AND json_extract(receipt.payload_json, '$.nativeSessionId') = ?
+        AND NOT EXISTS (SELECT 1 FROM session_events AS terminal
+          WHERE terminal.session_id = receipt.session_id AND terminal.turn_id = receipt.turn_id
+            AND terminal.type IN ('turn.failed', 'turn.cancelled'))
+      ORDER BY receipt.seq DESC LIMIT 1`).get(sessionId, harnessId, nativeSessionId) as { payload_json: string } | undefined;
+    if (!row) return;
+    const payload = safeJsonParse<{ snapshotId?: string; sectionHashes?: Record<string, string> }>(row.payload_json, {});
+    if (payload.snapshotId && payload.sectionHashes) return { snapshotId: payload.snapshotId, sectionHashes: payload.sectionHashes };
+  }
+
   getEventsInRange(
     sessionId: string,
     afterSeq = 0,

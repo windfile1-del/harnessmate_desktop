@@ -6,7 +6,6 @@ import type {
   ApprovalRequest,
   Attachment,
   CanonicalEvent,
-  ContextInjectionDriver,
   ContextPreview,
   ContextSyncMode,
   CreateSessionRequest,
@@ -32,24 +31,28 @@ import { AcpAdapter } from '../harnesses/acp-adapter.js';
 import { findLocalSession, readJsonlHistory } from '../harnesses/history-scanner.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type {
+  AdapterSessionConfig,
   AdapterSessionHandle,
-  ContextSyncPayload,
+  HarnessAdapter,
   NormalizedAdapterEvent,
   TurnInput,
 } from '../harnesses/types.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
-import { ContextCompiler } from './context-compiler.js';
+import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
-import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from './git-service.js';
-import { listHarnessCommands, type HarnessCommandTools } from './harness-commands.js';
-import { TaskLedgerService } from './task-ledger-service.js';
+import type { TaskLedgerService } from './task-ledger-service.js';
+import { PluginApiError } from '@harnessmate/plugin-api';
+import type { FailoverService, GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
+import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
+import { dispatchTurn } from './outbound-gate.js';
 
 interface LiveHandleEntry {
   key: string;
   sessionId: string;
   harnessId: string;
   harnessKind: HarnessKind;
+  adapter: HarnessAdapter;
   handle: AdapterSessionHandle;
   unsubscribe: () => void;
   nativeToGlobalApprovalId: Map<string, string>;
@@ -70,25 +73,20 @@ interface ActiveTurnMeta {
 }
 
 const MAX_WARM_HANDLES = 6;
+type TurnOptions = { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean };
 
 export class SessionManager {
   private readonly liveHandles = new Map<string, LiveHandleEntry>();
   private readonly activeTurnMeta = new Map<string, ActiveTurnMeta>();
   private readonly startingSessions = new Set<string>();
   private readonly importingSessions = new Map<string, Promise<Session>>();
-  readonly taskLedger: TaskLedgerService;
-  readonly contextCompiler: ContextCompiler;
-
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
     private readonly eventBus: DaemonEventBus,
-    private readonly pluginManager?: PluginManager,
-    private readonly commandTools?: HarnessCommandTools,
+    private readonly pluginManager: PluginManager,
     private readonly pluginCapabilities?: PluginCapabilities,
   ) {
-    this.taskLedger = new TaskLedgerService(store);
-    this.contextCompiler = new ContextCompiler(store, this.taskLedger);
     this.recoverStaleSessions();
   }
 
@@ -116,10 +114,14 @@ export class SessionManager {
     }
   }
 
-  private isPluginActive(pluginId: string): boolean {
-    if (!this.pluginManager) return true;
-    const found = this.pluginManager.listInstalled().find((p) => p.id === pluginId);
-    return found ? found.enabled : true;
+  private service<Service>(name: string): Service {
+    const service = this.pluginManager.host.get<Service>(name);
+    if (!service) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${name} 当前不可用`);
+    return service;
+  }
+
+  private get taskLedger(): TaskLedgerService {
+    return this.service('ledger');
   }
 
   // ── Workspaces ───────────────────────────────────────────────────────
@@ -132,12 +134,12 @@ export class SessionManager {
 
     const existing = this.store.getWorkspaceByPath(resolved);
     if (existing) {
-      const git = await inspectGitRepo(resolved);
-      this.store.updateWorkspaceGit(existing.id, git.isGitRepo, git.branch);
+      const git = await this.pluginManager.host.get<GitService>('git')?.inspect(resolved);
+      if (git) this.store.updateWorkspaceGit(existing.id, git.isGitRepo, git.branch);
       return this.store.getWorkspace(existing.id)!;
     }
 
-    const git = await inspectGitRepo(resolved);
+    const git = await this.pluginManager.host.get<GitService>('git')?.inspect(resolved) ?? { isGitRepo: false, branch: null };
     const registeredWhileInspecting = this.store.getWorkspaceByPath(resolved);
     if (registeredWhileInspecting) return registeredWhileInspecting;
     const ws: Workspace = {
@@ -190,14 +192,7 @@ export class SessionManager {
     const created = this.store.createSession(session);
     this.emitCanonical(created.id, 'session.status', { status: 'idle' });
 
-    // Initialize workspace ledger mirror when task-ledger plugin is active
-    if (this.isPluginActive('core.task-ledger')) {
-      const state = this.taskLedger.getOrCreate(created);
-      const ledgerPath = this.taskLedger.syncWorkspaceLedgerFile(created, state);
-      if (ledgerPath) {
-        this.store.upsertTaskState({ ...state, ledgerFilePath: ledgerPath });
-      }
-    }
+    await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.created', created));
 
     return this.store.getSession(created.id)!;
   }
@@ -302,7 +297,7 @@ export class SessionManager {
     let worktreeBranch: string | null = null;
     if (req.createWorktree && ws.isGitRepo) {
       const branch = req.worktreeBranch?.trim() || `hm/task-${Date.now().toString(36)}`;
-      const wt = await createGitWorktree(ws.rootPath, branch);
+      const wt = await this.service<GitService>('git').worktree(ws.rootPath, branch);
       cwd = wt.worktreePath;
       worktreeBranch = wt.branch;
     }
@@ -399,6 +394,8 @@ export class SessionManager {
   }
 
   async deleteSession(id: string): Promise<boolean> {
+    const session = this.store.getSession(id);
+    if (session) await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.closing', session));
     await this.disposeSessionHandles(id);
     return this.store.deleteSession(id);
   }
@@ -418,14 +415,21 @@ export class SessionManager {
     if (!adapter) throw new Error(`Harness not registered: ${targetId}`);
 
     const binding = this.store.getSessionBinding(sessionId, targetId);
-    const packet = await this.contextCompiler.compile({
+    const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
+    if (!compiler) return {
+      sessionId, targetHarnessId: targetId, targetHarnessKind: adapter.kind, currentLastSeq: session.lastSeq,
+      syncedUpToSeq: binding?.syncedUpToSeq ?? 0, unsyncedTurnCount: 0, estimatedTokens: 0, budgetTokens: 12_000,
+      driverPlanned: 'native_warm', isWarmBinding: Boolean(binding?.nativeSessionId), syncNeeded: false,
+      compiledMarkdown: '交接服务当前不可用', ledgerMarkdown: '', deltaTurnSummary: [],
+    };
+    const packet = await compiler.compile({
       session,
       targetHarnessId: adapter.id,
       targetHarnessKind: adapter.kind,
       binding,
       syncMode,
     });
-    return packet.preview;
+    return compiler.options.autoAttach ? packet.preview : { ...packet.preview, syncNeeded: false };
   }
 
   /**
@@ -481,13 +485,7 @@ export class SessionManager {
     const fromHarnessKind = current.harnessKind;
 
     // Preview exact delta that target harness will receive on next turn
-    const previewBefore = await this.contextCompiler.compile({
-      session: current,
-      targetHarnessId: targetAdapter.id,
-      targetHarnessKind: targetAdapter.kind,
-      binding: existingBinding,
-      syncMode: resolvedSyncMode,
-    });
+    const previewBefore = await this.getContextPreview(sessionId, targetAdapter.id, resolvedSyncMode);
 
     const participating = Array.from(
       new Set([...(current.participatingHarnesses ?? []), fromHarnessId, targetAdapter.id]),
@@ -524,8 +522,8 @@ export class SessionManager {
     // Capture lightweight Git anchor for timeline switch divider
     let gitAnchor: string | null = null;
     try {
-      const git = await getGitStatusSummary(updated.cwd);
-      if (git.isGitRepo) {
+      const git = await this.pluginManager.host.get<GitService>('git')?.status(updated.cwd);
+      if (git?.isGitRepo) {
         const dirty = git.changes.filter((c) => !c.path.startsWith('.harnessmate/')).length;
         gitAnchor = `${git.branch || 'detached'}${dirty > 0 ? ` · ${dirty} 个改动文件` : ' · clean'}`;
       }
@@ -539,24 +537,17 @@ export class SessionManager {
       toHarnessId: targetAdapter.id,
       toHarnessKind: targetAdapter.kind,
       toModel: resolvedModel,
-      syncedUpToSeq: previewBefore.preview.syncedUpToSeq,
-      currentLastSeq: previewBefore.preview.currentLastSeq,
-      unsyncedTurnCount: previewBefore.preview.unsyncedTurnCount,
-      estimatedTokens: previewBefore.preview.estimatedTokens,
-      driverPlanned: previewBefore.preview.driverPlanned,
-      isWarmBinding: previewBefore.preview.isWarmBinding,
+      syncedUpToSeq: previewBefore.syncedUpToSeq,
+      currentLastSeq: previewBefore.currentLastSeq,
+      unsyncedTurnCount: previewBefore.unsyncedTurnCount,
+      estimatedTokens: previewBefore.estimatedTokens,
+      driverPlanned: previewBefore.driverPlanned,
+      isWarmBinding: previewBefore.isWarmBinding,
       syncMode: resolvedSyncMode,
       gitAnchor,
     });
 
-    // Refresh workspace `.harnessmate/task-ledger.md` with new active harness
-    if (this.isPluginActive('core.task-ledger')) {
-      const state = this.taskLedger.getOrCreate(updated);
-      const ledgerPath = this.taskLedger.syncWorkspaceLedgerFile(updated, state);
-      if (ledgerPath && ledgerPath !== state.ledgerFilePath) {
-        this.store.upsertTaskState({ ...state, ledgerFilePath: ledgerPath });
-      }
-    }
+    this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(updated);
 
     // If a warm handle for target harness exists with stale model config, apply config now
     const warmTarget = this.liveHandles.get(this.handleKey(sessionId, targetAdapter.id));
@@ -577,12 +568,12 @@ export class SessionManager {
       sessionId,
       sessionTitle: updated.title,
       harnessId: targetAdapter.id,
-      summary: `已从 ${fromHarnessId} 切换至 ${targetAdapter.id}（待同步 ${previewBefore.preview.unsyncedTurnCount} 轮增量上下文）`,
+      summary: `已从 ${fromHarnessId} 切换至 ${targetAdapter.id}（待同步 ${previewBefore.unsyncedTurnCount} 轮增量上下文）`,
       timestamp: Date.now(),
     });
 
     const refreshed = this.store.getSession(sessionId)!;
-    return { session: refreshed, contextPreview: previewBefore.preview };
+    return { session: refreshed, contextPreview: previewBefore };
   }
 
   /**
@@ -595,29 +586,8 @@ export class SessionManager {
     const current = this.store.getSession(sessionId);
     if (!current) throw new Error(`Session not found: ${sessionId}`);
 
-    let retryText: string | null = null;
-    let retryAttachments: Attachment[] | undefined;
-
-    if (req.retryLastFailedTurn !== false) {
-      const events = this.store.getEventsAfter(sessionId, 0, 4000);
-      // Find the most recent turn that ended with turn.failed
-      for (let i = events.length - 1; i >= 0; i--) {
-        const ev = events[i]!;
-        if (ev.type === 'turn.failed' && ev.turnId) {
-          const userEv = events.find(
-            (e) => e.type === 'message.user' && e.turnId === ev.turnId,
-          );
-          if (userEv && typeof userEv.payload.text === 'string' && userEv.payload.text.trim()) {
-            retryText = userEv.payload.text;
-            if (Array.isArray(userEv.payload.attachments)) {
-              retryAttachments = userEv.payload.attachments as Attachment[];
-            }
-          }
-          break;
-        }
-        if (ev.type === 'turn.completed') break;
-      }
-    }
+    const failover = this.service<FailoverService>('failover');
+    const retry = req.retryLastFailedTurn === false ? undefined : failover.retryInput(sessionId);
 
     if (current.status === 'error') {
       this.setSessionStatus(sessionId, 'idle');
@@ -628,8 +598,8 @@ export class SessionManager {
       targetModel: req.targetModel,
     });
 
-    if (retryText) {
-      const { turnId } = await this.sendTurn(sessionId, retryText, retryAttachments);
+    if (retry) {
+      const { turnId } = await this.sendTurn(sessionId, retry.text, retry.attachments);
       return { session: this.store.getSession(sessionId)!, retriedTurnId: turnId };
     }
 
@@ -687,7 +657,7 @@ export class SessionManager {
     const targetAdapter = this.registry.get(targetHarnessId);
     if (!targetAdapter) throw new Error(`Target harness not registered: ${targetHarnessId}`);
 
-    const packet = await this.contextCompiler.compile({
+    const packet = await this.service<ContextCompiler>('handoff').compile({
       session: source,
       targetHarnessId: targetAdapter.id,
       targetHarnessKind: targetAdapter.kind,
@@ -730,7 +700,8 @@ export class SessionManager {
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
     const events = this.store.iterateEvents(sessionId, 0, session.lastSeq);
-    const ledger = this.taskLedger.getOrCreate(session);
+    const ledgerService = this.pluginManager.host.get<TaskLedgerService>('ledger');
+    const ledger = ledgerService?.getOrCreate(session);
     const lines: string[] = [
       `# ${session.title}`,
       '',
@@ -742,8 +713,8 @@ export class SessionManager {
       '',
     ];
 
-    if (ledger.objective || ledger.steps.length > 0 || ledger.pinnedFacts.length > 0) {
-      lines.push(this.taskLedger.renderLedgerMarkdown(ledger, session), '---', '');
+    if (ledgerService && ledger && (ledger.objective || ledger.steps.length > 0 || ledger.pinnedFacts.length > 0)) {
+      lines.push(ledgerService.renderLedgerMarkdown(ledger, session), '---', '');
     } else {
       lines.push('---', '');
     }
@@ -758,6 +729,13 @@ export class SessionManager {
     };
 
     for (const ev of events) {
+      if (ev.type === 'handoff.snapshot') {
+        flushAssistant();
+        const { driver, content } = ev.payload;
+        lines.push(`### 上下文交接 · ${String(driver ?? '')}`, '',
+          typeof content === 'string' ? content : JSON.stringify(content, null, 2), '');
+        continue;
+      }
       if (typeof ev.payload.harnessId === 'string') {
         const m =
           typeof ev.payload.actualModel === 'string' && ev.payload.actualModel
@@ -801,9 +779,10 @@ export class SessionManager {
   // ── Turn Execution (Unified Multi-Harness + Context Bridge) ──────────
 
   getHarnessCommands(session: Session): HarnessCommandInfo[] {
-    if (!this.isPluginActive('core.harness-commands')) return [];
+    const service = this.pluginManager.host.get<NativeCommandsService>('native-commands');
+    if (!service) return [];
     const source = session.nativeSessionId && this.store.getNativeHistory(session.id, session.nativeSessionId)?.source;
-    return listHarnessCommands(session.harnessKind, source === 'agy_desktop');
+    return service.list(session.harnessKind, source === 'agy_desktop');
   }
 
   private nativeActionReason(session: Session, command: RunHarnessCommandRequest['command']): string | undefined {
@@ -868,7 +847,8 @@ export class SessionManager {
       throw new Error('请在会话空闲时运行原生命令');
     }
     const adapter = this.registry.get(session.harnessId);
-    if (!adapter || !this.commandTools) throw new Error('当前 Harness 命令服务不可用');
+    if (!adapter) throw new Error('当前 Harness 命令服务不可用');
+    const tools = this.service<NativeCommandsService>('native-commands').tools;
 
     const result = (output: string, turnId?: string): HarnessCommandResult => ({
       output, turnId, session: this.store.getSession(sessionId)!,
@@ -877,7 +857,7 @@ export class SessionManager {
       const { turnId } = await this.startTurn(sessionId, text, undefined, undefined, { cliCommand: text });
       return result('', turnId);
     };
-    const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, null)).handle;
+    const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, false)).handle;
     const { command, args } = req;
     switch (command) {
       case 'model': {
@@ -907,7 +887,7 @@ export class SessionManager {
       case 'usage': {
         if (args) throw new Error('用法 /usage');
         return session.harnessKind === 'claude' ? rawCommand('/usage')
-          : result(await this.commandTools.getUsage(session));
+          : result(await tools.getUsage(session));
       }
       case 'goal': {
         if (session.harnessKind === 'codex') {
@@ -921,13 +901,13 @@ export class SessionManager {
       }
       case 'plugin': {
         if (args === 'reload' && session.harnessKind === 'claude') return rawCommand('/reload-plugins');
-        const output = await this.commandTools.runPluginCommand(session, args);
+        const output = await tools.runPluginCommand(session, args);
         if (args.startsWith('install ')) await this.disposeLiveHandle(sessionId, session.harnessId);
         return result(output);
       }
       case 'skills':
       case 'skill': {
-        const skills = session.harnessKind === 'agy' ? await this.commandTools.listAgySkills(session.cwd)
+        const skills = session.harnessKind === 'agy' ? await tools.listAgySkills(session.cwd)
           : await (await getHandle()).listSkills?.() ?? [];
         const availableSkills = skills.filter((skill) => skill.enabled !== false);
         if (command === 'skills') {
@@ -955,16 +935,22 @@ export class SessionManager {
     sessionId: string,
     text: string,
     attachments?: Attachment[],
-    turnOpts?: { harnessId?: string; model?: string | null },
+    turnOpts?: TurnOptions,
   ): Promise<{ turnId: string }> {
     return this.withSessionStartup(sessionId, () => this.startTurn(sessionId, text, attachments, turnOpts));
+  }
+
+  previewTurnSuggestion(sessionId: string, text: string, attachments?: Attachment[]) {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    return this.pluginManager.suggestBeforeTurn({ sessionId, harnessId: session.harnessId, cwd: session.cwd, text, attachments });
   }
 
   private async startTurn(
     sessionId: string,
     text: string,
     attachments?: Attachment[],
-    turnOpts?: { harnessId?: string; model?: string | null },
+    turnOpts?: TurnOptions,
     native?: Pick<TurnInput, 'cliCommand' | 'nativeSkill'>,
   ): Promise<{ turnId: string }> {
     let session = this.store.getSession(sessionId);
@@ -987,20 +973,8 @@ export class SessionManager {
     const turnId = `turn_${crypto.randomBytes(5).toString('hex')}`;
     const preTurnSeq = session.lastSeq;
 
-    // Run active plugin slash-command expansion & beforeTurn hooks
-    let effectiveText = text;
-    let expandedCommand: string | undefined;
-    if (this.pluginManager && !native) {
-      const hooked = await this.pluginManager.processBeforeTurn({
-        sessionId,
-        harnessId: session.harnessId,
-        cwd: session.cwd,
-        text,
-        attachments,
-      });
-      effectiveText = hooked.text;
-      expandedCommand = hooked.expandedCommand;
-    }
+    const { text: effectiveText, expandedCommand } = native || turnOpts?.literalText
+      ? { text, expandedCommand: undefined } : this.pluginManager.expandSlashCommand(text);
 
     // Auto-title session from first user prompt if still default
     if (!native && session.lastSeq <= 2 && session.title.includes('·')) {
@@ -1017,7 +991,7 @@ export class SessionManager {
       harnessKind: session.harnessKind,
       model: session.model,
       actualModel: session.actualModel ?? null,
-      advanceWatermark: !native?.cliCommand,
+      advanceWatermark: !native?.cliCommand && !turnOpts?.omitHandoff,
       reloadHandle: session.harnessKind === 'agy' && Boolean(native?.cliCommand),
       maintenance: ['/compact', '/usage', '/reload-plugins'].includes(native?.cliCommand?.split(/\s+/)[0] ?? ''),
     });
@@ -1027,6 +1001,7 @@ export class SessionManager {
       'message.user',
       {
         text,
+        ...(effectiveText !== text ? { sentText: effectiveText } : {}),
         expandedCommand: expandedCommand ?? null,
         harnessId: session.harnessId,
         harnessKind: session.harnessKind,
@@ -1048,10 +1023,14 @@ export class SessionManager {
 
     try {
       // Compile incremental context delta if Context Bridge plugin is active
-      const contextBridgeEnabled = this.isPluginActive('core.context-bridge');
+      const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
       const binding = this.store.getSessionBinding(sessionId, session.harnessId);
-      let compiled = contextBridgeEnabled
-        ? await this.contextCompiler.compile({
+      if (!compiler?.options.autoAttach && (session.participatingHarnesses?.length ?? 0) > 1) {
+        const meta = this.activeTurnMeta.get(sessionId);
+        if (meta) meta.advanceWatermark = false;
+      }
+      let compiled = compiler?.options.autoAttach && !turnOpts?.omitHandoff
+        ? await compiler.compile({
             session,
             targetHarnessId: session.harnessId,
             targetHarnessKind: session.harnessKind,
@@ -1064,13 +1043,13 @@ export class SessionManager {
       const entry = await this.ensureLiveHandle(
         sessionId,
         session.harnessId,
-        compiled?.syncNeeded ? compiled.systemLedgerPrompt : null,
+        Boolean(compiled?.syncNeeded && !native?.cliCommand),
         true,
       );
       const currentBinding = this.store.getSessionBinding(sessionId, session.harnessId);
-      if (contextBridgeEnabled && binding?.nativeSessionId &&
+      if (compiler?.options.autoAttach && !turnOpts?.omitHandoff && binding?.nativeSessionId &&
         currentBinding?.nativeSessionId !== binding.nativeSessionId) {
-        compiled = await this.contextCompiler.compile({
+        compiled = await compiler.compile({
           session, targetHarnessId: session.harnessId, targetHarnessKind: session.harnessKind,
           binding: currentBinding, upToSeq: preTurnSeq, excludeTurnId: turnId,
         });
@@ -1080,48 +1059,15 @@ export class SessionManager {
         if (meta) meta.advanceWatermark = !compiled?.syncNeeded;
       }
 
-      let contextPayloadForTurn: ContextSyncPayload | null = null;
-      let driverUsed: ContextInjectionDriver | null = null;
-
-      if (compiled?.syncNeeded && !native?.cliCommand) {
-        const syncPayload: ContextSyncPayload = {
-          systemLedgerPrompt: compiled.systemLedgerPrompt,
-          deltaMarkdown: compiled.deltaMarkdown,
-          codexInjectItems: compiled.codexInjectItems,
-          objective: compiled.objective,
-          isWarmBinding: compiled.preview.isWarmBinding,
-        };
-
-        // Prefer protocol-native pre-turn injection if supported (e.g. Codex thread/inject_items)
-        if (entry.handle.injectContext) {
-          const injectedDriver = await entry.handle.injectContext(syncPayload);
-          if (injectedDriver === 'codex_inject_items') {
-            driverUsed = 'codex_inject_items';
-            contextPayloadForTurn = null;
-          } else {
-            // Native RPC failed -> seamlessly fall back to prompt envelope on sendTurn
-            contextPayloadForTurn = syncPayload;
-          }
-        } else {
-          contextPayloadForTurn = syncPayload;
-        }
-      }
-
-      const sendResult = await entry.handle.sendTurn({
+      const finalDriver = await dispatchTurn(entry.handle, { id: session.harnessId, kind: session.harnessKind }, {
         turnId,
         text: effectiveText,
         attachments,
         model: session.model,
         reasoningEffort: session.reasoningEffort,
         permissionMode: session.permissionMode,
-        contextSync: contextPayloadForTurn,
         ...native,
-      });
-
-      const finalDriver =
-        driverUsed ??
-        (sendResult && typeof sendResult === 'object' ? sendResult.driverUsed ?? null : null) ??
-        (compiled?.syncNeeded ? 'prompt_envelope' : 'native_warm');
+      }, compiled, (type, payload) => { this.emitCanonical(sessionId, type, payload, turnId); });
 
       // Record that target harness has now received context up to preTurnSeq
       if (compiled?.syncNeeded && !native?.cliCommand) {
@@ -1239,6 +1185,10 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     const entries = Array.from(this.liveHandles.values());
     this.liveHandles.clear();
+    await Promise.all([...new Set(entries.map(({ sessionId }) => sessionId))].map(async (sessionId) => {
+      const session = this.store.getSession(sessionId);
+      if (session) await this.pluginManager.host.events.dispatch(sessionPluginEvent('session.closing', session));
+    }));
     await Promise.all(
       entries.map(async (entry) => {
         entry.unsubscribe();
@@ -1257,7 +1207,7 @@ export class SessionManager {
   private async ensureLiveHandle(
     sessionId: string,
     harnessId: string,
-    systemContextPrompt: string | null,
+    handoffContinuity: boolean,
     refreshPluginTools = false,
   ): Promise<LiveHandleEntry> {
     const key = this.handleKey(sessionId, harnessId);
@@ -1269,7 +1219,7 @@ export class SessionManager {
     const tools = adapter.pluginMcpTransport ? this.pluginCapabilities?.getTools(session) ?? [] : [];
     const pluginToolKey = this.pluginToolKey(tools);
     const existing = this.liveHandles.get(key);
-    if (existing && (!refreshPluginTools || existing.pluginToolKey === pluginToolKey)) {
+    if (existing?.adapter === adapter && (!refreshPluginTools || existing.pluginToolKey === pluginToolKey)) {
       existing.lastUsedAt = Date.now();
       return existing;
     }
@@ -1284,7 +1234,7 @@ export class SessionManager {
     // Evict oldest idle handle if warm pool is full
     await this.evictWarmPoolIfNeeded(sessionId);
 
-    const config = {
+    const config: AdapterSessionConfig = {
       cwd: session.cwd,
       model: session.model,
       reasoningEffort: session.reasoningEffort,
@@ -1293,7 +1243,11 @@ export class SessionManager {
       nativeHistorySource: nativeHistory?.source,
       nativeHistoryPath: nativeHistory?.sourcePath,
       requireNativeResume: Boolean(nativeHistory || (existing && nativeSessionId)),
-      systemContextPrompt,
+      handoffContinuity: handoffContinuity && (adapter.kind === 'codex' || adapter.kind === 'claude'),
+      onContinuityNotice: (channel, text) => {
+        this.emitCanonical(sessionId, 'handoff.system_notice', { harnessId, channel, text },
+          this.activeTurnMeta.get(sessionId)?.turnId);
+      },
     };
     let lease = tools.length ? this.pluginCapabilities?.openLease(session, harnessId, tools) : undefined;
     let handle: AdapterSessionHandle;
@@ -1340,6 +1294,7 @@ export class SessionManager {
       sessionId,
       harnessId: adapter.id,
       harnessKind: adapter.kind,
+      adapter,
       handle,
       unsubscribe,
       nativeToGlobalApprovalId,
@@ -1516,11 +1471,6 @@ export class SessionManager {
         this.setSessionStatus(sessionId, 'idle');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
 
-        // Deterministically extract Task State Ledger + mirror to `.harnessmate/task-ledger.md`
-        if (!meta?.maintenance && this.isPluginActive('core.task-ledger')) {
-          void this.refreshTaskLedgerAfterTurn(sessionId, ev.turnId, eventHarnessId);
-        }
-
         this.eventBus.publishAttention({
           kind: 'turn_completed',
           sessionId,
@@ -1562,10 +1512,6 @@ export class SessionManager {
         this.activeTurnMeta.delete(sessionId);
         this.setSessionStatus(sessionId, 'error');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
-
-        if (!meta?.maintenance && this.isPluginActive('core.task-ledger')) {
-          void this.refreshTaskLedgerAfterTurn(sessionId, ev.turnId, eventHarnessId);
-        }
 
         this.eventBus.publishAttention({
           kind: 'turn_failed',
@@ -1737,34 +1683,6 @@ export class SessionManager {
         });
         break;
       }
-    }
-  }
-
-  private async refreshTaskLedgerAfterTurn(
-    sessionId: string,
-    turnId: string,
-    harnessId: string,
-  ): Promise<void> {
-    try {
-      const latestSession = this.store.getSession(sessionId);
-      if (!latestSession) return;
-      const recentEvents = this.store.getEventsAfter(sessionId, Math.max(0, latestSession.lastSeq - 250), 300);
-      const updatedState = await this.taskLedger.ingestTurnEvents(
-        latestSession,
-        turnId,
-        harnessId,
-        recentEvents,
-      );
-      this.emitCanonical(sessionId, 'task.state_updated', {
-        version: updatedState.version,
-        objective: updatedState.objective,
-        stepsCount: updatedState.steps.length,
-        doneStepsCount: updatedState.steps.filter((s) => s.status === 'done').length,
-        touchedFilesCount: updatedState.touchedFiles.length,
-        ledgerFilePath: updatedState.ledgerFilePath ?? null,
-      });
-    } catch {
-      // never crash background turn completion
     }
   }
 

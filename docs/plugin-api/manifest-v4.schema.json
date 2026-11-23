@@ -1,0 +1,690 @@
+{
+  "$ref": "#/definitions/PluginManifestV4",
+  "definitions": {
+    "PluginManifestV4": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "version": {
+          "type": "string",
+          "default": "1.0.0"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "harness",
+            "tool",
+            "mcp",
+            "telemetry",
+            "ui",
+            "remote",
+            "workflow"
+          ],
+          "default": "workflow"
+        },
+        "apiVersion": {
+          "type": "number",
+          "const": 4
+        },
+        "engines": {
+          "type": "object",
+          "properties": {
+            "pluginApi": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "required": [
+            "pluginApi"
+          ],
+          "additionalProperties": false
+        },
+        "main": {
+          "type": "string"
+        },
+        "inject": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+          },
+          "maxItems": 32
+        },
+        "optional": {
+          "$ref": "#/definitions/PluginManifestV4/properties/inject"
+        },
+        "provides": {
+          "$ref": "#/definitions/PluginManifestV4/properties/inject"
+        },
+        "contributes": {
+          "type": "object",
+          "properties": {
+            "harnesses": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 48,
+                    "pattern": "^[a-z0-9][a-z0-9_-]*$"
+                  },
+                  "displayName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 240,
+                    "default": "Custom ACP CLI Harness"
+                  },
+                  "command": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [
+                      "acp",
+                      "--stdio"
+                    ]
+                  },
+                  "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "displayName",
+                  "command"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "slashCommands": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 40,
+                    "pattern": "^[a-z0-9][a-z0-9_-]*$"
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 160
+                  },
+                  "template": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "argumentHint": {
+                    "type": "string",
+                    "maxLength": 80
+                  }
+                },
+                "required": [
+                  "command",
+                  "description",
+                  "template"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "mcpPresets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "stdio",
+                      "http",
+                      "sse"
+                    ]
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "name",
+                  "description",
+                  "transport"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "panels": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$"
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 240
+                  },
+                  "sections": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "turns",
+                        "changed_files",
+                        "verifications",
+                        "recent_activity"
+                      ]
+                    },
+                    "maxItems": 4,
+                    "default": []
+                  },
+                  "actions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "label": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 48
+                        },
+                        "command": {
+                          "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/slashCommands/items/properties/command"
+                        },
+                        "args": {
+                          "type": "string",
+                          "maxLength": 240
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "command"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 6,
+                    "default": []
+                  }
+                },
+                "required": [
+                  "id",
+                  "title"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 6
+            },
+            "projections": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$"
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "session",
+                      "workspace"
+                    ]
+                  },
+                  "events": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "turn.completed",
+                        "turn.failed",
+                        "turn.cancelled"
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 3
+                  }
+                },
+                "required": [
+                  "id",
+                  "scope",
+                  "events"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 6
+            },
+            "dataPanels": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 240
+                  },
+                  "projection": {
+                    "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                  },
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "field": {
+                          "type": "string",
+                          "enum": [
+                            "time",
+                            "session",
+                            "harness",
+                            "status",
+                            "changed_files",
+                            "verifications"
+                          ]
+                        },
+                        "label": {
+                          "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/dataPanels/items/properties/title"
+                        }
+                      },
+                      "required": [
+                        "field",
+                        "label"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "minItems": 1,
+                    "maxItems": 6
+                  },
+                  "filters": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "harness",
+                        "status"
+                      ]
+                    },
+                    "maxItems": 2
+                  },
+                  "defaultEvent": {
+                    "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/events/items"
+                  },
+                  "counts": {
+                    "type": "boolean"
+                  },
+                  "openTurn": {
+                    "type": "boolean"
+                  },
+                  "placements": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "sidebar_tool",
+                        "composer_action"
+                      ]
+                    },
+                    "maxItems": 2
+                  },
+                  "copySummary": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/dataPanels/items/properties/title"
+                      },
+                      "command": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "id",
+                  "title",
+                  "projection",
+                  "columns"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 6
+            },
+            "programs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                  },
+                  "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160
+                  },
+                  "steps": {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "op": {
+                              "type": "string",
+                              "const": "trim"
+                            }
+                          },
+                          "required": [
+                            "op"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "op": {
+                              "type": "string",
+                              "const": "case"
+                            },
+                            "mode": {
+                              "type": "string",
+                              "enum": [
+                                "lower",
+                                "upper"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "op",
+                            "mode"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "op": {
+                              "type": "string",
+                              "const": "replace"
+                            },
+                            "find": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "replacement": {
+                              "type": "string",
+                              "maxLength": 256
+                            }
+                          },
+                          "required": [
+                            "op",
+                            "find",
+                            "replacement"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "op": {
+                              "type": "string",
+                              "const": "wrap"
+                            },
+                            "prefix": {
+                              "type": "string",
+                              "maxLength": 512
+                            },
+                            "suffix": {
+                              "type": "string",
+                              "maxLength": 512
+                            }
+                          },
+                          "required": [
+                            "op",
+                            "prefix",
+                            "suffix"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "op": {
+                              "type": "string",
+                              "const": "lines"
+                            },
+                            "contains": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "ignoreCase": {
+                              "type": "boolean"
+                            },
+                            "unique": {
+                              "type": "boolean"
+                            },
+                            "order": {
+                              "type": "string",
+                              "enum": [
+                                "asc",
+                                "desc"
+                              ]
+                            },
+                            "limit": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 200
+                            }
+                          },
+                          "required": [
+                            "op"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 16
+                  },
+                  "exposeToModel": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "id",
+                  "description",
+                  "steps"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 12
+            },
+            "actions": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "command": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                      },
+                      "description": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "program"
+                      },
+                      "program": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                      }
+                    },
+                    "required": [
+                      "command",
+                      "description",
+                      "kind",
+                      "program"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "command": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/projections/items/properties/id"
+                      },
+                      "description": {
+                        "$ref": "#/definitions/PluginManifestV4/properties/contributes/properties/actions/items/anyOf/0/properties/description"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "const": "harness"
+                      },
+                      "nativeCommand": {
+                        "type": "string",
+                        "enum": [
+                          "compact",
+                          "usage",
+                          "model",
+                          "plan",
+                          "goal",
+                          "skills",
+                          "skill"
+                        ]
+                      },
+                      "args": {
+                        "type": "string",
+                        "maxLength": 2000
+                      }
+                    },
+                    "required": [
+                      "command",
+                      "description",
+                      "kind",
+                      "nativeCommand"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "maxItems": 12
+            },
+            "uiSlots": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "sidebar_tool",
+                  "inspector_tab",
+                  "composer_action",
+                  "modal"
+                ]
+              }
+            },
+            "hooks": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "before_turn",
+                  "after_turn",
+                  "on_event"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false,
+          "default": {}
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "description",
+        "apiVersion",
+        "engines"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}

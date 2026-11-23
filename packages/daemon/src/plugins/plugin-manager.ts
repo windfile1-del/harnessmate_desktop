@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { PluginApiError } from '@harnessmate/plugin-api';
 import {
   HarnessCommandNameSchema,
   GeneratedPluginManifestSchema,
@@ -16,9 +17,15 @@ import {
 } from '@harnessmate/protocol';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
-import { MANIFEST_FILE, readPluginPackage, readRevisionPointer, revisionDirectory, writeRevision,
+import { MANIFEST_FILE, manifestPluginPackage, readPluginPackage, readRevisionPointer, requiresPluginTrust, revisionDirectory, writeRevision,
   writeRevisionPointer, type PluginPackage } from './plugin-package.js';
 import { PluginRuntime } from './plugin-runtime.js';
+import { normalizePluginManifest } from '../plugin-host/manifest/normalize.js';
+import { PluginHost, type HostPlugin } from '../plugin-host/runtime/lifecycle.js';
+import { toPluginEvent } from '../plugin-host/runtime/map-event.js';
+import { PluginComposition } from '../plugin-host/composition/profile.js';
+import { BUILTIN_PLUGINS } from '../plugin-host/builtin/manifests.js';
+import { CURATED_PLUGIN_CATALOG } from './plugin-catalog.js';
 
 export interface PluginTurnHookContext {
   sessionId: string;
@@ -28,354 +35,6 @@ export interface PluginTurnHookContext {
   attachments?: Attachment[];
 }
 
-export interface PluginRuntimeModule {
-  beforeTurn?: (
-    ctx: PluginTurnHookContext,
-  ) => Promise<{ text?: string } | void> | { text?: string } | void;
-  onEvent?: (event: unknown) => Promise<void> | void;
-}
-
-const BUILTIN_PLUGINS: PluginManifest[] = [
-  {
-    id: 'core.harness.codex',
-    name: 'Codex CLI 引擎插件',
-    version: '1.0.0',
-    description: '接入本机 Codex CLI (app-server JSON-RPC 2.0)，支持动态模型、账号限额与交互审批。',
-    author: 'HarnessMate Core',
-    category: 'harness',
-    contributes: { uiSlots: ['modal'] },
-  },
-  {
-    id: 'core.harness.agy',
-    name: 'Antigravity CLI (ACP) 引擎插件',
-    version: '1.0.0',
-    description: '接入本机 agy CLI 原生 ACP 协议，支持动态模型、思考档位校验与权限确认。',
-    author: 'HarnessMate Core',
-    category: 'harness',
-    contributes: { uiSlots: ['modal'] },
-  },
-  {
-    id: 'core.harness.claude',
-    name: 'Claude Code CLI 引擎插件',
-    version: '1.0.0',
-    description: '接入本机 Claude Code (stream-json 双向控制流)，自动读取 settings.json 模型目录。',
-    author: 'HarnessMate Core',
-    category: 'harness',
-    contributes: { uiSlots: ['modal'] },
-  },
-  {
-    id: 'core.attachments',
-    name: '图片与文件上下文插件',
-    version: '1.0.0',
-    description: '支持粘贴截图、拖拽图片与 @文件 引用，自动适配各 CLI 的多模态输入协议。',
-    author: 'HarnessMate Core',
-    category: 'tool',
-    contributes: { uiSlots: ['composer_action'] },
-  },
-  {
-    id: 'core.mcp-hub',
-    name: '跨 CLI MCP 统一管理中心',
-    version: '1.0.0',
-    description: '统一查看、安装、启停与跨端同步 Codex / AGY / Claude 的 MCP 服务器。',
-    author: 'HarnessMate Core',
-    category: 'mcp',
-    contributes: { uiSlots: ['sidebar_tool', 'modal'] },
-  },
-  {
-    id: 'core.account-usage',
-    name: '多账号与配额用量看板',
-    version: '1.0.0',
-    description: '实时聚合各 CLI 登录账号、5h/7d 速率限额、每日 Token 趋势与会话成本账本。',
-    author: 'HarnessMate Core',
-    category: 'telemetry',
-    contributes: { uiSlots: ['sidebar_tool', 'modal'] },
-  },
-  {
-    id: 'core.git-inspector',
-    name: 'Git Diff 与 Worktree 隔离插件',
-    version: '1.0.0',
-    description: '实时监控仓库变更、查看彩色 Unified Diff，并支持为并行会话创建隔离 Git Worktree。',
-    author: 'HarnessMate Core',
-    category: 'ui',
-    contributes: { uiSlots: ['inspector_tab'] },
-  },
-  {
-    id: 'core.terminal-runner',
-    name: '工作区终端与文件浏览器插件',
-    version: '1.0.0',
-    description: '在右侧检视抽屉提供工作区文件预览、一键 @引用 与快捷终端命令执行器。',
-    author: 'HarnessMate Core',
-    category: 'tool',
-    contributes: { uiSlots: ['inspector_tab'] },
-  },
-  {
-    id: 'core.harness-commands',
-    name: '原生 Harness 命令',
-    version: '1.0.0',
-    description: '在对话中调用当前 CLI 的模型、额度、计划、上下文、目标、插件与技能命令。',
-    author: 'HarnessMate Core',
-    category: 'tool',
-    contributes: { uiSlots: ['composer_action'] },
-  },
-  {
-    id: 'core.slash-workflows',
-    name: '内置工程 Slash 工作流插件',
-    version: '1.0.0',
-    description: '提供 /review、/test、/fix、/refactor、/explain 等结构化斜杠指令模板。',
-    author: 'HarnessMate Core',
-    category: 'workflow',
-    contributes: {
-      slashCommands: [
-        {
-          command: 'review',
-          description: '审查当前工作区改动与潜在风险',
-          argumentHint: '[关注范围或文件]',
-          template:
-            '请对当前工作区最新的代码改动执行严格的代码审查，重点关注正确性、边界条件、安全隐患与性能问题。给出按优先级排序的修改建议。\n\n补充说明：{{args}}',
-        },
-        {
-          command: 'test',
-          description: '运行测试套件并定位失败原因',
-          argumentHint: '[测试命令或模块]',
-          template:
-            '请定位并运行当前项目相关的自动化测试，如遇失败请分析根因并给出最小化修复方案。\n\n目标范围：{{args}}',
-        },
-        {
-          command: 'fix',
-          description: '诊断并修复指定 Bug 或报错',
-          argumentHint: '<报错信息或问题描述>',
-          template:
-            '请复现并排查以下问题，说明根因后执行干净的修复并验证回归：\n\n{{args}}',
-        },
-        {
-          command: 'refactor',
-          description: '重构模块结构以提升清晰度与可维护性',
-          argumentHint: '<目标文件或模块>',
-          template:
-            '请先分析目标代码的职责边界与耦合点，提出重构方案并在保持行为不变的前提下完成重构与验证：\n\n{{args}}',
-        },
-        {
-          command: 'explain',
-          description: '梳理代码架构与调用链路',
-          argumentHint: '<文件、符号或流程>',
-          template:
-            '请清晰拆解以下模块或流程的架构设计、核心数据结构与关键执行路径：\n\n{{args}}',
-        },
-      ],
-      hooks: ['before_turn'],
-    },
-  },
-  {
-    id: 'core.remote-mobile',
-    name: 'HM-Remote 移动端联动插件',
-    version: '1.0.0',
-    description: '为 Android 端 HarnessMate 提供扫码配对、局域网/Tailscale 远程会话与跨端审批。',
-    author: 'HarnessMate Core',
-    category: 'remote',
-    contributes: { uiSlots: ['sidebar_tool', 'modal'] },
-  },
-  {
-    id: 'core.context-bridge',
-    name: '跨引擎上下文桥接插件',
-    version: '1.0.0',
-    description: '基于水位线增量同步与协议原生注入（Codex inject_items / AGY embeddedContext / Claude sysfile），实现单会话内多引擎无缝切换。',
-    author: 'HarnessMate Core',
-    category: 'workflow',
-    contributes: { uiSlots: ['composer_action', 'inspector_tab'], hooks: ['before_turn'] },
-  },
-  {
-    id: 'core.task-ledger',
-    name: '结构化任务状态账本插件',
-    version: '1.0.0',
-    description: '自动沉淀任务目标、步骤清单、修改文件、验证结果与钉选铁律，并同步写入工作区 .harnessmate/task-ledger.md。',
-    author: 'HarnessMate Core',
-    category: 'workflow',
-    contributes: { uiSlots: ['inspector_tab'], hooks: ['after_turn'] },
-  },
-  {
-    id: 'core.auto-failover',
-    name: '限额/异常一键接力插件',
-    version: '1.0.0',
-    description: '当当前引擎遇到限额耗尽、超时或异常中断时，支持在同一会话内一键切换至备用引擎无缝续跑。',
-    author: 'HarnessMate Core',
-    category: 'workflow',
-    contributes: { uiSlots: ['composer_action'] },
-  },
-];
-
-const CURATED_PLUGIN_CATALOG: Array<PluginManifest & { tags: string[] }> = [
-  {
-    id: 'user.session-toolkit', name: '会话工具箱', version: '1.0.0', apiVersion: 3, category: 'tool',
-    description: '整理文本行，并在当前 Harness 支持时运行额度、压缩或计划动作。',
-    tags: ['会话动作', '模型工具'],
-    contributes: {
-      programs: [{ id: 'unique_lines', description: '去除重复文本行并排序', exposeToModel: true,
-        steps: [{ op: 'trim' }, { op: 'lines', unique: true, order: 'asc' }] }],
-      actions: [
-        { kind: 'program', command: 'unique-lines', description: '去除重复文本行并排序', program: 'unique_lines' },
-        { kind: 'harness', command: 'toolkit-usage', description: '查看当前 Harness 的用量', nativeCommand: 'usage', args: '' },
-        { kind: 'harness', command: 'toolkit-compact', description: '压缩当前会话的原生上下文', nativeCommand: 'compact', args: '' },
-        { kind: 'harness', command: 'toolkit-plan', description: '将当前会话切换到计划模式', nativeCommand: 'plan', args: '' },
-      ],
-    },
-  },
-  {
-    id: 'user.project-acceptance',
-    name: '项目验收台',
-    description: '按工作区查看三个 Harness 的轮次、已记录的改动文件和验证结果，支持筛选和定位到原轮次。',
-    version: '1.0.0',
-    apiVersion: 2,
-    category: 'ui',
-    tags: ['验收', '工作区'],
-    contributes: {
-      projections: [{ id: 'turns', scope: 'workspace', events: ['turn.completed', 'turn.failed', 'turn.cancelled'] }],
-      dataPanels: [{
-        id: 'acceptance', title: '项目验收台', projection: 'turns', counts: true,
-        filters: ['harness', 'status'], openTurn: true, placements: ['sidebar_tool', 'composer_action'],
-        columns: [
-          { field: 'time', label: '时间' }, { field: 'session', label: '会话' },
-          { field: 'harness', label: 'Harness' }, { field: 'status', label: '轮次' },
-          { field: 'changed_files', label: '改动文件' }, { field: 'verifications', label: '验证结果' },
-        ],
-        copySummary: { label: '复制验收摘要', command: 'acceptance' },
-      }],
-    },
-  },
-  {
-    id: 'ext.git-pr-studio',
-    name: 'Git 提交与 PR 写作套件',
-    version: '1.0.0',
-    description: '新增 /commit、/pr-desc、/changelog 三个工程斜杠指令，自动基于 git diff 生成规范说明。',
-    author: 'HarnessMate Community',
-    category: 'workflow',
-    tags: ['Slash 指令', 'Git', '效率'],
-    contributes: {
-      slashCommands: [
-        {
-          command: 'commit',
-          description: '根据当前 git diff 生成 Conventional Commit 提交信息',
-          argumentHint: '[可选补充说明]',
-          template:
-            '请查看当前 git status 与 git diff，总结本次改动意图，并给出符合 Conventional Commits 规范的中英双语提交信息（不直接执行 git push）。\n\n补充：{{args}}',
-        },
-        {
-          command: 'pr-desc',
-          description: '生成结构化 Pull Request 评审说明',
-          argumentHint: '[基线分支名]',
-          template:
-            '请基于当前分支相对主分支的改动，撰写清晰的 PR 描述：包含变更背景、核心改动清单、验证证据与潜在风险点。\n\n参考基线：{{args}}',
-        },
-        {
-          command: 'changelog',
-          description: '整理面向用户的版本更新日志',
-          template:
-            '请整理近期提交记录，按「新增特性 / 问题修复 / 体验优化」分类生成简洁的更新日志。\n\n范围：{{args}}',
-        },
-      ],
-    },
-  },
-  {
-    id: 'ext.security-auditor',
-    name: '安全审计与凭据扫描套件',
-    version: '1.0.0',
-    description: '提供 /sec-audit 与 /deps-check 指令，快速排查硬编码密钥、注入风险与权限越界。',
-    author: 'HarnessMate Community',
-    category: 'workflow',
-    tags: ['安全', '审计', 'Slash 指令'],
-    contributes: {
-      slashCommands: [
-        {
-          command: 'sec-audit',
-          description: '扫描工作区安全漏洞与敏感密钥泄露风险',
-          argumentHint: '[目录或模块]',
-          template:
-            '请以安全审计员视角检查工作区代码：重点排查硬编码凭据、命令/SQL 注入、路径遍历、未鉴权端点与不安全的反序列化，并按严重度给出修复建议。\n\n范围：{{args}}',
-        },
-        {
-          command: 'deps-check',
-          description: '检查依赖树风险与过时包',
-          template:
-            '请检查项目依赖清单，识别高危、废弃或存在明显冲突的依赖包并给出升级建议。\n\n补充：{{args}}',
-        },
-      ],
-    },
-  },
-  {
-    id: 'ext.mcp-devtools-pack',
-    name: '常用开发 MCP 预设包',
-    version: '1.0.0',
-    description: '提供 Context7 文档查询、Filesystem、Playwright 浏览器与 Sequential Thinking 一键安装预设。',
-    author: 'HarnessMate Community',
-    category: 'mcp',
-    tags: ['MCP', '一键安装', '工具链'],
-    contributes: {
-      mcpPresets: [
-        {
-          name: 'context7',
-          description: '实时拉取最新开源库官方文档与 API 示例',
-          transport: 'stdio',
-          command: 'npx',
-          args: ['-y', '@upstash/context7-mcp'],
-        },
-        {
-          name: 'sequential-thinking',
-          description: '结构化多步推理与复杂问题拆解 MCP',
-          transport: 'stdio',
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-sequential-thinking'],
-        },
-        {
-          name: 'playwright',
-          description: '自动化浏览器调试、页面截图与端到端测试 MCP',
-          transport: 'stdio',
-          command: 'npx',
-          args: ['-y', '@playwright/mcp@latest'],
-        },
-      ],
-    },
-  },
-  {
-    id: 'ext.acp-opencode',
-    name: 'OpenCode CLI (ACP 适配器插件)',
-    version: '1.0.0',
-    description: '通过标准 ACP 协议将本机 OpenCode CLI 接入 HarnessMate 多端统一前端。',
-    author: 'HarnessMate Community',
-    category: 'harness',
-    tags: ['ACP', 'Harness', 'OpenCode'],
-    contributes: {
-      harnesses: [
-        {
-          id: 'opencode',
-          displayName: 'OpenCode CLI',
-          description: 'OpenCode CLI via Agent Client Protocol',
-          command: 'opencode',
-          args: ['acp'],
-        },
-      ],
-    },
-  },
-  {
-    id: 'ext.acp-gemini',
-    name: 'Gemini CLI (ACP 适配器插件)',
-    version: '1.0.0',
-    description: '通过标准 ACP 协议接入 Google Gemini CLI，与 Codex/AGY/Claude 同台协作。',
-    author: 'HarnessMate Community',
-    category: 'harness',
-    tags: ['ACP', 'Harness', 'Gemini'],
-    contributes: {
-      harnesses: [
-        {
-          id: 'gemini-cli',
-          displayName: 'Gemini CLI',
-          description: 'Google Gemini CLI via ACP (--experimental-acp)',
-          command: 'gemini',
-          args: ['--experimental-acp'],
-        },
-      ],
-    },
-  },
-];
-
 interface LoadedPluginRecord {
   info: InstalledPluginInfo;
   runtime?: PluginRuntime;
@@ -383,9 +42,9 @@ interface LoadedPluginRecord {
   digest?: string;
 }
 
-export class PluginRevisionConflictError extends Error {
+export class PluginRevisionConflictError extends PluginApiError {
   constructor() {
-    super('已安装的插件版本已变更，请重新预览后再安装');
+    super('E_CONFLICT', '已安装的插件版本已变更，请重新预览后再安装');
   }
 }
 
@@ -394,15 +53,27 @@ export class PluginManager {
   private readonly pluginHarnesses = new Map<string, { adapter: HarnessAdapter; config: string }>();
   private mutation = Promise.resolve();
   private registryChanged = false;
+  private readonly composition: PluginComposition;
+  private compositionError?: string;
+  readonly host = new PluginHost((error) => console.error('插件生命周期错误', error));
 
   constructor(
     private readonly pluginsDir: string,
     private readonly registry: HarnessRegistry,
     private readonly getDisabledIds: () => string[],
-    private readonly setDisabledIds: (ids: string[]) => void,
+    private readonly firstParty: ReadonlyMap<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>> = new Map(),
   ) {
     fs.mkdirSync(this.pluginsDir, { recursive: true });
     this.pluginsDir = fs.realpathSync(this.pluginsDir);
+    this.composition = new PluginComposition(path.dirname(this.pluginsDir), BUILTIN_PLUGINS.map(({ id }) => id));
+  }
+
+  private installedNames(records = this.plugins): string[] {
+    return [...records.values()].filter(({ info }) => !info.builtin && !info.id.startsWith('broken.')).map(({ info }) => info.id);
+  }
+
+  getComposition() {
+    return { ...this.composition.resolve(this.installedNames()), error: this.compositionError };
   }
 
   private serialize<T>(action: () => Promise<T>): Promise<T> {
@@ -426,10 +97,15 @@ export class PluginManager {
 
   private async loadRegistry(): Promise<void> {
     const next = new Map<string, LoadedPluginRecord>();
-    const disabledSet = new Set(this.getDisabledIds());
+    try {
+      this.composition.reload(this.getDisabledIds());
+      this.compositionError = undefined;
+    } catch (error) {
+      this.compositionError = error instanceof Error ? error.message : String(error);
+    }
 
     for (const manifest of BUILTIN_PLUGINS) {
-      const enabled = !disabledSet.has(manifest.id);
+      const enabled = this.desiredEnabled(manifest.id, true);
       next.set(manifest.id, {
         info: {
           ...manifest,
@@ -446,39 +122,38 @@ export class PluginManager {
     for (const entry of directories) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
       const root = path.join(this.pluginsDir, entry.name);
+      let manifest: PluginManifest | undefined;
       try {
         const pointer = readRevisionPointer(root);
         const directory = pointer ? revisionDirectory(root, pointer.current) : root;
         if (!pointer && !fs.existsSync(path.join(root, MANIFEST_FILE))) continue;
         const pack = readPluginPackage(directory);
+        manifest = pack.manifest;
         if (pointer?.currentDigest && pointer.currentDigest !== pack.digest) {
           throw new Error('插件文件已变更，请重新预览并安装');
         }
-        if (pack.manifest.entry) {
-          if (!pointer) throw new Error('带 JavaScript 的插件需在插件中心预览并确认信任');
-          if (!pointer.currentDigest) {
-            const approved = this.plugins.get(pack.manifest.id)?.digest;
-            if (approved && approved !== pack.digest) throw new Error('插件程序文件已变更，请重新预览并确认信任');
-            writeRevisionPointer(root, { ...pointer, currentDigest: pack.digest });
-          }
-        }
+        this.checkPackageTrust(pack, pointer?.currentDigest, pointer?.currentTrusted);
         if (next.has(pack.manifest.id)) throw new Error('插件 ID 重复');
         this.validateManifest(pack.manifest, next);
-        const enabled = !disabledSet.has(pack.manifest.id);
+        const enabled = this.desiredEnabled(pack.manifest.id, false);
         const record = await this.prepare(pack, directory, root, enabled, Boolean(pointer?.previous));
         next.set(pack.manifest.id, record);
       } catch (error) {
         const previous = [...this.plugins.values()].find((record) => record.info.sourcePath === root);
         const message = error instanceof Error ? error.message : String(error);
-        if (previous && !next.has(previous.info.id) && !previous.runtime?.failed) {
+        if (previous && !next.has(previous.info.id) && !previous.runtime?.failed && !requiresPluginTrust(previous.info)) {
           previous.info.loadError = message;
           next.set(previous.info.id, previous);
         } else {
-          const id = previous?.info.id ?? `broken.${entry.name}`;
+          const preferredId = previous?.info.id ?? manifest?.id;
+          const id = preferredId && !next.has(preferredId) && !preferredId.startsWith('core.')
+            ? preferredId : `broken.${entry.name}`;
           next.set(id, { info: {
             ...previous?.info,
-            id, name: previous?.info.name ?? entry.name, version: previous?.info.version ?? '0.0.0',
-            description: previous?.info.description ?? '插件加载失败', category: previous?.info.category ?? 'workflow',
+            id, name: previous?.info.name ?? manifest?.name ?? entry.name,
+            version: previous?.info.version ?? manifest?.version ?? '0.0.0',
+            description: previous?.info.description ?? manifest?.description ?? '插件加载失败',
+            category: previous?.info.category ?? manifest?.category ?? 'workflow',
             contributes: previous?.info.contributes ?? {}, builtin: false, enabled: false,
             sourcePath: root, hasRuntimeHook: false, loadError: message,
             canRollback: Boolean(this.tryPrevious(root)),
@@ -494,9 +169,24 @@ export class PluginManager {
   }
 
   private activate(next: Map<string, LoadedPluginRecord>): void {
+    const previousAdapters = this.registry.listAdapters();
+    const composition = this.composition.resolve(this.installedNames(next));
+    const entries = new Map(composition.entries.map((entry) => [entry.name, entry]));
+    const ranked = [...next.values()].sort((first, second) =>
+      composition.entries.findIndex(({ name }) => name === first.info.id) -
+      composition.entries.findIndex(({ name }) => name === second.info.id));
+    const definitions: HostPlugin[] = ranked.map(({ info, digest, packageRoot }) => {
+      const entry = entries.get(info.id);
+      const core = this.firstParty.get(info.id);
+      return { id: info.id, enabled: info.enabled, revision: JSON.stringify([digest, entry?.config, info.inject]),
+        error: info.loadError && !packageRoot && !info.builtin ? info.loadError : undefined,
+        inject: core?.inject ?? info.inject, provides: core?.provides, apply: core?.apply ?? (() => {}),
+        config: entry?.config };
+    });
+    this.host.reconcile(definitions);
     const wanted = new Map<string, NonNullable<PluginManifest['contributes']['harnesses']>[number]>();
     for (const rec of next.values()) {
-      if (!rec.info.enabled) continue;
+      if (!rec.info.enabled || this.host.status(rec.info.id)?.state !== 'ACTIVE' || !this.host.get('harness.acp')) continue;
       for (const config of rec.info.contributes.harnesses ?? []) wanted.set(config.id, config);
     }
     for (const [id, record] of this.pluginHarnesses) {
@@ -520,6 +210,16 @@ export class PluginManager {
       if (record.runtime !== next.get(id)?.runtime) record.runtime?.retire();
     }
     this.plugins = next;
+    const adapters = this.registry.listAdapters();
+    this.registryChanged ||= adapters.length !== previousAdapters.length ||
+      previousAdapters.some((adapter) => this.registry.get(adapter.id) !== adapter);
+  }
+
+  private desiredEnabled(id: string, builtin: boolean): boolean {
+    const installed = this.installedNames();
+    if (!builtin && !installed.includes(id)) installed.push(id);
+    const entry = this.composition.resolve(installed).entries.find(({ name }) => name === id);
+    return entry ? !entry.disabled : !builtin;
   }
 
   private async prepare(pack: PluginPackage, directory: string, root: string, enabled: boolean, canRollback: boolean) {
@@ -530,7 +230,7 @@ export class PluginManager {
     };
     if (enabled && pack.manifest.entry) {
       const old = this.plugins.get(pack.manifest.id);
-      if (old?.packageRoot === directory && old.digest === pack.digest && old.runtime && !old.runtime.failed) {
+      if (old?.packageRoot === directory && old.digest === pack.digest && old.runtime?.reusable) {
         record.runtime = old.runtime;
       } else {
         const runtime = new PluginRuntime(path.join(directory, pack.manifest.entry.replace(/\\/g, '/')), (error) => {
@@ -552,6 +252,10 @@ export class PluginManager {
   }
 
   validateManifest(manifest: PluginManifest, occupied = this.plugins): void {
+    const normalized = normalizePluginManifest(manifest);
+    if ((!manifest.entry && normalized.main) || normalized.provides?.length) {
+      throw new PluginApiError('E_NOT_SUPPORTED', 'V4 代码入口与第三方服务提供方将在隔离运行时开放');
+    }
     if (manifest.id.startsWith('core.') || manifest.id.startsWith('broken.')) throw new Error('插件 ID 使用了保留前缀');
     const other = [...occupied.values()].filter(({ info }) => info.id !== manifest.id);
     const commands = new Set<string>([...HarnessCommandNameSchema.options, 'quota', 'plugins']);
@@ -574,7 +278,7 @@ export class PluginManager {
       const current = this.registry.get(config.id);
       const owned = (owns.has(config.id) || this.plugins.get(manifest.id)?.info.contributes.harnesses?.some(({ id }) => id === config.id))
         && this.pluginHarnesses.get(config.id)?.adapter === current;
-      if (contributedHarnesses.has(config.id) || (current && !owned)) {
+      if (this.registry.isReserved(config.id) || contributedHarnesses.has(config.id) || (current && !owned)) {
         throw new Error(`Harness ID ${config.id} 已被占用`);
       }
       contributedHarnesses.add(config.id);
@@ -588,14 +292,7 @@ export class PluginManager {
         if (!ownCommands.has(action.command)) throw new Error(`面板操作必须引用本插件的指令 /${action.command}`);
       }
     }
-    const { projections, dataPanels, harnesses, mcpPresets, hooks, uiSlots, actions, programs } = manifest.contributes;
-    if ((manifest.apiVersion ?? 1) < 2 && (projections || dataPanels)) {
-      throw new Error('事件投影和数据面板需要 apiVersion: 2 或更高版本');
-    }
-    if ((manifest.apiVersion ?? 1) >= 2 && (manifest.entry || harnesses?.length || mcpPresets?.length || hooks?.length || uiSlots?.length)) {
-      throw new Error('V2/V3 插件使用声明式扩展接口');
-    }
-    if (manifest.apiVersion !== 3 && (actions || programs)) throw new Error('插件动作和处理程序需要 apiVersion: 3');
+    const { projections, dataPanels, actions, programs } = normalized.contributes;
     const programIds = new Set(programs?.map(({ id }) => id));
     if (programIds.size !== (programs?.length ?? 0)) throw new Error('插件处理程序 ID 不能重复');
     for (const action of actions ?? []) {
@@ -623,14 +320,18 @@ export class PluginManager {
 
   getDataPanel(pluginId: string, panelId: string) {
     const plugin = this.plugins.get(pluginId)?.info;
-    if (!plugin?.enabled) return undefined;
+    if (!plugin || !this.isPluginEnabled(pluginId)) return undefined;
     const panel = plugin.contributes.dataPanels?.find(({ id }) => id === panelId);
     const projection = plugin.contributes.projections?.find(({ id }) => id === panel?.projection);
     return panel && projection ? { panel, projection } : undefined;
   }
 
   listInstalled(): InstalledPluginInfo[] {
-    return Array.from(this.plugins.values()).map((r) => r.info);
+    return [...this.plugins.values()].map(({ info, runtime }) => {
+      const status = this.host.status(info.id);
+      return { ...info, runtimeState: runtime?.failed ? 'FAILED' : status?.state,
+        missingServices: status?.missingServices, loadError: status?.error ?? info.loadError };
+    });
   }
 
   listCatalog(): PluginCatalogItem[] {
@@ -642,13 +343,13 @@ export class PluginManager {
 
   isPluginEnabled(id: string): boolean {
     const rec = this.plugins.get(id);
-    return rec ? rec.info.enabled : true;
+    return Boolean(rec?.info.enabled && this.host.status(id)?.state === 'ACTIVE' && !rec.runtime?.failed);
   }
 
   listActiveSlashCommands(): Array<PluginSlashCommand & { pluginId: string; pluginName: string }> {
     const cmds: Array<PluginSlashCommand & { pluginId: string; pluginName: string }> = [];
     for (const rec of this.plugins.values()) {
-      if (!rec.info.enabled) continue;
+      if (!this.isPluginEnabled(rec.info.id)) continue;
       for (const cmd of rec.info.contributes.slashCommands ?? []) {
         cmds.push({
           ...cmd,
@@ -663,7 +364,7 @@ export class PluginManager {
   listActiveMcpPresets(): Array<PluginMcpPreset & { pluginId: string; pluginName: string }> {
     const presets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }> = [];
     for (const rec of this.plugins.values()) {
-      if (!rec.info.enabled) continue;
+      if (!this.isPluginEnabled(rec.info.id)) continue;
       for (const preset of rec.info.contributes.mcpPresets ?? []) {
         presets.push({
           ...preset,
@@ -687,11 +388,9 @@ export class PluginManager {
         this.validateManifest(pack.manifest);
         candidate = await this.prepare(pack, record.packageRoot, record.info.sourcePath!, true, Boolean(record.info.canRollback));
       }
-      const disabled = new Set(this.getDisabledIds());
-      if (enabled) disabled.delete(id);
-      else disabled.add(id);
       try {
-        this.setDisabledIds([...disabled]);
+        if (this.compositionError) throw new PluginApiError('E_INVALID_INPUT', this.compositionError);
+        this.composition.setEnabled(id, enabled, this.installedNames());
       } catch (error) {
         if (candidate.runtime !== record.runtime) candidate.runtime?.retire();
         throw error;
@@ -722,6 +421,7 @@ export class PluginManager {
       installedManifest: current?.packageRoot ? PluginManifestSchema.parse(current.info) : undefined,
       installedDigest: current?.digest ?? null,
       installedEnabled: current?.info.enabled,
+      missingServices: manifest.inject?.filter((name) => !this.host.get(name)) ?? [],
     };
   }
 
@@ -730,26 +430,40 @@ export class PluginManager {
     return { ...this.reviewManifest(manifest, expectedInstalledDigest), digest, fileCount: files.size };
   }
 
+  private checkPackageTrust(pack: PluginPackage, digest?: string, trusted?: boolean): void {
+    const manifest = pack.manifest;
+    const legacyCodeApproval = manifest.entry && !manifest.contributes.harnesses?.length && !manifest.contributes.mcpPresets?.length;
+    if (requiresPluginTrust(manifest) && (digest !== pack.digest || !(trusted || legacyCodeApproval))) {
+      throw new Error('请在插件中心重新预览并确认信任此插件包');
+    }
+  }
+
+  private resolveInstallPackage(req: InstallPluginRequest): PluginPackage {
+    if (req.mode === 'local_dir') return readPluginPackage(req.dirPath);
+    const source = req.mode === 'manifest' ? req.manifest : CURATED_PLUGIN_CATALOG.find(({ id }) => id === req.catalogId);
+    if (!source) throw new Error('找不到目录中的插件');
+    const manifest = PluginManifestSchema.parse(source);
+    if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
+    return manifestPluginPackage(manifest);
+  }
+
+  previewInstall(req: InstallPluginRequest) {
+    const { manifest, files, digest } = this.resolveInstallPackage(req);
+    return { ...this.reviewManifest(manifest, req.expectedInstalledDigest), digest, fileCount: files.size,
+      requiresTrust: requiresPluginTrust(manifest) };
+  }
+
   installPlugin(req: InstallPluginRequest): Promise<InstalledPluginInfo[]> {
     return this.serialize(async () => {
-      let pack: PluginPackage;
-      if (req.mode === 'local_dir') {
-        pack = readPluginPackage(req.dirPath);
-        if (req.expectedDigest && req.expectedDigest !== pack.digest) throw new Error('插件文件已更改，请重新预览');
-        if (pack.manifest.entry && (!req.trustCode || !req.expectedDigest)) {
-          throw new Error('请预览本地插件并确认信任其中的 JavaScript');
-        }
-      } else {
-        const source = req.mode === 'manifest' ? req.manifest : CURATED_PLUGIN_CATALOG.find((item) => item.id === req.catalogId);
-        if (!source) throw new Error('找不到目录中的插件');
-        const manifest = PluginManifestSchema.parse(source);
-        if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
-        pack = { manifest, files: new Map([[MANIFEST_FILE, Buffer.from(JSON.stringify(manifest, null, 2))]]), digest: '' };
-      }
+      const pack = this.resolveInstallPackage(req);
+      if (req.expectedDigest && req.expectedDigest !== pack.digest) throw new Error('插件文件已更改，请重新预览');
+      const trusted = requiresPluginTrust(pack.manifest);
+      if (trusted && (!req.trustCode || !req.expectedDigest)) throw new Error('请预览并确认信任此插件包');
       this.validateManifest(pack.manifest);
       const id = pack.manifest.id;
-      const old = this.checkInstalledDigest(id, req.mode === 'catalog' ? undefined : req.expectedInstalledDigest);
-      const root = old?.info.sourcePath ?? path.join(this.pluginsDir, id);
+      const old = this.checkInstalledDigest(id, req.expectedInstalledDigest);
+      const broken = [...this.plugins.values()].find(({ info }) => info.id === `broken.${id}`);
+      const root = old?.info.sourcePath ?? broken?.info.sourcePath ?? path.join(this.pluginsDir, id);
       this.checkPluginRoot(root);
       const pointer = readRevisionPointer(root);
       const legacy = !pointer && old?.packageRoot ? readPluginPackage(old.packageRoot) : undefined;
@@ -757,15 +471,18 @@ export class PluginManager {
       const previousDigest = pointer?.currentDigest ?? old?.digest ?? legacy?.digest;
       const revision = writeRevision(root, pack.files);
       const directory = revisionDirectory(root, revision);
-      const enabled = !this.getDisabledIds().includes(id);
+      const enabled = this.desiredEnabled(id, false);
       let candidate: LoadedPluginRecord | undefined;
       try {
-        candidate = await this.prepare(readPluginPackage(directory), directory, root, true, Boolean(previous));
+        const saved = readPluginPackage(directory);
+        if (saved.digest !== pack.digest) throw new PluginApiError('E_CONFLICT', '待安装插件包内容发生变化');
+        candidate = await this.prepare(saved, directory, root, true, Boolean(previous));
         if (!enabled) {
           candidate.runtime?.retire();
           candidate = { ...candidate, runtime: undefined, info: { ...candidate.info, enabled, hasRuntimeHook: false } };
         }
-        writeRevisionPointer(root, { current: revision, previous, currentDigest: candidate.digest, previousDigest });
+        writeRevisionPointer(root, { current: revision, previous, currentDigest: candidate.digest, previousDigest,
+          currentTrusted: trusted, previousTrusted: pointer?.currentTrusted });
       } catch (error) {
         candidate?.runtime?.retire();
         this.removeRevision(root, revision);
@@ -793,11 +510,14 @@ export class PluginManager {
       if (pointer.previousDigest && pointer.previousDigest !== pack.digest) {
         throw new Error('回退版本的插件文件已变更，请重新预览并安装');
       }
+      if (pack.manifest.id !== id) throw new Error('回退版本的插件 ID 不匹配');
+      this.checkPackageTrust(pack, pointer.previousDigest, pointer.previousTrusted);
       this.validateManifest(pack.manifest);
-      const candidate = await this.prepare(pack, directory, root, !this.getDisabledIds().includes(pack.manifest.id), true);
+      const candidate = await this.prepare(pack, directory, root, this.desiredEnabled(pack.manifest.id, false), true);
       try {
         writeRevisionPointer(root, { current: pointer.previous, previous: pointer.current,
-          currentDigest: pack.digest, previousDigest: pointer.currentDigest });
+          currentDigest: pack.digest, previousDigest: pointer.currentDigest,
+          currentTrusted: pointer.previousTrusted, previousTrusted: pointer.currentTrusted });
       } catch (error) {
         candidate.runtime?.retire();
         throw error;
@@ -818,7 +538,7 @@ export class PluginManager {
       const removed = path.join(this.pluginsDir, `.uninstalled-${randomUUID()}`);
       fs.renameSync(root, removed);
       try {
-        this.setDisabledIds(this.getDisabledIds().filter((disabled) => disabled !== id));
+        if (!this.compositionError) this.composition.removePlugin(id);
       } catch (error) {
         fs.renameSync(removed, root);
         throw error;
@@ -843,12 +563,24 @@ export class PluginManager {
   }
 
   notifyEvent(event: CanonicalEvent): void {
-    if (!['turn.completed', 'turn.failed', 'turn.cancelled'].includes(event.type)) return;
+    const mapped = toPluginEvent(event);
+    if (!mapped) return;
+    void this.host.events.dispatch(mapped);
+    if (mapped.type !== 'turn.completed' && mapped.type !== 'turn.failed' && mapped.type !== 'turn.cancelled') return;
+    const { harnessKind, model, actualModel, code, maintenance } = event.payload;
+    const legacy = { sessionId: event.sessionId, seq: event.seq, type: mapped.type, turnId: event.turnId,
+      createdAt: event.createdAt, payload: { ...mapped.data,
+        ...(typeof harnessKind === 'string' ? { harnessKind } : {}),
+        ...(typeof model === 'string' || model === null ? { model } : {}),
+        ...(typeof actualModel === 'string' || actualModel === null ? { actualModel } : {}),
+        ...(typeof code === 'string' ? { code } : {}),
+        ...(maintenance === true ? { maintenance } : {}),
+      } };
     for (const record of this.plugins.values()) {
-      if (!record.info.enabled || !record.runtime?.hooks.includes('onEvent') || record.runtime.failed) continue;
+      if (!this.isPluginEnabled(record.info.id) || !record.runtime?.hooks.includes('onEvent')) continue;
       const hooks = record.info.contributes.hooks ?? [];
       if (!hooks.includes('on_event') && !hooks.includes('after_turn')) continue;
-      void record.runtime.request('onEvent', event).catch((error: Error) => {
+      void record.runtime.request('onEvent', legacy).catch((error: Error) => {
         record.info.loadError = error.message;
       });
     }
@@ -857,16 +589,14 @@ export class PluginManager {
   async close(): Promise<void> {
     await this.mutation;
     for (const record of this.plugins.values()) record.runtime?.retire();
+    this.host.reconcile([]);
   }
 
-  /**
-   * Expands active plugin slash commands (/cmd args) and runs any enabled JS beforeTurn hooks.
-   */
-  async processBeforeTurn(ctx: PluginTurnHookContext): Promise<{
+  expandSlashCommand(input: string): {
     text: string;
     expandedCommand?: string;
-  }> {
-    let text = ctx.text;
+  } {
+    let text = input;
     let expandedCommand: string | undefined;
 
     const trimmed = text.trim();
@@ -874,7 +604,7 @@ export class PluginManager {
       const match = trimmed.match(/^\/([a-z0-9][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i);
       if (match?.[1]) {
         const cmdName = match[1].toLowerCase();
-        if ([...this.plugins.values()].some(({ info }) => info.enabled &&
+        if ([...this.plugins.values()].some(({ info }) => this.isPluginEnabled(info.id) &&
           (info.contributes.dataPanels?.some(({ copySummary }) => copySummary?.command === cmdName) ||
             info.contributes.actions?.some(({ command }) => command === cmdName)))) {
           throw new Error(`/${cmdName} 是桌面插件面板命令或动作，请在桌面聊天中使用`);
@@ -882,27 +612,36 @@ export class PluginManager {
         const args = (match[2] ?? '').trim();
         const found = this.listActiveSlashCommands().find((c) => c.command === cmdName);
         if (found) {
-          text = found.template.replace(/\{\{args\}\}/g, args || '（无额外参数）');
+          text = found.template.replace(/\{\{args\}\}/g, () => args || '（无额外参数）');
           expandedCommand = `/${cmdName}`;
         }
       }
     }
 
+    return { text, expandedCommand };
+  }
+
+  async suggestBeforeTurn(ctx: PluginTurnHookContext): Promise<{ text: string; pluginNames: string[] } | null> {
+    const expanded = this.expandSlashCommand(ctx.text);
+    let text = expanded.text;
+    const pluginNames: string[] = [];
     const deadline = Date.now() + 1500;
     for (const rec of this.plugins.values()) {
-      if (!rec.info.enabled || !rec.runtime?.hooks.includes('beforeTurn') || rec.runtime.failed) continue;
+      if (!this.isPluginEnabled(rec.info.id) || !rec.runtime?.hooks.includes('beforeTurn')) continue;
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       try {
         const res = await rec.runtime.request('beforeTurn', { ...ctx, text }, Math.min(800, remaining)) as { text?: string } | undefined;
-        if (res && typeof res.text === 'string' && res.text.trim() && res.text.length <= Math.max(100_000, text.length)) {
+        if (res && typeof res.text === 'string' && res.text !== text && res.text.trim() &&
+          res.text.length <= Math.max(100_000, text.length) && this.plugins.get(rec.info.id)?.runtime === rec.runtime) {
           text = res.text;
+          pluginNames.push(rec.info.name);
         }
       } catch (error) {
         rec.info.loadError = error instanceof Error ? error.message : String(error);
       }
     }
 
-    return { text, expandedCommand };
+    return text !== expanded.text ? { text, pluginNames } : null;
   }
 }

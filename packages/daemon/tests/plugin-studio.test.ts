@@ -56,7 +56,9 @@ it('generates a reviewable draft, hot loads it and preserves the previous revisi
     expect(preview.statusCode).toBe(200);
     expect((await post('install', { mode: 'manifest', manifest: draft })).statusCode).toBe(201);
     const turn = { sessionId: 'test', harnessId: 'codex', cwd: workspacePath, text: '/delivery recent changes' };
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'Summarize recent changes' });
+    expect(daemon.pluginManager.expandSlashCommand(turn.text)).toMatchObject({ text: 'Summarize recent changes' });
+    expect(daemon.pluginManager.expandSlashCommand('/delivery $& $$ $1'))
+      .toMatchObject({ text: 'Summarize $& $$ $1' });
     expect(daemon.registry.get('codex')).toBe(adapter);
 
     const codeManifest = { ...draft, version: '2.0.0', entry: 'entry.mjs' };
@@ -68,25 +70,34 @@ it('generates a reviewable draft, hot loads it and preserves the previous revisi
     const failed = await post('install', { ...codeRequest, expectedDigest: firstPreview.digest, trustCode: true });
     expect(failed.statusCode).toBe(400);
     expect(failed.json().error).toContain('broken upgrade');
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'Summarize recent changes' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(turn)).toBeNull();
 
     fs.writeFileSync(path.join(localPluginPath, 'entry.mjs'), 'export const beforeTurn = ({ text }) => ({ text: "v2 " + text });');
     expect((await post('install', { ...codeRequest, expectedDigest: firstPreview.digest, trustCode: true })).statusCode).toBe(400);
     const secondPreview = (await post('preview', codeRequest)).json();
     expect((await post('install', { ...codeRequest, expectedDigest: secondPreview.digest, trustCode: true })).statusCode).toBe(201);
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'v2 Summarize recent changes' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(turn)).toMatchObject({ text: 'v2 Summarize recent changes' });
+    expect(daemon.pluginManager.expandSlashCommand(turn.text)).toMatchObject({ text: 'Summarize recent changes' });
+    const activeSession = await daemon.sessionManager.createSession({
+      workspaceId: workspace.id, harnessId: 'codex', title: 'Review', permissionMode: 'manual',
+    });
+    const suggested = await daemon.app.inject({ method: 'POST', url: `/api/v1/sessions/${activeSession.id}/turn-suggestion`,
+      payload: { text: turn.text } });
+    expect(suggested.json()).toEqual({ suggestion: { text: 'v2 Summarize recent changes', pluginNames: ['Delivery'] } });
 
     await daemon.stop();
     daemon = createDaemon({ dataDir, port: 0 });
     await daemon.start();
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'v2 Summarize recent changes' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(turn)).toMatchObject({ text: 'v2 Summarize recent changes' });
     expect((await post(`${draft.id}/rollback`)).statusCode).toBe(200);
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'Summarize recent changes' });
-    fs.writeFileSync(path.join(localPluginPath, 'entry.mjs'), 'export function beforeTurn() { for (;;) {} }');
+    expect(await daemon.pluginManager.suggestBeforeTurn(turn)).toBeNull();
+    fs.writeFileSync(path.join(localPluginPath, 'entry.mjs'),
+      'export async function beforeTurn({text}) { if (text.includes("slow")) await new Promise(resolve => setTimeout(resolve, 1000)); return {text: "ready " + text}; }');
     const stuckPreview = (await post('preview', codeRequest)).json();
     expect((await post('install', { ...codeRequest, expectedDigest: stuckPreview.digest, trustCode: true })).statusCode).toBe(201);
-    expect(await daemon.pluginManager.processBeforeTurn(turn)).toMatchObject({ text: 'Summarize recent changes' });
+    expect(await daemon.pluginManager.suggestBeforeTurn({ ...turn, text: '/delivery slow' })).toBeNull();
     expect(daemon.pluginManager.listInstalled().find(({ id }) => id === draft.id)?.loadError).toContain('超时');
+    expect(await daemon.pluginManager.suggestBeforeTurn(turn)).toMatchObject({ text: 'ready Summarize recent changes' });
     expect((await post(`${draft.id}/rollback`)).statusCode).toBe(200);
     const reserved = { ...draft, id: 'user.bad', contributes: {
       slashCommands: [{ command: 'compact', description: 'Reserved', template: 'Reserved' }],
@@ -111,11 +122,11 @@ it('requires review for a dropped JavaScript package and verifies approved bytes
     fs.writeFileSync(path.join(directory, 'entry.mjs'), 'export const beforeTurn = ({ text }) => ({ text: `trusted ${text}` });');
     await daemon.start();
     const input = { text: 'test', sessionId: 'fixture-session', harnessId: 'codex', cwd: dataDir };
-    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'test' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(input)).toBeNull();
     expect(daemon.pluginManager.listInstalled().find((item) => item.sourcePath === directory)?.loadError).toContain('确认信任');
     const preview = daemon.pluginManager.inspectPackage(directory);
     await daemon.pluginManager.installPlugin({ mode: 'local_dir', dirPath: directory, expectedDigest: preview.digest, trustCode: true });
-    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'trusted test' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(input)).toMatchObject({ text: 'trusted test' });
     const pointer = readRevisionPointer(directory)!;
     expect(pointer.currentDigest).toBe(preview.digest);
     const entry = path.join(revisionDirectory(directory, pointer.current), 'entry.mjs');
@@ -123,7 +134,7 @@ it('requires review for a dropped JavaScript package and verifies approved bytes
     fs.writeFileSync(entry, 'export const beforeTurn = () => ({ text: "modified" });');
     daemon = createDaemon({ dataDir, port: 0 });
     await daemon.start();
-    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'test' });
+    expect(await daemon.pluginManager.suggestBeforeTurn(input)).toBeNull();
     expect(daemon.pluginManager.listInstalled().find((item) => item.sourcePath === directory)?.loadError).toContain('文件已变更');
   } finally {
     await daemon.stop();

@@ -60,8 +60,7 @@ it('projects persisted CLI events across a workspace and preserves the active pa
     }] });
     expect(await read('?harnessId=claude&offset=25')).toMatchObject({ total: 26, rows: [{ turnId: 'claude-0' }] });
     expect((await panels('?event=approval.requested')).statusCode).toBe(400);
-    await expect(daemon.pluginManager.processBeforeTurn({ sessionId: session.id, harnessId: 'codex', cwd: workspacePath,
-      text: '/acceptance' })).rejects.toThrow('桌面插件面板命令');
+    expect(() => daemon.pluginManager.expandSlashCommand('/acceptance')).toThrow('桌面插件面板命令');
 
     const installed = daemon.pluginManager.listInstalled().find(({ id }) => id === pluginId)!;
     const upgraded: PluginManifest = { ...installed, version: '1.1.0', contributes: {

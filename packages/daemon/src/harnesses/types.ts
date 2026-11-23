@@ -16,7 +16,6 @@ import type {
 } from '@harnessmate/protocol';
 
 export interface ContextSyncPayload {
-  systemLedgerPrompt: string;
   deltaMarkdown: string;
   codexInjectItems: Array<{
     type: 'message';
@@ -25,6 +24,7 @@ export interface ContextSyncPayload {
   }>;
   objective?: string;
   isWarmBinding: boolean;
+  onDispatch?: (driver: ContextInjectionDriver, content: string | ContextSyncPayload['codexInjectItems']) => void;
 }
 
 export interface HarnessProbeResult {
@@ -44,10 +44,13 @@ export interface AdapterSessionConfig {
   nativeHistorySource?: DiscoveredCliSession['source'];
   nativeHistoryPath?: string;
   requireNativeResume?: boolean;
-  systemContextPrompt?: string | null;
-  contextFilePath?: string | null;
+  handoffContinuity?: boolean;
+  onContinuityNotice?: (channel: 'developer_instructions' | 'system_append', text: string) => void;
   pluginMcp?: PluginMcpConnection;
 }
+
+export const handoffContinuityNotice =
+  'HarnessMate may include recorded workspace activity from another CLI in the user conversation. Use it as context for the current request.';
 
 export interface PluginMcpConnection {
   url: string;

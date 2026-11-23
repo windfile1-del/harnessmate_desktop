@@ -160,6 +160,11 @@ export function ChatStage() {
   const attachments = session ? draftAttachmentsBySession[session.id] ?? [] : [];
 
   const [sending, setSending] = useState(false);
+  const [suggestion, setSuggestion] = useState<{ key: string; text: string; pluginNames: string[] }>();
+  const suggestionKey = session ? JSON.stringify([session.id, session.harnessId, inputText, attachments.map(({ id }) => id)]) : '';
+  const activeSuggestion = suggestion?.key === suggestionKey ? suggestion : undefined;
+  const [omitHandoffFor, setOmitHandoffFor] = useState<string>();
+  const handoffOmitted = Boolean(session && omitHandoffFor === `${session.id}:${session.harnessId}`);
   const [uploading, setUploading] = useState(false);
   const [draggingOver, setDraggingOver] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -364,9 +369,10 @@ export function ChatStage() {
     textareaRef.current?.focus();
   };
 
-  const handleSend = async () => {
+  const handleSend = async (suggestionChoice?: 'apply' | 'original') => {
     const trimmed = inputText.trim();
-    if ((!trimmed && attachments.length === 0) || sending || (isRunning && !isGoalControl)) return;
+    if ((!trimmed && attachments.length === 0) || sending || (isRunning && !isGoalControl) ||
+      (activeSuggestion && !suggestionChoice)) return;
     const panelCommand = nativeCommands.some(({ command }) => command === typedCommand) ? undefined
       : panelCommands.find(({ command }) => command === typedCommand);
     if (panelCommand) {
@@ -425,10 +431,28 @@ export function ChatStage() {
     setSending(true);
     const outgoingText = trimmed || '请结合附带的图片/文件进行分析。';
     const outgoingAtts = [...attachments];
-    clearDraft(session.id);
-    setFilePickerOpen(false);
     try {
-      await sendTurn(session.id, outgoingText, outgoingAtts.length > 0 ? outgoingAtts : undefined);
+      const turnAttachments = outgoingAtts.length > 0 ? outgoingAtts : undefined;
+      const wantsPreview = !suggestionChoice && plugins.some((plugin) => plugin.hasRuntimeHook && isPluginEnabled(plugin.id));
+      if (wantsPreview) {
+        const { suggestion: proposed } = await daemonApi.previewTurnSuggestion(session.id, outgoingText, turnAttachments)
+          .catch(() => ({ suggestion: null }));
+        const currentDraft = useAppStore.getState();
+        if ((currentDraft.draftTextBySession[session.id] ?? '') !== inputText ||
+          JSON.stringify((currentDraft.draftAttachmentsBySession[session.id] ?? []).map(({ id }) => id)) !==
+            JSON.stringify(outgoingAtts.map(({ id }) => id))) return;
+        if (proposed) {
+          setSuggestion({ ...proposed, key: suggestionKey });
+          return;
+        }
+      }
+      setSuggestion(undefined);
+      clearDraft(session.id);
+      setFilePickerOpen(false);
+      const approved = suggestionChoice === 'apply' && activeSuggestion;
+      await sendTurn(session.id, approved ? approved.text : outgoingText, turnAttachments,
+        { omitHandoff: handoffOmitted, literalText: Boolean(approved) });
+      setOmitHandoffFor(undefined);
     } finally {
       setSending(false);
       textareaRef.current?.focus();
@@ -866,6 +890,15 @@ export function ChatStage() {
               </div>
             )}
 
+            {activeSuggestion && <section className="mb-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-3 text-[12px]">
+              <p className="text-[var(--text-primary)]">插件建议 · {activeSuggestion.pluginNames.join('、')}</p>
+              <pre className="my-2 max-h-44 overflow-auto whitespace-pre-wrap break-words text-[var(--text-secondary)]">{activeSuggestion.text}</pre>
+              <div className="flex justify-end gap-3 text-[var(--accent-indigo)]">
+                <button type="button" disabled={sending || isRunning} onClick={() => void handleSend('original')}>发送原文</button>
+                <button type="button" disabled={sending || isRunning} onClick={() => void handleSend('apply')}>采用建议并发送</button>
+              </div>
+            </section>}
+
             {/* Context Bridge Sync Status Strip (shown when active harness has un-synced delta turns) */}
             {contextBridgeEnabled && contextPreview && contextPreview.syncNeeded && (
               <div
@@ -879,7 +912,7 @@ export function ChatStage() {
                 <div className="flex min-w-0 items-center gap-1.5 truncate">
                   <Sparkles size={12} className="shrink-0 text-[var(--accent-indigo)]" />
                   <span className="truncate">
-                    下条消息将通过{' '}
+                    {handoffOmitted ? '本轮已移除上下文交接' : <>下条消息将通过{' '}
                     <strong className="font-medium text-[var(--accent-indigo)]">
                       {DRIVER_LABELS[contextPreview.driverPlanned] ?? contextPreview.driverPlanned}
                     </strong>{' '}
@@ -890,6 +923,7 @@ export function ChatStage() {
                     <span className="font-mono-code opacity-80">
                       (~{formatTokenCount(contextPreview.estimatedTokens)} tok)
                     </span>
+                    </>}
                   </span>
                 </div>
                 <button
@@ -899,6 +933,10 @@ export function ChatStage() {
                 >
                   <Eye size={11} />
                   预览上下文
+                </button>
+                <button type="button" className="shrink-0 cursor-pointer rounded-md px-2 py-0.5 text-[var(--accent-indigo)] hover:bg-[var(--bg-surface)]"
+                  onClick={() => setOmitHandoffFor(handoffOmitted ? undefined : `${session.id}:${session.harnessId}`)}>
+                  {handoffOmitted ? '恢复交接' : '本轮移除'}
                 </button>
               </div>
             )}
@@ -1329,6 +1367,16 @@ function TurnBlock({
           )}
         </div>
       )}
+
+      {turn.handoffSnapshots?.map(({ seq, driver, content, sourceHarnesses, accepted }) => (
+        <details key={seq} className="rounded-lg border border-[var(--border-hairline)] px-3 py-2 text-[11.5px]">
+          <summary className="cursor-pointer text-[var(--text-secondary)]">
+            上下文交接{sourceHarnesses.length > 0 && ` · 来自 ${sourceHarnesses.join('、')}`} · {DRIVER_LABELS[driver] ?? driver}
+            {!accepted && ' · 待确认'}
+          </summary>
+          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words">{content}</pre>
+        </details>
+      ))}
 
       {/* Assistant Execution & Response Column (Per-Turn Harness & Confirmed Model Attribution) */}
       <div className="space-y-3">

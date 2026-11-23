@@ -136,17 +136,22 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
           <p>{preview.result.manifest.description}</p>
           {preview.result.installedVersion && <p>已安装 {preview.result.installedVersion} → 草稿 {preview.result.manifest.version}。替换后可回退至已安装版本。</p>}
           {preview.result.installedEnabled === false && <p>该插件当前停用。安装后可在已安装列表启用。</p>}
+          {Boolean(preview.result.missingServices?.length) && <p>安装后等待服务 · {preview.result.missingServices?.join('、')}</p>}
           <PluginDraftReview preview={preview.result} workspaceId={workspaceId} />
-          {preview.result.manifest.entry && <label className="flex items-start gap-2">
+          {preview.result.requiresTrust && <label className="flex items-start gap-2">
             <input type="checkbox" checked={trustCode} onChange={(event) => setTrustCode(event.target.checked)} />
-            <span>我信任此目录中的 JavaScript。入口 {preview.result.manifest.entry} 以本机用户权限运行。</span>
+            <span>我信任此插件包。
+              {preview.result.manifest.entry && `JavaScript 入口 ${preview.result.manifest.entry} 以本机用户权限运行。`}
+              {preview.result.manifest.contributes.harnesses?.map(({ id, command, args }) => ` ${id} 将启动 ${[command, ...args].join(' ')}。`)}
+              {preview.result.manifest.contributes.mcpPresets?.map(({ name, command, args, url }) =>
+                ` MCP 预设 ${name} 使用 ${command ? [command, ...(args ?? [])].join(' ') : url ?? '外部服务'}。`)}
+            </span>
           </label>}
           <button type="button" className={`${button} bg-[var(--accent-indigo)] text-white`}
-            disabled={!!busy || (Boolean(preview.result.manifest.entry) && !trustCode)}
+            disabled={!!busy || (Boolean(preview.result.requiresTrust) && !trustCode)}
             onClick={() => void run('正在安装插件…', async () => {
-              const request = preview.request.mode === 'local_dir'
-                ? { ...preview.request, expectedDigest: preview.result.digest, trustCode, expectedInstalledDigest: preview.result.installedDigest }
-                : { ...preview.request, manifest: preview.result.manifest, expectedInstalledDigest: preview.result.installedDigest };
+              const request = { ...preview.request, expectedDigest: preview.result.digest, trustCode,
+                expectedInstalledDigest: preview.result.installedDigest };
               await installPlugin(request);
               onInstalled();
             })}>{preview.result.installedEnabled === false ? '保存版本' : preview.result.installedVersion ? '替换并热加载' : '安装并热加载'}</button>

@@ -9,13 +9,20 @@ import type {
   UpdateTaskStateRequest,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
-import { getGitStatusSummary } from './git-service.js';
+import type { getGitStatusSummary } from './git-service.js';
 
 const VERIFICATION_CMD_RE =
   /\b(test|vitest|jest|pytest|mocha|phpunit|rspec|typecheck|tsc|lint|eslint|biome|build|compile|check|gradle|gradlew|cargo\s+(test|check|build)|go\s+(test|vet|build)|pnpm\s+(test|build|typecheck|lint)|npm\s+(test|run\s+(test|build|lint|typecheck)))\b/i;
 
 export class TaskLedgerService {
-  constructor(private readonly store: HarnessMateStore) {}
+  constructor(private readonly store: HarnessMateStore,
+    private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined) {}
+
+  syncSession(session: Session): void {
+    const state = this.getOrCreate(session);
+    const ledgerFilePath = this.syncWorkspaceLedgerFile(session, state);
+    if (ledgerFilePath && ledgerFilePath !== state.ledgerFilePath) this.store.upsertTaskState({ ...state, ledgerFilePath });
+  }
 
   getOrCreate(session: Session): SessionTaskState {
     const existing = this.store.getTaskState(session.id);
@@ -151,8 +158,8 @@ export class TaskLedgerService {
     // Reconcile live git modified files (Workspace Truth) only when inside a git worktree
     try {
       if (hasGitRepoAncestor(session.cwd)) {
-        const git = await getGitStatusSummary(session.cwd);
-        if (git.isGitRepo) {
+        const git = await this.gitStatus(session.cwd);
+        if (git?.isGitRepo) {
           for (const ch of git.changes) {
             if (ch.path && !ch.path.startsWith('.harnessmate/')) {
               touchedFiles.add(ch.path);
@@ -275,7 +282,7 @@ export class TaskLedgerService {
    * Renders the Task State Ledger into crisp, structured Markdown suitable both
    * for injection into any Harness and for `<cwd>/.harnessmate/task-ledger.md`.
    */
-  renderLedgerMarkdown(state: SessionTaskState, session: Session): string {
+  renderLedgerMarkdown(state: SessionTaskState, session: Session, style: 'directive' | 'reference' = 'directive'): string {
     const lines: string[] = [
       '# HarnessMate Task State Ledger',
       '',
@@ -283,7 +290,7 @@ export class TaskLedgerService {
       `- **Workspace**: \`${session.cwd}\``,
       `- **Active Harness**: \`${session.harnessId}\`${session.actualModel || session.model ? ` (${session.actualModel || session.model})` : ''}`,
       `- **Collaborating Harnesses**: ${(session.participatingHarnesses?.length ? session.participatingHarnesses : [session.harnessId]).join(', ')}`,
-      `- **Ledger Version**: v${state.version} · Updated ${new Date(state.updatedAt).toISOString()}`,
+      ...(style === 'directive' ? [`- **Ledger Version**: v${state.version} · Updated ${new Date(state.updatedAt).toISOString()}`] : []),
       '',
     ];
 
@@ -292,7 +299,7 @@ export class TaskLedgerService {
     }
 
     if (state.pinnedFacts.length > 0) {
-      lines.push('## Pinned Constraints (MUST FOLLOW — NEVER FORGET)', '');
+      lines.push(style === 'reference' ? '## Previously Recorded Constraints' : '## Pinned Constraints (MUST FOLLOW — NEVER FORGET)', '');
       for (const fact of state.pinnedFacts) {
         lines.push(`- [PINNED] ${fact}`);
       }
@@ -350,7 +357,7 @@ export class TaskLedgerService {
       lines.push('');
     }
 
-    if (state.rollingSummary) {
+    if (state.rollingSummary && style === 'directive') {
       lines.push('## Historical Digest', '', state.rollingSummary, '');
     }
 

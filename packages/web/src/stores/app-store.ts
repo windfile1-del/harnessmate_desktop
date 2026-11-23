@@ -159,7 +159,8 @@ interface AppState {
   updateTaskState: (sessionId: string, patch: UpdateTaskStateRequest) => Promise<void>;
   summarizeTaskState: (sessionId: string) => Promise<void>;
   handoffSession: (sourceId: string, targetHarnessId: string, targetModel?: string | null) => Promise<void>;
-  sendTurn: (sessionId: string, text: string, attachments?: Attachment[]) => Promise<void>;
+  sendTurn: (sessionId: string, text: string, attachments?: Attachment[],
+    options?: { omitHandoff?: boolean; literalText?: boolean }) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
   refreshGitStatus: (sessionId: string) => Promise<void>;
@@ -450,7 +451,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     isPluginEnabled: (pluginId) => {
       const found = get().plugins.find((p) => p.id === pluginId);
-      return found ? found.enabled : true;
+      return found ? found.enabled && (!found.runtimeState || found.runtimeState === 'ACTIVE') : true;
     },
 
     refreshAll: async () => {
@@ -908,9 +909,9 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
-    sendTurn: async (sessionId, text, attachments) => {
+    sendTurn: async (sessionId, text, attachments, options) => {
       try {
-        await daemonApi.sendTurn(sessionId, text, attachments);
+        await daemonApi.sendTurn(sessionId, text, attachments, options);
         const { session } = await daemonApi.getSession(sessionId);
         set((state) => ({
           sessions: state.sessions.map((s) => (s.id === sessionId ? session : s)),

@@ -28,7 +28,7 @@ export function listHarnessCommands(kind: HarnessKind, agyDesktop: boolean): Har
 
 export class HarnessCommandTools {
   constructor(
-    private readonly usage: UsageService,
+    private readonly getUsageService: () => UsageService | undefined,
     private readonly binaryOverrides: Record<string, string>,
   ) {}
 
@@ -48,7 +48,9 @@ export class HarnessCommandTools {
         ].filter(Boolean).join(' · ')));
       return lines.join('\n') || data?.description || 'AGY 没有返回模型额度';
     }
-    const usage = await this.usage.collectCodexUsage();
+    const service = this.getUsageService();
+    if (!service) throw new Error('额度服务已停用');
+    const usage = await service.collectCodexUsage();
     const windows = usage.rateLimits.map((item) =>
       `${item.label} · 剩余 ${(100 - item.usedPercent).toFixed(1)}%` +
       (item.resetsAt ? ` · ${new Date(item.resetsAt).toLocaleString()} 重置` : ''));

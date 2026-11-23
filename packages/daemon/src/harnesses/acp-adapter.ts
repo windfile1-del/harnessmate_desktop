@@ -412,7 +412,6 @@ class AcpSessionHandle implements AdapterSessionHandle {
   private activeConfirmedModel: string | null = null;
   private activeConfirmedEffort: string | null = null;
   private supportsEmbeddedContext = false;
-  private supportsSystemPromptAppend = false;
 
   constructor(
     child: ReturnType<typeof spawnCliProcess>,
@@ -453,15 +452,11 @@ class AcpSessionHandle implements AdapterSessionHandle {
       agentCapabilities?: {
         mcpCapabilities?: { http?: boolean };
         promptCapabilities?: { embeddedContext?: boolean };
-        _meta?: { antigravity?: { systemPrompt?: { append?: boolean } } };
       };
     };
 
     this.supportsEmbeddedContext = Boolean(
       initRes?.agentCapabilities?.promptCapabilities?.embeddedContext,
-    );
-    this.supportsSystemPromptAppend = Boolean(
-      initRes?.agentCapabilities?._meta?.antigravity?.systemPrompt?.append,
     );
 
     const mcp = this.config.pluginMcp;
@@ -482,38 +477,8 @@ class AcpSessionHandle implements AdapterSessionHandle {
       return this.rpc.request<AcpSessionNewResult>(method, params, 25_000);
     };
 
-    const buildSessionNewParams = (withSystemAppend: boolean): Record<string, unknown> => {
-      const base: Record<string, unknown> = {
-        cwd: this.config.cwd,
-        mcpServers: [],
-      };
-      if (withSystemAppend && this.supportsSystemPromptAppend && this.config.systemContextPrompt) {
-        base._meta = {
-          antigravity: {
-            systemPrompt: {
-              append: this.config.systemContextPrompt.slice(0, 8000),
-            },
-          },
-        };
-      }
-      return base;
-    };
-
-    const createFreshAcpSession = async (): Promise<AcpSessionNewResult | undefined> => {
-      if (this.supportsSystemPromptAppend && this.config.systemContextPrompt) {
-        try {
-          return await requestSession('session/new', buildSessionNewParams(true));
-        } catch (err) {
-          this.emit({
-            type: 'diagnostic.log',
-            level: 'warn',
-            stream: 'protocol',
-            message: `ACP session/new with systemPrompt.append fell back to standard session/new: ${err instanceof Error ? err.message : String(err)}`,
-          });
-        }
-      }
-      return requestSession('session/new', buildSessionNewParams(false));
-    };
+    const createFreshAcpSession = () =>
+      requestSession('session/new', { cwd: this.config.cwd, mcpServers: [] });
 
     let sessRes: AcpSessionNewResult | undefined;
     if (this.config.nativeSessionId) {
@@ -837,6 +802,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
       }
     }
 
+    if (driverUsed && input.contextSync) input.contextSync.onDispatch?.(driverUsed, input.contextSync.deltaMarkdown);
     void this.rpc
       .request<{ stopReason?: string }>(
         'session/prompt',

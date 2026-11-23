@@ -79,6 +79,8 @@ const MANIFEST_TEMPLATE = `{
   "id": "user.my-workflow",
   "name": "我的自定义斜杠指令插件",
   "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
   "description": "添加一个 /doc 斜杠指令快速生成代码文档",
   "author": "Local User",
   "category": "workflow",
@@ -108,7 +110,8 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     pushToast,
   } = useAppStore();
 
-  const [tab, setTab] = useState<'installed' | 'catalog' | 'install'>('installed');
+  const [tab, setTab] = useState<'installed' | 'catalog' | 'install' | 'composition'>('installed');
+  const [composition, setComposition] = useState<Awaited<ReturnType<typeof daemonApi.getPluginComposition>>>();
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<{ manifest: PluginManifest; digest: string }>();
   const [permissionPluginId, setPermissionPluginId] = useState<string>();
@@ -124,10 +127,30 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     void refreshPlugins().catch((err: Error) => pushToast({ kind: 'error', title: '无法读取插件', body: err.message }));
   }, [refreshPlugins, pushToast]);
 
+  useEffect(() => {
+    if (tab !== 'composition') return;
+    let current = true;
+    void daemonApi.getPluginComposition().then((result) => { if (current) setComposition(result); })
+      .catch((error: Error) => { if (current) pushToast({ kind: 'error', title: '无法读取组合', body: error.message }); });
+    return () => { current = false; };
+  }, [tab, plugins, pushToast]);
+
   const handleInstallCatalog = async (catalogId: string) => {
     setBusy(true);
     try {
-      await installPlugin({ mode: 'catalog', catalogId });
+      const request = { mode: 'catalog', catalogId } as const;
+      const preview = await daemonApi.previewPlugin(request);
+      if (preview.requiresTrust) {
+        const { harnesses, mcpPresets } = preview.manifest.contributes;
+        const targets = [
+          ...(harnesses ?? []).map(({ command, args }) => [command, ...args].join(' ')),
+          ...(mcpPresets ?? []).map(({ name, command, args, url }) =>
+            name + ' · ' + (command ? [command, ...(args ?? [])].join(' ') : url ?? '')),
+        ];
+        if (!window.confirm([`信任并安装 ${preview.manifest.name}？`, ...targets].join('\n'))) return;
+      }
+      await installPlugin({ ...request, expectedDigest: preview.digest, expectedInstalledDigest: preview.installedDigest,
+        trustCode: preview.requiresTrust });
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -147,7 +170,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
       />
 
       <div className="flex items-center justify-between gap-2 px-5 pt-3">
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <PillTab active={tab === 'installed'} onClick={() => setTab('installed')}>
             已安装 ({plugins.length})
           </PillTab>
@@ -156,6 +179,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
           </PillTab>
           <PillTab active={tab === 'install'} onClick={() => { setEditing(undefined); setTab('install'); }}>
             安装 / 创建插件
+          </PillTab>
+          <PillTab active={tab === 'composition'} onClick={() => setTab('composition')}>
+            查看完整组合
           </PillTab>
         </div>
 
@@ -224,6 +250,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                     {p.description}
                   </p>
                   {p.loadError && <p className="mt-1 break-words text-[11.8px] text-[var(--accent-rose)]">{p.loadError}</p>}
+                  {p.runtimeState === 'PENDING' && (
+                    <p className="mt-1 text-[11.8px] text-[var(--text-secondary)]">等待服务 · {p.missingServices?.join('、')}</p>
+                  )}
 
                   {/* Contributed items preview */}
                   <div className="mt-2 flex flex-wrap gap-1.5">
@@ -263,7 +292,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                 </div>
 
                 <div className="flex shrink-0 items-center gap-2">
-                  {p.apiVersion === 3 && (!!p.contributes.actions?.length || p.contributes.programs?.some(({ exposeToModel }) => exposeToModel)) &&
+                  {(!!p.contributes.actions?.length || p.contributes.programs?.some(({ exposeToModel }) => exposeToModel)) &&
                     <button type="button" className="text-[11px] text-[var(--accent-indigo)]"
                       onClick={() => setPermissionPluginId(p.id)}>工作区授权</button>}
                   {p.canRollback && <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
@@ -352,7 +381,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                     </>
                   ) : (
                     <>
-                      <Download size={12.5} /> 一键安装
+                      <Download size={12.5} /> 安装
                     </>
                   )}
                 </button>
@@ -365,6 +394,27 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
           <PluginAuthoringForm key={editing?.manifest.id ?? 'new'} editing={editing}
             initialManifest={editing ? JSON.stringify(editing.manifest, null, 2) : MANIFEST_TEMPLATE}
             onInstalled={() => { setEditing(undefined); setTab('installed'); }} />
+        )}
+        {tab === 'composition' && composition && (
+          <div className="space-y-2 text-[12px]">
+            <p className="text-[var(--text-secondary)]">组合包 · {composition.bundles.join(' → ') || '无'}</p>
+            {composition.error && <p role="alert" className="text-[var(--accent-rose)]">{composition.error}</p>}
+            {composition.entries.map((entry) => {
+              const plugin = plugins.find(({ id }) => id === entry.name);
+              return <div key={entry.id} className="rounded-xl border border-[var(--border-hairline)] p-3">
+                <div className="flex flex-wrap justify-between gap-2 text-[var(--text-primary)]">
+                  <span>{plugin?.name ?? entry.name} <span className="text-[var(--text-muted)]">· {entry.id}</span></span>
+                  <span>{entry.disabled ? '已停用' : !plugin ? '未安装'
+                    : plugin.runtimeState === 'PENDING' ? '等待服务' : plugin.runtimeState === 'FAILED' ? '加载失败' : '已启用'}</span>
+                </div>
+                <p className="mt-1 text-[var(--text-secondary)]">{entry.sources.join(' → ')}</p>
+                {Object.keys(entry.config).length > 0 && <details className="mt-2">
+                  <summary className="cursor-pointer text-[var(--accent-indigo)]">查看配置</summary>
+                  <pre className="overflow-auto whitespace-pre-wrap break-all">{JSON.stringify(entry.config, null, 2)}</pre>
+                </details>}
+              </div>;
+            })}
+          </div>
         )}
       </div>
     </div>

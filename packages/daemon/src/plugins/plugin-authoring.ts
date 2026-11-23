@@ -9,7 +9,7 @@ import type { AdapterSessionHandle } from '../harnesses/types.js';
 
 const schemaGuide = `Return exactly one JSON object, with no Markdown, implementation plan, tools, or file operations.
 The JSON defines a data-only HarnessMate plugin. Use labels and prompts in the user's language.
-Top level: id (user.<lowercase slug>), name, description, version, apiVersion (3 for actions or programs, 2 for data panels, 1 for legacy manifests), category ("workflow", "ui" or "tool"), contributes.
+Top level: id (user.<lowercase slug>), name, description, version, apiVersion: 4, engines: {pluginApi: "^4.0"}, category ("workflow", "ui" or "tool"), contributes. Preserve existing inject and optional service names when revising a V4 draft. Legacy manifests returned by older clients can still be read.
 contributes supports:
 - slashCommands: [{command, description, argumentHint?, template}]. Use lowercase command names distinct from built-in commands and {{args}} for the user input.
 - panels: [{id,title,description?,sections,actions}]. Sections are turns, changed_files, verifications, recent_activity. Actions are [{label,command,args?}] and refer to this plugin's slashCommands.

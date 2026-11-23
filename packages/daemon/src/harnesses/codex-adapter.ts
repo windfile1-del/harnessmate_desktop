@@ -23,7 +23,7 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
-import { pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
+import { handoffContinuityNotice, pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
 
 const VALID_EFFORTS = new Set<ReasoningEffort>([
   'none',
@@ -402,8 +402,9 @@ class CodexSessionHandle implements AdapterSessionHandle {
         approvalPolicy,
         sandbox,
       };
-      if (this.config.systemContextPrompt) {
-        startParams.developerInstructions = this.config.systemContextPrompt;
+      if (this.config.handoffContinuity) {
+        startParams.developerInstructions = handoffContinuityNotice;
+        this.config.onContinuityNotice?.('developer_instructions', handoffContinuityNotice);
       }
       const started = (await this.rpc.request('thread/start', startParams)) as {
         thread?: { id?: string; model?: string };
@@ -427,6 +428,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
     if (!this._nativeSessionId || payload.codexInjectItems.length === 0) {
       return 'prompt_envelope';
     }
+    payload.onDispatch?.('codex_inject_items', payload.codexInjectItems);
     try {
       await this.rpc.request(
         'thread/inject_items',
@@ -565,6 +567,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
     this.currentTurnId = input.turnId;
     let res: { turn?: { id?: string; model?: string }; turnId?: string } | undefined;
     try {
+      if (input.contextSync) input.contextSync.onDispatch?.('prompt_envelope', input.contextSync.deltaMarkdown);
       res = await this.rpc.request('turn/start', turnParams);
     } catch (err) {
       this.currentTurnId = null;

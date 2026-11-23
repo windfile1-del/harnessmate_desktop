@@ -31,6 +31,8 @@ export interface ProjectedTurn {
   userText: string;
   userAttachments: Attachment[];
   expandedCommand?: string | null;
+  handoffSnapshots?: Array<{ seq: number; driver: ContextInjectionDriver; content: string;
+    sourceHarnesses: string[]; snapshotId: string; accepted?: boolean }>;
   userTimestamp: number;
   thinking: string;
   thinkingDone: boolean;
@@ -135,6 +137,21 @@ export function projectSessionEvents(
     const p = ev.payload;
 
     switch (ev.type) {
+      case 'handoff.snapshot': {
+        const turn = getOrCreateTurn(ev.turnId, ev.createdAt);
+        (turn.handoffSnapshots ??= []).push({
+          seq: ev.seq, driver: p.driver as ContextInjectionDriver, snapshotId: String(p.snapshotId ?? ''),
+          sourceHarnesses: Array.isArray(p.sourceHarnesses) ? p.sourceHarnesses.filter((value): value is string => typeof value === 'string') : [],
+          content: typeof p.content === 'string' ? p.content : JSON.stringify(p.content, null, 2),
+        });
+        break;
+      }
+      case 'handoff.snapshot_delivered': {
+        const turn = getOrCreateTurn(ev.turnId, ev.createdAt);
+        const dispatched = turn.handoffSnapshots?.findLast((item) => item.snapshotId === p.snapshotId && item.driver === p.driver);
+        if (dispatched) dispatched.accepted = true;
+        break;
+      }
       case 'session.harness_switched': {
         items.push({
           kind: 'switch',

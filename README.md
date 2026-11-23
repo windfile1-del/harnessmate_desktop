@@ -35,7 +35,8 @@ AGY 的额度、压缩和目标等命令通过其 CLI 入口执行。导入的 A
 - 插件也可通过内置目录、JSON 清单或包含 `harnessmate-plugin.json` 的本地目录安装。清单支持 `apiVersion: 1`、`contributes.slashCommands`、`contributes.panels`、ACP Harness 和 MCP 预设。面板的 `sections` 可选 `turns`、`changed_files`、`verifications`、`recent_activity`，`actions` 中的 `{ label, command, args? }` 引用本插件的命令。
 - V2 插件可订阅轮次事件、按会话或工作区取数、配置面板列和筛选器，并注册侧栏、输入区和斜杠命令入口。可从插件目录安装「项目验收台」，或在插件中心让 AI 生成自定义清单。参见 [插件 SDK V2](docs/plugin-sdk-v2.md)。
 - V3 插件增加可组合的文本处理程序、聊天动作和会话级模型工具。安装「会话工具箱」后，可在已安装列表中按工作区授权。参见 [插件 SDK V3](docs/plugin-sdk-v3.md)。
-- 本地 JavaScript 插件通过目录预览确认信任后，在独立 Worker 中以本机用户权限运行。导出 `beforeTurn(context)` 可返回 `{ text }`，在清单声明 `on_event` 或 `after_turn` 后可通过 `onEvent(event)` 接收轮次完成、失败和取消。已安装脚本按包摘要校验，文件变化后需重新确认。
+- V4 声明式插件可用 `engines.pluginApi` 声明 API 范围，并用 `inject` 声明依赖。插件中心的「查看完整组合」显示组合包、用户覆盖和启用状态。参见 [V4 开发计划与进度](docs/plugin-sdk-v4-progress.md)。
+- 本地 V1 JavaScript 插件在信任预览后以本机用户权限运行。`beforeTurn(context)` 返回的文本会显示为可选建议，发送前由用户确认。`onEvent(event)` 兼容轮次完成、失败和取消。JavaScript、ACP 引擎和 MCP 预设均按本次预览的包摘要确认。
 - 安装先校验候选版本，再切换有效版本。初始化失败时保留当前版本。已安装列表提供启停、热重载和回退，版本记录在应用重启后保留。
 
 ## 架构概览
@@ -60,7 +61,7 @@ pnpm dev:electron
 ### 方式二：打包独立 Windows `.exe` 启动程序
 ```bash
 pnpm pack:exe
-# 输出位于 packages/electron/release/HarnessMate-Desktop-0.4.0-portable.exe
+# 输出位于 packages/electron/release/HarnessMate-Desktop-0.5.0-portable.exe
 ```
 
 ### 方式三：独立 Daemon + 浏览器开发模式

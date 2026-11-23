@@ -430,11 +430,18 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
     expect((codexInit?.params as { capabilities?: { experimentalApi?: boolean } })?.capabilities?.experimentalApi).toBe(true);
 
     const codexStart = captures.find((c) => c.harness === 'codex' && c.method === 'thread/start');
-    expect(String((codexStart?.params as { developerInstructions?: string })?.developerInstructions)).toContain('NEVER use npm; strictly use pnpm');
+    const developerInstructions = (codexStart?.params as { developerInstructions?: string })?.developerInstructions;
+    expect(developerInstructions).toContain('recorded workspace activity');
+    expect(developerInstructions).not.toContain('NEVER use npm; strictly use pnpm');
+    expect(captures.filter((capture) => capture.harness === 'agy' && capture.method === 'session/new')).not.toHaveLength(0);
+    for (const capture of captures.filter((entry) => entry.harness === 'agy' && entry.method === 'session/new')) {
+      expect(capture.params).not.toHaveProperty('_meta');
+    }
 
     const codexInject = captures.find((c) => c.harness === 'codex' && c.method === 'thread/inject_items');
     expect(codexInject).toBeDefined();
     expect(JSON.stringify(codexInject!.items)).toContain('STAR-LOOM-77');
+    expect(JSON.stringify(codexInject!.items)).toContain('NEVER use npm; strictly use pnpm');
 
     const codexGoals = captures.filter((c) => c.harness === 'codex' && c.method === 'thread/goal/set');
     expect(codexGoals).toHaveLength(1);
@@ -459,8 +466,18 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
     expect(agyBlocks[0]?.resource?.text).toContain('Codex verified STAR-LOOM-77');
     expect(agyBlocks[0]?.resource?.text).toContain('Claude audited both AGY and Codex turns.');
     expect(agyBlocks[0]?.resource?.text).toContain('mode="incremental_delta"');
+    expect(agyBlocks[0]?.resource?.text).toContain('Previous Workspace Activity');
+    expect(agyBlocks[0]?.resource?.text).not.toContain('Continuity Protocol');
+    expect(agyBlocks[0]?.resource?.text).not.toContain('MUST FOLLOW');
     expect(agyBlocks[1]?.type).toBe('text');
     expect(agyBlocks[1]?.text).toBe('Final round-trip summary.');
+    const agySnapshot = allEvents.find((event) =>
+      event.type === 'handoff.snapshot' && event.payload.driver === 'acp_embedded_context');
+    expect(agySnapshot?.payload).toMatchObject({
+      content: agyBlocks[0]?.resource?.text, sourceHarnesses: ['codex', 'claude'],
+    });
+    expect(allEvents.find((event) => event.type === 'handoff.snapshot_delivered' &&
+      event.payload.snapshotId === agySnapshot?.payload.snapshotId)).toBeDefined();
 
     // Verify SINGLE unified timeline contains all 4 user messages cleanly with per-turn harness attribution!
     const userMsgs = allEvents.filter((e) => e.type === 'message.user');
@@ -615,6 +632,11 @@ describe('v0.3.0 Unified Multi-Harness Session & Lossless Context Bridge', () =>
     expect(failRes.retriedTurnId).toBeTruthy();
 
     const finalEvents = await waitForSessionIdle(baseUrl, sessionId, 2);
+    const attemptedCodex = finalEvents.filter((event) =>
+      event.type === 'handoff.snapshot' && event.payload.targetHarnessId === 'codex');
+    expect(attemptedCodex.map(({ payload }) => payload.driver)).toEqual(['codex_inject_items', 'prompt_envelope']);
+    expect((codexInput?.input as Array<{ text: string }>)[0]?.text)
+      .toContain(attemptedCodex[1]?.payload.content);
     const userTexts = finalEvents
       .filter((e) => e.type === 'message.user')
       .map((e) => String(e.payload.text));

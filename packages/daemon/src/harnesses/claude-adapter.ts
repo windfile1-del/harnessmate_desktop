@@ -28,7 +28,7 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
-import { pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
+import { handoffContinuityNotice, pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
 
 const FALLBACK_CLAUDE_MODELS: HarnessModelInfo[] = [
   { id: 'sonnet', displayName: 'Claude Sonnet (Default)', group: 'Anthropic Claude', isDefault: true, supportedEfforts: ['low', 'medium', 'high', 'max'] },
@@ -156,14 +156,10 @@ export class ClaudeStreamJsonAdapter implements HarnessAdapter {
     if (config.nativeSessionId) {
       args.push('--resume', config.nativeSessionId);
     }
-    // Always disable static system-prompt snapshotting & inject lightweight continuity rules
-    // (safe well under Windows 32KB CreateProcess arg limit; full delta travels cleanly over stdin)
-    args.push(
-      '--system-prompt-snapshot',
-      'off',
-      '--append-system-prompt',
-      'You are participating in a unified multi-harness session orchestrated by HarnessMate Desktop. Prior turns may have been completed by Codex, AGY, or Claude on the same workspace. Treat any <harnessmate_context_sync> block and .harnessmate/task-ledger.md as authoritative shared memory and task state. Never ask the user to repeat prior context that is already provided.',
-    );
+    if (config.handoffContinuity) {
+      args.push('--system-prompt-snapshot', 'off', '--append-system-prompt', handoffContinuityNotice);
+      config.onContinuityNotice?.('system_append', handoffContinuityNotice);
+    }
 
     const mcp = config.pluginMcp;
     if (mcp) args.push('--mcp-config', JSON.stringify({ mcpServers: {
@@ -395,6 +391,7 @@ class ClaudeSessionHandle implements AdapterSessionHandle {
       }
     }
 
+    if (input.contextSync) input.contextSync.onDispatch?.('claude_sysfile_delta', input.contextSync.deltaMarkdown);
     this.writeJson({
       type: 'user',
       message: {

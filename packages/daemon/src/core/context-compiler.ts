@@ -8,8 +8,11 @@ import type {
   SessionHarnessBinding,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
-import { getGitStatusSummary } from './git-service.js';
+import type { getGitStatusSummary } from './git-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
+import { composeSnapshot, type HandoffSnapshot } from './handoff-snapshot.js';
+import type { PluginEvents } from '../plugin-host/runtime/events.js';
+import { PluginApiError, type Disposer } from '@harnessmate/plugin-api';
 
 export interface CodexInjectMessageItem {
   type: 'message';
@@ -19,8 +22,7 @@ export interface CodexInjectMessageItem {
 
 export interface CompiledContextPacket {
   preview: ContextPreview;
-  /** Compact system/developer prompt block (Workspace Truth + Task State Ledger + Continuity Protocol) */
-  systemLedgerPrompt: string;
+  snapshot: HandoffSnapshot;
   /** Full compiled context block (Block A + B + C + D) for ACP embeddedContext / Claude stdin / Envelope */
   deltaMarkdown: string;
   /** Structured Responses API message items for Codex thread/inject_items */
@@ -53,13 +55,30 @@ interface CompiledTurn {
   errorMessage: string | null;
 }
 
-const DEFAULT_TOKEN_BUDGET = 12_000;
-
 export class ContextCompiler {
+  private readonly sections = new Map<string, { source: string; order: number; text: string }>();
+
   constructor(
     private readonly store: HarnessMateStore,
     private readonly taskLedger: TaskLedgerService,
+    readonly options: { budgetTokens: number; autoAttach: boolean },
+    private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
+    private readonly events: PluginEvents,
   ) {}
+
+  registerSection(source: string, section: { id: string; order?: number; text: string }): Disposer {
+    if (!/^[a-z0-9._-]{1,64}$/i.test(source) || !/^[a-z0-9._-]{1,48}$/i.test(section.id)) {
+      throw new PluginApiError('E_INVALID_INPUT', '交接段落来源或 ID 无效');
+    }
+    const id = `${source}.${section.id}`;
+    if (this.sections.has(id)) throw new PluginApiError('E_CONFLICT', `交接段落 ${id} 已注册`);
+    if (this.sections.size >= 32 || section.text.length > 12_000) {
+      throw new PluginApiError('E_LIMIT_EXCEEDED', '交接段落超出限制');
+    }
+    const registration = { source, order: section.order ?? 500, text: section.text };
+    this.sections.set(id, registration);
+    return () => { if (this.sections.get(id) === registration) this.sections.delete(id); };
+  }
 
   /**
    * Compiles the exact incremental context packet required to bring
@@ -76,8 +95,9 @@ export class ContextCompiler {
     budgetTokens?: number;
   }): Promise<CompiledContextPacket> {
     const { session, targetHarnessId, targetHarnessKind, binding } = opts;
+    const referenceOnly = targetHarnessKind === 'agy' || targetHarnessKind === 'acp';
     const syncMode = opts.syncMode ?? session.contextSyncMode ?? 'auto';
-    const budgetTokens = opts.budgetTokens ?? DEFAULT_TOKEN_BUDGET;
+    const budgetTokens = opts.budgetTokens ?? this.options.budgetTokens;
     const targetSeq = opts.upToSeq ?? session.lastSeq;
 
     const syncedUpToSeq =
@@ -87,10 +107,10 @@ export class ContextCompiler {
     const rawEvents = this.store.iterateEvents(session.id, syncedUpToSeq, targetSeq);
     const turns = groupEventsIntoTurns(rawEvents, session.harnessId, opts.excludeTurnId);
 
-    // Filter out turns that were purely executed by targetHarnessId itself when already synced
-    const unsyncedTurns = turns.filter((t) => t.userText || t.assistantText || t.tools.length > 0);
+    const unsyncedTurns = turns.filter((turn) => (turn.userText || turn.assistantText || turn.tools.length > 0) &&
+      (!isWarmBinding || turn.harnessId !== targetHarnessId));
     const taskState = this.taskLedger.getOrCreate(session);
-    const ledgerMarkdown = this.taskLedger.renderLedgerMarkdown(taskState, session);
+    const ledgerMarkdown = this.taskLedger.renderLedgerMarkdown(taskState, session, referenceOnly ? 'reference' : 'directive');
 
     // Sync needed if there are un-synced turns OR a cold binding on a session with pre-seeded task ledger
     const hasLedgerFacts =
@@ -99,26 +119,13 @@ export class ContextCompiler {
       taskState.steps.length > 0 ||
       taskState.decisions.length > 0 ||
       taskState.blockers.length > 0;
-    const syncNeeded = unsyncedTurns.length > 0 || (!isWarmBinding && hasLedgerFacts && targetSeq > 1);
-
-    const driverPlanned = selectPlannedDriver(targetHarnessKind, isWarmBinding, syncNeeded);
+    const needsHistory = unsyncedTurns.length > 0 || (!isWarmBinding && hasLedgerFacts && targetSeq > 1);
 
     // Block A: Live Workspace Truth Anchor
-    const workspaceTruthBlock = await buildWorkspaceTruthBlock(session, taskState.ledgerFilePath);
+    const workspaceTruthBlock = await buildWorkspaceTruthBlock(session, taskState.ledgerFilePath, this.gitStatus);
 
     // Block B: Structured Task State Ledger
     const ledgerBlock = ledgerMarkdown.trim();
-
-    // System/developer prompt (Block A + Block B + Continuity Protocol)
-    const systemLedgerPrompt = [
-      'You are continuing a unified multi-harness session managed by HarnessMate Desktop.',
-      'Previous turns in this conversation may have been executed by other AI coding harnesses (Codex, AGY, Claude, or custom ACP agents) on the exact same workspace.',
-      'Treat the Workspace Truth Anchor, Task State Ledger, Pinned Constraints, and Synchronized Transcript below as authoritative shared memory. Do NOT ask the user to repeat prior context unless genuinely missing.',
-      '',
-      workspaceTruthBlock,
-      '',
-      ledgerBlock,
-    ].join('\n');
 
     // Allocate token budgets for Block C (Older Digest) and Block D (Verbatim Recent Window)
     const fixedTokens = estimateTokens(workspaceTruthBlock) + estimateTokens(ledgerBlock) + 320;
@@ -168,34 +175,54 @@ export class ContextCompiler {
             .join('\n\n---\n\n')
         : '';
 
-    // Assemble full deltaMarkdown (sent via ACP embeddedContext / Claude stdin / Envelope fallback)
+    const renderedVerbatim = verbatimBlock
+      ? `## ${isWarmBinding ? 'Incremental Transcript' : 'Recent Conversation Transcript'} (${verbatimTurns.length} turns)\n\n${verbatimBlock}`
+      : '';
+    const coreSections = [
+      { id: 'workspace', source: 'git', text: referenceOnly ? trimMiddle(workspaceTruthBlock, 2_500) : workspaceTruthBlock },
+      { id: 'ledger', source: 'ledger', text: referenceOnly ? trimMiddle(ledgerBlock, 5_000) : ledgerBlock },
+      { id: 'digest', source: 'conversation', text: digestBlock ? `## Earlier Context Digest\n\n${digestBlock}` : '' },
+      { id: 'transcript', source: 'conversation', text: renderedVerbatim },
+    ];
+    if (referenceOnly) {
+      coreSections[2]!.text = trimMiddle(coreSections[2]!.text, 2_500);
+      coreSections[3]!.text = trimMiddle(coreSections[3]!.text, 10_500);
+    }
+    const extraSections: typeof coreSections = [];
+    let remainingChars = referenceOnly ? 2_500 : Math.min(8_000, budgetTokens);
+    const registrations = [...this.sections].sort(([, first], [, second]) => first.order - second.order);
+    this.events.waterfall('handoff.compose', Object.freeze({ append: (id: string, source: string, text: string) => {
+      if (remainingChars < 200 || !text.trim()) return;
+      const formatted = `## ${id}\n\n${trimMiddle(text, Math.min(remainingChars - 120, 2_000))}`;
+      extraSections.push({ id, source, text: formatted });
+      remainingChars -= formatted.length;
+    } }), registrations.map(([id, { source, text }]) => (value, next) => { value.append(id, source, text); next(); }));
+    const sectionText = [...coreSections, ...extraSections];
+    const previous = referenceOnly && syncMode !== 'full_ledger' && binding?.nativeSessionId
+      ? this.store.getLastHandoffReceipt(session.id, targetHarnessId, binding.nativeSessionId)
+      : undefined;
+    const snapshot = composeSnapshot(sectionText, previous);
+    const ignored = new Set(['digest', 'transcript']);
+    const removed = previous ? Object.keys(previous.sectionHashes)
+      .filter((id) => !ignored.has(id) && snapshot.sectionHashes[id] === undefined) : [];
+    const syncNeeded = needsHistory || Boolean(previous &&
+      (removed.length || snapshot.sections.some(({ id }) => !ignored.has(id))));
+    const driverPlanned = selectPlannedDriver(targetHarnessKind, isWarmBinding, syncNeeded);
     const sections: string[] = [
-      `<harnessmate_context_sync version="1" session_id="${session.id}" target_harness="${targetHarnessId}" mode="${isWarmBinding ? 'incremental_delta' : 'initial_sync'}" synced_from_seq="${syncedUpToSeq}" synced_to_seq="${targetSeq}" unsynced_turns="${unsyncedTurns.length}">`,
-      '## Continuity Protocol',
-      isWarmBinding
+      `<harnessmate_context_sync version="1" snapshot="${snapshot.snapshotId}" session_id="${session.id}" target_harness="${targetHarnessId}" mode="${isWarmBinding ? 'incremental_delta' : 'initial_sync'}" synced_from_seq="${syncedUpToSeq}" synced_to_seq="${targetSeq}" unsynced_turns="${unsyncedTurns.length}">`,
+      referenceOnly ? '## Previous Workspace Activity' : '## Continuity Protocol',
+      referenceOnly
+        ? 'The following records describe previous conversations and task activity in this workspace.'
+        : isWarmBinding
         ? `You (${targetHarnessId}) previously participated in this session up to event #${syncedUpToSeq}. Below is ONLY the incremental progress completed by other harnesses since then, plus the latest Workspace Truth & Task State Ledger. Continue seamlessly without asking the user to repeat prior context.`
         : `You (${targetHarnessId}) are taking over an active unified session. Previous turns were executed by other harnesses on this exact workspace. Continue seamlessly from the Task State Ledger and transcript below without asking the user to repeat prior context.`,
-      '',
-      workspaceTruthBlock,
-      '',
-      ledgerBlock,
     ];
-
-    if (digestBlock) {
-      sections.push('', '## Earlier Context Digest', '', digestBlock);
+    if (snapshot.previousSnapshotId) {
+      const unchanged = sectionText.filter(({ id }) => snapshot.sectionHashes[id] && !snapshot.sections.some((section) => section.id === id));
+      if (unchanged.length) sections.push('', `Unchanged sections (${unchanged.map(({ id }) => id).join(', ')}) match snapshot ${snapshot.previousSnapshotId}.`);
+      if (removed.length) sections.push('', `Sections removed since the previous snapshot: ${removed.join(', ')}.`);
     }
-
-    if (verbatimBlock) {
-      sections.push(
-        '',
-        isWarmBinding
-          ? `## Incremental Transcript Since Your Last Turn (${verbatimTurns.length} recent turns)`
-          : `## Recent Conversation Transcript (${verbatimTurns.length} turns)`,
-        '',
-        verbatimBlock,
-      );
-    }
-
+    for (const section of snapshot.sections) sections.push('', section.text);
     sections.push('</harnessmate_context_sync>');
     const deltaMarkdown = sections.join('\n');
 
@@ -211,6 +238,7 @@ export class ContextCompiler {
       if (digestBlock) {
         anchorParts.push('## Earlier Un-Synced Turns Digest', digestBlock);
       }
+      anchorParts.push(...extraSections.map(({ text }) => text));
       codexInjectItems.push({
         type: 'message',
         role: 'user',
@@ -282,7 +310,7 @@ export class ContextCompiler {
 
     return {
       preview,
-      systemLedgerPrompt,
+      snapshot,
       deltaMarkdown,
       codexInjectItems,
       objective: taskState.objective || session.title,
@@ -299,14 +327,15 @@ function selectPlannedDriver(
 ): ContextInjectionDriver {
   if (!syncNeeded && isWarmBinding) return 'native_warm';
   if (kind === 'codex') return 'codex_inject_items';
-  if (kind === 'agy') return 'acp_embedded_context';
+  if (kind === 'agy' || kind === 'acp') return 'acp_embedded_context';
   if (kind === 'claude') return 'claude_sysfile_delta';
   return 'prompt_envelope';
 }
 
 async function buildWorkspaceTruthBlock(
   session: Session,
-  ledgerFilePath?: string | null,
+  ledgerFilePath: string | null | undefined,
+  gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
 ): Promise<string> {
   const lines: string[] = [
     '## Workspace Truth Anchor (Live)',
@@ -319,8 +348,8 @@ async function buildWorkspaceTruthBlock(
     lines.push(`- **Synced Ledger File**: \`${ledgerFilePath}\``);
   }
   try {
-    const git = await getGitStatusSummary(session.cwd);
-    if (git.isGitRepo) {
+    const git = await gitStatus(session.cwd);
+    if (git?.isGitRepo) {
       lines.push(`- **Git Branch**: \`${git.branch || 'detached'}\` (ahead ${git.ahead}, behind ${git.behind})`);
       const relevantChanges = git.changes.filter((c) => !c.path.startsWith('.harnessmate/'));
       if (relevantChanges.length > 0) {

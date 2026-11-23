@@ -47,12 +47,12 @@ import {
   searchWorkspaceFiles,
 } from '../core/attachment-service.js';
 import { DaemonEventBus } from '../core/event-bus.js';
-import { getGitStatusSummary } from '../core/git-service.js';
-import { HarnessCommandTools } from '../core/harness-commands.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
-import { UsageService } from '../core/usage-service.js';
+import type { UsageService } from '../core/usage-service.js';
+import { createBuiltinPlugins, type GitService } from '../plugin-host/builtin/services.js';
+import { PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { scanLocalCliSessions } from '../harnesses/history-scanner.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
@@ -94,32 +94,34 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   }
   const config = loadOrCreateConfig(paths.configPath, opts.port);
   const store = new HarnessMateStore(paths.dbPath);
-  const registry = new HarnessRegistry(config.binaryOverrides, config.customAcpHarnesses);
+  const eventBus = new DaemonEventBus();
+  const registry = new HarnessRegistry();
   if (opts.customAdapters) {
     for (const adapter of opts.customAdapters) {
-      registry.register(adapter);
+      if (!registry.isReserved(adapter.id)) registry.register(adapter);
     }
   }
 
-  const pluginManager = new PluginManager(
+  const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
     () => config.disabledPlugins,
-    (ids) => {
-      saveConfig(paths.configPath, { ...config, disabledPlugins: ids });
-      config.disabledPlugins = ids;
-    },
+    createBuiltinPlugins(store, registry, config, (state) => {
+      if (!store.getSession(state.sessionId)) return;
+      eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
+        version: state.version, objective: state.objective, stepsCount: state.steps.length,
+        doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
+        touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
+      }));
+    }, () => pluginManager.host.events, opts.customAdapters),
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const attachmentService = new AttachmentService(paths.attachmentsDir);
   const mcpService = new McpService(registry, config.binaryOverrides);
-  const usageService = new UsageService(store, registry, config.binaryOverrides);
 
   let boundPort = config.port;
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`);
-  const eventBus = new DaemonEventBus();
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager,
-    new HarnessCommandTools(usageService, config.binaryOverrides), pluginCapabilities);
+  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities);
   const auth = new RemoteAuthService(store, config.localToken);
   const wsGateway = new WsGateway({
     desktopId: config.desktopId,
@@ -158,7 +160,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (principal.kind === 'local' && !isLocalBrowserRequest(request.headers)) {
       return reply.code(403).send({ error: 'Local API origin or host is not allowed' });
     }
-    if (urlPath.startsWith('/api/v1/plugins/') && request.method !== 'GET'
+    if (urlPath.startsWith('/api/v1/plugins/') && (request.method !== 'GET' || urlPath === '/api/v1/plugins/composition')
       && (principal.kind !== 'local' || !isLoopbackAddress(request.socket.remoteAddress))) {
       return reply.code(403).send({ error: '插件管理仅在本机可用' });
     }
@@ -169,7 +171,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/health', async () => ({
     status: 'ok',
-    daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.3.0',
+    daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.5.0',
     protocolVersion: PROTOCOL_VERSION,
     desktopId: config.desktopId,
     desktopName: config.desktopName,
@@ -204,12 +206,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.post('/api/v1/harnesses/custom', async (request, reply) => {
+    if (!pluginManager.host.get('harness.acp')) return reply.code(409).send({ error: '自定义 ACP 引擎插件已停用' });
     const parsed = CustomAcpHarnessConfigSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid harness config' });
     }
     const existingIdx = config.customAcpHarnesses.findIndex((h) => h.id === parsed.data.id);
-    if (existingIdx < 0 && registry.get(parsed.data.id)) {
+    if (registry.isReserved(parsed.data.id) || (existingIdx < 0 && registry.get(parsed.data.id))) {
       return reply.code(409).send({ error: 'Harness ID 已被内置或插件引擎使用' });
     }
     if (existingIdx >= 0) {
@@ -231,7 +234,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(404).send({ error: 'Custom harness not found' });
     }
     saveConfig(paths.configPath, config);
-    registry.unregister(id);
+    if (!registry.isReserved(id) && registry.get(id)?.isCustom) registry.unregister(id);
     const harnesses = await registry.probeAll(false);
     return { harnesses };
   });
@@ -277,6 +280,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
+  app.get('/api/v1/plugins/composition', async () => pluginManager.getComposition());
   registerPluginMcp(app, pluginCapabilities);
 
   app.get('/api/v1/plugins/:id/permissions', async (request, reply) => {
@@ -309,14 +313,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.post('/api/v1/plugins/preview', async (request, reply) => {
     const parsed = InstallPluginRequestSchema.safeParse(request.body);
-    if (!parsed.success || parsed.data.mode === 'catalog') return reply.code(400).send({ error: '插件清单或目录无效' });
+    if (!parsed.success) return reply.code(400).send({ error: '插件清单或目录无效' });
     try {
-      if (parsed.data.mode === 'local_dir') return pluginManager.inspectPackage(parsed.data.dirPath, parsed.data.expectedInstalledDigest);
-      const { manifest } = parsed.data;
-      if (manifest.entry) throw new Error('带 JavaScript 入口的插件必须通过本地目录导入');
-      return pluginManager.reviewManifest(manifest, parsed.data.expectedInstalledDigest);
+      return pluginManager.previewInstall(parsed.data);
     } catch (error) {
-      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({ error: error instanceof Error ? error.message : String(error) });
+      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
     }
   });
 
@@ -390,7 +394,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       await pluginManager.installPlugin(parsed.data);
       return reply.code(201).send(await updatedPlugins());
     } catch (err) {
-      return reply.code(err instanceof PluginRevisionConflictError ? 409 : 400).send({ error: err instanceof Error ? err.message : String(err) });
+      return reply.code(err instanceof PluginRevisionConflictError ? 409 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code: err instanceof PluginApiError ? err.code : 'E_INVALID_INPUT',
+      });
     }
   });
 
@@ -467,8 +474,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   // ── Multi-Account & Quota Usage (/api/v1/usage/*) ────────────────────
 
-  app.get('/api/v1/usage/accounts', async () => {
-    const accounts = await usageService.collectAccountUsage();
+  app.get('/api/v1/usage/accounts', async (_request, reply) => {
+    const usage = pluginManager.host.get<UsageService>('usage');
+    if (!usage) return reply.code(409).send({ error: '额度服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const accounts = await usage.collectAccountUsage();
     return { accounts, collectedAt: Date.now() };
   });
 
@@ -611,8 +620,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const result = await sessionManager.sendTurn(id, parsed.data.text, parsed.data.attachments, {
         harnessId: parsed.data.harnessId,
         model: parsed.data.model,
+        omitHandoff: parsed.data.omitHandoff,
+        literalText: parsed.data.literalText,
       });
       return reply.code(202).send(result);
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/turn-suggestion', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) return reply.code(403).send({ error: '插件建议仅在本机预览' });
+    const { id } = request.params as { id: string };
+    const parsed = SendTurnRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '消息草稿无效' });
+    try {
+      return { suggestion: await sessionManager.previewTurnSuggestion(id, parsed.data.text, parsed.data.attachments) };
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -792,7 +815,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const git = await getGitStatusSummary(session.cwd);
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const git = await service.status(session.cwd);
     return { git };
   });
 

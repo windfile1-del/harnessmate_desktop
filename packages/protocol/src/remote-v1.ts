@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { PluginPanelQuerySchema } from './plugin-sdk.js';
+import { PluginManifestSchema } from '@harnessmate/plugin-api';
 import {
   ApprovalDecisionSchema,
   AttachmentSchema,
@@ -7,7 +8,6 @@ import {
   ContextSyncModeSchema,
   NativeHistorySourceSchema,
   PermissionModeSchema,
-  PluginManifestSchema,
   GeneratedPluginManifestSchema,
   ReasoningEffortSchema,
   TaskStepSchema,
@@ -111,6 +111,8 @@ export const SendTurnRequestSchema = z.object({
   attachments: z.array(AttachmentSchema).optional(),
   harnessId: z.string().min(1).optional(),
   model: z.string().nullable().optional(),
+  omitHandoff: z.boolean().optional(),
+  literalText: z.boolean().optional(),
 });
 export type SendTurnRequest = z.infer<typeof SendTurnRequestSchema>;
 
@@ -149,22 +151,27 @@ export type TogglePluginRequest = z.infer<typeof TogglePluginRequestSchema>;
 
 const installedPluginDigest = z.string().regex(/^[a-f0-9]{64}$/).nullable().optional();
 
+const pluginInstallConfirmation = {
+  expectedDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  expectedInstalledDigest: installedPluginDigest,
+  trustCode: z.boolean().optional(),
+};
+
 export const InstallPluginRequestSchema = z.union([
   z.object({
     mode: z.literal('catalog'),
     catalogId: z.string().min(1),
+    ...pluginInstallConfirmation,
   }),
   z.object({
     mode: z.literal('local_dir'),
     dirPath: z.string().min(1),
-    expectedDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-    expectedInstalledDigest: installedPluginDigest,
-    trustCode: z.boolean().optional(),
+    ...pluginInstallConfirmation,
   }),
   z.object({
     mode: z.literal('manifest'),
     manifest: PluginManifestSchema,
-    expectedInstalledDigest: installedPluginDigest,
+    ...pluginInstallConfirmation,
   }),
 ]);
 export type InstallPluginRequest = z.infer<typeof InstallPluginRequestSchema>;

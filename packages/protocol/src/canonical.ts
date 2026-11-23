@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { PluginActionSchema, PluginDataPanelSchema, PluginProgramSchema, PluginProjectionSchema } from './plugin-sdk.js';
+import { PluginContributesSchema, PluginManifestSchema } from '@harnessmate/plugin-api';
 
 export const HarnessKindSchema = z.enum(['codex', 'agy', 'claude', 'acp']);
 export type HarnessKind = z.infer<typeof HarnessKindSchema>;
@@ -93,16 +93,6 @@ export const HarnessInfoSchema = z.object({
   isCustom: z.boolean().optional(),
 });
 export type HarnessInfo = z.infer<typeof HarnessInfoSchema>;
-
-export const CustomAcpHarnessConfigSchema = z.object({
-  id: z.string().min(1).max(48).regex(/^[a-z0-9][a-z0-9_-]*$/),
-  displayName: z.string().min(1).max(80),
-  description: z.string().max(240).default('Custom ACP CLI Harness'),
-  command: z.string().min(1),
-  args: z.array(z.string()).default(['acp', '--stdio']),
-  env: z.record(z.string()).optional(),
-});
-export type CustomAcpHarnessConfig = z.infer<typeof CustomAcpHarnessConfigSchema>;
 
 export const WorkspaceSchema = z.object({
   id: z.string(),
@@ -274,6 +264,9 @@ export const CanonicalEventTypeSchema = z.enum([
   'session.model_confirmed',
   'session.harness_switched',
   'task.state_updated',
+  'handoff.snapshot',
+  'handoff.snapshot_delivered',
+  'handoff.system_notice',
   'turn.started',
   'turn.completed',
   'turn.failed',
@@ -347,79 +340,8 @@ export type WorkspaceFileEntry = z.infer<typeof WorkspaceFileEntrySchema>;
 
 // ── Modular Plugin System Schemas ──────────────────────────────────────
 
-export const PluginCategorySchema = z.enum([
-  'harness',
-  'tool',
-  'mcp',
-  'telemetry',
-  'ui',
-  'remote',
-  'workflow',
-]);
-export type PluginCategory = z.infer<typeof PluginCategorySchema>;
-
-export const PluginSlashCommandSchema = z.object({
-  command: z.string().min(1).max(40).regex(/^[a-z0-9][a-z0-9_-]*$/),
-  description: z.string().max(160),
-  template: z.string().min(1),
-  argumentHint: z.string().max(80).optional(),
-});
-export type PluginSlashCommand = z.infer<typeof PluginSlashCommandSchema>;
-
-export const PluginMcpPresetSchema = z.object({
-  name: z.string().min(1).max(64),
-  description: z.string().max(200),
-  transport: z.enum(['stdio', 'http', 'sse']),
-  command: z.string().optional(),
-  args: z.array(z.string()).optional(),
-  url: z.string().optional(),
-  env: z.record(z.string()).optional(),
-});
-export type PluginMcpPreset = z.infer<typeof PluginMcpPresetSchema>;
-
-export const PluginPanelSchema = z.object({
-  id: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/),
-  title: z.string().trim().min(1).max(64),
-  description: z.string().max(240).optional(),
-  sections: z.array(z.enum(['turns', 'changed_files', 'verifications', 'recent_activity'])).max(4).default([]),
-  actions: z.array(z.object({
-    label: z.string().trim().min(1).max(48),
-    command: PluginSlashCommandSchema.shape.command,
-    args: z.string().max(240).optional(),
-  })).max(6).default([]),
-}).strict();
-
-export const PluginContributesSchema = z.object({
-  harnesses: z.array(CustomAcpHarnessConfigSchema).optional(),
-  slashCommands: z.array(PluginSlashCommandSchema).optional(),
-  mcpPresets: z.array(PluginMcpPresetSchema).optional(),
-  panels: z.array(PluginPanelSchema).max(6).optional(),
-  projections: z.array(PluginProjectionSchema).max(6).optional(),
-  dataPanels: z.array(PluginDataPanelSchema).max(6).optional(),
-  programs: z.array(PluginProgramSchema).max(12).optional(),
-  actions: z.array(PluginActionSchema).max(12).optional(),
-  uiSlots: z
-    .array(z.enum(['sidebar_tool', 'inspector_tab', 'composer_action', 'modal']))
-    .optional(),
-  hooks: z.array(z.enum(['before_turn', 'after_turn', 'on_event'])).optional(),
-});
-export type PluginContributes = z.infer<typeof PluginContributesSchema>;
-
-export const PluginManifestSchema = z.object({
-  id: z.string().min(2).max(64).regex(/^[a-z0-9][a-z0-9._-]*$/),
-  name: z.string().min(1).max(80),
-  version: z.string().default('1.0.0'),
-  description: z.string().max(320),
-  author: z.string().max(80).optional(),
-  category: PluginCategorySchema.default('workflow'),
-  entry: z.string().optional(),
-  apiVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
-  contributes: PluginContributesSchema.default({}),
-});
-export type PluginManifest = z.infer<typeof PluginManifestSchema>;
-
 export const GeneratedPluginManifestSchema = PluginManifestSchema
-  .omit({ entry: true, contributes: true }).extend({
+  .omit({ entry: true, main: true, provides: true, contributes: true }).extend({
     contributes: PluginContributesSchema.pick({ slashCommands: true, panels: true, projections: true, dataPanels: true,
       programs: true, actions: true }).strict(),
   }).strict();
@@ -432,6 +354,8 @@ export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   loadError: z.string().nullable().optional(),
   canRollback: z.boolean().optional(),
   packageDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  runtimeState: z.enum(['PENDING', 'LOADING', 'ACTIVE', 'UNLOADING', 'DISPOSED', 'FAILED']).optional(),
+  missingServices: z.array(z.string()).optional(),
 });
 export type InstalledPluginInfo = z.infer<typeof InstalledPluginInfoSchema>;
 

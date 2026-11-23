@@ -1,34 +1,13 @@
 import type { CustomAcpHarnessConfig, HarnessInfo } from '@harnessmate/protocol';
 import { AcpAdapter } from './acp-adapter.js';
-import { ClaudeStreamJsonAdapter } from './claude-adapter.js';
-import { CodexAppServerAdapter } from './codex-adapter.js';
 import type { HarnessAdapter } from './types.js';
 
 export class HarnessRegistry {
   private readonly adapters = new Map<string, HarnessAdapter>();
   private cachedProbes = new Map<string, HarnessInfo>();
 
-  constructor(
-    binaryOverrides: Record<string, string> = {},
-    customAcpHarnesses: CustomAcpHarnessConfig[] = [],
-  ) {
-    this.register(new CodexAppServerAdapter(binaryOverrides.codex));
-    this.register(
-      new AcpAdapter({
-        id: 'agy',
-        kind: 'agy',
-        displayName: 'Antigravity CLI',
-        description: 'Google Antigravity CLI via native Agent Client Protocol (ACP)',
-        command: 'agy',
-        args: ['acp', '--stdio'],
-        binaryOverride: binaryOverrides.agy,
-      }),
-    );
-    this.register(new ClaudeStreamJsonAdapter(binaryOverrides.claude));
-
-    for (const custom of customAcpHarnesses) {
-      this.registerCustomAcp(custom);
-    }
+  isReserved(id: string): boolean {
+    return id === 'codex' || id === 'claude' || id === 'agy';
   }
 
   register(adapter: HarnessAdapter): void {
@@ -73,7 +52,7 @@ export class HarnessRegistry {
         }
         try {
           const info = await adapter.probe();
-          this.cachedProbes.set(adapter.id, info);
+          if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, info);
           return info;
         } catch (err) {
           const fallback: HarnessInfo = {
@@ -90,7 +69,7 @@ export class HarnessRegistry {
             models: [],
             isCustom: adapter.isCustom,
           };
-          this.cachedProbes.set(adapter.id, fallback);
+          if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, fallback);
           return fallback;
         }
       }),

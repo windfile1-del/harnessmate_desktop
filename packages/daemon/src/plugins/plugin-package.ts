@@ -19,6 +19,17 @@ export interface RevisionPointer {
   previous?: string;
   currentDigest?: string;
   previousDigest?: string;
+  currentTrusted?: boolean;
+  previousTrusted?: boolean;
+}
+
+export function manifestPluginPackage(manifest: PluginManifest): PluginPackage {
+  const files = new Map([[MANIFEST_FILE, Buffer.from(JSON.stringify(manifest, null, 2))]]);
+  return { manifest, files, digest: hashFiles(files) };
+}
+
+export function requiresPluginTrust(manifest: PluginManifest): boolean {
+  return Boolean(manifest.entry || manifest.main || manifest.contributes.harnesses?.length || manifest.contributes.mcpPresets?.length);
 }
 
 export function readPluginPackage(directory: string): PluginPackage {
@@ -47,18 +58,23 @@ export function readPluginPackage(directory: string): PluginPackage {
   const manifestFile = files.get(MANIFEST_FILE);
   if (!manifestFile) throw new Error(`插件目录缺少 ${MANIFEST_FILE}`);
   const manifest = PluginManifestSchema.parse(JSON.parse(manifestFile.toString('utf8').replace(/^\uFEFF/, '')));
-  if (manifest.entry) {
-    const entry = manifest.entry.replace(/\\/g, '/').replace(/^\.\//, '');
+  const entryFile = manifest.main ?? manifest.entry;
+  if (entryFile) {
+    const entry = entryFile.replace(/\\/g, '/').replace(/^\.\//, '');
     if (!files.has(entry) || !/\.(?:cjs|mjs|js)$/i.test(entry)) {
       throw new Error('插件入口必须指向包内的 .js、.mjs 或 .cjs 文件');
     }
   }
+  return { manifest, files, digest: hashFiles(files) };
+}
+
+function hashFiles(files: Map<string, Buffer>): string {
   const hash = crypto.createHash('sha256');
   for (const [name, file] of files) {
     hash.update(JSON.stringify([name, file.length]));
     hash.update(file);
   }
-  return { manifest, files, digest: hash.digest('hex') };
+  return hash.digest('hex');
 }
 
 export function readRevisionPointer(root: string): RevisionPointer | undefined {

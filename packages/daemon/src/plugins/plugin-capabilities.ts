@@ -55,7 +55,7 @@ export class PluginCapabilities {
 
   listActions(session: Session) {
     const grants = this.store.getPluginPermissions(session.workspaceId);
-    return this.plugins.listInstalled().filter((plugin) => plugin.enabled && plugin.packageDigest && plugin.apiVersion === 3)
+    return this.plugins.listInstalled().filter((plugin) => this.plugins.isPluginEnabled(plugin.id) && plugin.packageDigest)
       .flatMap((plugin) => (plugin.contributes.actions ?? []).map((action) => ({ plugin, action,
         granted: grants.some(({ pluginId, digest, capability }) => pluginId === plugin.id && digest === plugin.packageDigest && capability === `action:${action.command}`),
       })));
@@ -69,7 +69,7 @@ export class PluginCapabilities {
 
   getTools(session: Session): ToolDescriptor[] {
     const approved = this.listPermissions(session.workspaceId).filter(({ granted, capability }) => granted && capability.startsWith('tool:'));
-    return this.plugins.listInstalled().filter((plugin) => plugin.enabled).flatMap((plugin) => {
+    return this.plugins.listInstalled().filter((plugin) => this.plugins.isPluginEnabled(plugin.id)).flatMap((plugin) => {
       const prefix = createHash('sha256').update(plugin.id).digest('hex').slice(0, 12);
       return (plugin.contributes.programs ?? []).flatMap((program) => {
         const permission = approved.find((item) => item.pluginId === plugin.id && item.capability === `tool:${program.id}`);
