@@ -103,7 +103,7 @@ image.addEventListener('click', (event) => {
 image.addEventListener('wheel', (event) => {
   if (!size) return;
   event.preventDefault();
-  void run(browser.input({ type: 'wheel', ...point(event), deltaX: -event.deltaX, deltaY: -event.deltaY }));
+  void run(browser.input({ type: 'wheel', ...point(event), deltaX: event.deltaX, deltaY: event.deltaY }));
 }, { passive: false });
 image.addEventListener('keydown', (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;

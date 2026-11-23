@@ -10,7 +10,10 @@ interface Preview {
   timer?: ReturnType<typeof setTimeout>;
 }
 
-const KEYS = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'PageUp', 'PageDown']);
+const KEY_CODES: Readonly<Record<string, number>> = {
+  Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
+  Left: 37, Right: 39, Up: 38, Down: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34,
+};
 const LIMIT = 6;
 
 export function registerPluginBrowser(
@@ -115,15 +118,22 @@ export function registerPluginBrowser(
     return preview;
   }
 
-  function handleInput(preview: Preview, input: Partial<PluginBrowserInput> | undefined) {
+  async function handleInput(preview: Preview, input: Partial<PluginBrowserInput> | undefined) {
     const contents = preview.guest.webContents;
     if (!input) throw new Error('缺少浏览器输入');
+    // A hidden BrowserWindow cannot reliably hold native keyboard focus on Windows.
+    // Only pass structured input parameters to this guest's Chromium input domain.
+    const inputDriver = contents.debugger;
+    if (!inputDriver.isAttached()) inputDriver.attach('1.3');
     if (input.type === 'text' && typeof input.text === 'string') {
-      return contents.insertText(input.text.slice(0, 1000));
+      await inputDriver.sendCommand('Input.insertText', { text: input.text.slice(0, 1000) });
+      return;
     }
-    if (input.type === 'key' && typeof input.key === 'string' && KEYS.has(input.key)) {
-      contents.sendInputEvent({ type: 'keyDown', keyCode: input.key });
-      contents.sendInputEvent({ type: 'keyUp', keyCode: input.key });
+    if (input.type === 'key' && typeof input.key === 'string' && Object.hasOwn(KEY_CODES, input.key)) {
+      const key = ['Left', 'Right', 'Up', 'Down'].includes(input.key) ? `Arrow${input.key}` : input.key;
+      const params = { key, code: key, windowsVirtualKeyCode: KEY_CODES[input.key] };
+      await inputDriver.sendCommand('Input.dispatchKeyEvent', { ...params, type: 'rawKeyDown' });
+      await inputDriver.sendCommand('Input.dispatchKeyEvent', { ...params, type: 'keyUp' });
       return;
     }
     if (input.type === 'click' || input.type === 'move' || input.type === 'wheel') {
@@ -132,16 +142,16 @@ export function registerPluginBrowser(
       const y = Math.round(Number(input.y));
       if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= width! || y >= height!) return;
       if (input.type === 'wheel') {
-        contents.sendInputEvent({ type: 'mouseWheel', x, y,
+        await inputDriver.sendCommand('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y,
           deltaX: Math.max(-1200, Math.min(1200, Number(input.deltaX) || 0)),
           deltaY: Math.max(-1200, Math.min(1200, Number(input.deltaY) || 0)),
         });
       } else if (input.type === 'click') {
-        contents.focus();
-        contents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
-        contents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+        const params = { x, y, button: 'left', clickCount: 1 };
+        await inputDriver.sendCommand('Input.dispatchMouseEvent', { ...params, type: 'mousePressed', buttons: 1 });
+        await inputDriver.sendCommand('Input.dispatchMouseEvent', { ...params, type: 'mouseReleased', buttons: 0 });
       } else {
-        contents.sendInputEvent({ type: 'mouseMove', x, y });
+        await inputDriver.sendCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
       }
       return;
     }
