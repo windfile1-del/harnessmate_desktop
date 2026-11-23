@@ -34,7 +34,8 @@ AGY 的额度、压缩和目标等命令通过其 CLI 入口执行。导入的 A
 - 生成器支持斜杠命令及右侧检视器的插件面板。面板可显示轮次统计、已记录的改动文件、验证结果和近期轮次。面板按钮会把本插件的命令填入输入框，发送仍由你操作。
 - 插件也可通过内置目录、JSON 清单或包含 `harnessmate-plugin.json` 的本地目录安装。清单支持 `apiVersion: 1`、`contributes.slashCommands`、`contributes.panels`、ACP Harness 和 MCP 预设。面板的 `sections` 可选 `turns`、`changed_files`、`verifications`、`recent_activity`，`actions` 中的 `{ label, command, args? }` 引用本插件的命令。
 - V2 插件可订阅轮次事件、按会话或工作区取数、配置面板列和筛选器，并注册侧栏、输入区和斜杠命令入口。可从插件目录安装「项目验收台」，或在插件中心让 AI 生成自定义清单。参见 [插件 SDK V2](docs/plugin-sdk-v2.md)。
-- 本地插件可以带 JavaScript 入口，预览后需确认信任。入口在独立 Worker 中以本机用户权限运行。导出 `beforeTurn(context)` 可返回 `{ text }`，在清单声明 `on_event` 或 `after_turn` 后可通过 `onEvent(event)` 接收轮次完成、失败、取消事件。Worker 用于隔离异常和限制阻塞时间。已有目录继续按原授权加载。
+- V3 插件增加可组合的文本处理程序、聊天动作和会话级模型工具。安装「会话工具箱」后，可在已安装列表中按工作区授权。参见 [插件 SDK V3](docs/plugin-sdk-v3.md)。
+- 本地 JavaScript 插件通过目录预览确认信任后，在独立 Worker 中以本机用户权限运行。导出 `beforeTurn(context)` 可返回 `{ text }`，在清单声明 `on_event` 或 `after_turn` 后可通过 `onEvent(event)` 接收轮次完成、失败和取消。已安装脚本按包摘要校验，文件变化后需重新确认。
 - 安装先校验候选版本，再切换有效版本。初始化失败时保留当前版本。已安装列表提供启停、热重载和回退，版本记录在应用重启后保留。
 
 ## 架构概览
@@ -59,7 +60,7 @@ pnpm dev:electron
 ### 方式二：打包独立 Windows `.exe` 启动程序
 ```bash
 pnpm pack:exe
-# 输出位于 packages/electron/release/HarnessMate-Desktop-0.3.1-portable.exe
+# 输出位于 packages/electron/release/HarnessMate-Desktop-0.4.0-portable.exe
 ```
 
 ### 方式三：独立 Daemon + 浏览器开发模式

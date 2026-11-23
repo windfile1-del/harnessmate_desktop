@@ -24,6 +24,7 @@ import type {
   PluginSlashCommand,
   RemoteAccessStatus,
   RunHarnessCommandRequest,
+  RunPluginActionRequest,
   Session,
   SessionTaskState,
   SwitchHarnessRequest,
@@ -75,6 +76,8 @@ interface AppState {
 
   // Modular Plugin System
   plugins: InstalledPluginInfo[];
+  pluginPermissionRevision: number;
+  invalidatePluginPermissions: () => void;
   selectedPluginPanel: string | null;
   focusedTurn: { sessionId: string; turnId: string } | null;
   openPluginPanel: (key: string) => void;
@@ -146,6 +149,7 @@ interface AppState {
   createSession: (req: CreateSessionRequest) => Promise<Session>;
   importNativeSession: (req: ImportNativeSessionRequest) => Promise<Session>;
   runHarnessCommand: (id: string, req: RunHarnessCommandRequest) => Promise<HarnessCommandResult>;
+  runPluginAction: (id: string, req: RunPluginActionRequest) => Promise<HarnessCommandResult>;
   updateSession: (id: string, patch: UpdateSessionRequest) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   switchHarness: (sessionId: string, req: SwitchHarnessRequest) => Promise<void>;
@@ -345,6 +349,8 @@ export const useAppStore = create<AppState>((set, get) => {
     remoteStatus: null,
 
     plugins: [],
+    pluginPermissionRevision: 0,
+    invalidatePluginPermissions: () => set((state) => ({ pluginPermissionRevision: state.pluginPermissionRevision + 1 })),
     selectedPluginPanel: null,
     focusedTurn: null,
     openPluginPanel: (key) => set({ selectedPluginPanel: key, inspectorTab: 'plugins', inspectorOpen: true }),
@@ -738,6 +744,15 @@ export const useAppStore = create<AppState>((set, get) => {
 
     runHarnessCommand: async (id, req) => {
       const result = await daemonApi.runHarnessCommand(id, req);
+      set((state) => ({
+        sessions: state.sessions.map((session) => session.id === id && session.lastSeq <= result.session.lastSeq
+          ? result.session : session),
+      }));
+      return result;
+    },
+
+    runPluginAction: async (id, req) => {
+      const result = await daemonApi.runPluginAction(id, req);
       set((state) => ({
         sessions: state.sessions.map((session) => session.id === id && session.lastSeq <= result.session.lastSeq
           ? result.session : session),

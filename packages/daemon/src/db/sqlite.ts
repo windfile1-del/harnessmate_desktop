@@ -204,6 +204,14 @@ export class HarnessMateStore {
       CREATE INDEX IF NOT EXISTS idx_plugin_tool_events ON session_events(session_id, turn_id, seq)
         WHERE type IN ('tool.call.started', 'tool.call.completed');
 
+      CREATE TABLE IF NOT EXISTS plugin_permissions (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        plugin_id TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, plugin_id, capability)
+      );
+
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -832,6 +840,26 @@ export class HarnessMateStore {
       sessionId, turnId, seq: row.seq, type: row.type as CanonicalEventType, createdAt: row.created_at,
       payload: safeJsonParse<Record<string, unknown>>(row.payload_json, {}),
     }));
+  }
+
+  getPluginPermissions(workspaceId: string) {
+    return this.db.prepare(`SELECT plugin_id AS pluginId, digest, capability FROM plugin_permissions WHERE workspace_id = ?`)
+      .all(workspaceId) as Array<{ pluginId: string; digest: string; capability: string }>;
+  }
+
+  setPluginPermission(workspaceId: string, pluginId: string, digest: string, capability: string, granted: boolean): void {
+    if (granted) {
+      this.db.prepare(`INSERT INTO plugin_permissions (workspace_id, plugin_id, digest, capability) VALUES (?, ?, ?, ?)
+        ON CONFLICT (workspace_id, plugin_id, capability) DO UPDATE SET digest = excluded.digest`)
+        .run(workspaceId, pluginId, digest, capability);
+    } else {
+      this.db.prepare(`DELETE FROM plugin_permissions WHERE workspace_id = ? AND plugin_id = ? AND capability = ?`)
+        .run(workspaceId, pluginId, capability);
+    }
+  }
+
+  clearPluginPermissions(pluginId: string): void {
+    this.db.prepare('DELETE FROM plugin_permissions WHERE plugin_id = ?').run(pluginId);
   }
 
   // ── Session Harness Bindings (Per-Harness Sync Watermarks) ───────────

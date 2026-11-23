@@ -22,7 +22,10 @@ import {
   UpdateSessionRequestSchema,
   UpdateTaskStateRequestSchema,
   PluginPanelQuerySchema,
+  PreviewPluginProgramRequestSchema,
   ReplayPluginDraftRequestSchema,
+  RunPluginActionRequestSchema,
+  SetPluginPermissionRequestSchema,
   UploadAttachmentRequestSchema,
   type ContextSyncMode,
   type RemoteAccessStatus,
@@ -57,6 +60,9 @@ import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
 import { readPluginPanel } from '../plugins/plugin-panels.js';
+import { PluginCapabilities } from '../plugins/plugin-capabilities.js';
+import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
+import { runPluginProgram } from '../plugins/plugin-program.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
 
@@ -109,9 +115,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const mcpService = new McpService(registry, config.binaryOverrides);
   const usageService = new UsageService(store, registry, config.binaryOverrides);
 
+  let boundPort = config.port;
+  const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`);
   const eventBus = new DaemonEventBus();
   const sessionManager = new SessionManager(store, registry, eventBus, pluginManager,
-    new HarnessCommandTools(usageService, config.binaryOverrides));
+    new HarnessCommandTools(usageService, config.binaryOverrides), pluginCapabilities);
   const auth = new RemoteAuthService(store, config.localToken);
   const wsGateway = new WsGateway({
     desktopId: config.desktopId,
@@ -122,7 +130,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   const app = Fastify({ logger: false, bodyLimit: 24 * 1024 * 1024 });
-  let boundPort = config.port;
   const boundHost = opts.hostOverride ?? (config.lanEnabled ? '0.0.0.0' : '127.0.0.1');
 
   void app.register(cors, {
@@ -135,6 +142,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (!urlPath.startsWith('/api/v1/')) return;
     if (
       urlPath === '/api/v1/health' ||
+      urlPath === pluginMcpPath ||
       urlPath === '/api/v1/pair/exchange' ||
       urlPath.startsWith('/api/v1/attachments/')
     ) {
@@ -269,6 +277,30 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
+  registerPluginMcp(app, pluginCapabilities);
+
+  app.get('/api/v1/plugins/:id/permissions', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { workspaceId } = request.query as { workspaceId?: string };
+    if (typeof workspaceId !== 'string' || !store.getWorkspace(workspaceId)) return reply.code(404).send({ error: '工作区不存在' });
+    return { permissions: pluginCapabilities.listPermissions(workspaceId, id) };
+  });
+
+  app.put('/api/v1/plugins/:id/permissions', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = SetPluginPermissionRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '插件授权参数无效' });
+    try { return { permissions: pluginCapabilities.setPermission(id, parsed.data) }; }
+    catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+
+  app.post('/api/v1/plugins/actions/:sessionId', async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const parsed = RunPluginActionRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '插件动作参数无效' });
+    try { return await sessionManager.runPluginAction(sessionId, parsed.data); }
+    catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
 
   const updatedPlugins = async () => {
     const harnesses = pluginManager.takeRegistryChanged() ? await registry.probeAll(false) : undefined;
@@ -327,6 +359,18 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
+  app.post('/api/v1/plugins/preview/program', async (request, reply) => {
+    const parsed = PreviewPluginProgramRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '处理程序预览参数无效' });
+    const { manifest, programId, text } = parsed.data;
+    try {
+      pluginManager.validateManifest(manifest);
+      const program = manifest.contributes.programs?.find(({ id }) => id === programId);
+      if (!program) return reply.code(404).send({ error: '找不到草稿处理程序' });
+      return { output: runPluginProgram(program, text) };
+    } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+
   app.post('/api/v1/plugins/:id/rollback', async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
@@ -377,6 +421,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     try {
       await pluginManager.uninstallPlugin(id);
+      store.clearPluginPermissions(id);
       return await updatedPlugins();
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
@@ -538,7 +583,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { commands: sessionManager.getHarnessCommands(session) };
+    return { commands: sessionManager.getHarnessCommands(session), pluginActions: sessionManager.listPluginActions(session),
+      modelTools: sessionManager.getModelPluginTools(session) };
   });
 
   app.post('/api/v1/sessions/:id/commands', async (request, reply) => {

@@ -9,12 +9,14 @@ import type { AdapterSessionHandle } from '../harnesses/types.js';
 
 const schemaGuide = `Return exactly one JSON object, with no Markdown, implementation plan, tools, or file operations.
 The JSON defines a data-only HarnessMate plugin. Use labels and prompts in the user's language.
-Top level: id (user.<lowercase slug>), name, description, version, apiVersion (2, or 1 for legacy manifests), category ("workflow" or "ui"), contributes.
+Top level: id (user.<lowercase slug>), name, description, version, apiVersion (3 for actions or programs, 2 for data panels, 1 for legacy manifests), category ("workflow", "ui" or "tool"), contributes.
 contributes supports:
 - slashCommands: [{command, description, argumentHint?, template}]. Use lowercase command names distinct from built-in commands and {{args}} for the user input.
 - panels: [{id,title,description?,sections,actions}]. Sections are turns, changed_files, verifications, recent_activity. Actions are [{label,command,args?}] and refer to this plugin's slashCommands.
 - V2 projections: [{id,scope,events}]. Scope is "session" or "workspace". Events are "turn.completed", "turn.failed", "turn.cancelled".
-- V2 dataPanels: [{id,title,description?,projection,columns,filters?,defaultEvent?,counts?,openTurn?,placements?,copySummary?}]. Projection is the ID of a projection in this plugin. Columns are [{field,label}]; fields are time, session, harness, status, changed_files, verifications. Filters are harness or status. defaultEvent requires a status filter and an event in the referenced projection. Counts and openTurn are booleans. Placements are sidebar_tool or composer_action. copySummary is {label,command?}, a clipboard action and optional local slash command.
+- V2/V3 dataPanels: [{id,title,description?,projection,columns,filters?,defaultEvent?,counts?,openTurn?,placements?,copySummary?}]. Projection is the ID of a projection in this plugin. Columns are [{field,label}]; fields are time, session, harness, status, changed_files, verifications. Filters are harness or status. defaultEvent requires a status filter and an event in the referenced projection. Counts and openTurn are booleans. Placements are sidebar_tool or composer_action. copySummary is {label,command?}, a clipboard action and optional local slash command.
+- V3 programs: [{id,description,steps,exposeToModel?}]. Programs are pure text transformations. Steps: {op:"trim"}; {op:"case",mode:"upper" or "lower"}; {op:"replace",find,replacement}; {op:"wrap",prefix,suffix}; {op:"lines",contains?,ignoreCase?,unique?,order?:"asc" or "desc",limit?}. Tools exposed to models require workspace authorization.
+- V3 actions: [{kind:"program",command,description,program}] or [{kind:"harness",command,description,nativeCommand,args?}]. Program refers to a declared program. Native commands: compact, usage, model, plan, goal, skills, skill. If args is present it is fixed. These actions only execute when a user invokes them after workspace authorization.
 Include only supported data. No JavaScript, MCP, native harnesses, arbitrary UI code, background execution, or shell commands. Use at least one command or panel.
 For an installed plugin, keep its ID and choose a new version. When revising a pending draft, preserve its requested changes unless the new request changes them. Its new version can stay the same as the pending draft.`;
 
@@ -82,8 +84,9 @@ export class PluginAuthoring {
       const manifest = GeneratedPluginManifestSchema.parse(parsed);
       if (pluginId && manifest.id !== pluginId) throw new Error('更新草稿必须保留原插件 ID');
       if (installed && manifest.version === installed.version) throw new Error('新版本号必须与已安装版本不同');
-      if (!manifest.contributes.slashCommands?.length && !manifest.contributes.panels?.length && !manifest.contributes.dataPanels?.length) {
-        throw new Error('草稿至少需要一个指令或面板');
+      if (!manifest.contributes.slashCommands?.length && !manifest.contributes.panels?.length && !manifest.contributes.dataPanels?.length
+        && !manifest.contributes.actions?.length && !manifest.contributes.programs?.some(({ exposeToModel }) => exposeToModel)) {
+        throw new Error('草稿至少需要一个指令、面板、动作或模型工具');
       }
       return manifest;
     } finally {

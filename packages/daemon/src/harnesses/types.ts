@@ -46,7 +46,16 @@ export interface AdapterSessionConfig {
   requireNativeResume?: boolean;
   systemContextPrompt?: string | null;
   contextFilePath?: string | null;
+  pluginMcp?: PluginMcpConnection;
 }
+
+export interface PluginMcpConnection {
+  url: string;
+  token: string;
+}
+
+export const pluginMcpServerName = 'harnessmate_session_tools';
+export const pluginMcpTokenEnv = 'HARNESSMATE_SESSION_MCP_TOKEN';
 
 export interface TurnInput {
   turnId: string;
@@ -120,6 +129,7 @@ export type NormalizedAdapterEvent =
 
 export interface AdapterSessionHandle {
   readonly nativeSessionId: string | null;
+  readonly pluginMcpAvailable?: boolean;
   sendTurn(input: TurnInput): Promise<{ driverUsed?: ContextInjectionDriver } | void>;
   listSkills?(): Promise<NativeSkill[]>;
   runCodexGoal?(args: string): Promise<string>;
@@ -139,6 +149,7 @@ export interface HarnessAdapter {
   readonly protocolLabel: string;
   readonly capabilities: HarnessCapabilities;
   readonly isCustom?: boolean;
+  readonly pluginMcpTransport?: 'http' | 'acp';
 
   probe(): Promise<HarnessInfo>;
   createSession(config: AdapterSessionConfig): Promise<AdapterSessionHandle>;

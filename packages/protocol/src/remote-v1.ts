@@ -187,6 +187,11 @@ export const ReplayPluginDraftRequestSchema = z.object({
 }).strict();
 export type ReplayPluginDraftRequest = z.infer<typeof ReplayPluginDraftRequestSchema>;
 
+export const PreviewPluginProgramRequestSchema = z.object({
+  manifest: GeneratedPluginManifestSchema, programId: z.string().min(1).max(40), text: z.string().max(12_000),
+}).strict();
+export type PreviewPluginProgramRequest = z.infer<typeof PreviewPluginProgramRequestSchema>;
+
 export const AddMcpServerRequestSchema = z.object({
   targetHarnesses: z.array(z.enum(['codex', 'agy', 'claude'])).min(1),
   name: z.string().min(1).max(64).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/),

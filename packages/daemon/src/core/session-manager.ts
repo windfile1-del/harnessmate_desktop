@@ -17,7 +17,9 @@ import type {
   HarnessCommandResult,
   ImportNativeSessionRequest,
   RunHarnessCommandRequest,
+  RunPluginActionRequest,
   Session,
+  SessionPluginAction,
   SessionStatus,
   SessionTaskState,
   SwitchHarnessRequest,
@@ -36,6 +38,7 @@ import type {
   TurnInput,
 } from '../harnesses/types.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
+import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
 import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from './git-service.js';
@@ -51,6 +54,8 @@ interface LiveHandleEntry {
   unsubscribe: () => void;
   nativeToGlobalApprovalId: Map<string, string>;
   lastUsedAt: number;
+  pluginToolKey: string;
+  pluginToolLease?: PluginToolLease;
 }
 
 interface ActiveTurnMeta {
@@ -80,6 +85,7 @@ export class SessionManager {
     private readonly eventBus: DaemonEventBus,
     private readonly pluginManager?: PluginManager,
     private readonly commandTools?: HarnessCommandTools,
+    private readonly pluginCapabilities?: PluginCapabilities,
   ) {
     this.taskLedger = new TaskLedgerService(store);
     this.contextCompiler = new ContextCompiler(store, this.taskLedger);
@@ -800,103 +806,149 @@ export class SessionManager {
     return listHarnessCommands(session.harnessKind, source === 'agy_desktop');
   }
 
-  async runHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
+  private nativeActionReason(session: Session, command: RunHarnessCommandRequest['command']): string | undefined {
+    if (!this.registry.get(session.harnessId)) return '当前 Harness 适配器不可用';
+    if (!this.getHarnessCommands(session).some((entry) => entry.command === command)) return '当前 Harness 或会话来源未开放此命令';
+    if (command === 'compact' && !session.nativeSessionId && session.harnessKind !== 'claude') return '此会话尚无可压缩的原生上下文';
+  }
+
+  listPluginActions(session: Session): SessionPluginAction[] {
+    return this.pluginCapabilities?.listActions(session).map(({ plugin, action, granted }) => ({
+      ...action, pluginId: plugin.id, pluginName: plugin.name,
+      reason: session.status === 'archived' ? '会话已归档' : !granted ? '请在插件中心授权当前工作区'
+        : action.kind === 'harness' ? this.nativeActionReason(session, action.nativeCommand) : undefined,
+    })) ?? [];
+  }
+
+  getModelPluginTools(session: Session) {
+    const tools = this.pluginCapabilities?.getTools(session) ?? [];
+    const count = tools.length;
+    if (!count) return { count, status: 'none' as const };
+    if (!this.registry.get(session.harnessId)?.pluginMcpTransport) return { count, status: 'unsupported' as const };
+    const handle = this.liveHandles.get(this.handleKey(session.id, session.harnessId));
+    if (!handle || handle.pluginToolKey !== this.pluginToolKey(tools)) return { count, status: 'next_turn' as const };
+    if (!handle.pluginToolLease) return { count, status: 'unsupported' as const };
+    return { count, status: handle.pluginToolLease.discovered ? 'connected' as const : 'configured' as const };
+  }
+
+  async runPluginAction(sessionId: string, req: RunPluginActionRequest): Promise<HarnessCommandResult> {
     return this.withSessionStartup(sessionId, async () => {
       const session = this.store.getSession(sessionId);
-      if (!session) throw new Error(`Session not found: ${sessionId}`);
+      const capabilities = this.pluginCapabilities;
+      if (!session || !capabilities) throw new Error('会话或插件动作服务不存在');
       if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
-      if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
-        throw new Error('当前 Harness 或会话来源未开放此命令');
-      }
-      const busy = session.status === 'running' || session.status === 'awaiting_approval';
-      const goalControl = session.harnessKind === 'codex' && req.command === 'goal'
-        && ['', 'status', 'pause', 'clear'].includes(req.args);
-      if ((busy && !goalControl) || session.status === 'archived') {
-        throw new Error('请在会话空闲时运行原生命令');
-      }
-      const adapter = this.registry.get(session.harnessId);
-      if (!adapter || !this.commandTools) throw new Error('当前 Harness 命令服务不可用');
+      if (session.status === 'archived') throw new Error('会话已归档');
+      const entry = capabilities.listActions(session).find(({ action }) => action.command === req.command);
+      if (!entry) throw new Error('找不到已启用的插件动作');
+      if (!entry.granted) throw new Error('请在插件中心授权当前工作区');
+      const { action, plugin } = entry;
+      if (action.kind === 'program') return { output: capabilities.executeProgramAction(plugin, action, req.args), session };
+      const unavailable = this.nativeActionReason(session, action.nativeCommand);
+      if (unavailable) throw new Error(unavailable);
+      if (action.args !== undefined && req.args.trim()) throw new Error(`请单独发送 /${action.command}，该动作使用插件配置的参数`);
+      return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId });
+    });
+  }
 
-      const result = (output: string, turnId?: string): HarnessCommandResult => ({
-        output, turnId, session: this.store.getSession(sessionId)!,
-      });
-      const rawCommand = async (text: string) => {
-        const { turnId } = await this.startTurn(sessionId, text, undefined, undefined, { cliCommand: text });
-        return result('', turnId);
-      };
-      const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, null)).handle;
-      const { command, args } = req;
-      switch (command) {
-        case 'model': {
-          if (!args) {
-            const info = (await this.registry.probeAll()).find((h) => h.id === session.harnessId);
-            const models = info?.models.map((model) => `${model.id} · ${model.displayName}`) ?? [];
-            return result([`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'));
-          }
-          if (!/^[a-z0-9][a-z0-9_.:/\[\]-]*$/i.test(args)) throw new Error('请输入一个有效的模型 ID');
-          await this.updateSession(sessionId, { model: args === 'default' ? null : args, reasoningEffort: null });
-          return result(`已选择 ${args === 'default' ? 'CLI 默认模型' : args}`);
+  async runHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
+    return this.withSessionStartup(sessionId, () => this.executeHarnessCommand(sessionId, req));
+  }
+
+  private async executeHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
+      const session = this.store.getSession(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
+    if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
+      throw new Error('当前 Harness 或会话来源未开放此命令');
+    }
+    const busy = session.status === 'running' || session.status === 'awaiting_approval';
+    const goalControl = session.harnessKind === 'codex' && req.command === 'goal'
+      && ['', 'status', 'pause', 'clear'].includes(req.args);
+    if ((busy && !goalControl) || session.status === 'archived') {
+      throw new Error('请在会话空闲时运行原生命令');
+    }
+    const adapter = this.registry.get(session.harnessId);
+    if (!adapter || !this.commandTools) throw new Error('当前 Harness 命令服务不可用');
+
+    const result = (output: string, turnId?: string): HarnessCommandResult => ({
+      output, turnId, session: this.store.getSession(sessionId)!,
+    });
+    const rawCommand = async (text: string) => {
+      const { turnId } = await this.startTurn(sessionId, text, undefined, undefined, { cliCommand: text });
+      return result('', turnId);
+    };
+    const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, null)).handle;
+    const { command, args } = req;
+    switch (command) {
+      case 'model': {
+        if (!args) {
+          const info = (await this.registry.probeAll()).find((h) => h.id === session.harnessId);
+          const models = info?.models.map((model) => `${model.id} · ${model.displayName}`) ?? [];
+          return result([`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'));
         }
-        case 'plan': {
-          if (args === 'off') {
-            if (session.permissionMode === 'plan') await this.updateSession(sessionId, { permissionMode: 'manual' });
-            return result('已退出计划模式');
-          }
-          await this.updateSession(sessionId, { permissionMode: 'plan' });
-          const turn = args ? await this.startTurn(sessionId, args) : undefined;
-          return result('已启用计划模式', turn?.turnId);
+        if (!/^[a-z0-9][a-z0-9_.:/\[\]-]*$/i.test(args)) throw new Error('请输入一个有效的模型 ID');
+        await this.updateSession(sessionId, { model: args === 'default' ? null : args, reasoningEffort: null });
+        return result(`已选择 ${args === 'default' ? 'CLI 默认模型' : args}`);
+      }
+      case 'plan': {
+        if (args === 'off') {
+          if (session.permissionMode === 'plan') await this.updateSession(sessionId, { permissionMode: 'manual' });
+          return result('已退出计划模式');
         }
-        case 'compact': {
-          if (args && session.harnessKind !== 'claude') throw new Error('请使用 /compact');
-          if (!session.nativeSessionId && session.harnessKind !== 'claude') throw new Error('此会话尚无可压缩的原生上下文');
-          return rawCommand(args ? `/compact ${args}` : '/compact');
-        }
-        case 'usage': {
-          if (args) throw new Error('用法 /usage');
-          return session.harnessKind === 'claude' ? rawCommand('/usage')
-            : result(await this.commandTools.getUsage(session));
-        }
-        case 'goal': {
-          if (session.harnessKind === 'codex') {
-            const handle = await getHandle();
-            if (!handle.runCodexGoal) throw new Error('此 Codex 适配器未提供目标接口');
-            const output = await handle.runCodexGoal(args);
-            return result(output);
-          }
-          if (session.harnessKind === 'agy' && !args) throw new Error('用法 /goal <目标>');
-          return rawCommand(args ? `/goal ${args}` : '/goal');
-        }
-        case 'plugin': {
-          if (args === 'reload' && session.harnessKind === 'claude') return rawCommand('/reload-plugins');
-          const output = await this.commandTools.runPluginCommand(session, args);
-          if (args.startsWith('install ')) await this.disposeLiveHandle(sessionId, session.harnessId);
+        await this.updateSession(sessionId, { permissionMode: 'plan' });
+        const turn = args ? await this.startTurn(sessionId, args) : undefined;
+        return result('已启用计划模式', turn?.turnId);
+      }
+      case 'compact': {
+        if (args && session.harnessKind !== 'claude') throw new Error('请使用 /compact');
+        if (!session.nativeSessionId && session.harnessKind !== 'claude') throw new Error('此会话尚无可压缩的原生上下文');
+        return rawCommand(args ? `/compact ${args}` : '/compact');
+      }
+      case 'usage': {
+        if (args) throw new Error('用法 /usage');
+        return session.harnessKind === 'claude' ? rawCommand('/usage')
+          : result(await this.commandTools.getUsage(session));
+      }
+      case 'goal': {
+        if (session.harnessKind === 'codex') {
+          const handle = await getHandle();
+          if (!handle.runCodexGoal) throw new Error('此 Codex 适配器未提供目标接口');
+          const output = await handle.runCodexGoal(args);
           return result(output);
         }
-        case 'skills':
-        case 'skill': {
-          const skills = session.harnessKind === 'agy' ? await this.commandTools.listAgySkills(session.cwd)
-            : await (await getHandle()).listSkills?.() ?? [];
-          const availableSkills = skills.filter((skill) => skill.enabled !== false);
-          if (command === 'skills') {
-            if (args) throw new Error('用法 /skills');
-            return result(availableSkills.map((skill) =>
-              `${skill.name}${skill.description ? ` · ${skill.description}` : ''}`).join('\n') || '未发现可调用技能');
-          }
-          const [name = '', ...words] = args.split(/\s+/);
-          if (!/^[a-z0-9][a-z0-9_.:-]*$/i.test(name)) throw new Error('用法 /skill <名称> [参数]');
-          const skill = availableSkills.find((entry) => entry.name === name);
-          if (!skill) throw new Error(`未找到技能 ${name}，可用 /skills 查看列表`);
-          const skillArgs = words.join(' ');
-          if (session.harnessKind === 'codex') {
-            if (!skill.path) throw new Error('Codex 未返回技能路径');
-            const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, undefined,
-              { nativeSkill: { name, path: skill.path } });
-            return result('', turnId);
-          }
-          return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
-        }
+        if (session.harnessKind === 'agy' && !args) throw new Error('用法 /goal <目标>');
+        return rawCommand(args ? `/goal ${args}` : '/goal');
       }
-    });
+      case 'plugin': {
+        if (args === 'reload' && session.harnessKind === 'claude') return rawCommand('/reload-plugins');
+        const output = await this.commandTools.runPluginCommand(session, args);
+        if (args.startsWith('install ')) await this.disposeLiveHandle(sessionId, session.harnessId);
+        return result(output);
+      }
+      case 'skills':
+      case 'skill': {
+        const skills = session.harnessKind === 'agy' ? await this.commandTools.listAgySkills(session.cwd)
+          : await (await getHandle()).listSkills?.() ?? [];
+        const availableSkills = skills.filter((skill) => skill.enabled !== false);
+        if (command === 'skills') {
+          if (args) throw new Error('用法 /skills');
+          return result(availableSkills.map((skill) =>
+            `${skill.name}${skill.description ? ` · ${skill.description}` : ''}`).join('\n') || '未发现可调用技能');
+        }
+        const [name = '', ...words] = args.split(/\s+/);
+        if (!/^[a-z0-9][a-z0-9_.:-]*$/i.test(name)) throw new Error('用法 /skill <名称> [参数]');
+        const skill = availableSkills.find((entry) => entry.name === name);
+        if (!skill) throw new Error(`未找到技能 ${name}，可用 /skills 查看列表`);
+        const skillArgs = words.join(' ');
+        if (session.harnessKind === 'codex') {
+          if (!skill.path) throw new Error('Codex 未返回技能路径');
+          const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, undefined,
+            { nativeSkill: { name, path: skill.path } });
+          return result('', turnId);
+        }
+        return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
+      }
+    }
   }
 
   async sendTurn(
@@ -1013,6 +1065,7 @@ export class SessionManager {
         sessionId,
         session.harnessId,
         compiled?.syncNeeded ? compiled.systemLedgerPrompt : null,
+        true,
       );
       const currentBinding = this.store.getSessionBinding(sessionId, session.harnessId);
       if (contextBridgeEnabled && binding?.nativeSessionId &&
@@ -1189,6 +1242,7 @@ export class SessionManager {
     await Promise.all(
       entries.map(async (entry) => {
         entry.unsubscribe();
+        entry.pluginToolLease?.release();
         await entry.handle.dispose();
       }),
     );
@@ -1196,23 +1250,30 @@ export class SessionManager {
 
   // ── Warm Multi-Handle Runtime Pool ───────────────────────────────────
 
+  private pluginToolKey(tools: ReturnType<PluginCapabilities['getTools']>): string {
+    return tools.map(({ name, permission }) => `${name}:${permission.digest}`).join(',');
+  }
+
   private async ensureLiveHandle(
     sessionId: string,
     harnessId: string,
     systemContextPrompt: string | null,
+    refreshPluginTools = false,
   ): Promise<LiveHandleEntry> {
     const key = this.handleKey(sessionId, harnessId);
-    const existing = this.liveHandles.get(key);
-    if (existing) {
-      existing.lastUsedAt = Date.now();
-      return existing;
-    }
-
     const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
     const adapter = this.registry.get(harnessId);
     if (!adapter) throw new Error(`Harness adapter not found: ${harnessId}`);
+    const tools = adapter.pluginMcpTransport ? this.pluginCapabilities?.getTools(session) ?? [] : [];
+    const pluginToolKey = this.pluginToolKey(tools);
+    const existing = this.liveHandles.get(key);
+    if (existing && (!refreshPluginTools || existing.pluginToolKey === pluginToolKey)) {
+      existing.lastUsedAt = Date.now();
+      return existing;
+    }
+    if (existing) await this.disposeLiveHandle(sessionId, harnessId);
 
     const binding = this.store.getSessionBinding(sessionId, harnessId);
     const nativeSessionId =
@@ -1223,7 +1284,7 @@ export class SessionManager {
     // Evict oldest idle handle if warm pool is full
     await this.evictWarmPoolIfNeeded(sessionId);
 
-    const handle = await adapter.createSession({
+    const config = {
       cwd: session.cwd,
       model: session.model,
       reasoningEffort: session.reasoningEffort,
@@ -1231,9 +1292,24 @@ export class SessionManager {
       nativeSessionId,
       nativeHistorySource: nativeHistory?.source,
       nativeHistoryPath: nativeHistory?.sourcePath,
-      requireNativeResume: Boolean(nativeHistory),
+      requireNativeResume: Boolean(nativeHistory || (existing && nativeSessionId)),
       systemContextPrompt,
-    });
+    };
+    let lease = tools.length ? this.pluginCapabilities?.openLease(session, harnessId, tools) : undefined;
+    let handle: AdapterSessionHandle;
+    try {
+      handle = await adapter.createSession({ ...config, pluginMcp: lease?.connection });
+    } catch (error) {
+      if (!lease) throw error;
+      lease.release();
+      lease = undefined;
+      this.emitCanonical(sessionId, 'diagnostic.log', { level: 'warn', stream: 'protocol', message: '插件模型工具挂载失败，使用原会话能力重试' });
+      handle = await adapter.createSession(config);
+    }
+    if (lease && !handle.pluginMcpAvailable) {
+      lease.release();
+      lease = undefined;
+    }
 
     const resolvedNativeId = handle.nativeSessionId ?? nativeSessionId;
     if (resolvedNativeId) {
@@ -1268,6 +1344,8 @@ export class SessionManager {
       unsubscribe,
       nativeToGlobalApprovalId,
       lastUsedAt: Date.now(),
+      pluginToolKey,
+      pluginToolLease: lease,
     };
     this.liveHandles.set(key, entry);
     return entry;
@@ -1294,15 +1372,14 @@ export class SessionManager {
     if (!entry) return;
     this.liveHandles.delete(key);
     entry.unsubscribe();
+    entry.pluginToolLease?.release();
     await entry.handle.dispose();
   }
 
   private async disposeSessionHandles(sessionId: string): Promise<void> {
     const matching = Array.from(this.liveHandles.values()).filter((e) => e.sessionId === sessionId);
     for (const entry of matching) {
-      this.liveHandles.delete(entry.key);
-      entry.unsubscribe();
-      await entry.handle.dispose();
+      await this.disposeLiveHandle(entry.sessionId, entry.harnessId);
     }
   }
 

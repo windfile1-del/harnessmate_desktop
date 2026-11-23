@@ -23,6 +23,8 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
+import { pluginMcpServerName } from './types.js';
+import { pluginMcpStdioConfig } from './plugin-mcp-stdio.js';
 
 export interface AcpAdapterOptions {
   id: string;
@@ -79,6 +81,7 @@ export interface AcpLiveProbeSnapshot {
 const VALID_ACP_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 export class AcpAdapter implements HarnessAdapter {
+  readonly pluginMcpTransport = 'acp' as const;
   readonly id: string;
   readonly kind: HarnessKind;
   readonly displayName: string;
@@ -390,6 +393,7 @@ interface PendingAcpApproval {
 }
 
 class AcpSessionHandle implements AdapterSessionHandle {
+  pluginMcpAvailable = false;
   private readonly listeners = new Set<(event: NormalizedAdapterEvent) => void>();
   private readonly earlyBuffer: NormalizedAdapterEvent[] = [];
   private readonly rpc: StdioJsonRpcClient;
@@ -447,6 +451,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
       clientInfo: { name: 'harnessmate-desktop', version: '0.3.0' },
     })) as {
       agentCapabilities?: {
+        mcpCapabilities?: { http?: boolean };
         promptCapabilities?: { embeddedContext?: boolean };
         _meta?: { antigravity?: { systemPrompt?: { append?: boolean } } };
       };
@@ -458,6 +463,24 @@ class AcpSessionHandle implements AdapterSessionHandle {
     this.supportsSystemPromptAppend = Boolean(
       initRes?.agentCapabilities?._meta?.antigravity?.systemPrompt?.append,
     );
+
+    const mcp = this.config.pluginMcp;
+    const server = mcp && (initRes?.agentCapabilities?.mcpCapabilities?.http ? {
+      type: 'http', name: pluginMcpServerName, url: mcp.url,
+      headers: [{ name: 'Authorization', value: `Bearer ${mcp.token}` }],
+    } : pluginMcpStdioConfig(mcp));
+    this.pluginMcpAvailable = Boolean(server);
+    const requestSession = async (method: string, params: Record<string, unknown>) => {
+      if (server && this.pluginMcpAvailable) {
+        try {
+          return await this.rpc.request<AcpSessionNewResult>(method, { ...params, mcpServers: [server] }, 25_000);
+        } catch {
+          this.pluginMcpAvailable = false;
+          this.emit({ type: 'diagnostic.log', level: 'warn', stream: 'protocol', message: 'ACP 无法挂载会话插件工具，使用原会话能力重试' });
+        }
+      }
+      return this.rpc.request<AcpSessionNewResult>(method, params, 25_000);
+    };
 
     const buildSessionNewParams = (withSystemAppend: boolean): Record<string, unknown> => {
       const base: Record<string, unknown> = {
@@ -479,11 +502,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
     const createFreshAcpSession = async (): Promise<AcpSessionNewResult | undefined> => {
       if (this.supportsSystemPromptAppend && this.config.systemContextPrompt) {
         try {
-          return (await this.rpc.request(
-            'session/new',
-            buildSessionNewParams(true),
-            25_000,
-          )) as AcpSessionNewResult;
+          return await requestSession('session/new', buildSessionNewParams(true));
         } catch (err) {
           this.emit({
             type: 'diagnostic.log',
@@ -493,11 +512,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
           });
         }
       }
-      return (await this.rpc.request(
-        'session/new',
-        buildSessionNewParams(false),
-        25_000,
-      )) as AcpSessionNewResult;
+      return requestSession('session/new', buildSessionNewParams(false));
     };
 
     let sessRes: AcpSessionNewResult | undefined;
@@ -511,8 +526,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
         const supportsResume = (initRes.agentCapabilities as {
           sessionCapabilities?: { resume?: unknown };
         } | undefined)?.sessionCapabilities?.resume;
-        sessRes = await this.rpc.request<AcpSessionNewResult>(
-          supportsResume ? 'session/resume' : 'session/load', params, 25_000);
+        sessRes = await requestSession(supportsResume ? 'session/resume' : 'session/load', params);
         this._nativeSessionId = this.config.nativeSessionId;
       } catch (err) {
         if (this.config.requireNativeResume) throw err;

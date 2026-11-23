@@ -205,6 +205,21 @@ const BUILTIN_PLUGINS: PluginManifest[] = [
 
 const CURATED_PLUGIN_CATALOG: Array<PluginManifest & { tags: string[] }> = [
   {
+    id: 'user.session-toolkit', name: '会话工具箱', version: '1.0.0', apiVersion: 3, category: 'tool',
+    description: '整理文本行，并在当前 Harness 支持时运行额度、压缩或计划动作。',
+    tags: ['会话动作', '模型工具'],
+    contributes: {
+      programs: [{ id: 'unique_lines', description: '去除重复文本行并排序', exposeToModel: true,
+        steps: [{ op: 'trim' }, { op: 'lines', unique: true, order: 'asc' }] }],
+      actions: [
+        { kind: 'program', command: 'unique-lines', description: '去除重复文本行并排序', program: 'unique_lines' },
+        { kind: 'harness', command: 'toolkit-usage', description: '查看当前 Harness 的用量', nativeCommand: 'usage', args: '' },
+        { kind: 'harness', command: 'toolkit-compact', description: '压缩当前会话的原生上下文', nativeCommand: 'compact', args: '' },
+        { kind: 'harness', command: 'toolkit-plan', description: '将当前会话切换到计划模式', nativeCommand: 'plan', args: '' },
+      ],
+    },
+  },
+  {
     id: 'user.project-acceptance',
     name: '项目验收台',
     description: '按工作区查看三个 Harness 的轮次、已记录的改动文件和验证结果，支持筛选和定位到原轮次。',
@@ -436,6 +451,17 @@ export class PluginManager {
         const directory = pointer ? revisionDirectory(root, pointer.current) : root;
         if (!pointer && !fs.existsSync(path.join(root, MANIFEST_FILE))) continue;
         const pack = readPluginPackage(directory);
+        if (pointer?.currentDigest && pointer.currentDigest !== pack.digest) {
+          throw new Error('插件文件已变更，请重新预览并安装');
+        }
+        if (pack.manifest.entry) {
+          if (!pointer) throw new Error('带 JavaScript 的插件需在插件中心预览并确认信任');
+          if (!pointer.currentDigest) {
+            const approved = this.plugins.get(pack.manifest.id)?.digest;
+            if (approved && approved !== pack.digest) throw new Error('插件程序文件已变更，请重新预览并确认信任');
+            writeRevisionPointer(root, { ...pointer, currentDigest: pack.digest });
+          }
+        }
         if (next.has(pack.manifest.id)) throw new Error('插件 ID 重复');
         this.validateManifest(pack.manifest, next);
         const enabled = !disabledSet.has(pack.manifest.id);
@@ -532,6 +558,7 @@ export class PluginManager {
     const contributedHarnesses = new Set<string>();
     const commandNames = (plugin: PluginManifest) => [
       ...(plugin.contributes.slashCommands ?? []).map(({ command }) => command),
+      ...(plugin.contributes.actions ?? []).map(({ command }) => command),
       ...(plugin.contributes.dataPanels ?? []).flatMap(({ copySummary }) => copySummary?.command ? [copySummary.command] : []),
     ];
     for (const { info } of other) {
@@ -561,12 +588,20 @@ export class PluginManager {
         if (!ownCommands.has(action.command)) throw new Error(`面板操作必须引用本插件的指令 /${action.command}`);
       }
     }
-    const { projections, dataPanels, harnesses, mcpPresets, hooks, uiSlots } = manifest.contributes;
-    if (manifest.apiVersion !== 2 && (projections || dataPanels)) {
-      throw new Error('事件投影和数据面板需要 apiVersion: 2');
+    const { projections, dataPanels, harnesses, mcpPresets, hooks, uiSlots, actions, programs } = manifest.contributes;
+    if ((manifest.apiVersion ?? 1) < 2 && (projections || dataPanels)) {
+      throw new Error('事件投影和数据面板需要 apiVersion: 2 或更高版本');
     }
-    if (manifest.apiVersion === 2 && (manifest.entry || harnesses?.length || mcpPresets?.length || hooks?.length || uiSlots?.length)) {
-      throw new Error('V2 插件使用声明式扩展接口');
+    if ((manifest.apiVersion ?? 1) >= 2 && (manifest.entry || harnesses?.length || mcpPresets?.length || hooks?.length || uiSlots?.length)) {
+      throw new Error('V2/V3 插件使用声明式扩展接口');
+    }
+    if (manifest.apiVersion !== 3 && (actions || programs)) throw new Error('插件动作和处理程序需要 apiVersion: 3');
+    const programIds = new Set(programs?.map(({ id }) => id));
+    if (programIds.size !== (programs?.length ?? 0)) throw new Error('插件处理程序 ID 不能重复');
+    for (const action of actions ?? []) {
+      if (action.kind === 'program' && !programIds.has(action.program)) {
+        throw new Error(`动作 /${action.command} 引用了不存在的处理程序 ${action.program}`);
+      }
     }
     const projectionIds = new Set<string>();
     for (const projection of projections ?? []) {
@@ -648,6 +683,7 @@ export class PluginManager {
       if (enabled && !record.info.builtin) {
         if (!record.packageRoot) throw new Error('请先修复或回退损坏的插件');
         const pack = readPluginPackage(record.packageRoot);
+        if (record.digest !== pack.digest) throw new Error('插件文件已变更，请重新预览并安装');
         this.validateManifest(pack.manifest);
         candidate = await this.prepare(pack, record.packageRoot, record.info.sourcePath!, true, Boolean(record.info.canRollback));
       }
@@ -716,7 +752,9 @@ export class PluginManager {
       const root = old?.info.sourcePath ?? path.join(this.pluginsDir, id);
       this.checkPluginRoot(root);
       const pointer = readRevisionPointer(root);
-      const previous = pointer?.current ?? (old?.packageRoot ? writeRevision(root, readPluginPackage(old.packageRoot).files) : undefined);
+      const legacy = !pointer && old?.packageRoot ? readPluginPackage(old.packageRoot) : undefined;
+      const previous = pointer?.current ?? (legacy ? writeRevision(root, legacy.files) : undefined);
+      const previousDigest = pointer?.currentDigest ?? old?.digest ?? legacy?.digest;
       const revision = writeRevision(root, pack.files);
       const directory = revisionDirectory(root, revision);
       const enabled = !this.getDisabledIds().includes(id);
@@ -727,14 +765,18 @@ export class PluginManager {
           candidate.runtime?.retire();
           candidate = { ...candidate, runtime: undefined, info: { ...candidate.info, enabled, hasRuntimeHook: false } };
         }
-        writeRevisionPointer(root, { current: revision, previous });
+        writeRevisionPointer(root, { current: revision, previous, currentDigest: candidate.digest, previousDigest });
       } catch (error) {
         candidate?.runtime?.retire();
         this.removeRevision(root, revision);
         if (!pointer && previous) this.removeRevision(root, previous);
         throw error;
       }
-      this.activate(new Map(this.plugins).set(id, candidate));
+      const next = new Map(this.plugins);
+      for (const [otherId, record] of next) {
+        if (otherId !== id && otherId.startsWith('broken.') && record.info.sourcePath === root) next.delete(otherId);
+      }
+      this.activate(next.set(id, candidate));
       if (pointer?.previous) this.removeRevision(root, pointer.previous);
       return this.listInstalled();
     });
@@ -748,10 +790,14 @@ export class PluginManager {
       this.checkPluginRoot(root);
       const directory = revisionDirectory(root, pointer.previous);
       const pack = readPluginPackage(directory);
+      if (pointer.previousDigest && pointer.previousDigest !== pack.digest) {
+        throw new Error('回退版本的插件文件已变更，请重新预览并安装');
+      }
       this.validateManifest(pack.manifest);
       const candidate = await this.prepare(pack, directory, root, !this.getDisabledIds().includes(pack.manifest.id), true);
       try {
-        writeRevisionPointer(root, { current: pointer.previous, previous: pointer.current });
+        writeRevisionPointer(root, { current: pointer.previous, previous: pointer.current,
+          currentDigest: pack.digest, previousDigest: pointer.currentDigest });
       } catch (error) {
         candidate.runtime?.retire();
         throw error;
@@ -829,8 +875,9 @@ export class PluginManager {
       if (match?.[1]) {
         const cmdName = match[1].toLowerCase();
         if ([...this.plugins.values()].some(({ info }) => info.enabled &&
-          info.contributes.dataPanels?.some(({ copySummary }) => copySummary?.command === cmdName))) {
-          throw new Error(`/${cmdName} 是桌面插件面板命令，请在桌面聊天中使用`);
+          (info.contributes.dataPanels?.some(({ copySummary }) => copySummary?.command === cmdName) ||
+            info.contributes.actions?.some(({ command }) => command === cmdName)))) {
+          throw new Error(`/${cmdName} 是桌面插件面板命令或动作，请在桌面聊天中使用`);
         }
         const args = (match[2] ?? '').trim();
         const found = this.listActiveSlashCommands().find((c) => c.command === cmdName);

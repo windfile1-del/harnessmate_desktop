@@ -23,6 +23,7 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
+import { pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
 
 const VALID_EFFORTS = new Set<ReasoningEffort>([
   'none',
@@ -50,6 +51,7 @@ export interface CodexLiveProbeSnapshot {
 
 export class CodexAppServerAdapter implements HarnessAdapter {
   readonly id = 'codex';
+  readonly pluginMcpTransport = 'http' as const;
   readonly kind = 'codex' as const;
   readonly displayName = 'Codex CLI';
   readonly description = 'OpenAI Codex CLI via bidirectional app-server JSON-RPC 2.0';
@@ -253,8 +255,12 @@ export class CodexAppServerAdapter implements HarnessAdapter {
     }
 
     const store = config.nativeHistoryPath ? getCodexRolloutStore(config.nativeHistoryPath) : undefined;
-    const child = spawnCliProcess(binaryPath, this.extraArgs, {
-      cwd: config.cwd, env: store ? { CODEX_HOME: store.home } : undefined,
+    const mcp = config.pluginMcp;
+    const prefix = `mcp_servers.${pluginMcpServerName}`;
+    const args = mcp ? [...this.extraArgs, '-c', `${prefix}.url=${mcp.url}`,
+      '-c', `${prefix}.bearer_token_env_var=${pluginMcpTokenEnv}`, '-c', `${prefix}.startup_timeout_sec=3`] : this.extraArgs;
+    const child = spawnCliProcess(binaryPath, args, {
+      cwd: config.cwd, env: { ...(store ? { CODEX_HOME: store.home } : {}), ...(mcp ? { [pluginMcpTokenEnv]: mcp.token } : {}) },
     });
     const handle = new CodexSessionHandle(child, config);
     try {
@@ -346,6 +352,8 @@ class CodexSessionHandle implements AdapterSessionHandle {
   get nativeSessionId(): string | null {
     return this._nativeSessionId;
   }
+
+  get pluginMcpAvailable(): boolean { return Boolean(this.config.pluginMcp); }
 
   async initialize(): Promise<void> {
     await this.rpc.request('initialize', {
@@ -886,8 +894,9 @@ class CodexSessionHandle implements AdapterSessionHandle {
           itemType === 'webSearch'
         ) {
           const statusRaw = String(item.status ?? 'completed');
+          const mcpResult = itemType === 'mcpToolCall' ? item.result as { isError?: boolean; content?: Array<{ type: string; text?: string }> } | undefined : undefined;
           const status =
-            statusRaw === 'failed' || statusRaw === 'declined'
+            statusRaw === 'failed' || statusRaw === 'declined' || mcpResult?.isError
               ? 'error'
               : statusRaw === 'cancelled'
                 ? 'cancelled'
@@ -897,7 +906,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
               ? item.aggregatedOutput
               : typeof item.output === 'string'
                 ? item.output
-                : undefined;
+                : mcpResult?.content?.filter(({ type }) => type === 'text').map(({ text }) => text ?? '').join('\n');
           this.emit({
             type: 'tool.call.completed',
             turnId,

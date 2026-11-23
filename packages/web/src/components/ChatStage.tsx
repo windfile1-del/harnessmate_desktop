@@ -5,6 +5,8 @@ import type {
   PermissionMode,
   ReasoningEffort,
   Session,
+  SessionModelPluginTools,
+  SessionPluginAction,
   WorkspaceFileEntry,
 } from '@harnessmate/protocol';
 import { HarnessCommandNameSchema } from '@harnessmate/protocol';
@@ -79,6 +81,7 @@ export function ChatStage() {
     workspaces,
     slashCommands,
     plugins,
+    pluginPermissionRevision,
     focusedTurn,
     focusTurn,
     openPluginPanel,
@@ -97,6 +100,7 @@ export function ChatStage() {
     selectSession,
     sendTurn,
     runHarnessCommand,
+    runPluginAction,
     switchHarness,
     failoverSession,
     interruptSession,
@@ -161,7 +165,8 @@ export function ChatStage() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
-  const [commandCatalog, setCommandCatalog] = useState<{ key: string; commands: HarnessCommandInfo[] }>();
+  const [commandCatalog, setCommandCatalog] = useState<{ key: string; commands: HarnessCommandInfo[];
+    pluginActions: SessionPluginAction[]; modelTools: SessionModelPluginTools }>();
   const [commandOutputs, setCommandOutputs] = useState<Record<string, { command: string; output: string }>>({});
 
   // @file mention popover
@@ -195,13 +200,13 @@ export function ChatStage() {
   }, [focusedTurn, selectedSessionId, timeline, focusTurn]);
 
   useEffect(() => {
-    if (!selectedSessionId || !nativeCommandsEnabled) return;
+    if (!selectedSessionId) return;
     let current = true;
-    void daemonApi.getHarnessCommands(selectedSessionId).then(({ commands }) => {
-      if (current) setCommandCatalog({ key: commandCatalogKey, commands });
+    void daemonApi.getHarnessCommands(selectedSessionId).then((catalog) => {
+      if (current) setCommandCatalog({ key: commandCatalogKey, ...catalog });
     }).catch(() => {});
     return () => { current = false; };
-  }, [selectedSessionId, commandCatalogKey, nativeCommandsEnabled]);
+  }, [selectedSessionId, commandCatalogKey, session?.nativeSessionId, session?.status, plugins, pluginPermissionRevision]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -224,6 +229,8 @@ export function ChatStage() {
 
   const nativeCommands = nativeCommandsEnabled && commandCatalog?.key === commandCatalogKey
     ? commandCatalog.commands : [];
+  const pluginActions = commandCatalog?.key === commandCatalogKey ? commandCatalog.pluginActions ?? [] : [];
+  const modelTools = commandCatalog?.key === commandCatalogKey ? commandCatalog.modelTools : undefined;
   const pluginPanels = useMemo(() => listPluginPanels(plugins), [plugins]);
   const panelCommands = useMemo(() => pluginPanels.flatMap((entry) => {
     const action = entry.panel.copySummary;
@@ -241,9 +248,11 @@ export function ChatStage() {
       ...command, pluginId: 'core.harness-commands', pluginName: harness?.displayName ?? '原生命令',
     }));
     const nativeNames = new Set<string>(native.map(({ command }) => command));
-    return [...native, ...[...panelCommands, ...slashCommands].filter(({ command }) => !nativeNames.has(command))]
+    const actions = pluginActions.map((entry) => ({ ...entry, description: entry.reason ? `${entry.description} · ${entry.reason}` : entry.description,
+      argumentHint: entry.kind === 'program' ? '<文本>' : undefined }));
+    return [...native, ...[...panelCommands, ...actions, ...slashCommands].filter(({ command }) => !nativeNames.has(command))]
       .filter((c) => c.command.toLowerCase().includes(firstToken));
-  }, [inputText, nativeCommands, slashCommands, panelCommands, harness?.displayName]);
+  }, [inputText, nativeCommands, slashCommands, panelCommands, pluginActions, harness?.displayName]);
 
   if (!session) {
     return (
@@ -382,22 +391,31 @@ export function ChatStage() {
     }
     const name = nativeCommandName;
     const isWorkflow = slashCommands.some((command) => command.command === typedCommand);
-    if (nativeCommandsEnabled && name.success && (!isWorkflow || nativeCommands.some((command) => command.command === name.data))) {
+    const pluginAction = pluginActions.find(({ command }) => command === typedCommand);
+    const actionCommand = pluginAction?.command ?? plugins.filter(({ enabled }) => enabled)
+      .flatMap(({ contributes }) => contributes.actions ?? []).find(({ command }) => command === typedCommand)?.command;
+    const nativeCommand = nativeCommandsEnabled && name.success && (!isWorkflow || nativeCommands.some((command) => command.command === name.data))
+      ? name.data : undefined;
+    if (actionCommand || nativeCommand) {
+      if (pluginAction?.reason && !nativeCommand) {
+        pushToast({ kind: 'warning', title: '当前会话无法执行插件动作', body: pluginAction.reason });
+        return;
+      }
       if (attachments.length > 0) {
-        pushToast({ kind: 'warning', title: '请先移除附件再执行原生命令' });
+        pushToast({ kind: 'warning', title: '请先移除附件再执行命令' });
         return;
       }
       setSending(true);
       try {
-        const response = await runHarnessCommand(session.id, {
-          command: name.data, args: commandArgs, harnessId: session.harnessId,
-        });
+        const input = { args: commandArgs, harnessId: session.harnessId };
+        const response = nativeCommand ? await runHarnessCommand(session.id, { ...input, command: nativeCommand })
+          : await runPluginAction(session.id, { ...input, command: actionCommand! });
         if (useAppStore.getState().draftTextBySession[session.id] === inputText) clearDraft(session.id);
         setCommandOutputs((outputs) => ({ ...outputs,
-          [session.id]: { command: trimmed, output: response.output },
+          [session.id]: { command: trimmed, output: response.output || (actionCommand && !response.turnId ? '（空结果）' : '') },
         }));
       } catch (err) {
-        pushToast({ kind: 'error', title: '原生命令执行失败', body: err instanceof Error ? err.message : String(err) });
+        pushToast({ kind: 'error', title: actionCommand ? '插件动作执行失败' : '原生命令执行失败', body: err instanceof Error ? err.message : String(err) });
       } finally {
         setSending(false);
         textareaRef.current?.focus();
@@ -1002,7 +1020,7 @@ export function ChatStage() {
                   </>
                 )}
 
-                {(nativeCommands.length > 0 || slashCommands.length > 0 || panelCommands.length > 0) && (
+                {(nativeCommands.length > 0 || slashCommands.length > 0 || panelCommands.length > 0 || pluginActions.length > 0) && (
                   <button
                     type="button"
                     disabled={isRunning}
@@ -1020,6 +1038,14 @@ export function ChatStage() {
                     <Slash size={12} />
                   </button>
                 )}
+
+                {modelTools && modelTools.count > 0 && <span role="status" className="text-[11px] text-[var(--text-secondary)]" title={
+                  modelTools.status === 'connected' ? '当前 CLI 已查询插件工具列表'
+                    : modelTools.status === 'next_turn' ? '下次发送消息时更新会话工具'
+                    : modelTools.status === 'unsupported' ? '当前 CLI 会话未接受插件工具连接'
+                    : '已配置会话连接，等待 CLI 查询工具列表'}>
+                  {modelTools.count} 个模型工具{modelTools.status === 'unsupported' ? '不可用' : modelTools.status === 'next_turn' ? '待接入' : ''}
+                </span>}
 
                 {composerPanels.length > 0 && <select aria-label="在输入区打开插件面板" value=""
                   onChange={(event) => { if (event.target.value) openPluginPanel(event.target.value); }}

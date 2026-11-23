@@ -30,6 +30,7 @@ import { useAppStore } from '../stores/app-store';
 import { HarnessBadge } from './BrandMark';
 import { ModelPicker } from './ModelPicker';
 import { PluginAuthoringForm } from './PluginAuthoringForm';
+import { PluginPermissionsEditor } from './PluginPermissionsEditor';
 
 function StudioHeader({
   title,
@@ -110,6 +111,8 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<'installed' | 'catalog' | 'install'>('installed');
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<{ manifest: PluginManifest; digest: string }>();
+  const [permissionPluginId, setPermissionPluginId] = useState<string>();
+  const permissionPlugin = plugins.find(({ id }) => id === permissionPluginId);
   const runPluginAction = async (action: () => Promise<void>) => {
     setBusy(true);
     try { await action(); }
@@ -171,6 +174,8 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
       <div className="max-h-[480px] overflow-y-auto p-5">
         {tab === 'installed' && (
           <div className="space-y-2.5">
+            {permissionPlugin && <PluginPermissionsEditor key={permissionPlugin.id} plugin={permissionPlugin}
+              onClose={() => setPermissionPluginId(undefined)} />}
             {pluginsDir && (
               <div className="rounded-xl px-3 py-2 font-mono-code text-[11px] text-[var(--text-muted)]" style={{ backgroundColor: 'var(--bg-elevated)' }}>
                 外部插件目录：{pluginsDir}
@@ -258,6 +263,9 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                 </div>
 
                 <div className="flex shrink-0 items-center gap-2">
+                  {p.apiVersion === 3 && (!!p.contributes.actions?.length || p.contributes.programs?.some(({ exposeToModel }) => exposeToModel)) &&
+                    <button type="button" className="text-[11px] text-[var(--accent-indigo)]"
+                      onClick={() => setPermissionPluginId(p.id)}>工作区授权</button>}
                   {p.canRollback && <button type="button" disabled={busy} className="text-[11px] text-[var(--accent-indigo)]"
                     onClick={() => void runPluginAction(() => rollbackPlugin(p.id))}>回退</button>}
                   {!p.builtin && !p.loadError && p.packageDigest && GeneratedPluginManifestSchema.safeParse(PluginManifestSchema.parse(p)).success && (

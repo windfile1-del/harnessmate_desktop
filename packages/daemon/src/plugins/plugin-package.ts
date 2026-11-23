@@ -17,6 +17,8 @@ export interface PluginPackage {
 export interface RevisionPointer {
   current: string;
   previous?: string;
+  currentDigest?: string;
+  previousDigest?: string;
 }
 
 export function readPluginPackage(directory: string): PluginPackage {
@@ -65,6 +67,9 @@ export function readRevisionPointer(root: string): RevisionPointer | undefined {
   const pointer = JSON.parse(fs.readFileSync(file, 'utf8')) as RevisionPointer;
   if (!revisionPattern.test(pointer.current) || (pointer.previous && !revisionPattern.test(pointer.previous))) {
     throw new Error('插件版本记录无效');
+  }
+  for (const digest of [pointer.currentDigest, pointer.previousDigest]) {
+    if (digest !== undefined && !/^[a-f0-9]{64}$/.test(digest)) throw new Error('插件版本摘要无效');
   }
   return pointer;
 }

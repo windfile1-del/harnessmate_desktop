@@ -16,6 +16,8 @@ function entries(manifest?: PluginManifest) {
   contributes.panels?.forEach((panel, position) => add('panel', panel.id, `面板 ${panel.title}`, { position, ...panel }));
   contributes.dataPanels?.forEach((panel, position) => add('dataPanel', panel.id, `数据面板 ${panel.title}`, { position, ...panel }));
   contributes.projections?.forEach((projection) => add('projection', projection.id, `事件投影 ${projection.id}`, projection));
+  contributes.programs?.forEach((program) => add('program', program.id, `处理程序 ${program.id}`, program));
+  contributes.actions?.forEach((action) => add('action', action.command, `插件动作 /${action.command}`, action));
   contributes.hooks?.forEach((hook) => add('hook', hook, `运行时 Hook ${hook}`, hook));
   contributes.uiSlots?.forEach((slot) => add('slot', slot, `界面入口 ${slot}`, slot));
   contributes.harnesses?.forEach((harness) => add('harness', harness.id, `ACP ${harness.displayName}`, harness));
@@ -59,10 +61,45 @@ export function PluginDraftReview({ preview, workspaceId }: { preview: PluginPre
         {manifest.entry && <p>JavaScript 入口以当前系统用户权限运行。</p>}
         {!!manifest.contributes.harnesses?.length && <p>注册 ACP 适配器，使用适配器时运行其配置的程序。</p>}
         {!!manifest.contributes.mcpPresets?.length && <p>提供可在 MCP 中心应用的连接预设。</p>}
+        {manifest.contributes.actions?.map((action) => <p key={action.command}>/{action.command} · 工作区授权后由用户主动执行
+          {action.kind === 'harness' ? ` · /${action.nativeCommand}${action.args ? ` ${action.args}` : ''}` : ''}</p>)}
+        {manifest.contributes.programs?.filter(({ exposeToModel }) => exposeToModel).map((program) =>
+          <p key={program.id}>模型工具 {program.id} · 工作区授权后向当前 CLI 提供文本处理</p>)}
       </div>
       {panels.length > 0 && <PluginDraftReplay manifest={manifest} workspaceId={workspaceId} />}
+      {!!manifest.contributes.programs?.length && <PluginProgramPreview manifest={manifest} />}
     </>
   );
+}
+
+function PluginProgramPreview({ manifest }: { manifest: PluginManifest }) {
+  const programs = manifest.contributes.programs ?? [];
+  const [programId, setProgramId] = useState(programs[0]?.id ?? '');
+  const [text, setText] = useState('');
+  const [output, setOutput] = useState<string>();
+  const [error, setError] = useState('');
+  const [running, setRunning] = useState(false);
+  const run = async () => {
+    setRunning(true);
+    setOutput(undefined);
+    setError('');
+    try { setOutput((await daemonApi.previewPluginProgram({ manifest, programId, text })).output); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRunning(false); }
+  };
+  return <section aria-label="处理程序预演" className="space-y-2 rounded-lg border border-[var(--border-hairline)] p-3">
+    <h5 className="font-medium text-[var(--text-primary)]">处理程序预演</h5>
+    <select aria-label="预演处理程序" className="rounded bg-[var(--bg-surface)] p-1.5" value={programId} disabled={running}
+      onChange={(event) => { setProgramId(event.target.value); setOutput(undefined); setError(''); }}>
+      {programs.map(({ id, description }) => <option key={id} value={id}>{description}</option>)}
+    </select>
+    <textarea aria-label="处理程序输入" className="w-full rounded bg-[var(--bg-surface)] p-2" rows={3} maxLength={12_000} value={text}
+      disabled={running} onChange={(event) => { setText(event.target.value); setOutput(undefined); setError(''); }} />
+    <button type="button" className="rounded border border-[var(--border-hairline)] px-2 py-1 hover:bg-[var(--bg-hover)]"
+      disabled={running} onClick={() => void run()}>运行样例</button>
+    {output !== undefined && <pre aria-label="处理程序输出" className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-[var(--bg-surface)] p-2">{output || '（空结果）'}</pre>}
+    {error && <p role="alert" className="text-[var(--accent-rose)]">{error}</p>}
+  </section>;
 }
 
 function ChangeValue({ label, value }: { label: string; value: unknown }) {

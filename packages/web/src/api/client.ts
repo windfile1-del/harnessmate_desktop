@@ -23,11 +23,17 @@ import type {
   McpServerEntry,
   PluginCatalogItem,
   PluginMcpPreset,
+  PluginPermission,
+  PreviewPluginProgramRequest,
   PluginSlashCommand,
   RemoteAccessStatus,
   ReplayPluginDraftRequest,
   RunHarnessCommandRequest,
+  RunPluginActionRequest,
   Session,
+  SessionModelPluginTools,
+  SessionPluginAction,
+  SetPluginPermissionRequest,
   SessionTaskState,
   PluginPanelQuery,
   PluginPanelSnapshot,
@@ -192,6 +198,20 @@ export const daemonApi = {
   replayPluginDraft: (req: ReplayPluginDraftRequest, signal?: AbortSignal) =>
     apiFetch<PluginPanelSnapshot>('/api/v1/plugins/preview/replay', { method: 'POST', body: JSON.stringify(req), signal }),
 
+  previewPluginProgram: (request: PreviewPluginProgramRequest) =>
+    apiFetch<{ output: string }>('/api/v1/plugins/preview/program', { method: 'POST', body: JSON.stringify(request) }),
+
+  listPluginPermissions: (id: string, workspaceId: string) =>
+    apiFetch<{ permissions: PluginPermission[] }>(`/api/v1/plugins/${encodeURIComponent(id)}/permissions?workspaceId=${encodeURIComponent(workspaceId)}`),
+
+  setPluginPermission: (id: string, request: SetPluginPermissionRequest) =>
+    apiFetch<{ permissions: PluginPermission[] }>(`/api/v1/plugins/${encodeURIComponent(id)}/permissions`,
+      { method: 'PUT', body: JSON.stringify(request) }),
+
+  runPluginAction: (sessionId: string, request: RunPluginActionRequest) =>
+    apiFetch<HarnessCommandResult>(`/api/v1/plugins/actions/${encodeURIComponent(sessionId)}`,
+      { method: 'POST', body: JSON.stringify(request) }),
+
   generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
     apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),
 
@@ -308,7 +328,8 @@ export const daemonApi = {
     ),
 
   getHarnessCommands: (id: string) =>
-    apiFetch<{ commands: HarnessCommandInfo[] }>(`/api/v1/sessions/${encodeURIComponent(id)}/commands`),
+    apiFetch<{ commands: HarnessCommandInfo[]; pluginActions: SessionPluginAction[]; modelTools: SessionModelPluginTools }>(
+      `/api/v1/sessions/${encodeURIComponent(id)}/commands`),
 
   runHarnessCommand: (id: string, req: RunHarnessCommandRequest) =>
     apiFetch<HarnessCommandResult>(`/api/v1/sessions/${encodeURIComponent(id)}/commands`, {

@@ -5,6 +5,7 @@ import { expect, it } from 'vitest';
 import type { PluginManifest } from '@harnessmate/protocol';
 import type { NormalizedAdapterEvent } from '../src/harnesses/types.js';
 import { createDaemon } from '../src/server/app.js';
+import { readRevisionPointer, revisionDirectory } from '../src/plugins/plugin-package.js';
 
 it('generates a reviewable draft, hot loads it and preserves the previous revision on errors and restart', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-plugin-studio-'));
@@ -96,3 +97,36 @@ it('generates a reviewable draft, hot loads it and preserves the previous revisi
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }, 15_000);
+
+it('requires review for a dropped JavaScript package and verifies approved bytes at restart', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-plugin-trust-'));
+  let daemon = createDaemon({ dataDir, port: 0 });
+  try {
+    const id = 'user.trust-test';
+    const directory = path.join(daemon.paths.pluginsDir, id);
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, 'harnessmate-plugin.json'), JSON.stringify({
+      id, name: 'Trust test', description: 'Trust test', entry: 'entry.mjs',
+    }));
+    fs.writeFileSync(path.join(directory, 'entry.mjs'), 'export const beforeTurn = ({ text }) => ({ text: `trusted ${text}` });');
+    await daemon.start();
+    const input = { text: 'test', sessionId: 'fixture-session', harnessId: 'codex', cwd: dataDir };
+    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'test' });
+    expect(daemon.pluginManager.listInstalled().find((item) => item.sourcePath === directory)?.loadError).toContain('确认信任');
+    const preview = daemon.pluginManager.inspectPackage(directory);
+    await daemon.pluginManager.installPlugin({ mode: 'local_dir', dirPath: directory, expectedDigest: preview.digest, trustCode: true });
+    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'trusted test' });
+    const pointer = readRevisionPointer(directory)!;
+    expect(pointer.currentDigest).toBe(preview.digest);
+    const entry = path.join(revisionDirectory(directory, pointer.current), 'entry.mjs');
+    await daemon.stop();
+    fs.writeFileSync(entry, 'export const beforeTurn = () => ({ text: "modified" });');
+    daemon = createDaemon({ dataDir, port: 0 });
+    await daemon.start();
+    expect(await daemon.pluginManager.processBeforeTurn(input)).toMatchObject({ text: 'test' });
+    expect(daemon.pluginManager.listInstalled().find((item) => item.sourcePath === directory)?.loadError).toContain('文件已变更');
+  } finally {
+    await daemon.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}, 10_000);

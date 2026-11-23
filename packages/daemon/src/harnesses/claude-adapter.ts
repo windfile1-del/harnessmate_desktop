@@ -28,6 +28,7 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from './types.js';
+import { pluginMcpServerName, pluginMcpTokenEnv } from './types.js';
 
 const FALLBACK_CLAUDE_MODELS: HarnessModelInfo[] = [
   { id: 'sonnet', displayName: 'Claude Sonnet (Default)', group: 'Anthropic Claude', isDefault: true, supportedEfforts: ['low', 'medium', 'high', 'max'] },
@@ -43,6 +44,7 @@ export interface ClaudeLocalSettingsProbe {
 
 export class ClaudeStreamJsonAdapter implements HarnessAdapter {
   readonly id = 'claude';
+  readonly pluginMcpTransport = 'http' as const;
   readonly kind = 'claude' as const;
   readonly displayName = 'Claude Code';
   readonly description = 'Anthropic Claude Code CLI via bidirectional stream-json control protocol';
@@ -163,7 +165,11 @@ export class ClaudeStreamJsonAdapter implements HarnessAdapter {
       'You are participating in a unified multi-harness session orchestrated by HarnessMate Desktop. Prior turns may have been completed by Codex, AGY, or Claude on the same workspace. Treat any <harnessmate_context_sync> block and .harnessmate/task-ledger.md as authoritative shared memory and task state. Never ask the user to repeat prior context that is already provided.',
     );
 
-    const child = spawnCliProcess(binaryPath, args, { cwd: config.cwd });
+    const mcp = config.pluginMcp;
+    if (mcp) args.push('--mcp-config', JSON.stringify({ mcpServers: {
+      [pluginMcpServerName]: { type: 'http', url: mcp.url, headers: { Authorization: 'Bearer ${' + pluginMcpTokenEnv + '}' } },
+    } }));
+    const child = spawnCliProcess(binaryPath, args, { cwd: config.cwd, env: mcp ? { [pluginMcpTokenEnv]: mcp.token } : undefined });
     return new ClaudeSessionHandle(child, config);
   }
 }
@@ -259,6 +265,7 @@ interface PendingClaudeApproval {
 }
 
 class ClaudeSessionHandle implements AdapterSessionHandle {
+  get pluginMcpAvailable(): boolean { return Boolean(this.config.pluginMcp); }
   private readonly listeners = new Set<(event: NormalizedAdapterEvent) => void>();
   private readonly earlyBuffer: NormalizedAdapterEvent[] = [];
   private readonly parser: ResilientJsonLineParser;
