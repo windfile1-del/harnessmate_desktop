@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow';
 import type { Session, TaskStep, WorkspaceFileEntry } from '@harnessmate/protocol';
 import {
   AlertCircle,
@@ -13,6 +14,8 @@ import {
   Info,
   ListChecks,
   Loader2,
+  Maximize2,
+  Minimize2,
   Pin,
   Play,
   Plus,
@@ -25,7 +28,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { SlotErrorBoundary, useSlotItems, useSlotRegistry } from '../slots';
 import {
   daemonApi,
@@ -45,10 +48,13 @@ export function InspectorDrawer({
 }) {
   const {
     inspectorTab,
+    inspectorFile,
+    openInspectorFile,
+    closeInspectorFile,
     setInspectorTab,
     setInspectorOpen,
-    gitBySession,
-    taskStateBySession,
+    selectedGit,
+    selectedTaskState,
     selectedPluginPanel,
     openPluginPanel,
     refreshGitStatus,
@@ -59,11 +65,31 @@ export function InspectorDrawer({
     addDraftAttachment,
     pushToast,
     isPluginEnabled,
-  } = useAppStore();
+  } = useAppStore(useShallow((state) => ({
+    inspectorTab: state.inspectorTab,
+    inspectorFile: state.inspectorFile,
+    openInspectorFile: state.openInspectorFile,
+    closeInspectorFile: state.closeInspectorFile,
+    setInspectorTab: state.setInspectorTab,
+    setInspectorOpen: state.setInspectorOpen,
+    selectedGit: state.gitBySession[session.id],
+    selectedTaskState: state.taskStateBySession[session.id],
+    selectedPluginPanel: state.selectedPluginPanel,
+    openPluginPanel: state.openPluginPanel,
+    refreshGitStatus: state.refreshGitStatus,
+    refreshTaskState: state.refreshTaskState,
+    updateTaskState: state.updateTaskState,
+    summarizeTaskState: state.summarizeTaskState,
+    openModal: state.openModal,
+    addDraftAttachment: state.addDraftAttachment,
+    pushToast: state.pushToast,
+    isPluginEnabled: state.isPluginEnabled,
+  })));
 
   const slotRegistry = useSlotRegistry();
-  const git = gitBySession[session.id] ?? null;
-  const taskState = taskStateBySession[session.id] ?? null;
+  const [widePluginPanel, setWidePluginPanel] = useState(false);
+  const git = selectedGit ?? null;
+  const taskState = selectedTaskState ?? null;
   const inspectorSlotItems = useSlotItems('inspector.tabs');
   const selectedSlotItem =
     inspectorSlotItems.find(({ registrationKey }) => registrationKey === selectedPluginPanel) ??
@@ -90,10 +116,13 @@ export function InspectorDrawer({
   const [fileQuery, setFileQuery] = useState('');
   const [files, setFiles] = useState<WorkspaceFileEntry[]>([]);
   const [previewFile, setPreviewFile] = useState<{
+    target: NonNullable<typeof inspectorFile>;
     relativePath: string;
     content: string;
     truncated: boolean;
   } | null>(null);
+  const previewLine = useRef<HTMLElement>(null);
+  const activePreview = inspectorFile?.sessionId === session.id && previewFile?.target === inspectorFile ? previewFile : null;
   const [filesLoading, setFilesLoading] = useState(false);
 
   // Terminal tab state
@@ -124,18 +153,25 @@ export function InspectorDrawer({
     }
   }, [inspectorTab, session.id]);
 
-  const handleOpenFile = async (relPath: string) => {
-    try {
-      const res = await daemonApi.readSessionFile(session.id, relPath);
-      setPreviewFile(res);
-    } catch (err) {
-      pushToast({
+  useEffect(() => {
+    if (inspectorTab !== 'files' || inspectorFile?.sessionId !== session.id) return;
+    const controller = new AbortController();
+    void daemonApi.readSessionFile(session.id, inspectorFile.path, controller.signal).then((res) => {
+      if (!controller.signal.aborted) setPreviewFile({ ...res, target: inspectorFile });
+    }).catch((err: unknown) => {
+      if (!controller.signal.aborted) pushToast({
         kind: 'error',
         title: '无法读取文件',
         body: err instanceof Error ? err.message : String(err),
       });
-    }
-  };
+    });
+    return () => controller.abort();
+  }, [inspectorFile, inspectorTab, session.id, pushToast]);
+
+  useEffect(() => {
+    const line = previewLine.current;
+    if (line?.parentElement) line.parentElement.scrollTop = Math.max(0, line.offsetTop - 45);
+  }, [activePreview, inspectorTab]);
 
   const handleAttachFile = (entry: WorkspaceFileEntry) => {
     addDraftAttachment(session.id, {
@@ -170,8 +206,9 @@ export function InspectorDrawer({
 
   return (
     <aside
-      className="flex h-full w-[340px] shrink-0 flex-col"
+      className="flex h-full shrink-0 flex-col"
       style={{
+        width: inspectorTab === 'plugins' && widePluginPanel ? 'min(56vw, 820px)' : 340,
         backgroundColor: 'var(--bg-rail)',
         borderLeft: '1px solid var(--border-hairline)',
       }}
@@ -239,13 +276,19 @@ export function InspectorDrawer({
             />
           )}
         </div>
-        <button
-          type="button"
-          onClick={() => setInspectorOpen(false)}
-          className="shrink-0 cursor-pointer rounded-lg p-1 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-        >
-          <X size={14} />
-        </button>
+        <div className="flex shrink-0 gap-1">
+          {inspectorTab === 'plugins' && (
+            <button type="button" aria-label={widePluginPanel ? '还原插件面板宽度' : '扩大插件面板'}
+              aria-pressed={widePluginPanel} onClick={() => setWidePluginPanel((value) => !value)}
+              className="cursor-pointer rounded-lg p-1 text-[var(--text-muted)] hover:bg-[var(--bg-hover)]">
+              {widePluginPanel ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+            </button>
+          )}
+          <button type="button" aria-label="关闭侧栏" onClick={() => setInspectorOpen(false)}
+            className="cursor-pointer rounded-lg p-1 text-[var(--text-muted)] hover:bg-[var(--bg-hover)]">
+            <X size={14} />
+          </button>
+        </div>
       </div>
 
       {/* Body */}
@@ -804,7 +847,7 @@ export function InspectorDrawer({
               />
             </div>
 
-            {previewFile && (
+            {activePreview && (
               <div
                 className="overflow-hidden rounded-xl"
                 style={{
@@ -817,19 +860,27 @@ export function InspectorDrawer({
                   style={{ borderBottom: '1px solid var(--border-hairline)' }}
                 >
                   <span className="font-mono-code truncate text-[var(--accent-indigo)]">
-                    {previewFile.relativePath}
+                    {activePreview.relativePath}{activePreview.target.line ? `:${activePreview.target.line}` : ''}
                   </span>
                   <button
                     type="button"
-                    onClick={() => setPreviewFile(null)}
+                    aria-label="关闭文件预览"
+                    onClick={closeInspectorFile}
                     className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-primary)]"
                   >
                     <X size={13} />
                   </button>
                 </div>
-                <pre className="m-0 max-h-[260px] overflow-auto p-3 font-mono-code text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                  {previewFile.content}
-                  {previewFile.truncated ? '\n\n... [文件过大已截断]' : ''}
+                <pre className="relative m-0 max-h-[260px] overflow-auto p-3 font-mono-code text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  {activePreview.target.line ? (() => {
+                    const lines = activePreview.content.split('\n');
+                    const index = activePreview.target.line - 1;
+                    if (index >= lines.length) return activePreview.content;
+                    return <>{index > 0 ? `${lines.slice(0, index).join('\n')}\n` : ''}
+                      <mark ref={previewLine} className="bg-[var(--accent-indigo-soft)] text-[var(--text-primary)]">{lines[index] || ' '}</mark>
+                      {index + 1 < lines.length ? `\n${lines.slice(index + 1).join('\n')}` : ''}</>;
+                  })() : activePreview.content}
+                  {activePreview.truncated ? '\n\n... [文件过大已截断]' : ''}
                 </pre>
               </div>
             )}
@@ -856,7 +907,7 @@ export function InspectorDrawer({
                   >
                     <button
                       type="button"
-                      onClick={() => void handleOpenFile(f.relativePath)}
+                      onClick={() => openInspectorFile(session.id, f.relativePath)}
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
                     >
                       <FileCode2 size={12} className="shrink-0 text-[var(--text-muted)]" />

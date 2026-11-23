@@ -132,7 +132,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       opts.customAdapters,
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
     ),
-    { store, permissions: pluginPermissions, crashPolicy: opts.pluginCrashPolicy },
+    { store, permissions: pluginPermissions, crashPolicy: opts.pluginCrashPolicy,
+      onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const attachmentService = new AttachmentService(paths.attachmentsDir);
@@ -200,7 +201,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/health', async () => ({
     status: 'ok',
-    daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.5.0',
+    daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.6.0',
     protocolVersion: PROTOCOL_VERSION,
     desktopId: config.desktopId,
     desktopName: config.desktopName,
@@ -508,7 +509,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       const asset = resolvePluginUiAsset(pkg.packageRoot, wildcardPath);
       reply.header('Content-Type', asset.contentType);
-      reply.header('Content-Security-Policy', SANDBOX_IFRAME_CSP);
+      reply.header('Content-Security-Policy', `${SANDBOX_IFRAME_CSP}; sandbox allow-scripts`);
       reply.header('X-Content-Type-Options', 'nosniff');
       reply.header('Cache-Control', 'no-store');
       return reply.send(asset.buffer);
@@ -520,6 +521,20 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         code,
       });
     }
+  });
+
+  app.post('/api/v1/plugins/:id/browser-authorize', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { runId } = (request.body ?? {}) as { runId?: unknown };
+    const pkg = pluginManager.getPluginPackageRoot(id);
+    const plugin = pkg && pluginManager.listInstalled().find((entry) => entry.id === id);
+    if (!pkg || !plugin || typeof runId !== 'string' || runId !== (pkg.runId ?? pkg.digest)) {
+      return reply.code(409).send({ error: '插件实例已停止或已更新', code: 'E_STALE_RUN' });
+    }
+    if (!pluginPermissions.isGranted(plugin, 'browser:preview')) {
+      return reply.code(403).send({ error: '请在插件中心授权 browser:preview', code: 'E_PERMISSION_DENIED' });
+    }
+    return { ok: true };
   });
 
   app.post('/api/v1/plugins/:id/ui-message', async (request, reply) => {
@@ -876,6 +891,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         model: parsed.data.model,
         omitHandoff: parsed.data.omitHandoff,
         literalText: parsed.data.literalText,
+        mode: parsed.data.mode,
       });
       return reply.code(202).send(result);
     } catch (err) {

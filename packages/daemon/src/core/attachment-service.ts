@@ -157,15 +157,22 @@ export function readWorkspaceFilePreview(
 ): { relativePath: string; content: string; truncated: boolean; sizeBytes: number } {
   const root = path.resolve(cwd);
   const target = path.resolve(root, relativePath);
-  if (!target.startsWith(root + path.sep) && target !== root) {
+  const within = (base: string, item: string) => {
+    const relative = path.relative(base, item);
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  };
+  if (!within(root, target)) {
     throw new Error('Path traversal rejected');
   }
-  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+  if (!fs.existsSync(target)) {
     throw new Error(`File not found: ${relativePath}`);
   }
-  const stat = fs.statSync(target);
+  const realTarget = fs.realpathSync(target);
+  if (!within(fs.realpathSync(root), realTarget)) throw new Error('Path traversal rejected');
+  const stat = fs.statSync(realTarget);
+  if (!stat.isFile()) throw new Error(`File not found: ${relativePath}`);
   const truncated = stat.size > MAX_PREVIEW_BYTES;
-  const fd = fs.openSync(target, 'r');
+  const fd = fs.openSync(realTarget, 'r');
   try {
     const len = Math.min(stat.size, MAX_PREVIEW_BYTES);
     const buf = Buffer.alloc(len);

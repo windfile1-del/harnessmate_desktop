@@ -79,6 +79,7 @@ it('validates V4 contributes.slots, serves strict-CSP sandboxed UI docs with saf
         description: 'Sandboxed iframe slot plugin',
         apiVersion: 4,
         engines: { pluginApi: '^4.0' },
+        permissions: ['browser:preview'],
         contributes: {
           slots: [
             { slot: 'inspector.tab', id: 'pr-panel', title: 'PR 检查单', ui: 'ui/panel.html', order: 100 },
@@ -117,7 +118,7 @@ it('validates V4 contributes.slots, serves strict-CSP sandboxed UI docs with saf
       url: '/api/v1/plugins/user.pr-guard-ui/ui-doc?path=ui/panel.html',
     });
     expect(docRes.statusCode).toBe(200);
-    const doc = docRes.json() as { html: string; csp: string; pluginId: string; path: string };
+    const doc = docRes.json() as { html: string; csp: string; pluginId: string; path: string; runId: string };
     expect(doc.pluginId).toBe('user.pr-guard-ui');
     expect(doc.path).toBe('ui/panel.html');
     expect(doc.csp).toContain("default-src 'none'");
@@ -137,6 +138,22 @@ it('validates V4 contributes.slots, serves strict-CSP sandboxed UI docs with saf
     expect(rawRes.headers['content-type']).toContain('text/css');
     expect(rawRes.headers['x-content-type-options']).toBe('nosniff');
     expect(rawRes.headers['content-security-policy']).toContain("default-src 'none'");
+    expect(rawRes.headers['content-security-policy']).toContain('sandbox allow-scripts');
+
+    const authorize = (runId: string) => daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/user.pr-guard-ui/browser-authorize', payload: { runId },
+    });
+    const setPermission = (granted: boolean) => daemon.app.inject({
+      method: 'PUT', url: '/api/v1/plugins/user.pr-guard-ui/permissions', payload: {
+        workspaceId: '__global__', digest: preview.digest, capability: 'browser:preview', granted,
+      },
+    });
+    expect((await authorize(doc.runId)).statusCode).toBe(403);
+    expect((await setPermission(true)).statusCode).toBe(200);
+    expect((await authorize(doc.runId)).statusCode).toBe(200);
+    expect((await authorize('stale-run')).statusCode).toBe(409);
+    expect((await setPermission(false)).statusCode).toBe(200);
+    expect((await authorize(doc.runId)).statusCode).toBe(403);
 
     // Path traversal blocked with 403
     const escapeRes = await daemon.app.inject({
@@ -152,6 +169,7 @@ it('validates V4 contributes.slots, serves strict-CSP sandboxed UI docs with saf
       url: '/api/v1/plugins/user.pr-guard-ui/ui-doc?path=ui/panel.html',
     });
     expect(disabledRes.statusCode).toBe(404);
+    expect((await authorize(doc.runId)).statusCode).toBe(409);
   } finally {
     await daemon.stop();
     fs.rmSync(dataDir, { recursive: true, force: true });

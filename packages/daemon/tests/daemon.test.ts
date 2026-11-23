@@ -63,6 +63,38 @@ function writeMockScript(dir: string, name: string, source: string): string {
   return scriptPath;
 }
 
+it('replays a resolution for legacy expired approvals on startup', async () => {
+  const dataDir = makeTempDir('hm-expired-');
+  const workspaceDir = makeTempDir('hm-expired-workspace-');
+  const original = createDaemon({ dataDir, port: 0, hostOverride: '127.0.0.1' });
+  let sessionId: string;
+  try {
+    await original.start();
+    const workspace = await original.sessionManager.addWorkspace(workspaceDir);
+    const session = await original.sessionManager.createSession({ workspaceId: workspace.id, harnessId: 'agy', permissionMode: 'manual' });
+    sessionId = session.id;
+    const approval = {
+      id: 'appr_legacy', sessionId, nativeRequestId: 'acy_legacy', toolName: 'Edit', toolKind: 'file_edit',
+      input: null, summary: 'Review edit', diffPreview: null, riskLevel: 'medium', status: 'pending',
+      resolvedBy: null, decision: null, comment: null, createdAt: Date.now(), resolvedAt: null,
+    } as const;
+    original.store.createApproval(approval);
+    original.store.appendEvent(sessionId, 'approval.requested', { approval }, 'turn_legacy');
+    original.store.updateSession(sessionId, { status: 'awaiting_approval' });
+    original.store.expirePendingApprovals(sessionId);
+  } finally {
+    await original.stop();
+  }
+  const recovered = createDaemon({ dataDir, port: 0, hostOverride: '127.0.0.1' });
+  daemons.push(recovered);
+  expect(recovered.sessionManager.getSession(sessionId)?.status).toBe('idle');
+  expect(recovered.sessionManager.listPendingApprovals(sessionId)).toHaveLength(0);
+  const events = recovered.sessionManager.getSessionEvents(sessionId);
+  expect(events.filter(({ type }) => type === 'approval.resolved')).toMatchObject([
+    { payload: { approvalId: 'appr_legacy', status: 'expired' } },
+  ]);
+});
+
 it('imports a desktop rollout with large metadata and reads every event page', async () => {
   const dataDir = makeTempDir('hm-desktop-history-');
   const wsDir = fs.mkdtempSync(path.join(dataDir, 'workspace-'));
@@ -304,18 +336,29 @@ describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
       import readline from 'node:readline';
       const rl = readline.createInterface({ input: process.stdin });
       let promptReqId = null;
+      let mode = 'default';
+      const write = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\\n');
       rl.on('line', (line) => {
         if (!line.trim()) return;
         const msg = JSON.parse(line);
         if (msg.method === 'initialize') {
           process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } }) + '\\n');
         } else if (msg.method === 'session/new') {
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_sess_1' } }) + '\\n');
+          write({ id: msg.id, result: { sessionId: 'acp_sess_1', modes: {
+            currentModeId: mode, availableModes: ['default', 'accept-edits', 'plan', 'auto'].map((id) => ({ id })),
+          } } });
+        } else if (msg.method === 'session/set_mode') {
+          mode = msg.params.modeId;
+          write({ id: msg.id, result: {} });
         } else if (msg.method === 'session/prompt') {
           promptReqId = msg.id;
           process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello from AGY ACP' } } } }) + '\\n');
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: { toolCall: { title: 'Edit README.md', kind: 'edit' }, options: [{ optionId: 'opt_allow', kind: 'allow_once' }, { optionId: 'opt_deny', kind: 'reject_once' }] } }) + '\\n');
+          const kind = msg.params.prompt[0].text === 'shell' ? 'execute' : 'edit';
+          write({ id: 77, method: 'session/request_permission', params: { toolCall: { title: 'Example operation', kind }, options: [{ optionId: 'opt_allow', kind: 'allow_once' }, { optionId: 'opt_deny', kind: 'reject_once' }] } });
         } else if (msg.id === 77 && msg.result) {
+          write({ method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: {
+            type: 'text', text: mode + ':' + msg.result.outcome.optionId,
+          } } } });
           process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: promptReqId, result: { stopReason: 'end_turn' } }) + '\\n');
         }
       });
@@ -352,22 +395,41 @@ describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
       args: [mockAcpScript],
     });
 
-    const agyHandle = await agyAdapter.createSession({ cwd: wsDir, permissionMode: 'accept_edits' });
-    const agyEvents: string[] = [];
+    const agyHandle = await agyAdapter.createSession({ cwd: wsDir, permissionMode: 'manual' });
+    let agyEvents: string[] = [];
+    let answer = '';
     agyHandle.onEvent((ev) => {
       agyEvents.push(ev.type);
+      if (ev.type === 'message.assistant.completed') answer = ev.text;
       if (ev.type === 'approval.requested') {
         void agyHandle.resolveApproval(ev.nativeRequestId, 'allow_once');
       }
     });
-    await agyHandle.sendTurn({ turnId: 't1', text: 'hi' });
-    for (let i = 0; i < 30 && !agyEvents.includes('turn.completed'); i++) {
-      await new Promise((r) => setTimeout(r, 40));
+    try {
+      const scenarios = [
+        ['manual', 'edit', true, 'default:opt_allow'],
+        ['accept_edits', 'edit', false, 'accept-edits:opt_allow'],
+        ['accept_edits', 'shell', true, 'accept-edits:opt_allow'],
+        ['auto', 'shell', false, 'auto:opt_allow'],
+        ['plan', 'edit', false, 'plan:opt_deny'],
+        ['manual', 'edit', true, 'default:opt_allow'],
+      ] as const;
+      for (const [index, [permissionMode, text, manuallyReviewed, result]] of scenarios.entries()) {
+        agyEvents = [];
+        answer = '';
+        await agyHandle.updateConfig?.({ permissionMode });
+        await agyHandle.sendTurn({ turnId: `t_mock_${index}`, text, permissionMode });
+        for (let i = 0; i < 30 && !agyEvents.includes('turn.completed'); i++) {
+          await new Promise((r) => setTimeout(r, 40));
+        }
+        expect(agyEvents).toContain('message.assistant.delta');
+        expect(agyEvents.includes('approval.requested')).toBe(manuallyReviewed);
+        expect(agyEvents).toContain('turn.completed');
+        expect(answer).toContain(result);
+      }
+    } finally {
+      await agyHandle.dispose();
     }
-    await agyHandle.dispose();
-    expect(agyEvents).toContain('message.assistant.delta');
-    expect(agyEvents).toContain('approval.requested');
-    expect(agyEvents).toContain('turn.completed');
 
     // Test ClaudeStreamJsonAdapter with a runnable wrapper script
     const claudeWrapper =

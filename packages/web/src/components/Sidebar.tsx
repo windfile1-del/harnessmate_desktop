@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow';
 import {
   Activity,
   Command,
@@ -37,7 +38,25 @@ export function Sidebar() {
     deleteSession,
     openModal,
     isPluginEnabled,
-  } = useAppStore();
+  } = useAppStore(useShallow((state) => ({
+    theme: state.theme,
+    toggleTheme: state.toggleTheme,
+    connected: state.connected,
+    harnesses: state.harnesses,
+    workspaces: state.workspaces,
+    sessions: state.sessions,
+    plugins: state.plugins,
+    remoteStatus: state.remoteStatus,
+    selectedWorkspaceId: state.selectedWorkspaceId,
+    searchQuery: state.searchQuery,
+    selectedSessionId: state.selectedSessionId,
+    setSelectedWorkspaceId: state.setSelectedWorkspaceId,
+    setSearchQuery: state.setSearchQuery,
+    selectSession: state.selectSession,
+    deleteSession: state.deleteSession,
+    openModal: state.openModal,
+    isPluginEnabled: state.isPluginEnabled,
+  })));
 
   const readyCount = harnesses.filter((h) => h.health === 'ready').length;
   const enabledPluginsCount = plugins.filter((p) => p.enabled).length;

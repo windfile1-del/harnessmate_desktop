@@ -113,6 +113,7 @@ export const SendTurnRequestSchema = z.object({
   model: z.string().nullable().optional(),
   omitHandoff: z.boolean().optional(),
   literalText: z.boolean().optional(),
+  mode: z.literal('plugin_development').optional(),
 });
 export type SendTurnRequest = z.infer<typeof SendTurnRequestSchema>;
 
@@ -314,6 +315,7 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
     op: z.literal('attention'),
     item: AttentionItemSchema,
   }),
+  z.object({ op: z.literal('plugins_changed') }),
   z.object({
     op: z.literal('pong'),
     ts: z.number(),

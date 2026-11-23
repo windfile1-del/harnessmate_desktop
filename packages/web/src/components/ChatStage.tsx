@@ -1,6 +1,8 @@
+import { useShallow } from 'zustand/react/shallow';
 import type {
   ApprovalRequest,
   Attachment,
+  CanonicalEvent,
   HarnessCommandInfo,
   PermissionMode,
   ReasoningEffort,
@@ -45,7 +47,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { daemonApi, resolveAttachmentUrl } from '../api/client';
 import { formatPluginSummary, listPluginPanels } from '../lib/plugin-panels';
 import {
@@ -54,12 +56,13 @@ import {
   PERMISSION_MODE_LABELS,
 } from '../lib/harness-meta';
 import {
-  projectSessionEvents,
+  createSessionEventProjector,
   type ProjectedSwitchEvent,
   type ProjectedToolCall,
   type ProjectedTurn,
 } from '../lib/projector';
 import { useAppStore } from '../stores/app-store';
+import type { FileLink } from '../lib/file-links';
 import { Slot, SlotTurnProvider } from '../slots';
 import { HarnessBadge, StarLoomCrest } from './BrandMark';
 import { HarnessSwitcher } from './HarnessSwitcher';
@@ -74,6 +77,10 @@ const DRIVER_LABELS: Record<string, string> = {
   prompt_envelope: '结构化上下文信封',
   native_warm: '原生热记忆（零重传）',
 };
+const NO_ATTACHMENTS: Attachment[] = [];
+const NO_EVENTS: CanonicalEvent[] = [];
+const NO_ALTERNATIVES: [] = [];
+const TIMELINE_PAGE_SIZE = 80;
 
 export function ChatStage() {
   const {
@@ -86,16 +93,17 @@ export function ChatStage() {
     focusedTurn,
     focusTurn,
     selectedSessionId,
-    eventsBySession,
-    taskStateBySession,
-    contextPreviewBySession,
-    draftTextBySession,
-    draftAttachmentsBySession,
+    events,
+    selectedTaskState,
+    selectedContextPreview,
+    selectedDraft,
+    selectedAttachments,
     sidebarCollapsed,
     inspectorOpen,
     setSidebarCollapsed,
     setInspectorOpen,
     setInspectorTab,
+    openInspectorFile,
     openModal,
     selectSession,
     sendTurn,
@@ -112,7 +120,44 @@ export function ChatStage() {
     clearDraft,
     pushToast,
     isPluginEnabled,
-  } = useAppStore();
+  } = useAppStore(useShallow((state) => ({
+    sessions: state.sessions,
+    harnesses: state.harnesses,
+    workspaces: state.workspaces,
+    slashCommands: state.slashCommands,
+    plugins: state.plugins,
+    pluginPermissionRevision: state.pluginPermissionRevision,
+    focusedTurn: state.focusedTurn,
+    focusTurn: state.focusTurn,
+    selectedSessionId: state.selectedSessionId,
+    events: state.selectedSessionId ? state.eventsBySession[state.selectedSessionId] : undefined,
+    selectedTaskState: state.selectedSessionId ? state.taskStateBySession[state.selectedSessionId] : undefined,
+    selectedContextPreview: state.selectedSessionId ? state.contextPreviewBySession[state.selectedSessionId] : undefined,
+    selectedDraft: state.selectedSessionId ? state.draftTextBySession[state.selectedSessionId] : undefined,
+    selectedAttachments: state.selectedSessionId ? state.draftAttachmentsBySession[state.selectedSessionId] : undefined,
+    sidebarCollapsed: state.sidebarCollapsed,
+    inspectorOpen: state.inspectorOpen,
+    setSidebarCollapsed: state.setSidebarCollapsed,
+    setInspectorOpen: state.setInspectorOpen,
+    setInspectorTab: state.setInspectorTab,
+    openInspectorFile: state.openInspectorFile,
+    openModal: state.openModal,
+    selectSession: state.selectSession,
+    sendTurn: state.sendTurn,
+    runHarnessCommand: state.runHarnessCommand,
+    runPluginAction: state.runPluginAction,
+    switchHarness: state.switchHarness,
+    failoverSession: state.failoverSession,
+    interruptSession: state.interruptSession,
+    updateSession: state.updateSession,
+    resolveApproval: state.resolveApproval,
+    setDraftText: state.setDraftText,
+    addDraftAttachment: state.addDraftAttachment,
+    removeDraftAttachment: state.removeDraftAttachment,
+    clearDraft: state.clearDraft,
+    pushToast: state.pushToast,
+    isPluginEnabled: state.isPluginEnabled,
+  })));
 
   const session = useMemo(
     () => sessions.find((s) => s.id === selectedSessionId) ?? null,
@@ -135,17 +180,11 @@ export function ChatStage() {
     [sessions, selectedSessionId],
   );
 
-  const events = session ? eventsBySession[session.id] ?? [] : [];
-  const taskState = session ? taskStateBySession[session.id] ?? null : null;
-  const contextPreview = session ? contextPreviewBySession[session.id] ?? null : null;
-  const timeline = useMemo(
-    () =>
-      projectSessionEvents(
-        events,
-        session ? { id: session.harnessId, kind: session.harnessKind } : undefined,
-      ),
-    [events, session],
-  );
+  const visibleEvents = events ?? NO_EVENTS;
+  const taskState = selectedTaskState ?? null;
+  const contextPreview = selectedContextPreview ?? null;
+  const project = useMemo(() => createSessionEventProjector(), [selectedSessionId]);
+  const timeline = project(visibleEvents, session ? { id: session.harnessId, kind: session.harnessKind } : undefined);
   const readyAlternativeHarnesses = useMemo(
     () => harnesses.filter((h) => h.id !== session?.harnessId && h.health === 'ready'),
     [harnesses, session?.harnessId],
@@ -156,12 +195,24 @@ export function ChatStage() {
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
   const commandCatalogKey = session ? `${session.id}:${session.harnessId}` : '';
 
-  const inputText = session ? draftTextBySession[session.id] ?? '' : '';
-  const attachments = session ? draftAttachmentsBySession[session.id] ?? [] : [];
+  const inputText = selectedDraft ?? '';
+  const attachments = selectedAttachments ?? NO_ATTACHMENTS;
 
   const [sending, setSending] = useState(false);
+  const [visibleHistory, setVisibleHistory] = useState<{ sessionId: string; count: number }>();
+  const visibleCount = visibleHistory && visibleHistory.sessionId === selectedSessionId
+    ? visibleHistory.count : TIMELINE_PAGE_SIZE;
+  const firstVisible = Math.max(0, timeline.items.length - visibleCount);
+  const [pluginModeSessions, setPluginModeSessions] = useState<ReadonlySet<string>>(() => new Set());
+  const pluginMode = Boolean(session && pluginModeSessions.has(session.id));
+  const openFile = useCallback(({ path, line }: FileLink) => {
+    if (selectedSessionId) openInspectorFile(selectedSessionId, path, line);
+  }, [selectedSessionId, openInspectorFile]);
+  const onFailover = useCallback((targetHarnessId: string) => {
+    if (selectedSessionId) void failoverSession(selectedSessionId, { targetHarnessId, retryLastFailedTurn: true });
+  }, [selectedSessionId, failoverSession]);
   const [suggestion, setSuggestion] = useState<{ key: string; text: string; pluginNames: string[] }>();
-  const suggestionKey = session ? JSON.stringify([session.id, session.harnessId, inputText, attachments.map(({ id }) => id)]) : '';
+  const suggestionKey = session ? JSON.stringify([session.id, session.harnessId, pluginMode, inputText, attachments.map(({ id }) => id)]) : '';
   const activeSuggestion = suggestion?.key === suggestionKey ? suggestion : undefined;
   const [omitHandoffFor, setOmitHandoffFor] = useState<string>();
   const handoffOmitted = Boolean(session && omitHandoffFor === `${session.id}:${session.harnessId}`);
@@ -180,6 +231,7 @@ export function ChatStage() {
   const [filePickerItems, setFilePickerItems] = useState<WorkspaceFileEntry[]>([]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const previousHistoryHeight = useRef<number | null>(null);
   const followBottom = useRef(true);
   const previousSessionId = useRef<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -192,17 +244,31 @@ export function ChatStage() {
     }
     const el = scrollRef.current;
     if (el && followBottom.current) el.scrollTop = el.scrollHeight;
-  }, [events.length, selectedSessionId]);
+  }, [visibleEvents.length, selectedSessionId]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && previousHistoryHeight.current !== null) {
+      el.scrollTop += el.scrollHeight - previousHistoryHeight.current;
+      previousHistoryHeight.current = null;
+    }
+  }, [firstVisible]);
 
   useEffect(() => {
     if (!focusedTurn || focusedTurn.sessionId !== selectedSessionId) return;
     const target = document.getElementById(`chat-turn-${focusedTurn.turnId}`);
-    if (!target) return;
+    if (!target) {
+      const index = timeline.items.findIndex((item) => item.kind === 'turn' && item.turnId === focusedTurn.turnId);
+      if (index >= 0 && index < firstVisible) {
+        setVisibleHistory({ sessionId: selectedSessionId, count: timeline.items.length - index });
+      }
+      return;
+    }
     followBottom.current = false;
     target.scrollIntoView({ block: 'start' });
     target.focus({ preventScroll: true });
     focusTurn(null);
-  }, [focusedTurn, selectedSessionId, timeline, focusTurn]);
+  }, [focusedTurn, selectedSessionId, timeline, focusTurn, firstVisible]);
 
   useEffect(() => {
     if (!selectedSessionId) return;
@@ -245,7 +311,7 @@ export function ChatStage() {
   // The active CLI catalog takes precedence over workflow shortcuts of the same name.
   const slashMatches = useMemo(() => {
     const trimmed = inputText.trimStart();
-    if (!trimmed.startsWith('/') || trimmed.includes('\n')) return [];
+    if (pluginMode || !trimmed.startsWith('/') || trimmed.includes('\n')) return [];
     const firstToken = trimmed.slice(1).split(/\s/)[0]?.toLowerCase() ?? '';
     if (trimmed.includes(' ')) return [];
     const native = nativeCommands.map((command) => ({
@@ -256,7 +322,7 @@ export function ChatStage() {
       argumentHint: entry.kind === 'program' ? '<文本>' : undefined }));
     return [...native, ...[...panelCommands, ...actions, ...slashCommands].filter(({ command }) => !nativeNames.has(command))]
       .filter((c) => c.command.toLowerCase().includes(firstToken));
-  }, [inputText, nativeCommands, slashCommands, panelCommands, pluginActions, harness?.displayName]);
+  }, [inputText, nativeCommands, slashCommands, panelCommands, pluginActions, harness?.displayName, pluginMode]);
 
   if (!session) {
     return (
@@ -275,8 +341,10 @@ export function ChatStage() {
   }
 
   const isRunning = session.status === 'running' || session.status === 'awaiting_approval';
+  const permissionModes = new Set<PermissionMode>(harness?.capabilities.permissionModes ?? ['plan', 'accept_edits', 'auto']);
+  permissionModes.add(session.permissionMode);
   const attachmentsEnabled = isPluginEnabled('core.attachments');
-  const commandMatch = /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(inputText.trim());
+  const commandMatch = pluginMode ? null : /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(inputText.trim());
   const typedCommand = commandMatch?.[1]?.toLowerCase();
   const commandArgs = commandMatch?.[2]?.trim() ?? '';
   const nativeCommandName = HarnessCommandNameSchema.safeParse(
@@ -432,7 +500,7 @@ export function ChatStage() {
     const outgoingAtts = [...attachments];
     try {
       const turnAttachments = outgoingAtts.length > 0 ? outgoingAtts : undefined;
-      const wantsPreview = !suggestionChoice && plugins.some((plugin) => plugin.hasRuntimeHook && isPluginEnabled(plugin.id));
+      const wantsPreview = !pluginMode && !suggestionChoice && plugins.some((plugin) => plugin.hasRuntimeHook && isPluginEnabled(plugin.id));
       if (wantsPreview) {
         const { suggestion: proposed } = await daemonApi.previewTurnSuggestion(session.id, outgoingText, turnAttachments)
           .catch(() => ({ suggestion: null }));
@@ -450,7 +518,7 @@ export function ChatStage() {
       setFilePickerOpen(false);
       const approved = suggestionChoice === 'apply' && activeSuggestion;
       await sendTurn(session.id, approved ? approved.text : outgoingText, turnAttachments,
-        { omitHandoff: handoffOmitted, literalText: Boolean(approved) });
+        { omitHandoff: handoffOmitted, literalText: Boolean(approved), mode: pluginMode ? 'plugin_development' : undefined });
       setOmitHandoffFor(undefined);
     } finally {
       setSending(false);
@@ -726,6 +794,7 @@ export function ChatStage() {
         {/* Main Conversation Stream */}
         <div
           ref={scrollRef}
+          style={{ overflowAnchor: 'none' }}
           onScroll={(event) => {
             const el = event.currentTarget;
             followBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 72;
@@ -733,13 +802,23 @@ export function ChatStage() {
           className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6"
         >
           <div className="mx-auto max-w-[760px] space-y-7">
+            {firstVisible > 0 && (
+              <button type="button" className="mx-auto block cursor-pointer rounded-lg px-3 py-1.5 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+                onClick={() => {
+                  previousHistoryHeight.current = scrollRef.current?.scrollHeight ?? null;
+                  followBottom.current = false;
+                  setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
+                }}>
+                加载更早的消息（{firstVisible}）
+              </button>
+            )}
             {timeline.items.length === 0 ? (
               <SessionReadyPlaceholder
                 session={session}
                 onQuickPrompt={(t) => setDraftText(session.id, t)}
               />
             ) : (
-              timeline.items.map((item) =>
+              timeline.items.slice(firstVisible).map((item) =>
                 item.kind === 'switch' ? (
                   <HarnessSwitchDivider
                     key={`sw_${item.seq}`}
@@ -754,16 +833,12 @@ export function ChatStage() {
                     fallbackHarnessKind={session.harnessKind}
                     fallbackHarnessId={session.harnessId}
                     alternativeHarnesses={
-                      autoFailoverEnabled && !isRunning ? readyAlternativeHarnesses : []
+                      autoFailoverEnabled && !isRunning && item.status === 'failed' ? readyAlternativeHarnesses : NO_ALTERNATIVES
                     }
-                    onFailover={(targetHarnessId) =>
-                      void failoverSession(session.id, {
-                        targetHarnessId,
-                        retryLastFailedTurn: true,
-                      })
-                    }
-                    onPreviewImage={(src) => setLightboxImg(src)}
-                    onResolveApproval={(id, dec) => void resolveApproval(id, dec)}
+                    onFailover={onFailover}
+                    onPreviewImage={setLightboxImg}
+                    onResolveApproval={resolveApproval}
+                    onOpenFile={openFile}
                   />
                 ),
               )
@@ -790,6 +865,12 @@ export function ChatStage() {
 
         {/* Floating Glass Composer Dock (Drag-Drop + Paste Image + @file + /slash + ModelPicker) */}
         <div className="shrink-0 px-4 pb-4 pt-1">
+          {pluginMode && (
+            <div className="mx-auto mb-2 flex max-w-[760px] items-center justify-between gap-2 px-1 text-[12px] text-[var(--text-secondary)]">
+              <span>描述你想定制的功能，当前模型会收到 SDK、安装和热重载说明。</span>
+              <button type="button" className="shrink-0 cursor-pointer text-[var(--accent-indigo)] underline" onClick={() => openModal('plugins')}>插件中心</button>
+            </div>
+          )}
           <div
             onDragOver={(e) => {
               e.preventDefault();
@@ -1025,7 +1106,9 @@ export function ChatStage() {
                   ? '松开鼠标即可附带图片或文件...'
                   : isRunning
                     ? 'Agent 正在执行本轮任务，可随时点击右侧停止...'
-                    : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · / 对话命令 · @ 引用文件 · Ctrl+V 贴图`
+                    : pluginMode
+                      ? '描述你要开发的插件功能…'
+                      : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · / 对话命令 · @ 引用文件 · Ctrl+V 贴图`
               }
               className="max-h-[180px] w-full resize-none bg-transparent px-2.5 py-1.5 text-[13.8px] leading-relaxed text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
             />
@@ -1072,7 +1155,7 @@ export function ChatStage() {
                   </>
                 )}
 
-                {(nativeCommands.length > 0 || slashCommands.length > 0 || panelCommands.length > 0 || pluginActions.length > 0) && (
+                {!pluginMode && (nativeCommands.length > 0 || slashCommands.length > 0 || panelCommands.length > 0 || pluginActions.length > 0) && (
                   <button
                     type="button"
                     disabled={isRunning}
@@ -1104,6 +1187,19 @@ export function ChatStage() {
                   slotProps={{ session, isRunning }}
                   compactErrors
                 />
+
+                <button type="button" aria-pressed={pluginMode} disabled={isRunning || sending}
+                  onClick={() => setPluginModeSessions((current) => {
+                    const next = new Set(current);
+                    if (next.has(session.id)) next.delete(session.id);
+                    else next.add(session.id);
+                    return next;
+                  })}
+                  className={`inline-flex cursor-pointer items-center gap-1 rounded-lg border px-2 py-1 text-[11.5px] disabled:opacity-50 ${pluginMode
+                    ? 'border-[var(--accent-indigo)] bg-[var(--accent-indigo-soft)] text-[var(--accent-indigo)]'
+                    : 'border-[var(--border-hairline)] text-[var(--text-secondary)]'}`}>
+                  <Wrench size={12} /> 插件开发
+                </button>
 
                 {/* Inline Unified Harness Switcher */}
                 <HarnessSwitcher
@@ -1164,6 +1260,7 @@ export function ChatStage() {
                 {/* Permission Mode Selector */}
                 <select
                   value={session.permissionMode}
+                  aria-label="权限模式"
                   disabled={isRunning}
                   onChange={(e) =>
                     void updateSession(session.id, {
@@ -1176,7 +1273,7 @@ export function ChatStage() {
                     border: '1px solid var(--border-hairline)',
                   }}
                 >
-                  {(harness?.capabilities.permissionModes ?? ['plan', 'accept_edits', 'auto']).map(
+                  {[...permissionModes].map(
                     (mode) => (
                       <option key={mode} value={mode}>
                         模式: {PERMISSION_MODE_LABELS[mode]?.label ?? mode}
@@ -1300,7 +1397,7 @@ function HarnessSwitchDivider({
   );
 }
 
-function TurnBlock({
+const TurnBlock = memo(function TurnBlock({
   session,
   turn,
   fallbackHarnessKind,
@@ -1309,6 +1406,7 @@ function TurnBlock({
   onFailover,
   onPreviewImage,
   onResolveApproval,
+  onOpenFile,
 }: {
   session: Session;
   turn: ProjectedTurn;
@@ -1318,6 +1416,7 @@ function TurnBlock({
   onFailover: (targetHarnessId: string) => void;
   onPreviewImage: (src: string) => void;
   onResolveApproval: (id: string, decision: 'allow_once' | 'allow_session' | 'deny') => void;
+  onOpenFile: (file: FileLink) => void;
 }) {
   const effectiveKind = turn.harnessKind ?? fallbackHarnessKind;
   const effectiveId = turn.harnessId ?? fallbackHarnessId;
@@ -1439,7 +1538,7 @@ function TurnBlock({
         )}
 
         {turn.approvals
-          .filter((a) => a.status !== 'pending')
+          .filter((a) => a.status === 'approved' || a.status === 'denied')
           .map((appr) => (
             <ApprovalCard
               key={appr.id}
@@ -1455,7 +1554,9 @@ function TurnBlock({
               name="chat.message.wrapper"
               slotProps={{ session, turn, children: null }}
             >
-              <MarkdownView content={turn.assistantText} />
+              {turn.status === 'running' ? (
+                <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">{turn.assistantText}</div>
+              ) : <MarkdownView content={turn.assistantText} onOpenFile={onOpenFile} />}
             </Slot>
           </div>
         )}
@@ -1522,7 +1623,7 @@ function TurnBlock({
     </div>
     </SlotTurnProvider>
   );
-}
+});
 
 function ThinkingAccordion({ text, running }: { text: string; running: boolean }) {
   const [open, setOpen] = useState(false);

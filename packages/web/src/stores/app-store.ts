@@ -65,6 +65,7 @@ interface AppState {
   sidebarCollapsed: boolean;
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
+  inspectorFile: { sessionId: string; path: string; line?: number } | null;
   activeModal: ActiveModal;
   newSessionPresetHarnessId: string | null;
 
@@ -113,6 +114,8 @@ interface AppState {
   setSidebarCollapsed: (collapsed: boolean) => void;
   setInspectorOpen: (open: boolean) => void;
   setInspectorTab: (tab: InspectorTab) => void;
+  openInspectorFile: (sessionId: string, path: string, line?: number) => void;
+  closeInspectorFile: () => void;
   openModal: (modal: ActiveModal, presetHarnessId?: string | null) => void;
   setSelectedWorkspaceId: (id: string | null) => void;
   setHarnessFilter: (id: string | null) => void;
@@ -160,7 +163,7 @@ interface AppState {
   summarizeTaskState: (sessionId: string) => Promise<void>;
   handoffSession: (sourceId: string, targetHarnessId: string, targetModel?: string | null) => Promise<void>;
   sendTurn: (sessionId: string, text: string, attachments?: Attachment[],
-    options?: { omitHandoff?: boolean; literalText?: boolean }) => Promise<void>;
+    options?: { omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' }) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
   refreshGitStatus: (sessionId: string) => Promise<void>;
@@ -212,17 +215,42 @@ export const useAppStore = create<AppState>((set, get) => {
   const initialTheme = getInitialTheme();
   applyThemeToDocument(initialTheme);
 
-  const ingestEvent = (event: CanonicalEvent) => {
+  let eventQueue: CanonicalEvent[] = [];
+  let eventFlush: ReturnType<typeof setTimeout> | undefined;
+  const ingestEvents = (batch: CanonicalEvent[]) => {
+    const accepted: CanonicalEvent[] = [];
     set((state) => {
-      const list = state.eventsBySession[event.sessionId] ?? [];
-      if (list.some((e) => e.seq === event.seq)) {
-        return state;
+      const grouped = new Map<string, CanonicalEvent[]>();
+      for (const event of batch) {
+        const list = grouped.get(event.sessionId) ?? [];
+        list.push(event);
+        grouped.set(event.sessionId, list);
       }
-      const nextList = [...list, event].sort((a, b) => a.seq - b.seq);
-      wsClient?.updateCursor(event.sessionId, event.seq);
+      const eventsBySession = { ...state.eventsBySession };
+      const metadata = new Map<string, CanonicalEvent[]>();
+      for (const [sessionId, incoming] of grouped) {
+        const existing = eventsBySession[sessionId] ?? [];
+        const lastSeq = existing.at(-1)?.seq ?? 0;
+        let seen: Set<number> | undefined;
+        const fresh = incoming.sort((a, b) => a.seq - b.seq).filter((event, index) => {
+          if (event.seq === incoming[index - 1]?.seq) return false;
+          if (event.seq > lastSeq) return true;
+          seen ??= new Set(existing.map(({ seq }) => seq));
+          return !seen.has(event.seq);
+        });
+        if (!fresh.length) continue;
+        const next = [...existing, ...fresh];
+        if (fresh[0]!.seq < lastSeq) next.sort((a, b) => a.seq - b.seq);
+        eventsBySession[sessionId] = next;
+        accepted.push(...fresh);
+        wsClient?.updateCursor(sessionId, fresh.at(-1)!.seq);
+        const updates = fresh.filter(({ type }) => !type.endsWith('.delta'));
+        if (updates.length) metadata.set(sessionId, updates);
+      }
+      if (!accepted.length) return state;
 
-      const sessions = state.sessions.map((s) => {
-        if (s.id !== event.sessionId) return s;
+      const sessions = metadata.size ? state.sessions.map((s) => (metadata.get(s.id) ?? []).reduce((s, event) => {
+        if (event.seq <= s.lastSeq) return s;
         let status = s.status;
         let pendingApprovalCount = s.pendingApprovalCount;
         let usage = s.usage;
@@ -274,38 +302,31 @@ export const useAppStore = create<AppState>((set, get) => {
           lastSeq: Math.max(s.lastSeq, event.seq),
           updatedAt: event.createdAt,
         };
-      });
+      }, s)) : state.sessions;
 
       return {
-        eventsBySession: {
-          ...state.eventsBySession,
-          [event.sessionId]: nextList,
-        },
+        eventsBySession,
         sessions,
       };
     });
 
     const currentSelected = get().selectedSessionId;
-    if (event.type === 'turn.completed' || event.type === 'tool.call.completed') {
-      if (currentSelected === event.sessionId && get().inspectorOpen) {
-        void get().refreshGitStatus(event.sessionId);
-      }
-      if (event.type === 'turn.completed' && currentSelected === event.sessionId) {
-        void get().refreshContextPreview(event.sessionId);
-        void daemonApi
-          .getSession(event.sessionId)
-          .then(({ session, taskState }) =>
-            set((state) => ({
-              sessions: state.sessions.map((s) => (s.id === session.id ? session : s)),
-              ...(taskState
-                ? { taskStateBySession: { ...state.taskStateBySession, [session.id]: taskState } }
-                : {}),
-            })),
-          )
-          .catch(() => {});
-      }
-    } else if (event.type === 'task.state_updated' && currentSelected === event.sessionId) {
-      void get().refreshTaskState(event.sessionId);
+    const relevant = accepted.filter(({ sessionId }) => sessionId === currentSelected);
+    if (!currentSelected) return;
+    const turnEnded = relevant.some(({ type }) => type === 'turn.completed' || type === 'turn.failed' || type === 'turn.cancelled');
+    if (get().inspectorOpen && (turnEnded || relevant.some(({ type }) => type === 'tool.call.completed'))) {
+      void get().refreshGitStatus(currentSelected);
+    }
+    if (turnEnded) {
+      void get().refreshContextPreview(currentSelected);
+      void daemonApi.getSession(currentSelected).then(({ session, taskState }) =>
+        set((state) => ({
+          sessions: state.sessions.map((s) => s.id === session.id && s.lastSeq <= session.lastSeq ? session : s),
+          ...(taskState ? { taskStateBySession: { ...state.taskStateBySession, [session.id]: taskState } } : {}),
+        })),
+      ).catch(() => {});
+    } else if (relevant.some(({ type }) => type === 'task.state_updated')) {
+      void get().refreshTaskState(currentSelected);
     }
   };
 
@@ -383,12 +404,23 @@ export const useAppStore = create<AppState>((set, get) => {
     init: async () => {
       if (!wsClient) {
         wsClient = new DaemonWsClient({
-          onConnected: (connected) => set({ connected }),
+          onConnected: (connected) => {
+            set({ connected });
+            if (connected && !get().loading) void get().refreshPlugins().catch(() => {});
+          },
           onFrame: (frame) => {
             if (frame.op === 'event') {
-              ingestEvent(frame.event);
+              eventQueue.push(frame.event);
+              eventFlush ??= setTimeout(() => {
+                eventFlush = undefined;
+                const batch = eventQueue;
+                eventQueue = [];
+                ingestEvents(batch);
+              }, 25);
             } else if (frame.op === 'attention') {
               handleAttention(frame.item);
+            } else if (frame.op === 'plugins_changed') {
+              void get().refreshPlugins().catch(() => {});
             }
           },
         });
@@ -411,7 +443,12 @@ export const useAppStore = create<AppState>((set, get) => {
         void get().refreshGitStatus(sid);
       }
     },
+    inspectorFile: null,
     setInspectorTab: (tab) => set({ inspectorTab: tab }),
+    openInspectorFile: (sessionId, path, line) => set({
+      inspectorFile: { sessionId, path, line }, inspectorTab: 'files', inspectorOpen: true,
+    }),
+    closeInspectorFile: () => set({ inspectorFile: null }),
     openModal: (modal, presetHarnessId = null) =>
       set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId }),
     setSelectedWorkspaceId: (id) => set({ selectedWorkspaceId: id }),

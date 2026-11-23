@@ -1,6 +1,7 @@
 import type { CanonicalEvent } from '@harnessmate/protocol';
 import { describe, expect, it } from 'vitest';
-import { projectSessionEvents } from '../src/lib/projector';
+import { createSessionEventProjector, projectSessionEvents } from '../src/lib/projector';
+import { parseFileLink } from '../src/lib/file-links';
 
 describe('projectSessionEvents', () => {
   it('projects streaming assistant text, thinking, tools, and mobile-resolved approvals deterministically', () => {
@@ -111,6 +112,14 @@ describe('projectSessionEvents', () => {
     expect(turn.approvals[0]?.resolvedBy).toBe('mobile');
     expect(turn.assistantText).toBe('Working tree is clean.');
     expect(turn.status).toBe('completed');
+
+    const project = createSessionEventProjector();
+    const beforeResolution = project(events.slice(0, 4));
+    const expired: CanonicalEvent = { ...events[4]!, payload: { approvalId: 'appr_1', status: 'expired' } };
+    const afterResolution = project([...events.slice(0, 4), expired]);
+    expect(beforeResolution.pendingApprovals[0]?.status).toBe('pending');
+    expect(afterResolution.pendingApprovals).toHaveLength(0);
+    expect(afterResolution.turns[0]?.approvals[0]?.status).toBe('expired');
   });
 
   it('projects multi-harness turns with per-turn attribution and interleaved switch dividers', () => {
@@ -188,5 +197,19 @@ describe('projectSessionEvents', () => {
     expect(projected.turns[0]?.actualModel).toBe('gemini-4-neon');
     expect(projected.turns[1]?.harnessId).toBe('codex');
     expect(projected.turns[1]?.actualModel).toBe('gpt-6.2-sol');
+
+    const project = createSessionEventProjector();
+    const initial = project(events.slice(0, 3));
+    const append = project(events);
+    expect(append.turns[0]).toBe(initial.turns[0]);
+    expect(project([events[0]!, events[2]!]).turns[0]?.assistantText).toBe('');
   });
+});
+
+it('recognizes native and workspace file links without intercepting protocol URLs', () => {
+  expect(parseFileLink('/D:/Project/src/main.ts:25:3')).toEqual({ path: 'D:/Project/src/main.ts', line: 25 });
+  expect(parseFileLink('file:///D:/My%20Project/readme.md#L17-L21')).toEqual({ path: 'D:/My Project/readme.md', line: 17 });
+  expect(parseFileLink('src/index.ts#L3')).toEqual({ path: 'src/index.ts', line: 3 });
+  expect(parseFileLink('https://example.com/path.ts#L3')).toBeNull();
+  expect(parseFileLink('javascript:alert(1)')).toBeNull();
 });

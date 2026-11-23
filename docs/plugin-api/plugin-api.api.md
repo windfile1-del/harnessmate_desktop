@@ -559,16 +559,16 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
     title: string;
     slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "inspector.tab";
     ui: string;
-    order?: number | undefined;
     key?: string | undefined;
+    order?: number | undefined;
     height?: number | undefined;
 }, {
     id: string;
     title: string;
     slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "inspector.tab";
     ui: string;
-    order?: number | undefined;
     key?: string | undefined;
+    order?: number | undefined;
     height?: number | undefined;
 }>;
 export type PluginSlotContribution = z.infer<typeof PluginSlotContributionSchema>;
@@ -597,6 +597,14 @@ export interface PluginSlotRenderFailure {
     timestamp: number;
 }
 export type PluginSlotBridgeHostMessage = {
+    type: 'hm:browser:frame';
+    runId: string;
+    frame: PluginBrowserFrame;
+} | {
+    type: 'hm:browser:status';
+    runId: string;
+    status: PluginBrowserStatus;
+} | {
     type: 'hm:init';
     pluginId: string;
     runId: string;
@@ -638,4 +646,50 @@ export type PluginSlotBridgeIframeMessage = {
     method: string;
     params?: Record<string, unknown>;
 };
+import type { PluginBrowserFrame, PluginBrowserStatus } from './browser-preview.js';
+
+/** An HTTP(S) page rendered by the desktop host in a private Chromium session. */
+export interface PluginBrowserOptions {
+    url: string;
+    width?: number;
+    height?: number;
+}
+export type PluginBrowserInput = {
+    type: 'click' | 'move';
+    x: number;
+    y: number;
+} | {
+    type: 'wheel';
+    x: number;
+    y: number;
+    deltaX: number;
+    deltaY: number;
+} | {
+    type: 'key';
+    key: 'Enter' | 'Tab' | 'Escape' | 'Backspace' | 'Delete' | 'Left' | 'Right' | 'Up' | 'Down' | 'Home' | 'End' | 'PageUp' | 'PageDown';
+} | {
+    type: 'text';
+    text: string;
+};
+export interface PluginBrowserFrame {
+    dataUrl: string;
+    width: number;
+    height: number;
+}
+export interface PluginBrowserStatus {
+    state: 'loading' | 'ready' | 'error' | 'closed';
+    url?: string;
+    message?: string;
+}
+export interface PluginBrowserBridge {
+    available: boolean;
+    open(options: PluginBrowserOptions): Promise<void>;
+    close(): Promise<void>;
+    reload(): Promise<void>;
+    back(): Promise<void>;
+    forward(): Promise<void>;
+    input(event: PluginBrowserInput): Promise<void>;
+    onFrame(listener: (frame: PluginBrowserFrame) => void): () => void;
+    onStatus(listener: (status: PluginBrowserStatus) => void): () => void;
+}
 ```

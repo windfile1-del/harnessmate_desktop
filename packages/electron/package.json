@@ -1,6 +1,6 @@
 {
   "name": "@harnessmate/electron",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "HarnessMate Desktop — Unified Multi-Harness Manager & Mobile Remote Hub",
   "author": "HarnessMate",
@@ -16,6 +16,7 @@
   "dependencies": {},
   "devDependencies": {
     "@harnessmate/daemon": "workspace:*",
+    "@harnessmate/plugin-api": "workspace:*",
     "@types/node": "^22.13.10",
     "electron": "^35.0.0",
     "electron-builder": "^26.0.12",

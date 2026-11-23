@@ -82,12 +82,43 @@ export function projectSessionEvents(
   events: CanonicalEvent[],
   fallbackHarness?: { id: string; kind: HarnessKind },
 ): ProjectedTimeline {
+  return createSessionEventProjector()(events, fallbackHarness);
+}
+
+export function createSessionEventProjector() {
+  let projection = createProjection();
+  let previous: CanonicalEvent[] = [];
+  let harnessId: string | undefined;
+  let harnessKind: HarnessKind | undefined;
+  return (events: CanonicalEvent[], fallbackHarness?: { id: string; kind: HarnessKind }): ProjectedTimeline => {
+    // Live batches retain event identities. Merging missing history can change the prefix.
+    const appendOnly = events.length >= previous.length && (!previous.length ||
+      (events[0] === previous[0] && events[previous.length - 1] === previous.at(-1)));
+    if (!appendOnly || fallbackHarness?.id !== harnessId || fallbackHarness?.kind !== harnessKind) {
+      projection = createProjection(fallbackHarness);
+      previous = [];
+      harnessId = fallbackHarness?.id;
+      harnessKind = fallbackHarness?.kind;
+    }
+    projection.apply(events, previous.length);
+    previous = events;
+    return projection.snapshot();
+  };
+}
+
+function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
   const items: ProjectedTimelineItem[] = [];
   const turns: ProjectedTurn[] = [];
   const turnMap = new Map<string, ProjectedTurn>();
   const toolMap = new Map<string, ProjectedToolCall>();
   const approvalMap = new Map<string, ApprovalRequest>();
   const diagnostics: DiagnosticEntry[] = [];
+  const toolOwners = new Map<string, ProjectedTurn>();
+  const approvalOwners = new Map<string, ProjectedTurn>();
+  const pending = new Set<string>();
+  const snapshots = new WeakMap<ProjectedTurn, ProjectedTurn>();
+  const dirty = new Set<ProjectedTurn>();
+  let result: ProjectedTimeline = { items: [], turns: [], diagnostics: [], pendingApprovals: [] };
 
   const getOrCreateTurn = (turnId: string | null, ts: number): ProjectedTurn => {
     const key = turnId || 'turn_default';
@@ -115,6 +146,7 @@ export function projectSessionEvents(
       turns.push(turn);
       items.push(turn);
     }
+    dirty.add(turn);
     return turn;
   };
 
@@ -133,7 +165,7 @@ export function projectSessionEvents(
     }
   };
 
-  for (const ev of events) {
+  function applyEvent(ev: CanonicalEvent) {
     const p = ev.payload;
 
     switch (ev.type) {
@@ -248,6 +280,7 @@ export function projectSessionEvents(
             startedAt: ev.createdAt,
           };
           toolMap.set(toolCallId, tool);
+          toolOwners.set(toolCallId, turn);
           turn.tools.push(tool);
         }
         break;
@@ -257,6 +290,7 @@ export function projectSessionEvents(
         const toolCallId = String(p.toolCallId ?? '');
         const tool = toolMap.get(toolCallId);
         if (tool) {
+          dirty.add(toolOwners.get(toolCallId)!);
           if (typeof p.outputDelta === 'string') tool.output += p.outputDelta;
           if (typeof p.diffDelta === 'string') tool.diff += p.diffDelta;
         }
@@ -267,6 +301,7 @@ export function projectSessionEvents(
         const toolCallId = String(p.toolCallId ?? '');
         const tool = toolMap.get(toolCallId);
         if (tool) {
+          dirty.add(toolOwners.get(toolCallId)!);
           const st = String(p.status ?? 'success');
           tool.status = st === 'error' ? 'error' : st === 'cancelled' ? 'cancelled' : 'success';
           if (typeof p.output === 'string' && p.output.length > 0) {
@@ -287,6 +322,8 @@ export function projectSessionEvents(
           approvalMap.set(copy.id, copy);
           const turn = getOrCreateTurn(ev.turnId, ev.createdAt);
           turn.approvals.push(copy);
+          approvalOwners.set(copy.id, turn);
+          if (copy.status === 'pending') pending.add(copy.id);
         }
         break;
       }
@@ -295,12 +332,14 @@ export function projectSessionEvents(
         const approvalId = String(p.approvalId ?? '');
         const existing = approvalMap.get(approvalId);
         if (existing) {
-          const decision = p.decision as ApprovalDecision;
+          dirty.add(approvalOwners.get(approvalId)!);
+          pending.delete(approvalId);
+          const decision = (p.decision as ApprovalDecision | undefined) ?? null;
           existing.decision = decision;
-          existing.status = decision === 'deny' ? 'denied' : 'approved';
-          existing.resolvedBy = (p.resolvedBy as 'desktop' | 'mobile' | 'auto') ?? 'desktop';
+          existing.status = p.status === 'expired' ? 'expired' : decision === 'deny' ? 'denied' : 'approved';
+          existing.resolvedBy = existing.status === 'expired' ? null : (p.resolvedBy as 'desktop' | 'mobile' | 'auto') ?? 'desktop';
           existing.comment = typeof p.comment === 'string' ? p.comment : null;
-          existing.resolvedAt = ev.createdAt;
+          existing.resolvedAt = typeof p.resolvedAt === 'number' ? p.resolvedAt : ev.createdAt;
         }
         break;
       }
@@ -346,7 +385,29 @@ export function projectSessionEvents(
     }
   }
 
-  const pendingApprovals = Array.from(approvalMap.values()).filter((a) => a.status === 'pending');
-
-  return { items, turns, diagnostics, pendingApprovals };
+  return {
+    apply(events: CanonicalEvent[], offset: number) {
+      for (let i = offset; i < events.length; i++) applyEvent(events[i]!);
+    },
+    snapshot(): ProjectedTimeline {
+      const timelineChanged = dirty.size > 0 || items.length !== result.items.length;
+      if (!timelineChanged && diagnostics.length === result.diagnostics.length) return result;
+      for (const turn of dirty) {
+        snapshots.set(turn, {
+          ...turn,
+          tools: turn.tools.map((tool) => ({ ...tool })),
+          approvals: turn.approvals.map((approval) => ({ ...approval })),
+          handoffSnapshots: turn.handoffSnapshots?.map((snapshot) => ({ ...snapshot })),
+        });
+      }
+      dirty.clear();
+      result = {
+        items: timelineChanged ? items.map((item) => item.kind === 'turn' ? snapshots.get(item)! : item) : result.items,
+        turns: timelineChanged ? turns.map((turn) => snapshots.get(turn)!) : result.turns,
+        diagnostics: diagnostics.length === result.diagnostics.length ? result.diagnostics : diagnostics.slice(),
+        pendingApprovals: timelineChanged ? [...pending].map((id) => ({ ...approvalMap.get(id)! })) : result.pendingApprovals,
+      };
+      return result;
+    },
+  };
 }

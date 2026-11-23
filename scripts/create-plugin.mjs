@@ -113,7 +113,7 @@ const targetDir = args.dir ?? path.resolve(process.cwd(), String(id ?? 'my-plugi
 if (!id || !name) {
   console.error(
     '用法:\n' +
-      '  pnpm create:plugin --id user.my-plugin --name "我的插件" [--template isolated|ui-slot|service|declarative] [--dir ./out]\n' +
+      '  pnpm create:plugin --id user.my-plugin --name "我的插件" [--template isolated|ui-slot|service|declarative|browser-preview] [--dir ./out]\n' +
       '  pnpm create:plugin keygen\n' +
       '  pnpm create:plugin sign --dir ./out --key ./private.pem --publisher acme',
   );

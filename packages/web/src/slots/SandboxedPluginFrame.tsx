@@ -109,6 +109,7 @@ export function SandboxedPluginFrame({
       slot,
       session: initialSessionRef.current,
       props: initialPropsRef.current,
+      browserAvailable: Boolean(window.harnessMateBridge?.pluginBrowser),
     });
   }, [doc, pluginId, slotId, slot]);
 
@@ -140,13 +141,17 @@ export function SandboxedPluginFrame({
   useEffect(() => {
     if (!doc) return;
     const activeRunId = doc.runId;
+    const browser = window.harnessMateBridge?.pluginBrowser;
+    const viewId = browser ? window.crypto.randomUUID() : '';
+    let disposed = false;
+    let unsubscribeBrowser: (() => void) | undefined;
 
     const reply = (
       requestId: string,
       payload: { ok: true; result?: unknown } | { ok: false; error: { code: string; message: string } },
     ) => {
       const win = iframeRef.current?.contentWindow;
-      if (!win) return;
+      if (disposed || !win) return;
       const msg: PluginSlotBridgeHostMessage = {
         type: 'hm:rpc:response',
         requestId,
@@ -193,6 +198,27 @@ export function SandboxedPluginFrame({
           try {
             const currentSession = sessionRef.current;
             const store = useAppStore.getState();
+
+            if (method.startsWith('browser.')) {
+              if (!browser) {
+                reply(requestId, { ok: false, error: { code: 'E_NOT_SUPPORTED', message: '浏览器预览需要 HarnessMate Desktop' } });
+                return;
+              }
+              const action = method.slice('browser.'.length);
+              if (action === 'open' && !unsubscribeBrowser) {
+                unsubscribeBrowser = browser.subscribe(viewId, (update) => {
+                  if (disposed || iframeRef.current?.contentWindow !== iframeWindow) return;
+                  iframeWindow.postMessage('frame' in update
+                    ? { type: 'hm:browser:frame', runId, frame: update.frame } satisfies PluginSlotBridgeHostMessage
+                    : { type: 'hm:browser:status', runId, status: update.status } satisfies PluginSlotBridgeHostMessage, '*');
+                });
+              }
+              await browser.call(viewId, action, action === 'open'
+                ? { url: params?.url, width: params?.width, height: params?.height, pluginId, runId }
+                : params?.input);
+              reply(requestId, { ok: true });
+              return;
+            }
 
             if (method === 'plugin.message') {
               const res = await daemonApi.sendPluginUiMessage(pluginId, {
@@ -277,7 +303,14 @@ export function SandboxedPluginFrame({
     };
 
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      disposed = true;
+      window.removeEventListener('message', onMessage);
+      if (unsubscribeBrowser) {
+        unsubscribeBrowser();
+        void browser?.call(viewId, 'close').catch(() => {});
+      }
+    };
   }, [doc, pluginId, slot, slotId]);
 
   if (error) {

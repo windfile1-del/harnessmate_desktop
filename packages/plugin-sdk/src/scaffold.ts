@@ -1,6 +1,8 @@
 import { PLUGIN_MANIFEST_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 
-export type PluginScaffoldTemplate = 'isolated' | 'ui-slot' | 'service' | 'declarative';
+import { browserPreviewTemplate } from './browser-preview-template.js';
+
+export type PluginScaffoldTemplate = 'isolated' | 'ui-slot' | 'service' | 'declarative' | 'browser-preview';
 
 export interface PluginScaffoldOptions {
   id: string;
@@ -37,6 +39,24 @@ export function scaffoldPluginFiles(options: PluginScaffoldOptions): PluginScaff
   const description = (options.description?.trim() || `${name} — HarnessMate V4 插件`).slice(0, 320);
   const author = (options.author?.trim() || 'Local Developer').slice(0, 80);
   const slug = toSlug(id);
+
+  if (options.template === 'browser-preview') {
+    const manifest = {
+      id, name, description, author, version: '0.1.0', category: 'ui',
+      apiVersion: PLUGIN_MANIFEST_VERSION, engines: { pluginApi: '^4.0' },
+      permissions: ['browser:preview'],
+      contributes: { slots: [{
+        slot: 'inspector.tabs', id: 'browser', title: name, ui: 'ui/panel.html', order: 200, height: 430,
+      }] },
+    };
+    return {
+      manifest,
+      files: {
+        'harnessmate-plugin.json': JSON.stringify(manifest, null, 2) + '\n',
+        ...browserPreviewTemplate,
+      },
+    };
+  }
 
   if (options.template === 'ui-slot') {
     const manifest: Record<string, unknown> = {

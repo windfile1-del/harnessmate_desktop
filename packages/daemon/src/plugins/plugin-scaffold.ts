@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PLUGIN_MANIFEST_VERSION, PluginApiError } from '@harnessmate/plugin-api';
+import { scaffoldPluginFiles } from '@harnessmate/plugin-sdk';
 import type { ScaffoldPluginRequest } from '@harnessmate/protocol';
 
 const VALID_ID = /^[a-z0-9][a-z0-9._-]{1,63}$/;
@@ -15,6 +16,8 @@ export function buildScaffoldFiles(req: ScaffoldPluginRequest): {
   manifest: Record<string, unknown>;
   files: Record<string, string>;
 } {
+  if (req.template === 'browser-preview') return scaffoldPluginFiles(req);
+
   const id = req.id.trim();
   const name = req.name.trim();
   if (!VALID_ID.test(id) || id.startsWith('core.') || id.startsWith('broken.')) {

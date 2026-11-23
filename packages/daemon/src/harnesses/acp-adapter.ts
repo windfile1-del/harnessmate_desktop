@@ -108,6 +108,7 @@ export class AcpAdapter implements HarnessAdapter {
   constructor(opts: AcpAdapterOptions) {
     this.id = opts.id;
     this.kind = opts.kind;
+    if (opts.kind === 'agy') this.capabilities.permissionModes = ['plan', 'manual', 'accept_edits', 'auto'];
     this.displayName = opts.displayName;
     this.description = opts.description;
     this.command = opts.command;
@@ -242,14 +243,6 @@ export class AcpAdapter implements HarnessAdapter {
     const launchArgs = [...this.args];
     const dataDirectory = agyDataDirectory(config.nativeHistorySource);
     if (this.kind === 'agy' && dataDirectory) launchArgs.push('--app-data-dir', dataDirectory);
-    if (
-      this.kind === 'agy' &&
-      config.permissionMode === 'auto' &&
-      !launchArgs.includes('--dangerously-skip-permissions')
-    ) {
-      launchArgs.push('--dangerously-skip-permissions');
-    }
-
     const child = spawnCliProcess(binaryPath, launchArgs, { cwd: config.cwd, env: this.env });
     const handle = new AcpSessionHandle(child, config, this.kind === 'agy' ? binaryPath : undefined);
     try {
@@ -398,6 +391,10 @@ class AcpSessionHandle implements AdapterSessionHandle {
   private readonly earlyBuffer: NormalizedAdapterEvent[] = [];
   private readonly rpc: StdioJsonRpcClient;
   private readonly pendingApprovals = new Map<string, PendingAcpApproval>();
+  private permissionMode: PermissionMode = 'manual';
+  private permissionModeConfigured = false;
+  private availableModes: AcpSessionNewResult['modes'];
+  private appliedModeId?: string;
   private _nativeSessionId: string | null = null;
   private currentTurnId: string | null = null;
   private assistantAccum = '';
@@ -522,6 +519,8 @@ class AcpSessionHandle implements AdapterSessionHandle {
 
   private ingestSessionMetadata(res: AcpSessionNewResult | undefined): void {
     if (!res) return;
+    this.availableModes = res.modes;
+    this.appliedModeId = res.modes?.currentModeId;
     if (Array.isArray(res.configOptions)) {
       this.configOptions = res.configOptions;
     }
@@ -648,20 +647,28 @@ class AcpSessionHandle implements AdapterSessionHandle {
       this.emit({ type: 'model.confirmed', actualModel: this.activeConfirmedModel });
     }
 
-    if (patch.permissionMode) {
-      const acpMode = mapPermissionModeToAcpMode(patch.permissionMode);
-      if (acpMode) {
+    if (patch.permissionMode && (!this.permissionModeConfigured || patch.permissionMode !== this.permissionMode)) {
+      const requested = mapPermissionModeToAcpMode(patch.permissionMode);
+      const advertised = this.availableModes?.availableModes;
+      const acpMode = advertised?.find(({ id }) => id === requested)?.id ??
+        (this.agyBinary && patch.permissionMode !== 'plan'
+          ? advertised?.find(({ id }) => id === 'accept-edits')?.id ?? requested
+          : requested);
+      if (acpMode !== this.appliedModeId) {
         try {
           await this.rpc.request(
             'session/set_mode',
             { sessionId: this._nativeSessionId, modeId: acpMode },
             4000,
           );
+          this.appliedModeId = acpMode;
         } catch (err) {
-          if (this.agyBinary && patch.permissionMode === 'plan') throw err;
+          if (this.agyBinary && (patch.permissionMode === 'plan' || this.appliedModeId === 'plan' || this.appliedModeId === 'auto')) throw err;
           // Older custom ACP servers can omit mode switching.
         }
       }
+      this.permissionMode = patch.permissionMode;
+      this.permissionModeConfigured = true;
     }
   }
 
@@ -908,6 +915,29 @@ class AcpSessionHandle implements AdapterSessionHandle {
       const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;
       const rawOptions = Array.isArray(params.options) ? (params.options as AcpPermissionOption[]) : [];
 
+      if (this.agyBinary && (!this.currentTurnId || (typeof params.sessionId === 'string' && params.sessionId !== this._nativeSessionId))) {
+        this.rpc.respond(req.id, { outcome: { outcome: 'cancelled' } });
+        return;
+      }
+      if (this.agyBinary) {
+        const kind = String(toolCall.kind ?? '').toLowerCase();
+        const readOnly = kind === 'read' || kind === 'search';
+        const edit = ['edit', 'write', 'create'].includes(kind);
+        const allow = this.permissionMode === 'auto' ||
+          (this.permissionMode === 'accept_edits' && (readOnly || edit)) ||
+          (this.permissionMode === 'plan' && readOnly);
+        const reject = this.permissionMode === 'plan' && (edit || ['delete', 'move', 'execute', 'shell', 'terminal'].includes(kind));
+        if (allow || reject) {
+          const chosen = pickAcpOption(rawOptions, reject ? 'deny' : 'allow_once', true);
+          if (chosen || reject) {
+            this.rpc.respond(req.id, { outcome: chosen
+              ? { outcome: 'selected', optionId: chosen.optionId }
+              : { outcome: 'cancelled' } });
+            return;
+          }
+        }
+      }
+
       const toolName = String(toolCall.title ?? toolCall.kind ?? 'Tool Permission');
       const toolKind = mapAcpToolKind(String(toolCall.kind ?? ''));
       const diffPreview = extractAcpDiff(toolCall);
@@ -1014,7 +1044,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
   }
 }
 
-function mapPermissionModeToAcpMode(mode: PermissionMode): string | null {
+function mapPermissionModeToAcpMode(mode: PermissionMode): string {
   switch (mode) {
     case 'plan':
       return 'plan';
@@ -1023,9 +1053,7 @@ function mapPermissionModeToAcpMode(mode: PermissionMode): string | null {
     case 'manual':
       return 'default';
     case 'auto':
-      return 'accept-edits';
-    default:
-      return null;
+      return 'auto';
   }
 }
 
@@ -1060,20 +1088,23 @@ function classifyAcpRisk(kind: ToolKind): RiskLevel {
 function pickAcpOption(
   options: AcpPermissionOption[],
   decision: ApprovalDecision,
+  strict = false,
 ): AcpPermissionOption | undefined {
   if (options.length === 0) return undefined;
   const preferredKinds =
     decision === 'allow_once'
-      ? ['allow_once', 'allow_always']
+      ? ['allow_once']
       : decision === 'allow_session'
         ? ['allow_always', 'allow_once']
         : ['reject_once', 'reject_always'];
 
   for (const kind of preferredKinds) {
-    const match = options.find((o) => o.kind === kind);
+    const match = options.find((o) => o?.kind === kind && typeof o.optionId === 'string');
     if (match) return match;
   }
-  return decision === 'deny' ? options[options.length - 1] : options[0];
+  // Requests without a valid rejection option are cancelled rather than selecting an arbitrary choice.
+  return !strict && decision !== 'deny' && options.every((option) => !option?.kind)
+    ? options.find((option) => typeof option?.optionId === 'string') : undefined;
 }
 
 function extractAcpToolOutput(obj: Record<string, unknown>): string | undefined {

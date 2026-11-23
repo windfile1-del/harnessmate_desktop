@@ -148,6 +148,8 @@ export interface PluginSlotRenderFailure {
 }
 
 export type PluginSlotBridgeHostMessage =
+  | { type: 'hm:browser:frame'; runId: string; frame: PluginBrowserFrame }
+  | { type: 'hm:browser:status'; runId: string; status: PluginBrowserStatus }
   | {
       type: 'hm:init';
       pluginId: string;
@@ -187,3 +189,4 @@ export type PluginSlotBridgeIframeMessage =
       method: string;
       params?: Record<string, unknown>;
     };
+import type { PluginBrowserFrame, PluginBrowserStatus } from './browser-preview.js';

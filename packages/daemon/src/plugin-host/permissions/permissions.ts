@@ -32,6 +32,7 @@ const STATIC_PERMISSION_META: Record<string, PermissionMeta> = {
   'fs:workspace:write': { description: '写入工作区内的文件', risk: 'high', scope: 'workspace' },
   notify: { description: '发送桌面通知', risk: 'low', scope: 'global' },
   'clipboard:write': { description: '写入系统剪贴板', risk: 'low', scope: 'global' },
+  'browser:preview': { description: '在独立 Chromium 中显示和操作 HTTP(S) 页面，包括本机开发页面', risk: 'medium', scope: 'global' },
   'tools:model': { description: '通过官方 MCP 通道向模型注册会话级工具', risk: 'medium', scope: 'workspace' },
 };
 

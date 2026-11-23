@@ -253,6 +253,7 @@ export function PluginDevPanel({
             >
               <option value="isolated">隔离代码 + 沙箱 UI 插槽 (推荐)</option>
               <option value="ui-slot">纯声明式沙箱 UI 插槽</option>
+              <option value="browser-preview">浏览器预览</option>
               <option value="service">第三方服务提供方 (provides)</option>
               <option value="declarative">纯声明式斜杠命令 + 数据面板</option>
             </select>

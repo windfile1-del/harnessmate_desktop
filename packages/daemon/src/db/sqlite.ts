@@ -212,6 +212,8 @@ export class HarnessMateStore {
         WHERE type IN ('turn.completed', 'turn.failed', 'turn.cancelled');
       CREATE INDEX IF NOT EXISTS idx_plugin_tool_events ON session_events(session_id, turn_id, seq)
         WHERE type IN ('tool.call.started', 'tool.call.completed');
+      CREATE INDEX IF NOT EXISTS idx_approval_resolution_events
+        ON session_events(session_id, json_extract(payload_json, '$.approvalId')) WHERE type = 'approval.resolved';
 
       CREATE TABLE IF NOT EXISTS plugin_permissions (
         workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -1255,6 +1257,21 @@ export class HarnessMateStore {
           .prepare("UPDATE approvals SET status = 'expired', resolved_at = ? WHERE status = 'pending'")
           .run(now);
     return Number(res.changes);
+  }
+
+  expireApprovalIfPending(id: string): boolean {
+    return Number(this.db.prepare(
+      "UPDATE approvals SET status = 'expired', resolved_at = ? WHERE id = ? AND status = 'pending'",
+    ).run(Date.now(), id).changes) === 1;
+  }
+
+  listUnpublishedExpiredApprovals(): ApprovalRequest[] {
+    const rows = this.db.prepare(`SELECT a.* FROM approvals a
+      WHERE a.status = 'expired' AND NOT EXISTS (
+        SELECT 1 FROM session_events e WHERE e.session_id = a.session_id
+        AND e.type = 'approval.resolved' AND json_extract(e.payload_json, '$.approvalId') = a.id
+      )`).all() as unknown as ApprovalRow[];
+    return rows.map(mapApproval);
   }
 
   // ── Paired Remote Devices ────────────────────────────────────────────

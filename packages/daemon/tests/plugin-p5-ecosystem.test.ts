@@ -59,6 +59,18 @@ it('scaffolds V4 templates, hot-reloads linked dev-mode plugins with unified log
     expect(created.files).toContain('index.mjs');
     expect(created.files).toContain('ui/panel.html');
 
+    const browserScaffold = await daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/scaffold', payload: {
+        id: 'user.dev-browser', name: 'Preview', template: 'browser-preview', linkDevMode: false,
+      },
+    });
+    expect(browserScaffold.statusCode).toBe(201);
+    const browserScaffoldResult = browserScaffold.json() as { dirPath: string; files: string[] };
+    expect(browserScaffoldResult.files).toContain('ui/panel.js');
+    expect(browserScaffoldResult.files).not.toContain('index.mjs');
+    expect(JSON.parse(fs.readFileSync(path.join(browserScaffoldResult.dirPath, 'harnessmate-plugin.json'), 'utf8')))
+      .toMatchObject({ permissions: ['browser:preview'] });
+
     const initialPlugin = created.plugins.find(({ id }) => id === 'user.dev-demo');
     expect(initialPlugin?.devMode).toBe(true);
     expect(initialPlugin?.runtimeState).toBe('ACTIVE');

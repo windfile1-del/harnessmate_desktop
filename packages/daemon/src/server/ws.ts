@@ -8,7 +8,7 @@ import {
 import { WebSocket, WebSocketServer } from 'ws';
 import type { DaemonEventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
-import { isLocalBrowserRequest, type RemoteAuthService } from './auth.js';
+import { isLocalBrowserRequest, isLoopbackAddress, type RemoteAuthService } from './auth.js';
 
 export interface WsGatewayDeps {
   desktopId: string;
@@ -20,6 +20,7 @@ export interface WsGatewayDeps {
 
 export class WsGateway {
   private readonly wss: WebSocketServer;
+  private readonly localSockets = new Set<WebSocket>();
 
   constructor(private readonly deps: WsGatewayDeps) {
     this.wss = new WebSocketServer({ noServer: true });
@@ -53,8 +54,16 @@ export class WsGateway {
     }
 
     this.wss.handleUpgrade(request, socket, head, (ws) => {
+      if (principal.kind === 'local' && isLoopbackAddress(request.socket.remoteAddress)) {
+        this.localSockets.add(ws);
+        ws.once('close', () => this.localSockets.delete(ws));
+      }
       this.wss.emit('connection', ws, request);
     });
+  }
+
+  notifyPluginsChanged(): void {
+    for (const ws of this.localSockets) this.send(ws, { op: 'plugins_changed' });
   }
 
   close(): void {

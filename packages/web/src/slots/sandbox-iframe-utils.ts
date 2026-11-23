@@ -97,6 +97,7 @@ export function buildIframeSrcDoc(params: {
   slot: PluginSlotKey;
   session: PublicSession | null;
   props: Record<string, unknown>;
+  browserAvailable?: boolean;
 }): string {
   const sanitizedCssVars: Record<string, string> = {};
   for (const [key, value] of Object.entries(params.cssVars)) {
@@ -113,6 +114,7 @@ export function buildIframeSrcDoc(params: {
     cssVars: sanitizedCssVars,
     session: params.session,
     props: params.props,
+    browserAvailable: params.browserAvailable === true,
   });
 
   const cspMeta = `<meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttr(params.csp)}">`;
@@ -124,6 +126,8 @@ export function buildIframeSrcDoc(params: {
   var reqSeq = 0;
   var themeListeners = [];
   var contextListeners = [];
+  var browserFrameListeners = new Set();
+  var browserStatusListeners = new Set();
 
   function applyTheme(theme, cssVars) {
     init.theme = theme;
@@ -160,6 +164,7 @@ export function buildIframeSrcDoc(params: {
   }
 
   window.addEventListener('message', function (event) {
+    if (event.source !== window.parent) return;
     var data = event.data;
     if (!data || typeof data !== 'object') return;
     if (data.type === 'hm:theme') {
@@ -170,6 +175,10 @@ export function buildIframeSrcDoc(params: {
       for (var i = 0; i < contextListeners.length; i++) {
         try { contextListeners[i](init.session, init.props); } catch (_) {}
       }
+    } else if (data.type === 'hm:browser:frame' && data.runId === init.runId) {
+      browserFrameListeners.forEach(function (listener) { try { listener(data.frame); } catch (_) {} });
+    } else if (data.type === 'hm:browser:status' && data.runId === init.runId) {
+      browserStatusListeners.forEach(function (listener) { try { listener(data.status); } catch (_) {} });
     } else if (data.type === 'hm:rpc:response') {
       var entry = pending[data.requestId];
       if (!entry) return;
@@ -203,6 +212,17 @@ export function buildIframeSrcDoc(params: {
     resize: function (height) { post({ type: 'hm:resize', slotId: init.slotId, height: Number(height) || 120 }); },
     onTheme: function (cb) { themeListeners.push(cb); return function () { themeListeners = themeListeners.filter(function (fn) { return fn !== cb; }); }; },
     onContext: function (cb) { contextListeners.push(cb); return function () { contextListeners = contextListeners.filter(function (fn) { return fn !== cb; }); }; },
+    browser: {
+      available: init.browserAvailable,
+      open: function (options) { return call('browser.open', options); },
+      close: function () { return call('browser.close'); },
+      reload: function () { return call('browser.reload'); },
+      back: function () { return call('browser.back'); },
+      forward: function () { return call('browser.forward'); },
+      input: function (input) { return call('browser.input', { input: input }); },
+      onFrame: function (cb) { browserFrameListeners.add(cb); return function () { browserFrameListeners.delete(cb); }; },
+      onStatus: function (cb) { browserStatusListeners.add(cb); return function () { browserStatusListeners.delete(cb); }; }
+    },
   };
 
   document.documentElement.setAttribute('data-theme', init.theme);

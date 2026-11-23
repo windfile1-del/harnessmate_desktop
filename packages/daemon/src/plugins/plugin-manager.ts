@@ -68,6 +68,7 @@ export interface PluginManagerOptions {
   store?: HarnessMateStore;
   permissions?: PluginPermissionService;
   crashPolicy?: CrashPolicy;
+  onDevReload?: () => void;
 }
 
 export class PluginManager {
@@ -103,7 +104,7 @@ export class PluginManager {
       this.appendHostLog(pluginId, 'info', `检测到源码变更${filename ? ` (${filename})` : ''}，正在热重载…`);
       void this.reloadDevPlugin(pluginId).catch((err: unknown) => {
         this.appendHostLog(pluginId, 'error', `开发模式热重载失败: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      }).finally(() => options?.onDevReload?.());
     });
     if (options?.store) {
       this.permissions = options.permissions ?? new PluginPermissionService(options.store);

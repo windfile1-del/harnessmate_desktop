@@ -39,6 +39,7 @@ import type {
 } from '../harnesses/types.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
+import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
@@ -73,13 +74,14 @@ interface ActiveTurnMeta {
 }
 
 const MAX_WARM_HANDLES = 6;
-type TurnOptions = { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean };
+type TurnOptions = { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' };
 
 export class SessionManager {
   private readonly liveHandles = new Map<string, LiveHandleEntry>();
   private readonly activeTurnMeta = new Map<string, ActiveTurnMeta>();
   private readonly startingSessions = new Set<string>();
   private readonly importingSessions = new Map<string, Promise<Session>>();
+  private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
@@ -106,10 +108,13 @@ export class SessionManager {
 
   private recoverStaleSessions(): void {
     this.store.expirePendingApprovals();
+    for (const approval of this.store.listUnpublishedExpiredApprovals()) {
+      this.publishExpiredApproval(approval);
+    }
     const sessions = this.store.listSessions({ includeArchived: true });
     for (const s of sessions) {
       if (s.status === 'running' || s.status === 'awaiting_approval') {
-        this.store.updateSession(s.id, { status: 'idle' });
+        this.setSessionStatus(s.id, 'idle');
       }
     }
   }
@@ -986,8 +991,10 @@ export class SessionManager {
     const turnId = `turn_${crypto.randomBytes(5).toString('hex')}`;
     const preTurnSeq = session.lastSeq;
 
-    const { text: effectiveText, expandedCommand } = native || turnOpts?.literalText
+    const { text: expandedText, expandedCommand } = native || turnOpts?.literalText || turnOpts?.mode
       ? { text, expandedCommand: undefined } : this.pluginManager.expandSlashCommand(text);
+    const effectiveText = !native && turnOpts?.mode === 'plugin_development'
+      ? `${expandedText}\n\n${pluginDevelopmentBrief}` : expandedText;
 
     // Auto-title session from first user prompt if still default
     if (!native && session.lastSeq <= 2 && session.title.includes('·')) {
@@ -1015,6 +1022,7 @@ export class SessionManager {
       {
         text,
         ...(effectiveText !== text ? { sentText: effectiveText } : {}),
+        ...(turnOpts?.mode ? { mode: turnOpts.mode } : {}),
         expandedCommand: expandedCommand ?? null,
         harnessId: session.harnessId,
         harnessKind: session.harnessKind,
@@ -1141,7 +1149,7 @@ export class SessionManager {
       }
     }
     this.activeTurnMeta.delete(sessionId);
-    this.store.expirePendingApprovals(sessionId);
+    this.expireSessionApprovals(sessionId);
     this.setSessionStatus(sessionId, 'idle');
   }
 
@@ -1165,6 +1173,7 @@ export class SessionManager {
     if (!updated) {
       return approval;
     }
+    this.clearApprovalTimer(approval.id);
 
     this.emitCanonical(approval.sessionId, 'approval.resolved', {
       approvalId: approval.id,
@@ -1177,8 +1186,9 @@ export class SessionManager {
     for (const entry of this.liveHandles.values()) {
       if (
         entry.sessionId === approval.sessionId &&
-        entry.nativeToGlobalApprovalId.has(approval.nativeRequestId)
+        entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
       ) {
+        entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
         await entry.handle.resolveApproval(approval.nativeRequestId, decision, comment);
         break;
       }
@@ -1195,7 +1205,39 @@ export class SessionManager {
     return approval;
   }
 
+  private clearApprovalTimer(id: string): void {
+    clearTimeout(this.approvalTimers.get(id));
+    this.approvalTimers.delete(id);
+  }
+
+  private publishExpiredApproval(approval: ApprovalRequest): void {
+    this.emitCanonical(approval.sessionId, 'approval.resolved', {
+      approvalId: approval.id, status: 'expired', resolvedAt: approval.resolvedAt,
+    });
+  }
+
+  private expireApproval(approval: ApprovalRequest): void {
+    this.clearApprovalTimer(approval.id);
+    if (!this.store.expireApprovalIfPending(approval.id)) return;
+    this.publishExpiredApproval({ ...approval, resolvedAt: Date.now() });
+    for (const entry of this.liveHandles.values()) {
+      if (entry.sessionId !== approval.sessionId || entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) !== approval.id) continue;
+      entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
+      void entry.handle.resolveApproval(approval.nativeRequestId, 'deny', '审批已过期').catch(() => {});
+      break;
+    }
+    if (this.store.getSession(approval.sessionId)?.status === 'awaiting_approval' &&
+        this.store.listPendingApprovals(approval.sessionId).length === 0) {
+      this.setSessionStatus(approval.sessionId, this.activeTurnMeta.has(approval.sessionId) ? 'running' : 'idle');
+    }
+  }
+
+  private expireSessionApprovals(sessionId?: string): void {
+    for (const approval of this.store.listPendingApprovals(sessionId)) this.expireApproval(approval);
+  }
+
   async shutdown(): Promise<void> {
+    this.expireSessionApprovals();
     const entries = Array.from(this.liveHandles.values());
     this.liveHandles.clear();
     await Promise.all([...new Set(entries.map(({ sessionId }) => sessionId))].map(async (sessionId) => {
@@ -1347,6 +1389,7 @@ export class SessionManager {
   }
 
   private async disposeSessionHandles(sessionId: string): Promise<void> {
+    this.expireSessionApprovals(sessionId);
     const matching = Array.from(this.liveHandles.values()).filter((e) => e.sessionId === sessionId);
     for (const entry of matching) {
       await this.disposeLiveHandle(entry.sessionId, entry.harnessId);
@@ -1454,6 +1497,7 @@ export class SessionManager {
       }
 
       case 'turn.completed': {
+        this.expireSessionApprovals(sessionId);
         const completedEv = this.emitCanonical(
           sessionId,
           'turn.completed',
@@ -1498,6 +1542,7 @@ export class SessionManager {
       }
 
       case 'turn.cancelled': {
+        this.expireSessionApprovals(sessionId);
         this.emitCanonical(
           sessionId,
           'turn.cancelled',
@@ -1511,6 +1556,7 @@ export class SessionManager {
       }
 
       case 'turn.failed': {
+        this.expireSessionApprovals(sessionId);
         this.emitCanonical(
           sessionId,
           'turn.failed',
@@ -1652,6 +1698,9 @@ export class SessionManager {
           resolvedAt: null,
         };
         this.store.createApproval(approval);
+        const expiry = setTimeout(() => this.expireApproval(approval), 120_000);
+        expiry.unref();
+        this.approvalTimers.set(approvalId, expiry);
         this.setSessionStatus(sessionId, 'awaiting_approval');
         this.emitCanonical(sessionId, 'approval.requested', { approval }, ev.turnId);
         void this.annotatePendingApproval(session, approval);

@@ -42,6 +42,8 @@ import type {
   PluginPanelQuery,
   PluginPanelSnapshot,
   PluginUiMessageRequest,
+  PluginBrowserFrame,
+  PluginBrowserStatus,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
   UpdatePluginRegistryConfigRequest,
@@ -61,6 +63,10 @@ declare global {
       pickDirectory: () => Promise<string | null>;
       openExternal: (url: string) => Promise<void>;
       notify: (title: string, body: string) => void;
+      pluginBrowser?: {
+        call: (viewId: string, method: string, data?: unknown) => Promise<void>;
+        subscribe: (viewId: string, listener: (payload: { frame: PluginBrowserFrame } | { status: PluginBrowserStatus }) => void) => () => void;
+      };
     };
   }
 }
@@ -438,7 +444,7 @@ export const daemonApi = {
     id: string,
     text: string,
     attachments?: Attachment[],
-    opts?: { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean },
+    opts?: { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' },
   ) =>
     apiFetch<{ turnId: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/turns`, {
       method: 'POST',
@@ -449,6 +455,7 @@ export const daemonApi = {
         ...(opts?.model !== undefined ? { model: opts.model } : {}),
         omitHandoff: opts?.omitHandoff,
         literalText: opts?.literalText,
+        mode: opts?.mode,
       }),
     }),
 
@@ -523,9 +530,9 @@ export const daemonApi = {
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/files?q=${encodeURIComponent(q)}`,
     ),
 
-  readSessionFile: (sessionId: string, relativePath: string) =>
+  readSessionFile: (sessionId: string, relativePath: string, signal?: AbortSignal) =>
     apiFetch<{ relativePath: string; content: string; truncated: boolean; sizeBytes: number }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-content?path=${encodeURIComponent(relativePath)}`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-content?path=${encodeURIComponent(relativePath)}`, { signal },
     ),
 
   getSessionRules: (sessionId: string) =>

@@ -32,6 +32,7 @@ export async function runAgyCommand(
   if (nativeSessionId) args.push('--conversation', nativeSessionId);
   if (compact || config.permissionMode === 'plan') args.push('--mode', 'plan');
   else if (config.permissionMode === 'accept_edits') args.push('--mode', 'accept-edits');
+  else if (config.permissionMode === 'auto') args.push('--mode', 'auto');
   if (config.model) args.push('--model', config.model);
   if (config.reasoningEffort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(config.reasoningEffort)) {
     args.push('--effort', config.reasoningEffort);

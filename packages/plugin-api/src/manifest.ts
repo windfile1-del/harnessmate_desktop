@@ -39,6 +39,7 @@ export const STATIC_PLUGIN_PERMISSIONS = [
   'fs:workspace:write',
   'notify',
   'clipboard:write',
+  'browser:preview',
   'tools:model',
 ] as const;
 export type StaticPluginPermission = typeof STATIC_PLUGIN_PERMISSIONS[number];

@@ -11,11 +11,15 @@ import {
   Notification,
   shell,
   Tray,
+  type IpcMainEvent,
+  type IpcMainInvokeEvent,
 } from 'electron';
+import { registerPluginBrowser } from './plugin-browser';
 
 const DAEMON_PORT = Number(process.env.HARNESSMATE_PORT || 4789);
 const DEV_WEB_URL = process.env.HARNESSMATE_DEV_URL || 'http://127.0.0.1:5173';
 const IS_DEV = process.env.HARNESSMATE_DEV === '1';
+const APP_URL = IS_DEV ? DEV_WEB_URL : `http://127.0.0.1:${DAEMON_PORT}`;
 
 // Enforce single instance so re-launching the .exe brings the existing tray/window to focus
 const gotLock = app.requestSingleInstanceLock();
@@ -28,6 +32,21 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let daemonProcess: ChildProcess | null = null;
 let isQuitting = false;
+
+function isAppPage(value: string): boolean {
+  try {
+    const current = new URL(value);
+    const start = new URL(APP_URL);
+    return current.origin === start.origin && current.pathname === start.pathname;
+  } catch { return false; }
+}
+
+function trustedOwner(event: IpcMainEvent | IpcMainInvokeEvent): boolean {
+  return event.sender === mainWindow?.webContents && event.senderFrame === event.sender.mainFrame &&
+    isAppPage(event.senderFrame?.url ?? '');
+}
+
+const closePluginBrowsers = registerPluginBrowser(DAEMON_PORT, APP_URL, trustedOwner);
 
 function resolveDaemonEntry(): string {
   if (app.isPackaged) {
@@ -89,9 +108,13 @@ async function ensureDaemonRunning(): Promise<void> {
         method: 'POST',
         signal: AbortSignal.timeout(1500),
       });
-      await new Promise((r) => setTimeout(r, 400));
     } catch {
       // ignore if older daemon has no /shutdown endpoint
+    }
+    for (let i = 0; i < 15; i++) {
+      if (!(await checkDaemonHealth()).ok) break;
+      if (i === 14) throw new Error('旧版 HarnessMate 后台仍在运行，请从托盘退出后重新打开。');
+      await new Promise((r) => setTimeout(r, 150));
     }
   }
 
@@ -124,7 +147,7 @@ async function ensureDaemonRunning(): Promise<void> {
 
   for (let i = 0; i < 60; i++) {
     const h = await checkDaemonHealth();
-    if (h.ok) return;
+    if (h.ok && h.daemonVersion === expectedVersion) return;
     if (daemonProcess.exitCode !== null) {
       throw new Error(
         `HarnessMate daemon exited prematurely (code=${daemonProcess.exitCode}).\n${stderrLog}`,
@@ -176,8 +199,19 @@ function createWindow(): void {
     },
   });
 
-  const targetUrl = IS_DEV ? DEV_WEB_URL : `http://127.0.0.1:${DAEMON_PORT}`;
-  void mainWindow.loadURL(targetUrl);
+  const contents = mainWindow.webContents;
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url) && new URL(url).origin !== new URL(APP_URL).origin) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  contents.on('will-navigate', (event, url) => { if (!isAppPage(url)) event.preventDefault(); });
+  contents.on('will-redirect', (event, url) => { if (!isAppPage(url)) event.preventDefault(); });
+  contents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) closePluginBrowsers(contents);
+  });
+  contents.on('destroyed', () => closePluginBrowsers(contents));
+  contents.on('render-process-gone', () => closePluginBrowsers(contents));
+  void mainWindow.loadURL(APP_URL);
 
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
@@ -229,7 +263,8 @@ function createTray(): void {
   tray.on('click', () => showOrCreateWindow());
 }
 
-ipcMain.handle('dialog:pickDirectory', async () => {
+ipcMain.handle('dialog:pickDirectory', async (event) => {
+  if (!trustedOwner(event)) return null;
   const win = mainWindow ?? BrowserWindow.getFocusedWindow();
   const res = await dialog.showOpenDialog(win ?? undefined!, {
     properties: ['openDirectory'],
@@ -238,14 +273,14 @@ ipcMain.handle('dialog:pickDirectory', async () => {
   return res.canceled ? null : res.filePaths[0] ?? null;
 });
 
-ipcMain.handle('shell:openExternal', async (_event, url: string) => {
-  if (/^https?:\/\//i.test(url)) {
+ipcMain.handle('shell:openExternal', async (event, url: string) => {
+  if (trustedOwner(event) && typeof url === 'string' && /^https?:\/\//i.test(url)) {
     await shell.openExternal(url);
   }
 });
 
-ipcMain.on('desktop:notify', (_event, payload: { title: string; body: string }) => {
-  if (Notification.isSupported()) {
+ipcMain.on('desktop:notify', (event, payload: { title: string; body: string }) => {
+  if (trustedOwner(event) && Notification.isSupported()) {
     new Notification({ title: payload.title, body: payload.body }).show();
   }
 });

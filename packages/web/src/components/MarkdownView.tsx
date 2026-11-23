@@ -1,8 +1,9 @@
 import { Check, Copy } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
+import { memo, useMemo, useState, type ReactNode } from 'react';
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
+import { parseFileLink, type FileLink } from '../lib/file-links';
 
 function CodeBlock({ children, className }: { children?: ReactNode; className?: string }) {
   const [copied, setCopied] = useState(false);
@@ -58,13 +59,23 @@ function extractText(node: ReactNode): string {
   return '';
 }
 
-export function MarkdownView({ content }: { content: string }) {
-  return (
-    <div className="hm-prose">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
-        components={{
+export const MarkdownView = memo(function MarkdownView({ content, onOpenFile }: {
+  content: string;
+  onOpenFile?: (file: FileLink) => void;
+}) {
+  const components = useMemo<Components>(() => ({
+          a({ href, children, title }) {
+            const file = onOpenFile && href ? parseFileLink(href) : null;
+            if (file) return <button type="button" className="cursor-pointer break-all text-[var(--accent-indigo)] underline"
+              title={title ?? file.path} onClick={() => onOpenFile?.(file)}>{children}</button>;
+            return <a href={href} title={title} target={href?.startsWith('#') ? undefined : '_blank'} rel="noreferrer"
+              onClick={(event) => {
+                if (href && /^https?:\/\//i.test(href) && window.harnessMateBridge) {
+                  event.preventDefault();
+                  void window.harnessMateBridge.openExternal(href);
+                }
+              }}>{children}</a>;
+          },
           pre({ children }) {
             return <>{children}</>;
           },
@@ -79,10 +90,17 @@ export function MarkdownView({ content }: { content: string }) {
             }
             return <CodeBlock className={className}>{children}</CodeBlock>;
           },
-        }}
+  }), [onOpenFile]);
+  return (
+    <div className="hm-prose">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
+        urlTransform={(url, key) => key === 'href' && onOpenFile && parseFileLink(url) ? url : defaultUrlTransform(url)}
+        components={components}
       >
         {content}
       </ReactMarkdown>
     </div>
   );
-}
+});

@@ -1,3 +1,4 @@
+import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
 import { ChatStage } from './components/ChatStage';
@@ -41,7 +42,19 @@ export function App() {
     openModal,
     toasts,
     dismissToast,
-  } = useAppStore();
+  } = useAppStore(useShallow((state) => ({
+    init: state.init,
+    sessions: state.sessions,
+    selectedSessionId: state.selectedSessionId,
+    sidebarCollapsed: state.sidebarCollapsed,
+    setSidebarCollapsed: state.setSidebarCollapsed,
+    inspectorOpen: state.inspectorOpen,
+    setInspectorOpen: state.setInspectorOpen,
+    activeModal: state.activeModal,
+    openModal: state.openModal,
+    toasts: state.toasts,
+    dismissToast: state.dismissToast,
+  })));
 
   const selectedSession = useMemo(
     () => sessions.find((s) => s.id === selectedSessionId) ?? null,

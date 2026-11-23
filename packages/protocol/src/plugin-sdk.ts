@@ -95,7 +95,7 @@ export interface PluginLogEntryDto {
   meta?: Record<string, unknown>;
 }
 
-export const PluginScaffoldTemplateSchema = z.enum(['isolated', 'ui-slot', 'service', 'declarative']);
+export const PluginScaffoldTemplateSchema = z.enum(['isolated', 'ui-slot', 'service', 'declarative', 'browser-preview']);
 export type PluginScaffoldTemplateDto = z.infer<typeof PluginScaffoldTemplateSchema>;
 
 export const ScaffoldPluginRequestSchema = z.object({
