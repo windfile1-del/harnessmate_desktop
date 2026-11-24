@@ -1,8 +1,12 @@
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   CanonicalEvent,
   ContextInjectionDriver,
   ContextPreview,
   ContextSyncMode,
+  HarnessHistoryInjectionMode,
   HarnessKind,
   Session,
   SessionHarnessBinding,
@@ -11,12 +15,29 @@ import type { HarnessMateStore } from '../db/sqlite.js';
 import type { getGitStatusSummary } from './git-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
 import { composeSnapshot, type HandoffSnapshot } from './handoff-snapshot.js';
+import {
+  HandoffRedactor,
+  type HandoffRedactContext,
+  type HandoffRedactHook,
+} from './handoff-redactor.js';
 import type { PluginEvents } from '../plugin-host/runtime/events.js';
 import { PluginApiError, type Disposer, type HandoffComposeEvent } from '@harnessmate/plugin-api';
 
 import type { PortableHistoryMessage } from '../harnesses/types.js';
 
 export type CodexInjectMessageItem = PortableHistoryMessage;
+
+export type HandoffForceFreshReason = 'uncertain_previous_delivery' | 'context_budget_overflow';
+
+export interface HandoffDeliveryLifecycle {
+  stagePending(params: {
+    turnId?: string | null;
+    driver: ContextInjectionDriver;
+    fromInstanceId?: string | null;
+  }): string;
+  confirmDelivery(handoffId: string): void;
+  failDelivery(handoffId: string, resetBinding?: boolean): void;
+}
 
 export interface CompiledContextPacket {
   preview: ContextPreview;
@@ -31,6 +52,25 @@ export interface CompiledContextPacket {
   coveredUpToSeq: number;
   /** True when target harness needs context injection before executing the next turn */
   syncNeeded: boolean;
+  /** True when previous pending delivery or context overflow forces a fresh native thread */
+  forceFreshNativeSession?: boolean;
+  forceFreshReason?: HandoffForceFreshReason | null;
+  redaction?: {
+    redactedCount: number;
+    categories: string[];
+  };
+  omitted?: {
+    count: number;
+    itemIds: string[];
+    mcpPullAvailable: boolean;
+    mcpPullInstruction?: string;
+  };
+  workspaceAnchor?: {
+    workspaceDigest: string;
+    mutatedSinceTargetLastTurn: boolean;
+    mutatedFiles: string[];
+  };
+  deliveryLifecycle?: HandoffDeliveryLifecycle;
 }
 
 interface CompiledTurn {
@@ -63,7 +103,12 @@ export class ContextCompiler {
     private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
     private readonly events: PluginEvents,
     private readonly collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
+    private readonly redactor: HandoffRedactor = new HandoffRedactor(),
   ) {}
+
+  registerRedactor(hook: HandoffRedactHook): Disposer {
+    return this.redactor.registerHook(hook);
+  }
 
   registerSection(source: string, section: { id: string; order?: number; text: string }): Disposer {
     if (!/^[a-z0-9._-]{1,64}$/i.test(source) || !/^[a-z0-9._-]{1,48}$/i.test(section.id)) {
@@ -82,6 +127,7 @@ export class ContextCompiler {
   /**
    * Compiles the exact incremental context packet required to bring
    * `targetHarnessId` up to date with `session` up to `upToSeq`.
+   * Strictly side-effect free (safe for read-only previews).
    */
   async compile(opts: {
     session: Session;
@@ -92,6 +138,10 @@ export class ContextCompiler {
     excludeTurnId?: string;
     upToSeq?: number;
     budgetTokens?: number;
+    modelContextWindow?: number;
+    nativeUsedTokens?: number;
+    currentUserText?: string;
+    redactHooks?: HandoffRedactHook[];
   }): Promise<CompiledContextPacket> {
     const { session, targetHarnessId, targetHarnessKind, binding } = opts;
     const referenceOnly = targetHarnessKind === 'agy' || targetHarnessKind === 'acp';
@@ -99,15 +149,20 @@ export class ContextCompiler {
     const budgetTokens = opts.budgetTokens ?? this.options.budgetTokens;
     const targetSeq = opts.upToSeq ?? session.lastSeq;
 
-    const syncedUpToSeq =
-      syncMode === 'full_ledger' ? 0 : Math.min(binding?.syncedUpToSeq ?? 0, targetSeq);
-    const isWarmBinding = Boolean(syncedUpToSeq > 0);
+    const latestHandoff = this.store.getLatestHandoffRecord(session.id, targetHarnessId);
+    const uncertainPreviousDelivery = latestHandoff?.deliveryStatus === 'pending';
 
-    const rawEvents = this.store.iterateEvents(session.id, syncedUpToSeq, targetSeq);
-    const turns = groupEventsIntoTurns(rawEvents, session.harnessId, opts.excludeTurnId);
+    let forceFreshNativeSession = uncertainPreviousDelivery;
+    let forceFreshReason: HandoffForceFreshReason | null = uncertainPreviousDelivery
+      ? 'uncertain_previous_delivery'
+      : null;
 
-    const unsyncedTurns = turns.filter((turn) => (turn.userText || turn.assistantText || turn.tools.length > 0) &&
-      (!isWarmBinding || turn.harnessId !== targetHarnessId));
+    let syncedUpToSeq =
+      syncMode === 'full_ledger' || uncertainPreviousDelivery
+        ? 0
+        : Math.min(binding?.syncedUpToSeq ?? 0, targetSeq);
+    let isWarmBinding = Boolean(syncedUpToSeq > 0);
+
     const taskState = typeof (this.taskLedger as { getOrCreate?: unknown }).getOrCreate === 'function'
       ? this.taskLedger.getOrCreate(session)
       : await (async () => {
@@ -122,6 +177,7 @@ export class ContextCompiler {
             verifications: [],
             blockers: Array.isArray(remote?.blockers) ? remote.blockers : [],
             pinnedFacts: Array.isArray(remote?.pinnedFacts) ? remote.pinnedFacts : [],
+            failedAttempts: Array.isArray(remote?.failedAttempts) ? remote.failedAttempts : [],
             rollingSummary: '',
             summarizedUpToSeq: 0,
             version: typeof remote?.version === 'number' ? remote.version : 1,
@@ -135,6 +191,9 @@ export class ContextCompiler {
           '## Task State Ledger',
           taskState.objective ? `- Objective: ${taskState.objective}` : '',
           taskState.decisions.length ? `- Decisions: ${taskState.decisions.join('; ')}` : '',
+          taskState.failedAttempts?.length
+            ? `- Failed Attempts: ${taskState.failedAttempts.map((fa) => `${fa.summary}: ${fa.failureReason}`).join('; ')}`
+            : '',
           taskState.blockers.length ? `- Blockers: ${taskState.blockers.join('; ')}` : '',
         ].filter(Boolean).join('\n');
 
@@ -144,14 +203,137 @@ export class ContextCompiler {
       taskState.pinnedFacts.length > 0 ||
       taskState.steps.length > 0 ||
       taskState.decisions.length > 0 ||
-      taskState.blockers.length > 0;
-    const needsHistory = unsyncedTurns.length > 0 || (!isWarmBinding && hasLedgerFacts && targetSeq > 1);
+      taskState.blockers.length > 0 ||
+      (taskState.failedAttempts?.length ?? 0) > 0;
 
-    // Block A: Live Workspace Truth Anchor
-    const workspaceTruthBlock = await buildWorkspaceTruthBlock(session, taskState.ledgerFilePath, this.gitStatus);
+    let rawEvents = [...this.store.iterateEvents(session.id, syncedUpToSeq, targetSeq)];
 
-    // Block B: Structured Task State Ledger
-    const ledgerBlock = ledgerMarkdown.trim();
+    const workspaceInfo = await inspectWorkspaceTruth(
+      session,
+      taskState.ledgerFilePath,
+      this.gitStatus,
+      taskState.touchedFiles,
+    );
+
+    const previousHandoffDigest =
+      typeof latestHandoff?.snapshot?.workspaceDigest === 'string'
+        ? latestHandoff.snapshot.workspaceDigest
+        : null;
+    let mutatedFiles = extractMutatedFilesFromEvents(
+      rawEvents,
+      session.cwd,
+      targetHarnessId,
+      opts.excludeTurnId,
+    );
+    let mutatedSinceTargetLastTurn =
+      isWarmBinding &&
+      (mutatedFiles.length > 0 ||
+        (previousHandoffDigest !== null && previousHandoffDigest !== workspaceInfo.workspaceDigest));
+
+    const buildWorkspaceText = (mutated: boolean, files: string[]) => {
+      if (!mutated) return workspaceInfo.blockText;
+      const detail = files.length > 0
+        ? files.map((f) => `\`${f}\``).join(', ')
+        : 'workspace digest changed';
+      return `${workspaceInfo.blockText}\n- **[WORKSPACE_MUTATED_SINCE_LAST_TURN]**: Workspace files changed since your last turn (${detail}). Re-read affected files from disk before making edits.`;
+    };
+
+    let rawWorkspaceTruthBlock = buildWorkspaceText(mutatedSinceTargetLastTurn, mutatedFiles);
+
+    // Check warm context window budget overflow -> auto-fresh native thread
+    if (isWarmBinding) {
+      const fixedTokensPre =
+        estimateTokens(rawWorkspaceTruthBlock) + estimateTokens(ledgerMarkdown.trim()) + 320;
+      let windowOverflow = false;
+      if (opts.modelContextWindow !== undefined && opts.nativeUsedTokens !== undefined) {
+        const workReserve = Math.min(
+          Math.max(16_000, Math.ceil(opts.modelContextWindow * 0.25)),
+          Math.ceil(opts.modelContextWindow * 0.5),
+        );
+        const currentUserTokens = estimateTokens(opts.currentUserText ?? '');
+        const remainingWindow =
+          opts.modelContextWindow - opts.nativeUsedTokens - currentUserTokens - workReserve;
+        windowOverflow = remainingWindow < 1_000 || remainingWindow < fixedTokensPre + 400;
+      }
+      const tightBudgetOverflow = budgetTokens - fixedTokensPre < 600;
+      if (windowOverflow || tightBudgetOverflow) {
+        forceFreshNativeSession = true;
+        forceFreshReason = 'context_budget_overflow';
+        syncedUpToSeq = 0;
+        isWarmBinding = false;
+        rawEvents = [...this.store.iterateEvents(session.id, 0, targetSeq)];
+        mutatedFiles = extractMutatedFilesFromEvents(
+          rawEvents,
+          session.cwd,
+          targetHarnessId,
+          opts.excludeTurnId,
+        );
+        mutatedSinceTargetLastTurn = false;
+        rawWorkspaceTruthBlock = buildWorkspaceText(false, mutatedFiles);
+      }
+    }
+
+    const turns = groupEventsIntoTurns(rawEvents, session.harnessId, opts.excludeTurnId);
+    const rawUnsyncedTurns = turns.filter(
+      (turn) =>
+        (turn.userText || turn.assistantText || turn.tools.length > 0) &&
+        (!isWarmBinding || turn.harnessId !== targetHarnessId),
+    );
+
+    const redactCtx: HandoffRedactContext = {
+      sessionId: session.id,
+      source: 'handoff_compile',
+      targetHarnessId,
+    };
+    let compilerRedactedCount = 0;
+    const redactedCategories = new Set<string>();
+    const redactField = async (value: string): Promise<string> => {
+      if (!value) return value;
+      const res = await this.redactor.redact(value, redactCtx, opts.redactHooks);
+      compilerRedactedCount += res.redactedCount;
+      for (const cat of res.categories) {
+        redactedCategories.add(cat);
+      }
+      return res.text;
+    };
+
+    const unsyncedTurns: CompiledTurn[] = [];
+    for (const turn of rawUnsyncedTurns) {
+      const redactedTools: CompiledTurn['tools'] = [];
+      for (const tool of turn.tools) {
+        redactedTools.push({
+          ...tool,
+          summary: await redactField(tool.summary),
+          outputExcerpt: await redactField(tool.outputExcerpt),
+          diffExcerpt: await redactField(tool.diffExcerpt),
+        });
+      }
+      const redactedAttachments: string[] = [];
+      for (const note of turn.attachmentNotes) {
+        redactedAttachments.push(await redactField(note));
+      }
+      unsyncedTurns.push({
+        ...turn,
+        userText: await redactField(turn.userText),
+        attachmentNotes: redactedAttachments,
+        tools: redactedTools,
+        assistantText: await redactField(turn.assistantText),
+        errorMessage: turn.errorMessage ? await redactField(turn.errorMessage) : null,
+      });
+    }
+
+    const needsHistory =
+      unsyncedTurns.length > 0 ||
+      (!isWarmBinding && hasLedgerFacts && targetSeq > 1) ||
+      (forceFreshNativeSession && (unsyncedTurns.length > 0 || hasLedgerFacts));
+
+    // Block A: Live Workspace Truth Anchor (redacted)
+    const workspaceTruthBlock = await redactField(rawWorkspaceTruthBlock);
+
+    // Block B: Structured Task State Ledger (redacted)
+    const ledgerBlock = await redactField(ledgerMarkdown.trim());
+
+    const safeObjective = await redactField(taskState.objective || session.title);
 
     // Allocate token budgets for Block C (Older Digest) and Block D (Verbatim Recent Window)
     const fixedTokens = estimateTokens(workspaceTruthBlock) + estimateTokens(ledgerBlock) + 320;
@@ -177,10 +359,31 @@ export class ContextCompiler {
     const overflowCount = unsyncedTurns.length - verbatimTurns.length;
     const overflowTurns = overflowCount > 0 ? unsyncedTurns.slice(0, overflowCount) : [];
 
+    // Collect omitted TurnBlockRecord item IDs for hm_session_read pull-on-demand
+    const omittedInfo = collectOmittedItemIds(
+      this.store,
+      session.id,
+      syncedUpToSeq,
+      targetSeq,
+      overflowTurns,
+      budgetTokens,
+    );
+    const mcpPullInstruction = omittedInfo.count > 0
+      ? [
+          '### Omitted Context Recovery (`hm_session_read`)',
+          `- ${omittedInfo.count} earlier or large items were omitted to fit the context budget (recent IDs: ${omittedInfo.displayedItemIds.join(', ')}).`,
+          `- Call MCP tool \`hm_session_read\` with \`{ "sessionId": "${session.id}", "itemId": "<itemId>", "textOffset": 0, "maxChars": 8000 }\` (or \`afterSeq\` / \`beforeSeq\`) to retrieve full redacted content on demand.`,
+        ].join('\n')
+      : undefined;
+
     // Block C: Rolling Episode Digest (for turns beyond verbatim window + saved rollingSummary)
     const digestParts: string[] = [];
     if (taskState.rollingSummary && !isWarmBinding) {
-      digestParts.push(trimToTokenBudget(taskState.rollingSummary, Math.floor(digestBudget * 0.45)));
+      digestParts.push(
+        await redactField(
+          trimToTokenBudget(taskState.rollingSummary, Math.floor(digestBudget * 0.45)),
+        ),
+      );
     }
     if (overflowTurns.length > 0) {
       const skeletonLines = overflowTurns.map((t, idx) => renderTurnSkeleton(t, idx + 1));
@@ -190,6 +393,9 @@ export class ContextCompiler {
           Math.floor(digestBudget * 0.55),
         ),
       );
+    }
+    if (mcpPullInstruction) {
+      digestParts.push(mcpPullInstruction);
     }
     const digestBlock = digestParts.filter(Boolean).join('\n\n');
 
@@ -232,30 +438,48 @@ export class ContextCompiler {
         { source: sec.source, order: sec.order, text: sec.text },
       ]),
     ].sort(([, first], [, second]) => first.order - second.order);
+    const rawExtraSections: typeof coreSections = [];
     this.events.waterfall('handoff.compose', Object.freeze({ append: (id: string, source: string, text: string) => {
       if (remainingChars < 200 || !text.trim()) return;
       const formatted = `## ${id}\n\n${trimMiddle(text, Math.min(remainingChars - 120, 2_000))}`;
-      extraSections.push({ id, source, text: formatted });
+      rawExtraSections.push({ id, source, text: formatted });
       remainingChars -= formatted.length;
     } }), registrations.map(([id, { source, text }]) => (value, next) => { value.append(id, source, text); next(); }));
+    for (const sec of rawExtraSections) {
+      extraSections.push({
+        ...sec,
+        text: await redactField(sec.text),
+      });
+    }
+
     const sectionText = [...coreSections, ...extraSections];
     const previous = referenceOnly && syncMode !== 'full_ledger' && binding?.nativeSessionId
       ? this.store.getLastHandoffReceipt(session.id, targetHarnessId, binding.nativeSessionId)
       : undefined;
-    const snapshot = composeSnapshot(sectionText, previous);
+    const snapshot = composeSnapshot(sectionText, previous, { redact: true });
+    const totalRedactedCount = compilerRedactedCount + (snapshot.redactedCount ?? 0);
+    for (const cat of snapshot.redactedCategories ?? []) {
+      redactedCategories.add(cat);
+    }
+
     const ignored = new Set(['digest', 'transcript']);
     const removed = previous ? Object.keys(previous.sectionHashes)
       .filter((id) => !ignored.has(id) && snapshot.sectionHashes[id] === undefined) : [];
     const syncNeeded = needsHistory || Boolean(previous &&
       (removed.length || snapshot.sections.some(({ id }) => !ignored.has(id))));
     const driverPlanned = selectPlannedDriver(targetHarnessKind, isWarmBinding, syncNeeded);
+    const forceFreshAttr = forceFreshReason ? ` force_fresh_reason="${forceFreshReason}"` : '';
     const sections: string[] = [
-      `<harnessmate_context_sync version="1" snapshot="${snapshot.snapshotId}" session_id="${session.id}" target_harness="${targetHarnessId}" mode="${isWarmBinding ? 'incremental_delta' : 'initial_sync'}" synced_from_seq="${syncedUpToSeq}" synced_to_seq="${targetSeq}" unsynced_turns="${unsyncedTurns.length}">`,
+      `<harnessmate_context_sync version="2" snapshot="${snapshot.snapshotId}" session_id="${session.id}" target_harness="${targetHarnessId}" mode="${isWarmBinding ? 'incremental_delta' : 'initial_sync'}" synced_from_seq="${syncedUpToSeq}" synced_to_seq="${targetSeq}" unsynced_turns="${unsyncedTurns.length}"${forceFreshAttr}>`,
       referenceOnly ? '## Previous Workspace Activity' : '## Continuity Protocol',
       referenceOnly
         ? 'The following records describe previous conversations and task activity in this workspace.'
         : isWarmBinding
         ? `You (${targetHarnessId}) previously participated in this session up to event #${syncedUpToSeq}. Below is ONLY the incremental progress completed by other harnesses since then, plus the latest Workspace Truth & Task State Ledger. Continue seamlessly without asking the user to repeat prior context.`
+        : forceFreshReason === 'uncertain_previous_delivery'
+        ? `Previous context delivery to ${targetHarnessId} did not confirm completion (recovery reason: uncertain_previous_delivery). A fresh thread is starting with the complete synced Task State Ledger and workspace transcript below.`
+        : forceFreshReason === 'context_budget_overflow'
+        ? `Your previous native thread approached its context window capacity (reason: context_budget_overflow). A fresh thread is starting with the compacted Task State Ledger and recent transcript below.`
         : `You (${targetHarnessId}) are taking over an active unified session. Previous turns were executed by other harnesses on this exact workspace. Continue seamlessly from the Task State Ledger and transcript below without asking the user to repeat prior context.`,
     ];
     if (snapshot.previousSnapshotId) {
@@ -340,7 +564,7 @@ export class ContextCompiler {
       isWarmBinding,
       syncNeeded,
       compiledMarkdown: syncNeeded ? deltaMarkdown : '(目标引擎已是最新上下文，无需额外注入)',
-      ledgerMarkdown,
+      ledgerMarkdown: ledgerBlock,
       deltaTurnSummary: unsyncedTurns.map((t) => ({
         turnId: t.turnId,
         harnessId: t.harnessId,
@@ -349,14 +573,93 @@ export class ContextCompiler {
       })),
     };
 
+    const compilerStore = this.store;
+    const defaultFromInstanceId =
+      [...unsyncedTurns].reverse().find((t) => t.harnessId !== targetHarnessId)?.harnessId ??
+      (session.harnessId !== targetHarnessId ? session.harnessId : null);
+
+    const deliveryLifecycle: HandoffDeliveryLifecycle = {
+      stagePending: ({ turnId, driver, fromInstanceId }) => {
+        if (forceFreshNativeSession) {
+          compilerStore.setSessionBindingExact(session.id, targetHarnessId, {
+            nativeSessionId: null,
+            syncedUpToSeq: 0,
+            driverUsed: null,
+          });
+          if (session.harnessId === targetHarnessId) {
+            compilerStore.updateSession(session.id, { nativeSessionId: null });
+          }
+        }
+        const handoffId = randomUUID();
+        compilerStore.createHandoffRecord({
+          handoffId,
+          sessionId: session.id,
+          turnId: turnId ?? null,
+          fromInstanceId: fromInstanceId ?? defaultFromInstanceId,
+          toInstanceId: targetHarnessId,
+          mode: isWarmBinding ? 'delta_since_target_last_seen' : 'full_session_summary',
+          deliveryChannel: mapDriverToChannel(driver),
+          deliveryStatus: 'pending',
+          coveredUpToSeq: targetSeq,
+          estimatedChars: deltaMarkdown.length,
+          redactedCount: totalRedactedCount,
+          forceFreshReason,
+          snapshot: {
+            snapshotId: snapshot.snapshotId,
+            sectionHashes: snapshot.sectionHashes,
+            workspaceDigest: workspaceInfo.workspaceDigest,
+            mutatedFiles,
+            omittedItemIds: omittedInfo.itemIds,
+          },
+          createdAt: Date.now(),
+          confirmedAt: null,
+        });
+        return handoffId;
+      },
+      confirmDelivery: (handoffId) => {
+        compilerStore.updateHandoffDeliveryStatus(handoffId, 'confirmed', Date.now());
+      },
+      failDelivery: (handoffId, resetBinding = false) => {
+        compilerStore.updateHandoffDeliveryStatus(handoffId, 'failed');
+        if (resetBinding) {
+          compilerStore.setSessionBindingExact(session.id, targetHarnessId, {
+            nativeSessionId: null,
+            syncedUpToSeq: 0,
+            driverUsed: null,
+          });
+          if (session.harnessId === targetHarnessId) {
+            compilerStore.updateSession(session.id, { nativeSessionId: null });
+          }
+        }
+      },
+    };
+
     return {
       preview,
       snapshot,
       deltaMarkdown,
       portableItems,
-      objective: taskState.objective || session.title,
+      objective: safeObjective,
       coveredUpToSeq: targetSeq,
       syncNeeded,
+      forceFreshNativeSession,
+      forceFreshReason,
+      redaction: {
+        redactedCount: totalRedactedCount,
+        categories: [...redactedCategories],
+      },
+      omitted: {
+        count: omittedInfo.count,
+        itemIds: omittedInfo.itemIds,
+        mcpPullAvailable: omittedInfo.count > 0,
+        ...(mcpPullInstruction ? { mcpPullInstruction } : {}),
+      },
+      workspaceAnchor: {
+        workspaceDigest: workspaceInfo.workspaceDigest,
+        mutatedSinceTargetLastTurn,
+        mutatedFiles,
+      },
+      deliveryLifecycle,
     };
   }
 }
@@ -373,11 +676,25 @@ function selectPlannedDriver(
   return 'prompt_envelope';
 }
 
-async function buildWorkspaceTruthBlock(
+function mapDriverToChannel(driver: ContextInjectionDriver): HarnessHistoryInjectionMode {
+  switch (driver) {
+    case 'codex_inject_items':
+      return 'native_items';
+    case 'acp_embedded_context':
+      return 'embedded_context';
+    case 'claude_sysfile_delta':
+      return 'sysfile_delta';
+    default:
+      return 'inline';
+  }
+}
+
+async function inspectWorkspaceTruth(
   session: Session,
   ledgerFilePath: string | null | undefined,
   gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
-): Promise<string> {
+  touchedFiles: string[] = [],
+): Promise<{ blockText: string; workspaceDigest: string }> {
   const lines: string[] = [
     '## Workspace Truth Anchor (Live)',
     `- **Working Directory**: \`${session.cwd}\``,
@@ -388,11 +705,28 @@ async function buildWorkspaceTruthBlock(
   if (ledgerFilePath) {
     lines.push(`- **Synced Ledger File**: \`${ledgerFilePath}\``);
   }
+  const digest = createHash('sha256');
+  digest.update(session.cwd.replace(/\\/g, '/')).update('\0');
+  let gitInspected = false;
   try {
     const git = await gitStatus(session.cwd);
     if (git?.isGitRepo) {
+      gitInspected = true;
       lines.push(`- **Git Branch**: \`${git.branch || 'detached'}\` (ahead ${git.ahead}, behind ${git.behind})`);
-      const relevantChanges = git.changes.filter((c) => !c.path.startsWith('.harnessmate/'));
+      digest
+        .update(git.branch || 'detached')
+        .update('\0')
+        .update(`${git.ahead}:${git.behind}`)
+        .update('\0');
+      const relevantChanges = git.changes
+        .filter((c) => !c.path.replace(/\\/g, '/').startsWith('.harnessmate/'))
+        .sort((a, b) => a.path.localeCompare(b.path));
+      for (const c of relevantChanges) {
+        digest.update(`${c.status}:${c.path.replace(/\\/g, '/')}`).update('\n');
+      }
+      if (typeof (git as { diff?: unknown }).diff === 'string') {
+        digest.update(String((git as { diff?: string }).diff));
+      }
       if (relevantChanges.length > 0) {
         lines.push(`- **Uncommitted Changes (${relevantChanges.length} files)**:`);
         for (const c of relevantChanges.slice(0, 18)) {
@@ -408,7 +742,215 @@ async function buildWorkspaceTruthBlock(
   } catch {
     // non-git or git unavailable
   }
-  return lines.join('\n');
+  if (!gitInspected) {
+    const normalizedTouched = [...new Set(touchedFiles.map((f) => f.replace(/\\/g, '/')))].sort().slice(0, 40);
+    for (const rel of normalizedTouched) {
+      digest.update(rel);
+      try {
+        if (session.cwd) {
+          const abs = path.resolve(session.cwd, rel);
+          if (fs.existsSync(abs)) {
+            const st = fs.statSync(abs);
+            digest.update(`:${st.size}:${Math.trunc(st.mtimeMs)}`);
+          }
+        }
+      } catch {
+        // ignore stat errors
+      }
+      digest.update('\n');
+    }
+  }
+  return {
+    blockText: lines.join('\n'),
+    workspaceDigest: digest.digest('hex').slice(0, 16),
+  };
+}
+
+function extractMutatedFilesFromEvents(
+  events: Iterable<CanonicalEvent>,
+  cwd: string,
+  targetHarnessId: string,
+  excludeTurnId?: string,
+): string[] {
+  const mutated = new Set<string>();
+  const startHarnessByTurn = new Map<string, string>();
+  const toolInfo = new Map<string, { toolKind: string; toolName: string; summary: string; input: unknown; harnessId?: string }>();
+
+  const addPath = (rawPath: string) => {
+    const trimmed = rawPath.trim();
+    if (!trimmed || trimmed.length > 260) return;
+    let rel = trimmed;
+    if (path.isAbsolute(trimmed) && cwd) {
+      const computed = path.relative(path.resolve(cwd), trimmed);
+      if (computed && !computed.startsWith('..') && !path.isAbsolute(computed)) {
+        rel = computed;
+      }
+    }
+    const normalized = rel.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (normalized && !normalized.startsWith('.harnessmate/') && normalized !== '/dev/null') {
+      mutated.add(normalized);
+    }
+  };
+
+  for (const ev of events) {
+    if (!ev.turnId || ev.payload.maintenance === true) continue;
+    if (excludeTurnId && ev.turnId === excludeTurnId) continue;
+    const p = ev.payload;
+    if (typeof p.harnessId === 'string' && p.harnessId) {
+      startHarnessByTurn.set(ev.turnId, p.harnessId);
+    }
+    const eventHarness = typeof p.harnessId === 'string' && p.harnessId
+      ? p.harnessId
+      : startHarnessByTurn.get(ev.turnId);
+    if (eventHarness && eventHarness === targetHarnessId) continue;
+
+    if (ev.type === 'tool.call.started') {
+      const toolCallId = typeof p.toolCallId === 'string' ? p.toolCallId : '';
+      const info = {
+        toolKind: String(p.toolKind ?? 'other'),
+        toolName: String(p.toolName ?? ''),
+        summary: String(p.summary ?? ''),
+        input: p.input,
+        harnessId: eventHarness,
+      };
+      if (toolCallId) toolInfo.set(toolCallId, info);
+    } else if (ev.type === 'tool.call.completed') {
+      const callId = typeof p.toolCallId === 'string' ? p.toolCallId : '';
+      const start = callId ? toolInfo.get(callId) : undefined;
+      const toolKind = start?.toolKind ?? String(p.toolKind ?? 'other');
+      const toolName = start?.toolName ?? String(p.toolName ?? '');
+      const diff = typeof p.diff === 'string' ? p.diff : '';
+      const status = String(p.status ?? 'success');
+      if (status === 'error' || status === 'cancelled') continue;
+
+      if (diff) {
+        for (const line of diff.split(/\r?\n/)) {
+          const m = line.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
+          if (m?.[1] && m[1] !== '/dev/null') addPath(m[1]);
+        }
+      }
+      if (toolKind === 'file_edit' || diff || /write|edit|patch|create|modify|delete|unlink/i.test(toolName)) {
+        const input = start?.input ?? p.input;
+        if (input && typeof input === 'object') {
+          const obj = input as Record<string, unknown>;
+          for (const key of ['path', 'file_path', 'filePath', 'Path', 'target_file', 'TargetFile', 'file']) {
+            if (typeof obj[key] === 'string') addPath(obj[key] as string);
+          }
+          if (Array.isArray(obj.files)) {
+            for (const f of obj.files) {
+              if (typeof f === 'string') addPath(f);
+            }
+          }
+        } else if (start?.summary) {
+          const match = start.summary.match(/([\w./\\-]+\.[a-zA-Z0-9]{1,8})/);
+          if (match?.[1]) addPath(match[1]);
+        }
+      }
+    }
+  }
+  return [...mutated];
+}
+
+function collectOmittedItemIds(
+  store: HarnessMateStore,
+  sessionId: string,
+  syncedUpToSeq: number,
+  targetSeq: number,
+  overflowTurns: CompiledTurn[],
+  budgetTokens: number,
+): { count: number; itemIds: string[]; displayedItemIds: string[] } {
+  const overflowTurnIds = new Set(overflowTurns.map((t) => t.turnId));
+  const itemsInRange: ReturnType<HarnessMateStore['listTurnItems']> = [];
+  let cursorSeq = syncedUpToSeq;
+  while (cursorSeq < targetSeq) {
+    const batch = store.listTurnItems(sessionId, { afterSeq: cursorSeq, limit: 2000 });
+    if (batch.length === 0) break;
+    let reachedEnd = false;
+    for (const item of batch) {
+      if (item.seq > targetSeq) {
+        reachedEnd = true;
+        break;
+      }
+      if (item.blockType !== 'reasoning') {
+        itemsInRange.push(item);
+      }
+    }
+    const lastSeq = batch[batch.length - 1]!.seq;
+    if (reachedEnd || batch.length < 2000 || lastSeq <= cursorSeq) break;
+    cursorSeq = lastSeq;
+  }
+
+  const itemsByTurn = new Map<string, string[]>();
+  const candidates: Array<{ id: string; seq: number; subOrder: number; insertOrder: number }> = [];
+  let insertOrder = 0;
+
+  for (const item of itemsInRange) {
+    if (item.turnId) {
+      const list = itemsByTurn.get(item.turnId) ?? [];
+      list.push(item.itemId);
+      itemsByTurn.set(item.turnId, list);
+    }
+    if ((item.turnId && overflowTurnIds.has(item.turnId)) || item.outputOmitted) {
+      candidates.push({
+        id: item.itemId,
+        seq: item.seq,
+        subOrder: 0,
+        insertOrder: insertOrder++,
+      });
+    }
+  }
+
+  for (const turn of overflowTurns) {
+    if ((itemsByTurn.get(turn.turnId)?.length ?? 0) === 0) {
+      if (turn.userText) {
+        candidates.push({
+          id: `${turn.turnId}:user`,
+          seq: turn.startSeq,
+          subOrder: 1,
+          insertOrder: insertOrder++,
+        });
+      }
+      if (turn.assistantText || turn.tools.length > 0) {
+        candidates.push({
+          id: `${turn.turnId}:assistant:main`,
+          seq: turn.endSeq,
+          subOrder: 2,
+          insertOrder: insertOrder++,
+        });
+      }
+    }
+  }
+
+  candidates.sort(
+    (a, b) => a.seq - b.seq || a.subOrder - b.subOrder || a.insertOrder - b.insertOrder,
+  );
+
+  const collected: string[] = [];
+  const seen = new Set<string>();
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const id = candidates[i]!.id;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    collected.push(id);
+  }
+  collected.reverse();
+
+  const recent = collected.slice(-20);
+  const maxListChars = Math.max(300, Math.floor(budgetTokens / 2));
+  const displayed: string[] = [];
+  let chars = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const id = recent[i]!;
+    if (displayed.length > 0 && chars + id.length + 2 > maxListChars) break;
+    displayed.unshift(id);
+    chars += id.length + 2;
+  }
+
+  return {
+    count: collected.length,
+    itemIds: recent,
+    displayedItemIds: displayed,
+  };
 }
 
 function groupEventsIntoTurns(

@@ -30,14 +30,34 @@ export async function dispatchTurn(
       recordedDriver = driver;
     },
   };
-  const injectedDriver = handle.injectContext && payload.portableItems.length > 0
-    ? await handle.injectContext(payload)
-    : null;
-  const injected = injectedDriver !== null && injectedDriver !== 'prompt_envelope';
-  const result = await handle.sendTurn({ ...turn, contextSync: injected ? null : payload });
-  const finalDriver = injected ? injectedDriver : (result?.driverUsed ?? 'prompt_envelope');
-  if (recordedDriver === finalDriver) {
-    record('handoff.snapshot_delivered', { ...attribution, driver: finalDriver, sectionHashes: snapshot.sectionHashes });
+  const plannedChannelDriver: ContextInjectionDriver =
+    handle.injectContext && payload.portableItems.length > 0
+      ? 'codex_inject_items'
+      : preview.driverPlanned;
+  const handoffId = context.deliveryLifecycle?.stagePending({
+    turnId: turn.turnId,
+    driver: plannedChannelDriver,
+  });
+
+  let injected = false;
+  try {
+    const injectedDriver = handle.injectContext && payload.portableItems.length > 0
+      ? await handle.injectContext(payload)
+      : null;
+    injected = injectedDriver !== null && injectedDriver !== 'prompt_envelope';
+    const result = await handle.sendTurn({ ...turn, contextSync: injected ? null : payload });
+    const finalDriver = injected ? injectedDriver! : (result?.driverUsed ?? 'prompt_envelope');
+    if (handoffId) {
+      context.deliveryLifecycle?.confirmDelivery(handoffId);
+    }
+    if (recordedDriver === finalDriver) {
+      record('handoff.snapshot_delivered', { ...attribution, driver: finalDriver, sectionHashes: snapshot.sectionHashes });
+    }
+    return finalDriver;
+  } catch (error) {
+    if (handoffId) {
+      context.deliveryLifecycle?.failDelivery(handoffId, injected);
+    }
+    throw error;
   }
-  return finalDriver;
 }
