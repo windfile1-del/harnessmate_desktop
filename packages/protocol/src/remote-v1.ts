@@ -95,9 +95,10 @@ export const RunHarnessCommandRequestSchema = z.object({
 export type RunHarnessCommandRequest = z.infer<typeof RunHarnessCommandRequestSchema>;
 
 export interface HarnessCommandInfo {
-  command: HarnessCommandName;
+  command: string;
   description: string;
   argumentHint?: string;
+  source?: 'builtin' | 'native_advertised';
 }
 
 export interface HarnessCommandResult {

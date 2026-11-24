@@ -7,10 +7,12 @@ import type {
   HarnessModelInfo,
   HarnessPresentationMeta,
   PermissionMode,
+  ReasoningEffort,
 } from '@harnessmate/protocol';
 import {
   AcpAdapter,
   type AcpAdapterOptions,
+  type AcpConfigOption,
   type AcpFlavorPolicy,
   type AcpPermissionOption,
   type AcpSessionNewResult,
@@ -26,6 +28,7 @@ import {
 import { execCliQuick, resolveBinary } from '../process.js';
 import type { HarnessDriverFactory } from '../registry.js';
 import type { AdapterSessionConfig, AdapterUsageLimitResult } from '../types.js';
+import { AgyModelEffortCache, resolveAgyTurnConfig } from './agy-config-scope.js';
 import {
   AGY_STRIP_ENV_KEYS,
   type AgyLaunchContext,
@@ -145,16 +148,51 @@ export class AntigravityAcpFlavorPolicy implements AcpFlavorPolicy {
     advertised: Array<{ id: string; name?: string }> | undefined,
     permissionMode: PermissionMode,
   ): string {
-    return (
-      advertised?.find(({ id }) => id === requested)?.id ??
-      (permissionMode !== 'plan'
-        ? advertised?.find(({ id }) => id === 'accept-edits')?.id ?? requested
-        : requested)
-    );
+    return this.resolveModeWithEnforcement(requested, advertised, permissionMode).modeId;
+  }
+
+  resolveModeWithEnforcement(
+    requested: string,
+    advertised: Array<{ id: string; name?: string }> | undefined,
+    permissionMode: PermissionMode,
+  ): { modeId: string; enforcement: 'native' | 'client_guard' } {
+    const exact = advertised?.find(({ id }) => id === requested)?.id;
+    if (exact) {
+      return { modeId: exact, enforcement: 'native' };
+    }
+    if (permissionMode === 'auto') {
+      // Never fake native 'auto' support if the backend does not advertise it
+      return {
+        modeId: advertised?.find(({ id }) => id === 'default')?.id ?? 'default',
+        enforcement: 'client_guard',
+      };
+    }
+    if (permissionMode === 'accept_edits') {
+      const acceptEdits = advertised?.find(({ id }) => id === 'accept-edits')?.id;
+      if (acceptEdits) return { modeId: acceptEdits, enforcement: 'native' };
+    }
+    return {
+      modeId: requested,
+      enforcement: permissionMode === 'plan' ? 'native' : 'client_guard',
+    };
   }
 
   shouldThrowOnModeError(permissionMode: PermissionMode, appliedModeId?: string): boolean {
     return permissionMode === 'plan' || appliedModeId === 'plan' || appliedModeId === 'auto';
+  }
+
+  shouldEmitAvailableCommandsAsBlock(): boolean {
+    return false;
+  }
+
+  extractPermissionSecurityWarning(options: AcpPermissionOption[]): string | undefined {
+    for (const opt of options) {
+      const warning = opt?._meta?.['agy.security.warning'];
+      if (typeof warning === 'string' && warning.trim()) {
+        return warning.trim();
+      }
+    }
+    return undefined;
   }
 
   canRunNativeCliCommand(): boolean {
@@ -282,6 +320,12 @@ function buildAgyAdapterOptions(opts: AgyAdapterOptions): {
   return { acpOpts, initialContext };
 }
 
+export interface AgyAdvertisedCommand {
+  name: string;
+  description?: string;
+  argumentHint?: string;
+}
+
 export class AgyAdapter extends AcpAdapter {
   private profileConfig: AgyProfileConfig;
   private readonly profilesRootDir: string;
@@ -289,6 +333,12 @@ export class AgyAdapter extends AcpAdapter {
   private readonly userHome?: string;
   private launchContext: AgyLaunchContext;
   private profilePrepared = false;
+  private readonly effortCache = new AgyModelEffortCache();
+  private liveDetailedCommands: AgyAdvertisedCommand[] = [];
+  protected lastObservedVersion: string | null = null;
+  protected override readonly onConfigOptionsObserved?: (opts: AcpConfigOption[]) => void;
+  protected override readonly onDetailedCommandsObserved?: (cmds: AgyAdvertisedCommand[]) => void;
+  protected override readonly onVersionObservedCallback?: (version: string) => void;
 
   constructor(opts: AgyAdapterOptions) {
     const { acpOpts, initialContext } = buildAgyAdapterOptions(opts);
@@ -299,6 +349,37 @@ export class AgyAdapter extends AcpAdapter {
     this.applyWindowsAcl = opts.applyWindowsAcl;
     this.userHome = opts.userHome;
     this.launchContext = initialContext;
+    this.onConfigOptionsObserved = (configOpts) => {
+      const modelOpt = configOpts.find((c) => c.id === 'model' || c.category === 'model');
+      if (modelOpt?.currentValue) {
+        this.effortCache.recordFromConfigOptions(modelOpt.currentValue, configOpts);
+      }
+    };
+    this.onDetailedCommandsObserved = (cmds) => {
+      this.liveDetailedCommands = cmds;
+    };
+    this.onVersionObservedCallback = (ver) => {
+      this.lastObservedVersion = ver;
+    };
+  }
+
+  getAdvertisedCommands(): AgyAdvertisedCommand[] {
+    return this.liveDetailedCommands;
+  }
+
+  getObservedEffortsForModel(modelId: string): ReasoningEffort[] | undefined {
+    return this.effortCache.get(modelId);
+  }
+
+  private enrichModelsWithObservedEfforts(models: HarnessModelInfo[]): HarnessModelInfo[] {
+    return models.map((m) => {
+      const cachedEfforts = this.effortCache.get(m.id);
+      return {
+        ...m,
+        group: classifyAgyModelGroup(m.id),
+        ...(cachedEfforts && cachedEfforts.length > 0 ? { supportedEfforts: cachedEfforts } : {}),
+      };
+    });
   }
 
   getProfile(): AgyProfileConfig {
@@ -374,6 +455,7 @@ export class AgyAdapter extends AcpAdapter {
 
   override async probePassive() {
     const info = await super.probePassive();
+    const enrichedModels = this.enrichModelsWithObservedEfforts(info.models);
     if (
       info.health === 'ready' &&
       this.profileConfig.isolationMode === 'profile_isolated' &&
@@ -382,11 +464,15 @@ export class AgyAdapter extends AcpAdapter {
     ) {
       return {
         ...info,
+        models: enrichedModels,
         health: 'unauthenticated' as const,
         healthMessage: 'AGY 隔离账号尚未登录，请在设置中完成官方 Google 登录',
       };
     }
-    return info;
+    return {
+      ...info,
+      models: enrichedModels,
+    };
   }
 
   override async readUsageLimits(): Promise<AdapterUsageLimitResult> {
@@ -400,12 +486,30 @@ export class AgyAdapter extends AcpAdapter {
 
   override async createSession(config: AdapterSessionConfig) {
     this.ensureProfilePrepared();
-    return super.createSession(config);
+    const resolved = resolveAgyTurnConfig({
+      accountDefaults: this.profileConfig.defaults,
+      session: {
+        ...(config.model !== undefined ? { model: config.model } : {}),
+        ...(config.reasoningEffort !== undefined ? { reasoningEffort: config.reasoningEffort } : {}),
+        permissionMode: config.permissionMode,
+      },
+      fallbackPermissionMode: config.permissionMode,
+    });
+    return super.createSession({
+      ...config,
+      model: resolved.effectiveRequested.model,
+      reasoningEffort: resolved.effectiveRequested.reasoningEffort,
+      permissionMode: resolved.effectiveRequested.permissionMode,
+    });
   }
 
   override async probeAcpSessionMetadata(binaryPathOverride?: string, forceRefresh = false) {
     this.ensureProfilePrepared();
-    return super.probeAcpSessionMetadata(binaryPathOverride, forceRefresh);
+    const snap = await super.probeAcpSessionMetadata(binaryPathOverride, forceRefresh);
+    return {
+      ...snap,
+      models: this.enrichModelsWithObservedEfforts(snap.models),
+    };
   }
 
   override async readHistory(session: DiscoveredCliSession, cwd: string): Promise<HistoryMessage[]> {

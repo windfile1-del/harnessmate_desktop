@@ -96,6 +96,20 @@ export interface NativeSkill {
 export type NormalizedAdapterEvent =
   | { type: 'native_session_ready'; nativeSessionId: string }
   | { type: 'model.confirmed'; actualModel: string; reroutedFrom?: string; reason?: string }
+  | {
+      type: 'config.confirmed';
+      model?: string | null;
+      thoughtLevel?: string | null;
+      availableThoughtLevels?: string[];
+      modeId?: string | null;
+      permissionEnforcement?: 'native' | 'client_guard';
+      tierName?: string | null;
+    }
+  | {
+      type: 'commands.updated';
+      commands: Array<{ name: string; description?: string; argumentHint?: string }>;
+    }
+  | { type: 'session.title_updated'; title: string }
   | { type: 'turn.started'; turnId: string; continuation?: boolean }
   | { type: 'turn.completed'; turnId: string; stopReason?: string }
   | { type: 'turn.failed'; turnId: string; message: string; code?: string; failureClass?: string; resetAt?: number | null }
@@ -142,6 +156,7 @@ export type NormalizedAdapterEvent =
       diffPreview?: string;
       riskLevel: RiskLevel;
       supportedDecisions?: string[];
+      securityWarning?: string;
       questionSpec?: UserQuestionSpec;
       secretSpec?: SecretRequestSpec;
     }
@@ -180,6 +195,10 @@ export interface AdapterSessionHandle {
   /** Optional structured answer delivery for user_question requests. */
   resolveQuestion?(nativeRequestId: string, answer: { selectedOptionIds?: string[]; freeText?: string }): Promise<void>;
   updateConfig?(patch: Partial<AdapterSessionConfig>): Promise<void>;
+  /** Mid-turn non-cancelling steering input (supported on versions advertising supportsActiveSteering). */
+  steerTurn?(input: TurnInput): Promise<void>;
+  /** True when non-daemon background processes or scheduled timers keep the native session alive. */
+  hasActiveBackgroundWork?(): boolean;
   dispose(): Promise<void>;
   onEvent(listener: (event: NormalizedAdapterEvent) => void): () => void;
 }

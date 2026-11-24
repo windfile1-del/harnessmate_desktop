@@ -167,6 +167,45 @@ export interface AcpFlavorPolicy {
   readonly presentation: HarnessPresentationMeta;
   readonly defaultNativeCommands: string[];
   resolveContinuationKey?(opts: AcpAdapterOptions): string | undefined;
+  shouldEmitAvailableCommandsAsBlock?(): boolean;
+  extractPermissionSecurityWarning?(options: AcpPermissionOption[]): string | undefined;
+  resolveModeWithEnforcement?(
+    requested: string,
+    advertised: Array<{ id: string; name?: string }> | undefined,
+    permissionMode: PermissionMode,
+  ): { modeId: string; enforcement: 'native' | 'client_guard' };
+  onSessionUpdate?(
+    update: Record<string, unknown>,
+    ctx: {
+      turnId: string;
+      emit: (ev: NormalizedAdapterEvent) => void;
+      markBackgroundWork?: (active: boolean) => void;
+    },
+  ): boolean;
+  onPermissionRequest?(
+    reqId: string | number,
+    params: Record<string, unknown>,
+    options: AcpPermissionOption[],
+    ctx: {
+      turnId: string;
+      nativeRequestId: string;
+      emit: (ev: NormalizedAdapterEvent) => void;
+      registerPending: (nativeRequestId: string, rpcId: string | number, options: AcpPermissionOption[]) => void;
+    },
+  ): boolean;
+  beforeTurnPrompt?(nativeSessionId: string): unknown;
+  afterTurnPrompt?(
+    nativeSessionId: string,
+    beforeToken: unknown,
+    turnId: string,
+    emit: (ev: NormalizedAdapterEvent) => void,
+  ): {
+    failed: boolean;
+    message?: string;
+    code?: string;
+    failureClass?: string;
+    resetAt?: number | null;
+  } | null;
   buildLaunchArgs(
     baseArgs: readonly string[],
     source?: DiscoveredCliSession['source'],
@@ -287,6 +326,11 @@ export class AcpAdapter implements HarnessAdapter {
   protected liveNativeCommands: string[] | null = null;
   protected lastSupportsEmbeddedContext: boolean | null = null;
   protected authRequired = false;
+  protected readonly onConfigOptionsObserved?: (opts: AcpConfigOption[]) => void;
+  protected readonly onDetailedCommandsObserved?: (
+    commands: Array<{ name: string; description?: string; argumentHint?: string }>,
+  ) => void;
+  protected readonly onVersionObservedCallback?: (version: string) => void;
 
   constructor(opts: AcpAdapterOptions) {
     this.id = opts.id;
@@ -410,6 +454,9 @@ export class AcpAdapter implements HarnessAdapter {
     const verRes = await execCliQuick(binaryPath, ['--version'], 10_000, { env, unsetEnv, input: '' });
     const verText = `${verRes.stdout}\n${verRes.stderr}`.trim();
     let version = verText.match(/(\d+\.\d+\.\d+[\w.-]*)/)?.[1] ?? (verText.split(/\r?\n/)[0] || null);
+    if (version) {
+      this.onVersionObservedCallback?.(version);
+    }
 
     let models: HarnessModelInfo[] = [];
     let defaultModelId: string | null = null;
@@ -566,6 +613,10 @@ export class AcpAdapter implements HarnessAdapter {
       );
       if (Array.isArray(sessRes?.configOptions)) {
         this.liveConfigOptions = sessRes.configOptions;
+        this.onConfigOptionsObserved?.(sessRes.configOptions);
+      }
+      if (initRes?.agentInfo?.version) {
+        this.onVersionObservedCallback?.(initRes.agentInfo.version);
       }
       const snapshot: AcpLiveProbeSnapshot = {
         models: parsed.models,
@@ -617,9 +668,16 @@ export class AcpAdapter implements HarnessAdapter {
       },
       onConfigOptionsUpdated: (opts) => {
         this.liveConfigOptions = opts;
+        this.onConfigOptionsObserved?.(opts);
       },
       onAvailableCommandsUpdated: (cmds) => {
         this.liveNativeCommands = cmds;
+      },
+      onDetailedCommandsUpdated: (cmds) => {
+        this.onDetailedCommandsObserved?.(cmds);
+      },
+      onVersionObserved: (version) => {
+        this.onVersionObservedCallback?.(version);
       },
       onEmbeddedContextSupportChanged: (supported) => {
         this.lastSupportsEmbeddedContext = supported;
@@ -824,6 +882,7 @@ export interface AcpSessionRuntimeOptions {
   flavorPolicy: AcpFlavorPolicy;
   cliBinary?: string;
   appDataDir?: string;
+  additionalDirectories?: string[];
   spawnEnv?: Record<string, string | undefined>;
   unsetEnv?: readonly string[];
   authMethodId?: string;
@@ -833,6 +892,10 @@ export interface AcpSessionRuntimeOptions {
   onAuthenticated?: () => void;
   onConfigOptionsUpdated?: (configOptions: AcpConfigOption[]) => void;
   onAvailableCommandsUpdated?: (commands: string[]) => void;
+  onDetailedCommandsUpdated?: (
+    commands: Array<{ name: string; description?: string; argumentHint?: string }>,
+  ) => void;
+  onVersionObserved?: (version: string) => void;
   onEmbeddedContextSupportChanged?: (supported: boolean) => void;
 }
 
@@ -861,6 +924,9 @@ export class AcpSessionHandle implements AdapterSessionHandle {
   private availableVariantIds = new Set<string>();
   private activeConfirmedModel: string | null = null;
   private activeConfirmedEffort: string | null = null;
+  private permissionEnforcement: 'native' | 'client_guard' = 'native';
+  private observedTierName: string | null = null;
+  private backgroundWorkUntilMs = 0;
   private supportsEmbeddedContext = false;
 
   constructor(
@@ -921,6 +987,11 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         this.runtimeOpts.onAuthRequired?.();
       }
       throw err;
+    }
+
+    const versionStr = (initRes as { agentInfo?: { version?: string } })?.agentInfo?.version;
+    if (typeof versionStr === 'string' && versionStr.trim()) {
+      this.runtimeOpts.onVersionObserved?.(versionStr.trim());
     }
 
     this.supportsEmbeddedContext = Boolean(
@@ -1103,6 +1174,10 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     );
     this.activeConfirmedModel = modelOpt?.currentValue ?? res.models?.currentModelId ?? this.activeConfirmedModel;
     this.activeConfirmedEffort = effortOpt?.currentValue ?? this.activeConfirmedEffort;
+    const tier = this.runtimeOpts.flavorPolicy.extractTierName(res);
+    if (tier) {
+      this.observedTierName = tier;
+    }
   }
 
   private async applyRuntimeConfig(
@@ -1221,11 +1296,22 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     if (patch.permissionMode && (!this.permissionModeConfigured || patch.permissionMode !== this.permissionMode)) {
       const requested = mapPermissionModeToAcpMode(patch.permissionMode);
       const advertised = this.availableModes?.availableModes;
-      const acpMode = this.runtimeOpts.flavorPolicy.resolveModeId(
-        requested,
-        advertised,
-        patch.permissionMode,
-      );
+      const modeResolution = this.runtimeOpts.flavorPolicy.resolveModeWithEnforcement
+        ? this.runtimeOpts.flavorPolicy.resolveModeWithEnforcement(
+            requested,
+            advertised,
+            patch.permissionMode,
+          )
+        : {
+            modeId: this.runtimeOpts.flavorPolicy.resolveModeId(
+              requested,
+              advertised,
+              patch.permissionMode,
+            ),
+            enforcement: 'native' as const,
+          };
+      const acpMode = modeResolution.modeId;
+      this.permissionEnforcement = modeResolution.enforcement;
       if (acpMode !== this.appliedModeId) {
         try {
           await this.rpc.request(
@@ -1238,6 +1324,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           if (this.runtimeOpts.flavorPolicy.shouldThrowOnModeError(patch.permissionMode, this.appliedModeId)) {
             throw err;
           }
+          this.permissionEnforcement = 'client_guard';
           this.emit({
             type: 'diagnostic.log',
             level: 'warn',
@@ -1249,6 +1336,22 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       this.permissionMode = patch.permissionMode;
       this.permissionModeConfigured = true;
     }
+
+    const effortOptAfter = this.configOptions.find(
+      (c) => c.id === 'thought_level' || c.category === 'thought_level',
+    );
+    const availableThoughtLevels = (effortOptAfter?.options ?? [])
+      .map((o) => o.value)
+      .filter((v): v is string => typeof v === 'string' && v.length > 0);
+    this.emit({
+      type: 'config.confirmed',
+      model: this.activeConfirmedModel,
+      thoughtLevel: this.activeConfirmedEffort,
+      availableThoughtLevels,
+      modeId: this.appliedModeId ?? null,
+      permissionEnforcement: this.permissionEnforcement,
+      tierName: this.observedTierName,
+    });
   }
 
   private async applyEffortOption(effort: string): Promise<void> {
@@ -1452,6 +1555,10 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     }
 
     const sessionId = this._nativeSessionId;
+    const beforeToken =
+      sessionId && this.runtimeOpts.flavorPolicy.beforeTurnPrompt
+        ? this.runtimeOpts.flavorPolicy.beforeTurnPrompt(sessionId)
+        : undefined;
     const runPrompt = async () => {
       try {
         return await this.rpc.request<{ stopReason?: string }>(
@@ -1508,7 +1615,27 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         if (stopReason === 'cancelled') {
           this.emit({ type: 'turn.cancelled', turnId });
         } else {
-          this.emit({ type: 'turn.completed', turnId, stopReason });
+          const outcome =
+            sessionId && this.runtimeOpts.flavorPolicy.afterTurnPrompt
+              ? this.runtimeOpts.flavorPolicy.afterTurnPrompt(
+                  sessionId,
+                  beforeToken,
+                  turnId,
+                  (ev) => this.emit(ev),
+                )
+              : null;
+          if (outcome?.failed) {
+            this.emit({
+              type: 'turn.failed',
+              turnId,
+              message: outcome.message || 'Agent turn failed silently',
+              ...(outcome.code ? { code: outcome.code } : {}),
+              ...(outcome.failureClass ? { failureClass: outcome.failureClass } : {}),
+              ...(outcome.resetAt !== undefined ? { resetAt: outcome.resetAt } : {}),
+            });
+          } else {
+            this.emit({ type: 'turn.completed', turnId, stopReason });
+          }
         }
       })
       .catch((err: Error) => {
@@ -1542,6 +1669,59 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       const turnId = this.currentTurnId;
       this.currentTurnId = null;
       this.emit({ type: 'turn.cancelled', turnId });
+    }
+  }
+
+  async steerTurn(input: TurnInput): Promise<void> {
+    if (!this._nativeSessionId) {
+      throw new Error('ACP session is not initialized');
+    }
+    const basePromptText = buildPromptWithFileAttachments(input.text, input.attachments);
+    const { promptBlocks } = this.buildPromptBlocks(
+      input,
+      basePromptText,
+      this.supportsEmbeddedContext,
+    );
+    await this.rpc.request(
+      'session/prompt',
+      {
+        sessionId: this._nativeSessionId,
+        prompt: promptBlocks,
+      },
+      15 * 60_000,
+    );
+  }
+
+  hasActiveBackgroundWork(): boolean {
+    return Date.now() < this.backgroundWorkUntilMs;
+  }
+
+  async resolveQuestion(
+    nativeRequestId: string,
+    answer: { selectedOptionIds?: string[]; freeText?: string },
+  ): Promise<void> {
+    const pending = this.pendingApprovals.get(nativeRequestId);
+    if (!pending) return;
+    this.pendingApprovals.delete(nativeRequestId);
+
+    const wanted = answer.selectedOptionIds?.[0]?.trim() || answer.freeText?.trim();
+    const matched = wanted
+      ? pending.options.find(
+          (o) =>
+            o.optionId === wanted ||
+            o.name?.toLowerCase() === wanted.toLowerCase(),
+        )
+      : undefined;
+    if (matched) {
+      this.rpc.respond(pending.rpcId, {
+        outcome: { outcome: 'selected', optionId: matched.optionId },
+      });
+    } else if (wanted && pending.options[0]?.optionId) {
+      this.rpc.respond(pending.rpcId, {
+        outcome: { outcome: 'selected', optionId: pending.options[0].optionId },
+      });
+    } else {
+      this.rpc.respond(pending.rpcId, { outcome: { outcome: 'cancelled' } });
     }
   }
 
@@ -1608,9 +1788,30 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         return;
       }
 
+      const policyHandled = this.runtimeOpts.flavorPolicy.onPermissionRequest?.(
+        req.id,
+        params,
+        rawOptions,
+        {
+          turnId,
+          nativeRequestId,
+          emit: (ev) => this.emit(ev),
+          registerPending: (reqKey, rpcId, optsList) => {
+            this.pendingApprovals.set(reqKey, { rpcId, options: optsList });
+          },
+        },
+      );
+      if (policyHandled) {
+        return;
+      }
+
       const toolName = String(toolCall.title ?? toolCall.kind ?? 'Tool Permission');
       const toolKind = mapAcpToolKind(String(toolCall.kind ?? ''));
       const diffPreview = extractAcpDiff(toolCall);
+      const securityWarning =
+        this.runtimeOpts.flavorPolicy.extractPermissionSecurityWarning?.(rawOptions);
+      const baseSummary = String(toolCall.title ?? 'Permission requested by ACP agent');
+      const summary = securityWarning ? `${baseSummary} · ⚠️ ${securityWarning}` : baseSummary;
 
       this.pendingApprovals.set(nativeRequestId, { rpcId: req.id, options: rawOptions });
       this.emit({
@@ -1619,10 +1820,11 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         nativeRequestId,
         toolName,
         toolKind,
-        summary: String(toolCall.title ?? 'Permission requested by ACP agent'),
+        summary,
         input: toolCall.rawInput ?? toolCall,
         diffPreview,
         riskLevel: classifyAcpRisk(toolKind),
+        ...(securityWarning ? { securityWarning } : {}),
       });
       return;
     }
@@ -1643,6 +1845,15 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     const update = (params.update ?? params) as Record<string, unknown>;
     const kind = String(update.sessionUpdate ?? update.type ?? '');
     const turnId = this.currentTurnId ?? 'turn_bg';
+
+    const intercepted = this.runtimeOpts.flavorPolicy.onSessionUpdate?.(update, {
+      turnId,
+      emit: (ev) => this.emit(ev),
+      markBackgroundWork: (active) => {
+        this.backgroundWorkUntilMs = active ? Date.now() + 30 * 60_000 : 0;
+      },
+    });
+    if (intercepted) return;
 
     switch (kind) {
       case 'agent_message_chunk': {
@@ -1733,21 +1944,51 @@ export class AcpSessionHandle implements AdapterSessionHandle {
 
       case 'available_commands_update': {
         const rawCommands = Array.isArray(update.availableCommands) ? update.availableCommands : [];
-        const commandNames = rawCommands
-          .map((c) => (c && typeof c === 'object' ? String((c as { name?: string }).name ?? '') : String(c ?? '')))
-          .filter(Boolean);
+        const detailedCommands = rawCommands
+          .map((c) => {
+            if (c && typeof c === 'object') {
+              const rec = c as {
+                name?: unknown;
+                description?: unknown;
+                argumentHint?: unknown;
+                input?: { hint?: unknown };
+              };
+              const name = typeof rec.name === 'string' ? rec.name.replace(/^\//, '').trim() : '';
+              if (!name) return null;
+              return {
+                name,
+                ...(typeof rec.description === 'string' && rec.description.trim()
+                  ? { description: rec.description.trim() }
+                  : {}),
+                ...((typeof rec.argumentHint === 'string' && rec.argumentHint.trim()) ||
+                (typeof rec.input?.hint === 'string' && rec.input.hint.trim())
+                  ? {
+                      argumentHint: String(rec.argumentHint ?? rec.input?.hint).trim(),
+                    }
+                  : {}),
+              };
+            }
+            const name = String(c ?? '').replace(/^\//, '').trim();
+            return name ? { name } : null;
+          })
+          .filter((c): c is { name: string; description?: string; argumentHint?: string } => c !== null);
+        const commandNames = detailedCommands.map((c) => c.name);
         this.advertisedCommands = commandNames;
         this.runtimeOpts.onAvailableCommandsUpdated?.(commandNames);
-        this.emit({
-          type: 'turn_block.ext',
-          turnId,
-          itemId: `acp_cmds_${Date.now()}`,
-          blockType: 'ext:acp.available_commands',
-          title: 'Available Commands',
-          fallbackSummary: commandNames.join(', ') || 'No commands advertised',
-          status: 'completed',
-          payload: { commands: rawCommands },
-        });
+        this.runtimeOpts.onDetailedCommandsUpdated?.(detailedCommands);
+        this.emit({ type: 'commands.updated', commands: detailedCommands });
+        if (this.runtimeOpts.flavorPolicy.shouldEmitAvailableCommandsAsBlock?.() !== false) {
+          this.emit({
+            type: 'turn_block.ext',
+            turnId,
+            itemId: `acp_cmds_${Date.now()}`,
+            blockType: 'ext:acp.available_commands',
+            title: 'Available Commands',
+            fallbackSummary: commandNames.join(', ') || 'No commands advertised',
+            status: 'completed',
+            payload: { commands: rawCommands },
+          });
+        }
         break;
       }
 

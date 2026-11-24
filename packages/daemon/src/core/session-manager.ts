@@ -49,6 +49,7 @@ import type {
 import type { HarnessMateStore } from '../db/sqlite.js';
 import { AcpAdapter } from '../harnesses/acp-adapter.js';
 import { findLocalSession, readJsonlHistory } from '../harnesses/history-scanner.js';
+import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type {
   AdapterSessionConfig,
@@ -1397,7 +1398,27 @@ export class SessionManager {
     const service = this.pluginManager.host.get<NativeCommandsService>('native-commands');
     if (!service) return [];
     const source = session.nativeSessionId && this.store.getNativeHistory(session.id, session.nativeSessionId)?.source;
-    return service.list(session.harnessKind, source === 'agy_desktop');
+    const base: HarnessCommandInfo[] = service
+      .list(session.harnessKind, source === 'agy_desktop')
+      .map((cmd) => ({
+        ...cmd,
+        source: 'builtin' as const,
+      }));
+    const adapter = this.registry.get(session.harnessId);
+    if (adapter instanceof AgyAdapter) {
+      const seen = new Set(base.map((c) => c.command));
+      for (const liveCmd of adapter.getAdvertisedCommands()) {
+        if (!liveCmd.name || seen.has(liveCmd.name)) continue;
+        seen.add(liveCmd.name);
+        base.push({
+          command: liveCmd.name,
+          description: liveCmd.description ?? `AGY 原生命令 /${liveCmd.name}`,
+          ...(liveCmd.argumentHint ? { argumentHint: liveCmd.argumentHint } : {}),
+          source: 'native_advertised' as const,
+        });
+      }
+    }
+    return base;
   }
 
   private nativeActionReason(session: Session, command: RunHarnessCommandRequest['command']): string | undefined {
@@ -2426,6 +2447,51 @@ export class SessionManager {
           },
           meta?.turnId ?? null,
         );
+        break;
+      }
+
+      case 'config.confirmed': {
+        this.emitCanonical(
+          sessionId,
+          'session.config_confirmed',
+          {
+            harnessId: eventHarnessId,
+            model: ev.model ?? null,
+            thoughtLevel: ev.thoughtLevel ?? null,
+            availableThoughtLevels: ev.availableThoughtLevels ?? [],
+            modeId: ev.modeId ?? null,
+            permissionEnforcement: ev.permissionEnforcement ?? 'native',
+            tierName: ev.tierName ?? null,
+          },
+          meta?.turnId ?? null,
+        );
+        break;
+      }
+
+      case 'commands.updated': {
+        this.emitCanonical(
+          sessionId,
+          'session.commands_updated',
+          {
+            harnessId: eventHarnessId,
+            commands: ev.commands,
+          },
+          meta?.turnId ?? null,
+        );
+        break;
+      }
+
+      case 'session.title_updated': {
+        const nextTitle = ev.title.trim().slice(0, 160);
+        if (nextTitle && session.title.includes('·')) {
+          this.store.updateSession(sessionId, { title: nextTitle });
+          this.emitCanonical(
+            sessionId,
+            'session.title_updated',
+            { title: nextTitle, harnessId: eventHarnessId },
+            meta?.turnId ?? null,
+          );
+        }
         break;
       }
 
