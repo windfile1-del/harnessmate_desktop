@@ -95,7 +95,14 @@ export interface PluginLogEntryDto {
   meta?: Record<string, unknown>;
 }
 
-export const PluginScaffoldTemplateSchema = z.enum(['isolated', 'ui-slot', 'service', 'declarative', 'browser-preview']);
+export const PluginScaffoldTemplateSchema = z.enum([
+  'isolated',
+  'ui-slot',
+  'service',
+  'declarative',
+  'browser-preview',
+  'harness-adapter',
+]);
 export type PluginScaffoldTemplateDto = z.infer<typeof PluginScaffoldTemplateSchema>;
 
 export const ScaffoldPluginRequestSchema = z.object({
@@ -105,6 +112,8 @@ export const ScaffoldPluginRequestSchema = z.object({
   author: z.string().max(80).optional(),
   template: PluginScaffoldTemplateSchema.default('isolated'),
   serviceName: z.string().max(100).optional(),
+  driverId: z.string().max(40).optional(),
+  binaryName: z.string().max(64).optional(),
   targetDir: z.string().min(1).max(500).optional(),
   linkDevMode: z.boolean().default(true),
 }).strict();
@@ -164,4 +173,129 @@ export interface PluginRegistryStateDto {
   trustedPublishers: TrustedPublisher[];
   lastSyncedAt: number | null;
   errors: Array<{ url: string; error: string }>;
+}
+
+// ── AI Plugin Builder v2 Schemas ────────────────────────────────────────
+
+export const PluginBuilderTierSchema = z.enum(['auto', 'tier1', 'tier2']);
+export type PluginBuilderTier = z.infer<typeof PluginBuilderTierSchema>;
+
+export const PluginBuilderTemplateSchema = z.enum([
+  'isolated',
+  'ui-slot',
+  'service',
+  'harness-adapter',
+]);
+export type PluginBuilderTemplate = z.infer<typeof PluginBuilderTemplateSchema>;
+
+export const PluginBuilderInstallModeSchema = z.enum(['local_install', 'dev_link']);
+export type PluginBuilderInstallMode = z.infer<typeof PluginBuilderInstallModeSchema>;
+
+export const PluginAuditIssueSchema = z.object({
+  code: z.string(),
+  severity: z.enum(['error', 'warning']),
+  file: z.string().optional(),
+  line: z.number().int().positive().optional(),
+  message: z.string(),
+  suggestion: z.string().optional(),
+});
+export type PluginAuditIssue = z.infer<typeof PluginAuditIssueSchema>;
+
+export const PluginAuditPermissionSummarySchema = z.object({
+  capability: z.string(),
+  risk: z.enum(['low', 'medium', 'high']),
+  scope: z.enum(['workspace', 'global']),
+  description: z.string(),
+  unused: z.boolean().optional(),
+});
+export type PluginAuditPermissionSummary = z.infer<typeof PluginAuditPermissionSummarySchema>;
+
+export const PluginStaticAuditReportSchema = z.object({
+  passed: z.boolean(),
+  blockingIssues: z.array(PluginAuditIssueSchema),
+  warnings: z.array(PluginAuditIssueSchema),
+  permissionSummary: z.array(PluginAuditPermissionSummarySchema),
+});
+export type PluginStaticAuditReport = z.infer<typeof PluginStaticAuditReportSchema>;
+
+export const BuilderVerificationStepSchema = z.object({
+  step: z.enum([
+    'manifest_schema',
+    'static_audit_and_syntax',
+    'mock_host_activation',
+    'sandbox_ui_check',
+  ]),
+  label: z.string(),
+  status: z.enum(['passed', 'failed', 'skipped']),
+  durationMs: z.number().nonnegative(),
+  details: z.string(),
+  errors: z.array(z.string()).default([]),
+});
+export type BuilderVerificationStep = z.infer<typeof BuilderVerificationStepSchema>;
+
+export const BuilderAttemptLogSchema = z.object({
+  attempt: z.number().int().min(1),
+  durationMs: z.number().nonnegative(),
+  passed: z.boolean(),
+  steps: z.array(BuilderVerificationStepSchema),
+  errorSummary: z.string().optional(),
+});
+export type BuilderAttemptLog = z.infer<typeof BuilderAttemptLogSchema>;
+
+export const BuilderV2GenerateRequestSchema = z
+  .object({
+    description: z.string().trim().min(3).max(8_000),
+    harnessId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    model: z.string().min(1).optional(),
+    tier: PluginBuilderTierSchema.default('auto'),
+    template: PluginBuilderTemplateSchema.optional(),
+    pluginId: z.string().min(2).max(64).regex(/^[a-z0-9][a-z0-9._-]*$/).optional(),
+    name: z.string().trim().min(1).max(80).optional(),
+    previous: z.record(z.unknown()).optional(),
+    editing: z
+      .object({
+        id: z.string().min(2).max(64),
+        digest: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict()
+      .optional(),
+    maxAttempts: z.number().int().min(1).max(3).default(3),
+  })
+  .strict();
+export type BuilderV2GenerateRequest = z.infer<typeof BuilderV2GenerateRequestSchema>;
+
+export const BuilderV2AuditRequestSchema = z
+  .object({
+    manifest: z.record(z.unknown()).optional(),
+    files: z.record(z.string()),
+  })
+  .strict();
+export type BuilderV2AuditRequest = z.infer<typeof BuilderV2AuditRequestSchema>;
+
+export const BuilderV2InstallRequestSchema = z
+  .object({
+    draftId: z.string().min(1).max(120).optional(),
+    files: z.record(z.string()).optional(),
+    expectedDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    trustCode: z.boolean(),
+    installMode: PluginBuilderInstallModeSchema.default('local_install'),
+    targetDir: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+export type BuilderV2InstallRequest = z.infer<typeof BuilderV2InstallRequestSchema>;
+
+export interface BuilderV2Result {
+  tierUsed: 'tier1' | 'tier2';
+  classificationReason: string;
+  templateUsed?: PluginBuilderTemplate;
+  draftId?: string;
+  digest?: string;
+  verified: boolean;
+  manifest?: Record<string, unknown>;
+  files?: Record<string, string>;
+  audit?: PluginStaticAuditReport;
+  steps?: BuilderVerificationStep[];
+  attempts?: BuilderAttemptLog[];
+  error?: string;
 }

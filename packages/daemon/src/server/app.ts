@@ -4,6 +4,9 @@ import fastifyStatic from '@fastify/static';
 import {
   AddMcpServerRequestSchema,
   AddTrustedPublisherRequestSchema,
+  BuilderV2AuditRequestSchema,
+  BuilderV2GenerateRequestSchema,
+  BuilderV2InstallRequestSchema,
   CreateCustomRiskRuleRequestSchema,
   CreateSessionRequestSchema,
   CreateWorkspaceRequestSchema,
@@ -91,6 +94,8 @@ import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
+import { PluginBuilderV2 } from '../plugins/plugin-builder-v2.js';
+import { auditPluginPackage } from '../plugins/plugin-static-audit.js';
 import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { PluginCapabilities } from '../plugins/plugin-capabilities.js';
 import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
@@ -168,6 +173,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
+  const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
   const attachmentService = new AttachmentService(paths.attachmentsDir);
   const mcpService = new McpService(registry, config.binaryOverrides);
 
@@ -253,6 +259,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       void (async () => {
         wsGateway.close();
         pluginAuthoring.cancel();
+        pluginBuilderV2.cancel();
         await sessionManager.shutdown();
         await app.close();
         await pluginManager.close();
@@ -688,6 +695,77 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({ error: error instanceof Error ? error.message : String(error) });
     } finally {
       reply.raw.off('close', disconnect);
+    }
+  });
+
+  app.post('/api/v1/plugins/builder-v2/generate', async (request, reply) => {
+    const parsed = BuilderV2GenerateRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: parsed.error.issues[0]?.message ?? '请提供完整的插件需求、工作区与 Harness',
+        code: 'E_INVALID_INPUT',
+      });
+    }
+    const workspace = store.getWorkspace(parsed.data.workspaceId);
+    if (!workspace) return reply.code(404).send({ error: '工作区不存在' });
+    const abort = new AbortController();
+    const disconnect = () => abort.abort(new Error('AI Plugin Builder v2 请求已取消'));
+    reply.raw.once('close', disconnect);
+    try {
+      const result = await pluginBuilderV2.generate(parsed.data, workspace.rootPath, abort.signal);
+      return result;
+    } catch (error) {
+      const status =
+        error instanceof PluginRevisionConflictError
+          ? 409
+          : error instanceof PluginApiError && error.code === 'E_PERMISSION_DENIED'
+            ? 403
+            : 400;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    } finally {
+      reply.raw.off('close', disconnect);
+    }
+  });
+
+  app.post('/api/v1/plugins/builder-v2/audit', async (request, reply) => {
+    const parsed = BuilderV2AuditRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: '无效的代码包审计参数', code: 'E_INVALID_INPUT' });
+    }
+    const audit = auditPluginPackage(parsed.data.files, parsed.data.manifest);
+    return { audit };
+  });
+
+  app.post('/api/v1/plugins/builder-v2/install', async (request, reply) => {
+    const parsed = BuilderV2InstallRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: parsed.error.issues[0]?.message ?? '无效的 Builder v2 安装参数',
+        code: 'E_INVALID_INPUT',
+      });
+    }
+    try {
+      const res = await pluginBuilderV2.installDraft(parsed.data);
+      return reply.code(201).send({
+        ...(await updatedPlugins()),
+        installedId: res.installedId,
+        installMode: res.installMode,
+        dirPath: res.dirPath,
+      });
+    } catch (error) {
+      const status =
+        error instanceof PluginRevisionConflictError
+          ? 409
+          : error instanceof PluginApiError && error.code === 'E_PERMISSION_DENIED'
+            ? 403
+            : 400;
+      return reply.code(status).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
     }
   });
 
@@ -1987,6 +2065,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     async stop() {
       wsGateway.close();
       pluginAuthoring.cancel();
+      pluginBuilderV2.cancel();
       await sessionManager.shutdown();
       await app.close();
       await pluginManager.close();

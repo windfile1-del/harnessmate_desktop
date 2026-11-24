@@ -16,7 +16,9 @@ export function buildScaffoldFiles(req: ScaffoldPluginRequest): {
   manifest: Record<string, unknown>;
   files: Record<string, string>;
 } {
-  if (req.template === 'browser-preview') return scaffoldPluginFiles(req);
+  if (req.template === 'browser-preview' || req.template === 'harness-adapter') {
+    return scaffoldPluginFiles(req);
+  }
 
   const id = req.id.trim();
   const name = req.name.trim();

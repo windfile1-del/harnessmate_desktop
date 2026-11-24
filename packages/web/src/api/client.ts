@@ -4,6 +4,10 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
+  BuilderV2AuditRequest,
+  BuilderV2GenerateRequest,
+  BuilderV2InstallRequest,
+  BuilderV2Result,
   CanonicalEvent,
   CheckpointRevertMode,
   CheckpointRevertResult,
@@ -54,6 +58,7 @@ import type {
   PluginMcpPreset,
   PluginPermission,
   PluginRegistryStateDto,
+  PluginStaticAuditReport,
   PortableSessionBundleV2,
   PreviewPluginProgramRequest,
   PluginSlashCommand,
@@ -385,6 +390,31 @@ export const daemonApi = {
 
   generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
     apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),
+
+  generatePluginV2: (req: BuilderV2GenerateRequest, signal?: AbortSignal) =>
+    apiFetch<BuilderV2Result>('/api/v1/plugins/builder-v2/generate', {
+      method: 'POST',
+      body: JSON.stringify(req),
+      signal,
+    }),
+
+  auditPluginPackage: (req: BuilderV2AuditRequest) =>
+    apiFetch<{ audit: PluginStaticAuditReport }>('/api/v1/plugins/builder-v2/audit', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  installPluginV2: (req: BuilderV2InstallRequest) =>
+    apiFetch<
+      PluginBundleResponse & {
+        installedId: string;
+        installMode: 'local_install' | 'dev_link';
+        dirPath: string;
+      }
+    >('/api/v1/plugins/builder-v2/install', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
 
   rollbackPlugin: (id: string) =>
     apiFetch<PluginBundleResponse>(`/api/v1/plugins/${encodeURIComponent(id)}/rollback`, { method: 'POST' }),

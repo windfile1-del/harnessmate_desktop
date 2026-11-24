@@ -113,7 +113,7 @@ const targetDir = args.dir ?? path.resolve(process.cwd(), String(id ?? 'my-plugi
 if (!id || !name) {
   console.error(
     '用法:\n' +
-      '  pnpm create:plugin --id user.my-plugin --name "我的插件" [--template isolated|ui-slot|service|declarative|browser-preview] [--dir ./out]\n' +
+      '  pnpm create:plugin --id user.my-plugin --name "我的插件" [--template isolated|ui-slot|service|declarative|browser-preview|harness-adapter] [--dir ./out]\n' +
       '  pnpm create:plugin keygen\n' +
       '  pnpm create:plugin sign --dir ./out --key ./private.pem --publisher acme',
   );
@@ -127,6 +127,8 @@ const { files } = scaffoldPluginFiles({
   author: typeof args.author === 'string' ? args.author : undefined,
   template,
   serviceName: typeof args.service === 'string' ? args.service : undefined,
+  driverId: typeof args.driverId === 'string' ? args.driverId : undefined,
+  binaryName: typeof args.binary === 'string' ? args.binary : undefined,
 });
 
 fs.mkdirSync(targetDir, { recursive: true });

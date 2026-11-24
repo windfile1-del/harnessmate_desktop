@@ -252,6 +252,7 @@ export function PluginDevPanel({
               className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[11.5px] text-[var(--text-primary)]"
             >
               <option value="isolated">隔离代码 + 沙箱 UI 插槽 (推荐)</option>
+              <option value="harness-adapter">第三方 Harness 引擎驱动 (V5 Adapter)</option>
               <option value="ui-slot">纯声明式沙箱 UI 插槽</option>
               <option value="browser-preview">浏览器预览</option>
               <option value="service">第三方服务提供方 (provides)</option>

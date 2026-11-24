@@ -2,7 +2,13 @@ import { PLUGIN_MANIFEST_VERSION, PluginApiError } from '@harnessmate/plugin-api
 
 import { browserPreviewTemplate } from './browser-preview-template.js';
 
-export type PluginScaffoldTemplate = 'isolated' | 'ui-slot' | 'service' | 'declarative' | 'browser-preview';
+export type PluginScaffoldTemplate =
+  | 'isolated'
+  | 'ui-slot'
+  | 'service'
+  | 'declarative'
+  | 'browser-preview'
+  | 'harness-adapter';
 
 export interface PluginScaffoldOptions {
   id: string;
@@ -11,6 +17,8 @@ export interface PluginScaffoldOptions {
   author?: string;
   template: PluginScaffoldTemplate;
   serviceName?: string;
+  driverId?: string;
+  binaryName?: string;
 }
 
 export interface PluginScaffoldOutput {
@@ -39,6 +47,438 @@ export function scaffoldPluginFiles(options: PluginScaffoldOptions): PluginScaff
   const description = (options.description?.trim() || `${name} — HarnessMate V4 插件`).slice(0, 320);
   const author = (options.author?.trim() || 'Local Developer').slice(0, 80);
   const slug = toSlug(id);
+
+  if (options.template === 'harness-adapter') {
+    const rawDriverId = (options.driverId?.trim() || slug).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    if (rawDriverId === 'codex' || rawDriverId === 'claude' || rawDriverId === 'agy' || rawDriverId === 'acp') {
+      throw new PluginApiError('E_INVALID_INPUT', `禁止使用内置保留驱动 ID: ${rawDriverId}`);
+    }
+    const driverId = /^[a-z0-9]/.test(rawDriverId) ? rawDriverId.slice(0, 32) : `driver-${rawDriverId.slice(0, 24)}`;
+    const binaryName = (options.binaryName?.trim() || `${driverId}-cli`).replace(/[^a-z0-9._-]/gi, '-').slice(0, 48);
+    const extBlockType = `ext:${driverId}.status_card`;
+    const manifest: Record<string, unknown> = {
+      id,
+      name,
+      version: '0.1.0',
+      description,
+      author,
+      category: 'harness',
+      apiVersion: PLUGIN_MANIFEST_VERSION,
+      engines: { pluginApi: '^4.0.0' },
+      main: 'index.mjs',
+      permissions: [
+        'harness:driver:register',
+        `process:spawn:${binaryName}`,
+        'storage:plugin',
+      ],
+      contributes: {
+        slots: [
+          {
+            slot: 'chat.block',
+            id: `${driverId}-status-card`,
+            title: `${name} 状态卡`,
+            ui: 'ui/block-card.html',
+            key: extBlockType,
+            order: 100,
+            height: 150,
+          },
+          {
+            slot: 'harness.settings',
+            id: `${driverId}-settings`,
+            title: `${name} 设置`,
+            ui: 'ui/settings.html',
+            key: driverId,
+            order: 100,
+            height: 280,
+          },
+        ],
+      },
+    };
+
+    const files: Record<string, string> = {
+      'harnessmate-plugin.json': JSON.stringify(manifest, null, 2) + '\n',
+      'index.mjs': `export const name = ${JSON.stringify(id)};
+export const DRIVER_ID = ${JSON.stringify(driverId)};
+export const DEFAULT_BINARY = ${JSON.stringify(binaryName)};
+export const EXT_BLOCK_TYPE = ${JSON.stringify(extBlockType)};
+
+export const DRIVER_CAPABILITIES = {
+  streaming: true,
+  interactiveApproval: false,
+  reasoningEfforts: ['medium', 'high'],
+  permissionModes: ['manual', 'accept_edits'],
+  sessionResume: false,
+  sessionFork: false,
+  imageInput: false,
+  subagents: false,
+};
+
+export const DRIVER_CAPABILITIES_V2 = {
+  ...DRIVER_CAPABILITIES,
+  transport: 'stream_json',
+  historyInjectionMode: 'inline',
+  supportsNativeRollback: false,
+  supportsActiveSteering: false,
+  supportsUsageLimits: false,
+  supportsDynamicOptions: true,
+  nativeCommands: [],
+  optionDescriptors: [
+    {
+      key: 'verboseTrace',
+      label: '详细跟踪输出',
+      description: '在状态卡中展示执行步骤耗时',
+      kind: 'boolean',
+      defaultValue: false,
+    },
+    {
+      key: 'maxSteps',
+      label: '最大推理步数',
+      kind: 'number',
+      min: 1,
+      max: 64,
+      step: 1,
+      defaultValue: 8,
+    },
+  ],
+};
+
+export const DRIVER_PRESENTATION = {
+  shortLabel: ${JSON.stringify(name.slice(0, 14))},
+  accentColor: '#10b981',
+  softBg: 'rgba(16, 185, 129, 0.12)',
+  tagline: ${JSON.stringify(`${name} · V5 Isolated Driver`)},
+};
+
+export function parseNdjsonLine(line, turnId) {
+  const trimmed = String(line ?? '').trim();
+  if (!trimmed) return null;
+  let frame;
+  try {
+    frame = JSON.parse(trimmed);
+  } catch {
+    return { type: 'message.assistant.delta', turnId, text: trimmed };
+  }
+  if (!frame || typeof frame !== 'object') return null;
+  switch (frame.type) {
+    case 'delta':
+      return { type: 'message.assistant.delta', turnId, text: String(frame.text ?? '') };
+    case 'thinking':
+      return { type: 'thinking.delta', turnId, text: String(frame.text ?? '') };
+    case 'status_card':
+      return {
+        type: 'turn_block.ext',
+        turnId,
+        itemId: \`\${turnId}:\${DRIVER_ID}:status\`,
+        blockType: EXT_BLOCK_TYPE,
+        title: String(frame.title ?? ${JSON.stringify(`${name} 执行状态`)}),
+        fallbackSummary: String(frame.summary ?? ''),
+        status: frame.status === 'failed' ? 'failed' : 'completed',
+        payload: {
+          driverId: DRIVER_ID,
+          summary: String(frame.summary ?? ''),
+          steps: Number(frame.steps ?? 0),
+        },
+      };
+    case 'usage':
+      return {
+        type: 'usage.updated',
+        turnId,
+        usage: {
+          inputTokens: Number(frame.inputTokens ?? 0),
+          outputTokens: Number(frame.outputTokens ?? 0),
+          ...(frame.modelContextWindow ? { modelContextWindow: Number(frame.modelContextWindow) } : {}),
+        },
+      };
+    case 'error':
+      return {
+        type: 'turn.failed',
+        turnId,
+        message: String(frame.message ?? 'Driver execution error'),
+        code: typeof frame.code === 'string' ? frame.code : undefined,
+        failureClass: typeof frame.failureClass === 'string' ? frame.failureClass : 'provider_error',
+      };
+    case 'done':
+      return [
+        ...(typeof frame.text === 'string' ? [{ type: 'message.assistant.completed', turnId, text: frame.text }] : []),
+        { type: 'turn.completed', turnId, stopReason: String(frame.stopReason ?? 'end_turn') },
+      ];
+    default:
+      return null;
+  }
+}
+
+export function apply(ctx) {
+  let settings = { defaultModel: \`\${DRIVER_ID}-default\`, extraArgs: [] };
+  const activeProcesses = new Set();
+
+  void ctx.storage.plugin.get('settings').then((saved) => {
+    if (saved && typeof saved === 'object') settings = { ...settings, ...saved };
+  }).catch(() => {});
+
+  const probeInfo = () => ({
+    binaryPath: DEFAULT_BINARY,
+    version: '0.1.0',
+    health: 'ready',
+    models: [
+      { id: \`\${DRIVER_ID}-default\`, displayName: ${JSON.stringify(`${name} Default`)}, isDefault: true },
+    ],
+    defaultModelId: settings.defaultModel || \`\${DRIVER_ID}-default\`,
+    capabilitiesV2: DRIVER_CAPABILITIES_V2,
+    presentation: DRIVER_PRESENTATION,
+  });
+
+  ctx.harnesses.registerDriver({
+    driverId: DRIVER_ID,
+    displayName: ${JSON.stringify(name)},
+    description: ${JSON.stringify(description)},
+    protocolLabel: 'ndjson-stdio',
+    capabilities: DRIVER_CAPABILITIES,
+    capabilitiesV2: DRIVER_CAPABILITIES_V2,
+    presentation: DRIVER_PRESENTATION,
+    probePassive: () => probeInfo(),
+    probe: async () => probeInfo(),
+    async createSession(config) {
+      const listeners = new Set();
+      let currentProc = null;
+      const emit = (ev) => {
+        for (const fn of [...listeners]) fn(ev);
+      };
+
+      return {
+        nativeSessionId: config.nativeSessionId ?? \`\${DRIVER_ID}_\${Date.now().toString(36)}\`,
+        async sendTurn(input) {
+          emit({ type: 'turn.started', turnId: input.turnId });
+          const proc = await ctx.runtime.spawnCli({
+            command: DEFAULT_BINARY,
+            args: ['--json-stdio', ...(Array.isArray(settings.extraArgs) ? settings.extraArgs : [])],
+            cwd: config.cwd,
+          });
+          currentProc = proc;
+          activeProcesses.add(proc);
+
+          let buffer = '';
+          let terminalEmitted = false;
+          let fullText = '';
+
+          const dispatchLine = (line) => {
+            const parsed = parseNdjsonLine(line, input.turnId);
+            const items = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+            for (const ev of items) {
+              if (ev.type === 'message.assistant.delta') fullText += ev.text;
+              if (ev.type === 'turn.completed' || ev.type === 'turn.failed' || ev.type === 'turn.cancelled') {
+                terminalEmitted = true;
+              }
+              emit(ev);
+            }
+          };
+
+          proc.onStdout((chunk) => {
+            buffer += chunk;
+            const lines = buffer.split(/\\r?\\n/);
+            buffer = lines.pop() ?? '';
+            for (const line of lines) dispatchLine(line);
+          });
+
+          proc.onExit(({ code }) => {
+            activeProcesses.delete(proc);
+            if (currentProc === proc) currentProc = null;
+            if (buffer.trim()) dispatchLine(buffer);
+            if (!terminalEmitted) {
+              if (code === 0 || code === null) {
+                if (fullText) emit({ type: 'message.assistant.completed', turnId: input.turnId, text: fullText });
+                emit({ type: 'turn.completed', turnId: input.turnId });
+              } else {
+                emit({
+                  type: 'turn.failed',
+                  turnId: input.turnId,
+                  message: \`CLI exited with code \${code}\`,
+                  failureClass: 'process_exit',
+                });
+              }
+            }
+          });
+
+          await proc.writeStdin(JSON.stringify({
+            turnId: input.turnId,
+            text: input.text,
+            model: input.model ?? settings.defaultModel,
+            turnOptions: input.turnOptions ?? {},
+          }) + '\\n');
+          await proc.closeStdin();
+        },
+        async interrupt() {
+          if (currentProc) await currentProc.kill('SIGTERM').catch(() => {});
+        },
+        async resolveApproval() {},
+        async dispose() {
+          if (currentProc) {
+            await currentProc.kill('SIGTERM').catch(() => {});
+            activeProcesses.delete(currentProc);
+            currentProc = null;
+          }
+          listeners.clear();
+        },
+        onEvent(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      };
+    },
+  });
+
+  ctx.slots.register({
+    slot: 'harness.settings',
+    id: \`\${DRIVER_ID}-settings\`,
+    title: ${JSON.stringify(`${name} 设置`)},
+    ui: 'ui/settings.html',
+    key: DRIVER_ID,
+    order: 100,
+    async onMessage(payload) {
+      if (payload && typeof payload === 'object' && payload.action === 'save') {
+        settings = {
+          defaultModel: String(payload.defaultModel || \`\${DRIVER_ID}-default\`),
+          extraArgs: Array.isArray(payload.extraArgs) ? payload.extraArgs.map(String) : [],
+        };
+        await ctx.storage.plugin.set('settings', settings);
+        return { ok: true, settings };
+      }
+      return { ok: true, settings };
+    },
+  });
+
+  ctx.slots.register({
+    slot: 'chat.block',
+    id: \`\${DRIVER_ID}-status-card\`,
+    title: ${JSON.stringify(`${name} 状态卡`)},
+    ui: 'ui/block-card.html',
+    key: EXT_BLOCK_TYPE,
+    order: 100,
+  });
+
+  ctx.effect(() => () => {
+    for (const proc of [...activeProcesses]) {
+      void proc.kill('SIGTERM').catch(() => {});
+    }
+    activeProcesses.clear();
+  });
+}
+`,
+      'ui/settings.html': `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>${name} 设置</title>
+  <style>
+    body { margin: 0; padding: 12px; font-family: system-ui, sans-serif; color: var(--text-primary, #f2f4fb); background: transparent; }
+    .panel { padding: 12px; border-radius: 10px; background: var(--bg-elevated, #181d2e); border: 1px solid var(--border-hairline, rgba(255,255,255,0.08)); }
+    label { display: block; font-size: 11.5px; color: var(--text-secondary, #98a1ba); margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border-strong, rgba(255,255,255,0.14)); background: var(--bg-surface, #121623); color: var(--text-primary, #f2f4fb); font-size: 12px; }
+    .row { margin-top: 10px; display: flex; align-items: center; gap: 8px; }
+    button { cursor: pointer; padding: 6px 12px; border-radius: 8px; border: none; background: var(--accent-indigo, #6366f1); color: #fff; font-size: 12px; }
+    .status { font-size: 11px; color: var(--text-secondary, #98a1ba); }
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <label for="model-input">默认模型 ID</label>
+    <input id="model-input" type="text" placeholder="${driverId}-default" />
+    <div class="row">
+      <button id="save-btn" type="button">保存配置</button>
+      <span id="status" class="status"></span>
+    </div>
+  </section>
+  <script>
+    const input = document.getElementById('model-input');
+    const statusEl = document.getElementById('status');
+    async function load() {
+      try {
+        const res = await window.harnessMate.sendToPlugin({ action: 'load' });
+        if (res && res.settings && input) input.value = res.settings.defaultModel || '';
+      } catch (err) {
+        if (statusEl) statusEl.textContent = '加载失败';
+      }
+    }
+    document.getElementById('save-btn').addEventListener('click', async () => {
+      try {
+        await window.harnessMate.sendToPlugin({ action: 'save', defaultModel: input.value.trim() });
+        if (statusEl) statusEl.textContent = '已保存';
+      } catch (err) {
+        if (statusEl) statusEl.textContent = '保存失败';
+      }
+    });
+    void load();
+  </script>
+</body>
+</html>
+`,
+      'ui/block-card.html': `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>${name} 状态卡</title>
+  <style>
+    body { margin: 0; padding: 8px; font-family: system-ui, sans-serif; color: var(--text-primary, #f2f4fb); background: transparent; }
+    .card { padding: 10px 12px; border-radius: 10px; background: var(--bg-elevated, #181d2e); border: 1px solid var(--border-hairline, rgba(255,255,255,0.08)); }
+    .head { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+    .body { font-size: 11.5px; color: var(--text-secondary, #98a1ba); }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="title" class="head">${name}</div>
+    <div id="summary" class="body">等待执行状态…</div>
+  </div>
+  <script>
+    const titleEl = document.getElementById('title');
+    const summaryEl = document.getElementById('summary');
+    function render(props) {
+      const payload = (props && props.block && props.block.payload) || {};
+      if (titleEl && props && props.block && props.block.title) titleEl.textContent = props.block.title;
+      if (summaryEl) summaryEl.textContent = payload.summary || '已完成';
+    }
+    render(window.harnessMate.props);
+    window.harnessMate.onContext((_session, props) => render(props));
+  </script>
+</body>
+</html>
+`,
+      'tests/adapter-replay.test.mjs': `import { createMockCliProcess, createMockPluginHost, replayAdapterTranscript } from '@harnessmate/plugin-sdk/testing';
+import * as plugin from '../index.mjs';
+
+const transcript = [
+  JSON.stringify({ type: 'thinking', text: 'Planning response...' }),
+  JSON.stringify({ type: 'delta', text: 'Hello from ' }),
+  JSON.stringify({ type: 'delta', text: '${driverId}!' }),
+  JSON.stringify({ type: 'status_card', title: '${name} 状态', summary: '执行完成', steps: 2 }),
+  JSON.stringify({ type: 'done', text: 'Hello from ${driverId}!' }),
+];
+
+export async function runReplayTest() {
+  const host = createMockPluginHost({
+    pluginId: ${JSON.stringify(id)},
+    permissions: ['harness:driver:register', ${JSON.stringify(`process:spawn:${binaryName}`)}, 'storage:plugin'],
+    spawnCliHandler: () => createMockCliProcess({ stdoutLines: transcript, autoEmitOnStdin: true }),
+  });
+  await host.activate(plugin);
+  const driver = host.drivers.get(plugin.DRIVER_ID);
+  if (!driver) throw new Error('Driver was not registered');
+
+  const result = await replayAdapterTranscript(driver, transcript);
+  result.assert({
+    terminalType: 'turn.completed',
+    assistantTextContains: 'Hello from ${driverId}!',
+    thinkingTextContains: 'Planning',
+    extBlockTypes: [plugin.EXT_BLOCK_TYPE],
+    supportsNativeRollback: false,
+  });
+  host.dispose();
+  return result;
+}
+`,
+      'README.md': `# ${name}\n\nHarnessMate V5 隔离进程 Harness Adapter 插件（驱动 ID: \`${driverId}\`，CLI: \`${binaryName}\`）。\n\n- 驱动入口：\`index.mjs\`（通过 \`ctx.harnesses.registerDriver\` 与 \`ctx.runtime.spawnCli\` 运行）\n- 沙箱 UI 插槽：\`ui/settings.html\`（\`harness.settings\`）与 \`ui/block-card.html\`（\`chat.block\`）\n- 离线回放测试：\`tests/adapter-replay.test.mjs\`（基于 \`@harnessmate/plugin-sdk/testing\`）\n`,
+    };
+    return { manifest, files };
+  }
 
   if (options.template === 'browser-preview') {
     const manifest = {

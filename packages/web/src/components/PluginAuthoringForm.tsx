@@ -1,29 +1,41 @@
-import type { InstallPluginRequest, PluginManifest } from '@harnessmate/protocol';
+import type {
+  BuilderV2Result,
+  InstallPluginRequest,
+  PluginBuilderInstallMode,
+  PluginBuilderTemplate,
+  PluginBuilderTier,
+  PluginManifest,
+} from '@harnessmate/protocol';
 import { FolderOpen, Sparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { daemonApi, type PluginPreview } from '../api/client';
 import { useAppStore } from '../stores/app-store';
-import { PluginDraftReview } from './PluginDraftReview';
+import { PluginBuilderV2Review, PluginDraftReview } from './PluginDraftReview';
 
 const field = 'min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[var(--text-primary)]';
 const button = 'cursor-pointer rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 hover:bg-[var(--bg-hover)] disabled:opacity-40';
 
 type DraftInstallRequest = Exclude<InstallPluginRequest, { mode: 'catalog' }>;
 
-export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
+export function PluginAuthoringForm({ initialManifest, editing, initialTier, onInstalled }: {
   initialManifest: string;
   editing?: { manifest: PluginManifest; digest: string };
+  initialTier?: PluginBuilderTier;
   onInstalled: () => void;
 }) {
-  const { workspaces, harnesses, sessions, selectedSessionId, selectedWorkspaceId, installPlugin } = useAppStore();
+  const { workspaces, harnesses, sessions, selectedSessionId, selectedWorkspaceId, installPlugin, refreshPlugins } = useAppStore();
   const selected = sessions.find(({ id }) => id === selectedSessionId);
   const [workspaceId, setWorkspaceId] = useState(selected?.workspaceId ?? selectedWorkspaceId ?? workspaces[0]?.id ?? '');
   const [harnessId, setHarnessId] = useState(selected?.harnessId ?? harnesses.find((harness) => harness.health === 'ready')?.id ?? harnesses[0]?.id ?? '');
   const [model, setModel] = useState(selected?.model ?? '');
   const [description, setDescription] = useState('');
+  const [builderTier, setBuilderTier] = useState<PluginBuilderTier>(initialTier ?? (editing ? 'tier1' : 'auto'));
+  const [builderTemplate, setBuilderTemplate] = useState<PluginBuilderTemplate>('isolated');
   const [manifestJson, setManifestJson] = useState(initialManifest);
   const [directory, setDirectory] = useState('');
   const [preview, setPreview] = useState<{ result: PluginPreview; request: DraftInstallRequest }>();
+  const [builderV2Result, setBuilderV2Result] = useState<BuilderV2Result | null>(null);
+  const [installModeV2, setInstallModeV2] = useState<PluginBuilderInstallMode>('local_install');
   const [editingDigest, setEditingDigest] = useState<string | null>(editing?.digest ?? null);
   const [trustCode, setTrustCode] = useState(false);
   const [busy, setBusy] = useState('');
@@ -34,6 +46,7 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
   const availableModels = harnesses.find(({ id }) => id === harnessId)?.models ?? [];
   const resetPreview = () => {
     setPreview(undefined);
+    setBuilderV2Result(null);
     setTrustCode(false);
     setError('');
   };
@@ -57,21 +70,61 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
     return manifest;
   };
 
-  const generate = () => run('正在生成草稿…', async () => {
+  const generate = () => run('正在生成插件…', async () => {
     const previous = manifestJson.trim() && manifestJson !== initialManifest ? readDraft() : undefined;
     const controller = new AbortController();
     generation.current = controller;
     resetPreview();
     try {
-      const { manifest } = await daemonApi.generatePlugin({
-        description: description.trim(), harnessId, workspaceId, model: model || undefined, previous,
-        editing: editing && editingDigest ? { id: editing.manifest.id, digest: editingDigest } : undefined,
+      // Preserve legacy Tier 1 endpoint cleanly when editing or explicitly Tier 1
+      if (editing && builderTier === 'tier1') {
+        const { manifest } = await daemonApi.generatePlugin({
+          description: description.trim(),
+          harnessId,
+          workspaceId,
+          model: model || undefined,
+          previous,
+          editing: editing && editingDigest ? { id: editing.manifest.id, digest: editingDigest } : undefined,
+        }, controller.signal);
+        setManifestJson(JSON.stringify(manifest, null, 2));
+        const request = {
+          mode: 'manifest',
+          manifest,
+          expectedInstalledDigest: editing ? editingDigest : undefined,
+        } as const;
+        const result = await daemonApi.previewPlugin(request);
+        setPreview({ request, result });
+        return;
+      }
+
+      const v2Result = await daemonApi.generatePluginV2({
+        description: description.trim(),
+        harnessId,
+        workspaceId,
+        model: model || undefined,
+        tier: builderTier,
+        ...(builderTier === 'tier2' ? { template: builderTemplate } : {}),
+        previous: previous as Record<string, unknown> | undefined,
+        maxAttempts: 3,
       }, controller.signal);
-      setManifestJson(JSON.stringify(manifest, null, 2));
-      const request = { mode: 'manifest', manifest,
-        expectedInstalledDigest: editing ? editingDigest : undefined } as const;
-      const result = await daemonApi.previewPlugin(request);
-      setPreview({ request, result });
+
+      if (v2Result.tierUsed === 'tier1' && v2Result.manifest) {
+        const manifest = v2Result.manifest as unknown as PluginManifest;
+        setManifestJson(JSON.stringify(manifest, null, 2));
+        const request = {
+          mode: 'manifest',
+          manifest,
+          expectedInstalledDigest: editing ? editingDigest : undefined,
+        } as const;
+        const result = await daemonApi.previewPlugin(request);
+        setPreview({ request, result });
+        return;
+      }
+
+      if (v2Result.manifest) {
+        setManifestJson(JSON.stringify(v2Result.manifest, null, 2));
+      }
+      setBuilderV2Result(v2Result);
     } finally { generation.current = null; }
   });
 
@@ -85,10 +138,66 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
     setPreview({ request, result });
   });
 
+  const installV2 = () => run('正在安装验证通过的插件…', async () => {
+    if (!builderV2Result?.digest) throw new Error('缺少已验证插件包摘要');
+    await daemonApi.installPluginV2({
+      draftId: builderV2Result.draftId,
+      files: builderV2Result.files,
+      expectedDigest: builderV2Result.digest,
+      trustCode,
+      installMode: installModeV2,
+    });
+    await refreshPlugins();
+    onInstalled();
+  });
+
   return (
     <div className="space-y-4 text-[12px] text-[var(--text-secondary)]">
-      <section className="space-y-2 rounded-xl border border-[var(--border-hairline)] p-3">
-        <h4 className="flex items-center gap-1.5 font-medium text-[var(--text-primary)]"><Sparkles size={14} /> {editing ? `用 AI 修改 ${editing.manifest.name}` : '用 AI 制作插件'}</h4>
+      <section className="space-y-2.5 rounded-xl border border-[var(--border-hairline)] p-3">
+        <h4 className="flex items-center gap-1.5 font-medium text-[var(--text-primary)]">
+          <Sparkles size={14} />
+          {editing ? `用 AI 修改 ${editing.manifest.name}` : 'AI Plugin Builder v2 · 用自然语言生成插件'}
+        </h4>
+
+        {/* Tier 1 / Tier 2 Mode Switcher + Template Selector */}
+        {!editing && (
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="space-y-1">
+              <span className="text-[11px] text-[var(--text-muted)]">生成模式（两级架构）</span>
+              <select
+                aria-label="Builder 模式"
+                data-testid="builder-tier-select"
+                className={`${field} w-full`}
+                value={builderTier}
+                disabled={!!busy}
+                onChange={(e) => setBuilderTier(e.target.value as PluginBuilderTier)}
+              >
+                <option value="auto">Auto · 自动分类（声明式 vs 代码工程）</option>
+                <option value="tier1">Tier 1 · 声明式快速草稿（斜杠命令 / 面板）</option>
+                <option value="tier2">Tier 2 · 完整代码插件工程（4 步沙箱验证）</option>
+              </select>
+            </label>
+            {builderTier === 'tier2' && (
+              <label className="space-y-1">
+                <span className="text-[11px] text-[var(--text-muted)]">Tier 2 代码模板</span>
+                <select
+                  aria-label="Tier 2 模板"
+                  data-testid="builder-template-select"
+                  className={`${field} w-full`}
+                  value={builderTemplate}
+                  disabled={!!busy}
+                  onChange={(e) => setBuilderTemplate(e.target.value as PluginBuilderTemplate)}
+                >
+                  <option value="isolated">isolated · 隔离代码 + 沙箱 UI 插槽</option>
+                  <option value="ui-slot">ui-slot · 纯沙箱 HTML UI 插槽</option>
+                  <option value="service">service · 第三方服务提供方 (provides)</option>
+                  <option value="harness-adapter">harness-adapter · 第三方 Harness Adapter 驱动</option>
+                </select>
+              </label>
+            )}
+          </div>
+        )}
+
         <div className="grid gap-2 sm:grid-cols-3">
           <select aria-label="工作区" className={field} value={workspaceId} disabled={!!busy} onChange={(event) => setWorkspaceId(event.target.value)}>
             <option value="">选择工作区</option>
@@ -104,13 +213,43 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
             {availableModels.map(({ id, displayName }) => <option key={id} value={id}>{displayName}</option>)}
           </select>
         </div>
-        <textarea aria-label="插件需求" rows={3} value={description} maxLength={6000} disabled={!!busy}
+
+        <textarea aria-label="插件需求" rows={3} value={description} maxLength={8000} disabled={!!busy}
           onChange={(event) => setDescription(event.target.value)} className={`${field} w-full`}
-          placeholder="例如，添加一个面板展示当前任务的改动文件和测试结果，再加一个指令生成交付摘要。" />
-        <button type="button" className={button} disabled={!!busy || !workspaceId || !harnessId || description.trim().length < 3}
-          onClick={() => void generate()}>{manifestJson.trim() && manifestJson !== initialManifest ? '继续修改草稿' : '生成草稿'}</button>
-        {busy === '正在生成草稿…' && <button type="button" className={`${button} ml-2`} onClick={() => generation.current?.abort()}>取消生成</button>}
+          placeholder={
+            builderTier === 'tier2'
+              ? '例如：为本地 CLI 引擎创建一个 Harness Adapter 插件，并附加 chat.block 状态卡片与 harness.settings 配置面板。'
+              : '例如：添加一个斜杠命令 /delivery 和数据面板；或描述外部 API / 沙箱 UI / Harness 适配器需求自动升级为 Tier 2 代码工程。'
+          }
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" data-testid="builder-generate-btn" className={button} disabled={!!busy || !workspaceId || !harnessId || description.trim().length < 3}
+            onClick={() => void generate()}>
+            {builderTier === 'tier2'
+              ? '生成并沙箱验证代码插件'
+              : manifestJson.trim() && manifestJson !== initialManifest
+                ? '继续修改草稿'
+                : '生成插件'}
+          </button>
+          {busy === '正在生成插件…' && (
+            <button type="button" className={button} onClick={() => generation.current?.abort()}>取消生成</button>
+          )}
+        </div>
       </section>
+
+      {builderV2Result && (
+        <PluginBuilderV2Review
+          result={builderV2Result}
+          trustCode={trustCode}
+          onTrustCodeChange={setTrustCode}
+          installMode={installModeV2}
+          onInstallModeChange={setInstallModeV2}
+          installing={busy === '正在安装验证通过的插件…'}
+          onInstall={() => void installV2()}
+        />
+      )}
+
       <section className="space-y-2">
         <label htmlFor="plugin-manifest" className="font-medium text-[var(--text-primary)]">插件清单</label>
         <textarea id="plugin-manifest" value={manifestJson} rows={8} spellCheck={false} disabled={!!busy}
@@ -118,18 +257,20 @@ export function PluginAuthoringForm({ initialManifest, editing, onInstalled }: {
           onChange={(event) => { setManifestJson(event.target.value); resetPreview(); }} />
         <button type="button" className={button} disabled={!!busy || !manifestJson.trim()} onClick={() => void review('manifest')}>校验并预览清单</button>
       </section>
+
       {!editing && <section className="space-y-2">
         <label htmlFor="plugin-directory" className="font-medium text-[var(--text-primary)]">从本地目录导入</label>
         <div className="flex flex-wrap gap-2">
           <input id="plugin-directory" className={`${field} flex-1`} value={directory} disabled={!!busy} placeholder="包含 harnessmate-plugin.json 的目录"
             onChange={(event) => { setDirectory(event.target.value); resetPreview(); }} />
-          {window.harnessMateBridge && <button type="button" className={button} disabled={!!busy} onClick={() => void run('正在选择目录…', async () => {
+          {typeof window !== 'undefined' && window.harnessMateBridge && <button type="button" className={button} disabled={!!busy} onClick={() => void run('正在选择目录…', async () => {
             const selectedDirectory = await window.harnessMateBridge?.pickDirectory();
             if (selectedDirectory) { setDirectory(selectedDirectory); resetPreview(); }
           })}><FolderOpen size={13} aria-label="选择目录" /></button>}
           <button type="button" className={button} disabled={!!busy || !directory.trim()} onClick={() => void review('directory')}>预览目录</button>
         </div>
       </section>}
+
       {preview && (
         <section className="space-y-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-elevated)] p-3">
           <h4 className="font-medium text-[var(--text-primary)]">{preview.result.manifest.name} · {preview.result.manifest.version}</h4>
