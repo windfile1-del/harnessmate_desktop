@@ -39,6 +39,7 @@ import type {
   SideChatPromoteRequest,
   SideChatRequest,
   SwitchHarnessRequest,
+  TerminalContextChip,
   TurnBlockRecord,
   TurnOptionsMap,
   UpdateSessionRequest,
@@ -72,6 +73,10 @@ import type { DaemonEventBus } from './event-bus.js';
 import { classifyTerminalFailure, FAILOVER_TRIGGER_CLASSES } from './failover-service.js';
 import { SessionExplorerService, type SessionExplorerQueryOptions } from './session-explorer-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
+import {
+  stripAnsiAndClip,
+  type TerminalWorkspaceService,
+} from './terminal-workspace-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
 import type { FailoverService, GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
@@ -116,6 +121,7 @@ type TurnOptions = {
   omitHandoff?: boolean;
   literalText?: boolean;
   mode?: 'plugin_development';
+  terminalContexts?: TerminalContextChip[];
 };
 
 export class SessionManager {
@@ -137,6 +143,7 @@ export class SessionManager {
     private readonly pluginManager: PluginManager,
     private readonly pluginCapabilities?: PluginCapabilities,
     commandOutputHub?: CommandOutputHub,
+    private readonly terminalWorkspace?: TerminalWorkspaceService,
   ) {
     this.commandOutputHub = commandOutputHub ?? new CommandOutputHub();
     this.deltaCoalescer = new TextDeltaCoalescer({
@@ -729,11 +736,42 @@ export class SessionManager {
   }
 
   async deleteWorkspace(id: string): Promise<boolean> {
+    await this.terminalWorkspace?.closeWorkspaceTerminals(id);
     const sessions = this.store.listSessions({ workspaceId: id, includeArchived: true });
     for (const s of sessions) {
       await this.disposeSessionHandles(s.id);
     }
     return this.store.deleteWorkspace(id);
+  }
+
+  recordTerminalEvent(
+    sessionId: string,
+    type: 'terminal.opened' | 'terminal.exited' | 'terminal.context_attached',
+    payload: Record<string, unknown>,
+  ): void {
+    if (!this.store.getSession(sessionId)) return;
+    this.emitCanonical(sessionId, type, payload, null);
+  }
+
+  private formatTerminalContextsBlock(chips: readonly TerminalContextChip[]): string {
+    const sections = chips.slice(0, 12).map((chip) => {
+      const sanitized = stripAnsiAndClip(chip.cleanText, {
+        lineStart: 1,
+        lineEnd: 500,
+        maxBytes: 16_384,
+      });
+      const exitLabel =
+        chip.exitCode !== null && chip.exitCode !== undefined ? ` · exit ${chip.exitCode}` : '';
+      const truncLabel = chip.truncated || sanitized.truncated ? ' · truncated' : '';
+      return [
+        `### ${chip.terminalTitle} (lines ${chip.lineStart}–${chip.lineEnd}${exitLabel}${truncLabel})`,
+        `- **CWD**: \`${chip.cwd}\``,
+        '```text',
+        sanitized.cleanText,
+        '```',
+      ].join('\n');
+    });
+    return [`## Attached Terminal Context (${sections.length})`, '', ...sections].join('\n');
   }
 
   // ── Sessions ─────────────────────────────────────────────────────────
@@ -1565,8 +1603,24 @@ export class SessionManager {
 
     const { text: expandedText, expandedCommand } = native || turnOpts?.literalText || turnOpts?.mode
       ? { text, expandedCommand: undefined } : this.pluginManager.expandSlashCommand(text);
-    const effectiveText = !native && turnOpts?.mode === 'plugin_development'
+    const baseEffectiveText = !native && turnOpts?.mode === 'plugin_development'
       ? `${expandedText}\n\n${pluginDevelopmentBrief}` : expandedText;
+    const terminalChips = !native && turnOpts?.terminalContexts?.length
+      ? turnOpts.terminalContexts
+      : undefined;
+    const effectiveText = terminalChips
+      ? `${baseEffectiveText}\n\n${this.formatTerminalContextsBlock(terminalChips)}`
+      : baseEffectiveText;
+    const compactTerminalChips = terminalChips?.map((c) => ({
+      id: c.id,
+      terminalId: c.terminalId,
+      terminalTitle: c.terminalTitle,
+      cwd: c.cwd,
+      lineStart: c.lineStart,
+      lineEnd: c.lineEnd,
+      truncated: c.truncated,
+      exitCode: c.exitCode ?? null,
+    }));
 
     // Auto-title session from first user prompt if still default
     if (!native && session.lastSeq <= 2 && session.title.includes('·')) {
@@ -1607,6 +1661,7 @@ export class SessionManager {
         text,
         ...(effectiveText !== text ? { sentText: effectiveText } : {}),
         ...(turnOpts?.mode ? { mode: turnOpts.mode } : {}),
+        ...(compactTerminalChips ? { terminalContexts: compactTerminalChips } : {}),
         expandedCommand: expandedCommand ?? null,
         harnessId: session.harnessId,
         harnessKind: session.harnessKind,
@@ -1624,6 +1679,14 @@ export class SessionManager {
       },
       turnId,
     );
+    if (compactTerminalChips) {
+      this.emitCanonical(
+        sessionId,
+        'terminal.context_attached',
+        { terminalContexts: compactTerminalChips, count: compactTerminalChips.length },
+        turnId,
+      );
+    }
     const userItemId = `${turnId}:user`;
     this.store.upsertTurnItem({
       itemId: userItemId,
@@ -1637,7 +1700,10 @@ export class SessionManager {
       status: 'completed',
       title: 'User',
       textBody: text,
-      payload: { expandedCommand: expandedCommand ?? null },
+      payload: {
+        expandedCommand: expandedCommand ?? null,
+        ...(compactTerminalChips ? { terminalContexts: compactTerminalChips } : {}),
+      },
       outputOmitted: false,
       omittedBytes: 0,
       createdAt: userEvent.createdAt,
@@ -2111,6 +2177,7 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     this.deltaCoalescer.flushAll();
     this.deltaCoalescer.dispose();
+    await this.terminalWorkspace?.disposeAll();
     this.store.settleRunningTurnItems(undefined, 'interrupted');
     this.expireSessionApprovals();
     const entries = Array.from(this.liveHandles.values());

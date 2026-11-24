@@ -504,6 +504,9 @@ export const CanonicalEventTypeSchema = z.enum([
   'subagent.merged',
   'compression.chunk_ready',
   'compression.fallback_triggered',
+  'terminal.opened',
+  'terminal.exited',
+  'terminal.context_attached',
   'usage.updated',
   'diagnostic.log',
 ]);
@@ -1224,3 +1227,47 @@ export const SessionCompressionStatusSchema = z.object({
   cacheStats: CompressionCacheStatsSchema,
 });
 export type SessionCompressionStatus = z.infer<typeof SessionCompressionStatusSchema>;
+
+// ── Integrated PTY Terminal & Context Chips ────────────────────────────
+
+export const TerminalBackendKindSchema = z.enum(['pty', 'pipe']);
+export type TerminalBackendKind = z.infer<typeof TerminalBackendKindSchema>;
+
+export const TerminalTabStatusSchema = z.enum(['running', 'exited']);
+export type TerminalTabStatus = z.infer<typeof TerminalTabStatusSchema>;
+
+export const DevServerHintSchema = z.object({
+  command: z.string(),
+  framework: z.string(),
+  detectedAt: z.number(),
+});
+export type DevServerHint = z.infer<typeof DevServerHintSchema>;
+
+export const ManagedTerminalTabSchema = z.object({
+  terminalId: z.string(),
+  workspaceId: z.string(),
+  cwd: z.string(),
+  title: z.string(),
+  shell: z.string(),
+  pid: z.number().int().nonnegative(),
+  backend: TerminalBackendKindSchema,
+  status: TerminalTabStatusSchema,
+  exitCode: z.number().int().nullable().optional(),
+  ringBufferBytes: z.number().int().nonnegative().default(0),
+  devServerHint: DevServerHintSchema.nullable().optional(),
+  createdAt: z.number(),
+});
+export type ManagedTerminalTab = z.infer<typeof ManagedTerminalTabSchema>;
+
+export const TerminalContextChipSchema = z.object({
+  id: z.string().min(1),
+  terminalId: z.string().min(1),
+  terminalTitle: z.string().min(1),
+  cwd: z.string().min(1),
+  lineStart: z.number().int().positive(),
+  lineEnd: z.number().int().positive(),
+  cleanText: z.string().max(16_384),
+  truncated: z.boolean(),
+  exitCode: z.number().int().nullable().optional(),
+});
+export type TerminalContextChip = z.infer<typeof TerminalContextChipSchema>;

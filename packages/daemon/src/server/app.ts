@@ -9,6 +9,7 @@ import {
   BuilderV2InstallRequestSchema,
   CreateCustomRiskRuleRequestSchema,
   CreateSessionRequestSchema,
+  CreateTerminalContextChipRequestSchema,
   CreateWorkspaceRequestSchema,
   CreateWorktreeRequestSchema,
   CustomAcpHarnessConfigSchema,
@@ -32,8 +33,10 @@ import {
   ManualCompressRequestSchema,
   MergeBackRequestSchema,
   MergeSubagentRequestSchema,
+  OpenTerminalRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
+  ReleaseTerminalsPathRequestSchema,
   RemoveWorktreeRequestSchema,
   ResolveApprovalRequestSchema,
   RevertCheckpointRequestSchema,
@@ -44,6 +47,7 @@ import {
   SideChatPromoteRequestSchema,
   SideChatRequestSchema,
   SwitchHarnessRequestSchema,
+  TerminalInputRequestSchema,
   ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
   TrustSetupScriptRequestSchema,
@@ -86,6 +90,11 @@ import { GitOperationError } from '../core/git-service.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
+import {
+  TERMINAL_WORKSPACE_PLUGIN_ID,
+  TerminalWorkspaceError,
+  TerminalWorkspaceService,
+} from '../core/terminal-workspace-service.js';
 import type { UsageService } from '../core/usage-service.js';
 import type { FailoverCoordinator } from '../core/failover-service.js';
 import {
@@ -130,6 +139,7 @@ export interface DaemonInstance {
   pluginSecrets: PluginSecretStore;
   sessionManager: SessionManager;
   commandOutputHub: CommandOutputHub;
+  terminalWorkspace: TerminalWorkspaceService;
   outboxWorker: EffectOutboxWorker;
   auth: RemoteAuthService;
   config: DaemonPersistedConfig;
@@ -155,6 +165,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   const pluginPermissions = new PluginPermissionService(store);
   const pluginSecrets = new PluginSecretStore();
+  const terminalWorkspace = new TerminalWorkspaceService(store, { initialActive: false });
+  const terminalSessionOwners = new Map<string, string>();
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
@@ -174,6 +186,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       () => pluginManager.host.events,
       opts.customAdapters,
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
+      terminalWorkspace,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy,
       onDevReload: () => wsGateway.notifyPluginsChanged() },
@@ -187,7 +200,21 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const commandOutputHub = new CommandOutputHub();
   const outboxWorker = new EffectOutboxWorker(store);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub);
+  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace);
+  terminalWorkspace.subscribeStatus(({ terminal, event }) => {
+    const ownerSessionId = terminalSessionOwners.get(terminal.terminalId);
+    if (ownerSessionId && event === 'exited') {
+      sessionManager.recordTerminalEvent(ownerSessionId, 'terminal.exited', {
+        terminalId: terminal.terminalId,
+        title: terminal.title,
+        cwd: terminal.cwd,
+        exitCode: terminal.exitCode ?? null,
+      });
+    }
+    if (event === 'closed') {
+      terminalSessionOwners.delete(terminal.terminalId);
+    }
+  });
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
     const session = store.getSession(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
@@ -205,6 +232,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     auth,
     eventBus,
     sessionManager,
+    terminalWorkspace,
   });
 
   const app = Fastify({ logger: false, bodyLimit: 24 * 1024 * 1024 });
@@ -266,6 +294,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         wsGateway.close();
         pluginAuthoring.cancel();
         pluginBuilderV2.cancel();
+        await terminalWorkspace.disposeAll();
         await sessionManager.shutdown();
         await app.close();
         await pluginManager.close();
@@ -1092,6 +1121,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         omitHandoff: parsed.data.omitHandoff,
         literalText: parsed.data.literalText,
         mode: parsed.data.mode,
+        terminalContexts: parsed.data.terminalContexts,
       });
       return reply.code(202).send(result);
     } catch (err) {
@@ -1256,6 +1286,133 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  // ── Integrated PTY Terminal Workspace & Context Chips ─────────────────
+
+  app.get('/api/v1/workspaces/:id/terminals', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    const q = request.query as { cwd?: string };
+    return {
+      enabled: pluginManager.isPluginEnabled(TERMINAL_WORKSPACE_PLUGIN_ID),
+      ptyAvailable: terminalWorkspace.isPtyAvailable(),
+      terminals: terminalWorkspace.listTerminals(id, q.cwd || undefined),
+    };
+  });
+
+  app.post('/api/v1/workspaces/:id/terminals', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    if (!pluginManager.isPluginEnabled(TERMINAL_WORKSPACE_PLUGIN_ID)) {
+      return reply.code(409).send({
+        error: '集成终端与上下文插件当前未启用，请先在插件管理中启用。',
+        code: 'E_PLUGIN_DISABLED',
+      });
+    }
+    const parsed = OpenTerminalRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid open terminal payload' });
+    }
+    try {
+      const created = await terminalWorkspace.openTerminal(id, {
+        cwd: parsed.data.cwd,
+        title: parsed.data.title,
+        cols: parsed.data.cols,
+        rows: parsed.data.rows,
+        initialCommand: parsed.data.initialCommand,
+      });
+      if (parsed.data.sessionId && sessionManager.getSession(parsed.data.sessionId)) {
+        terminalSessionOwners.set(created.terminal.terminalId, parsed.data.sessionId);
+        sessionManager.recordTerminalEvent(parsed.data.sessionId, 'terminal.opened', {
+          terminalId: created.terminal.terminalId,
+          title: created.terminal.title,
+          cwd: created.terminal.cwd,
+          backend: created.terminal.backend,
+        });
+      }
+      return reply.code(201).send(created);
+    } catch (err) {
+      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_OPEN_FAILED';
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_WORKSPACE_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/terminals/:terminalId/input', async (request, reply) => {
+    const { terminalId } = request.params as { terminalId: string };
+    const parsed = TerminalInputRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid terminal input payload' });
+    }
+    try {
+      terminalWorkspace.writeInput(terminalId, parsed.data.data);
+      return { ok: true };
+    } catch (err) {
+      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_INPUT_FAILED';
+      const status = code === 'E_TERMINAL_NOT_FOUND' ? 404 : code === 'E_PLUGIN_DISABLED' || code === 'E_TERMINAL_EXITED' ? 409 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/terminals/:terminalId/interrupt', async (request, reply) => {
+    const { terminalId } = request.params as { terminalId: string };
+    try {
+      const terminal = await terminalWorkspace.interruptTerminal(terminalId);
+      return { terminal };
+    } catch (err) {
+      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_INTERRUPT_FAILED';
+      return reply.code(code === 'E_TERMINAL_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/terminals/:terminalId/restart', async (request, reply) => {
+    const { terminalId } = request.params as { terminalId: string };
+    try {
+      const terminal = await terminalWorkspace.restartTerminal(terminalId);
+      return { terminal };
+    } catch (err) {
+      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_RESTART_FAILED';
+      const status = code === 'E_TERMINAL_NOT_FOUND' ? 404 : code === 'E_PLUGIN_DISABLED' ? 409 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/terminals/:terminalId/context-chip', async (request, reply) => {
+    const { terminalId } = request.params as { terminalId: string };
+    const parsed = CreateTerminalContextChipRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid context chip request' });
+    }
+    try {
+      const chip = terminalWorkspace.createContextChip(terminalId, parsed.data);
+      return { chip };
+    } catch (err) {
+      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_CONTEXT_CHIP_FAILED';
+      return reply.code(code === 'E_TERMINAL_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.delete('/api/v1/terminals/:terminalId', async (request, reply) => {
+    const { terminalId } = request.params as { terminalId: string };
+    const closed = await terminalWorkspace.closeTerminal(terminalId);
+    if (!closed) return reply.code(404).send({ error: 'Terminal not found' });
+    return { closed: true };
+  });
+
+  app.post('/api/v1/terminals/release-path', async (request, reply) => {
+    const parsed = ReleaseTerminalsPathRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid release-path payload' });
+    }
+    const result = await terminalWorkspace.releaseTerminalsUnderPath(parsed.data.targetPath);
+    return result;
   });
 
   app.post('/api/v1/sessions/:id/handoff', async (request, reply) => {
@@ -1803,7 +1960,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
     );
     const setupScript = service.inspectSetupScript(workspace.rootPath, store);
-    return { worktrees, setupScript };
+    const blockingTerminalsByPath: Record<string, ReturnType<typeof terminalWorkspace.listTerminalsUsingPath>> = {};
+    for (const wt of worktrees) {
+      const blocking = terminalWorkspace.listTerminalsUsingPath(wt.path);
+      if (blocking.length > 0) {
+        blockingTerminalsByPath[wt.path] = blocking;
+      }
+    }
+    return { worktrees, setupScript, blockingTerminalsByPath };
   });
 
   app.post('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
@@ -1843,6 +2007,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     };
     const parsed = RemoveWorktreeRequestSchema.safeParse(rawBody);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid worktreePath' });
+    const blockingTerminals = terminalWorkspace.listTerminalsUsingPath(parsed.data.worktreePath);
+    if (blockingTerminals.length > 0) {
+      return reply.code(409).send({
+        error: `Worktree 目录正被 ${blockingTerminals.length} 个运行中终端占用，请先关闭或一键释放占用终端后重试 (${blockingTerminals.map((t) => t.title).join(', ')})`,
+        code: 'E_WORKTREE_BUSY',
+        blockingTerminals,
+      });
+    }
     try {
       const result = await service.removeWorktree(workspace.rootPath, parsed.data.worktreePath, {
         force: parsed.data.force,
@@ -2141,6 +2313,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     pluginSecrets,
     sessionManager,
     commandOutputHub,
+    terminalWorkspace,
     outboxWorker,
     auth,
     config,
@@ -2159,6 +2332,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       wsGateway.close();
       pluginAuthoring.cancel();
       pluginBuilderV2.cancel();
+      await terminalWorkspace.disposeAll();
       await sessionManager.shutdown();
       await app.close();
       await pluginManager.close();

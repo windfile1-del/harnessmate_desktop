@@ -18,6 +18,7 @@
 - `native-commands`
 - `orchestrator`
 - `session-search`
+- `terminal-workspace`
 - `usage`
 
 ## 交接配置

@@ -38,6 +38,7 @@ import {
 } from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
+import { TerminalWorkspaceService } from '../../core/terminal-workspace-service.js';
 import { UsageService } from '../../core/usage-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { AcpAdapter } from '../../harnesses/acp-adapter.js';
@@ -95,7 +96,8 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   ledgerUpdated: (state: SessionTaskState) => void,
   events: () => PluginEvents,
   overrides: readonly HarnessAdapter[] = [],
-  collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>) {
+  collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
+  terminalWorkspace?: TerminalWorkspaceService) {
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
   const adapterPlugin = (id: string, create: () => HarnessAdapter) => {
     const service = `harness.${id}`;
@@ -336,6 +338,18 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       });
       ctx.effect(() => () => {
         compressor.onPluginDisabled();
+      });
+    },
+  });
+  plugins.set('hm.plugin.terminal-workspace', {
+    provides: ['terminal-workspace'],
+    apply(ctx) {
+      const svc = terminalWorkspace ?? new TerminalWorkspaceService(store);
+      svc.attachGitService(() => ctx.get<GitService>('git'));
+      svc.setPluginActive(true);
+      ctx.provide('terminal-workspace', svc);
+      ctx.effect(() => () => {
+        void svc.onPluginDisabled().catch(() => {});
       });
     },
   });

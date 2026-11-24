@@ -65,6 +65,7 @@ const defaultBundle = 'harnessmate-core';
 const OPTIONAL_BUILTIN_PLUGINS = new Set<string>([
   'hm.plugin.multi-harness-orchestrator',
   'hm.plugin.context-compression',
+  'hm.plugin.terminal-workspace',
 ]);
 const stableIds: Record<string, string> = {
   'core.task-ledger': 'ledger', 'core.context-bridge': 'handoff', 'core.git-inspector': 'git',

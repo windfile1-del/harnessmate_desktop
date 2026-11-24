@@ -12,6 +12,7 @@ import type {
   Session,
   SessionModelPluginTools,
   SessionPluginAction,
+  TerminalContextChip,
   TurnBlockRecord,
   TurnOptionValue,
   WorkspaceFileEntry,
@@ -100,6 +101,7 @@ import {
   WorkGroupRow,
 } from './MessageStudio';
 import { ModelPicker } from './ModelPicker';
+import { ComposerPendingTerminalContexts } from './TerminalContextInlineChip';
 import {
   loadSavedTraitValues,
   sanitizeTraitValues,
@@ -118,6 +120,7 @@ const DRIVER_LABELS: Record<string, string> = {
   native_warm: '原生热记忆（零重传）',
 };
 const NO_ATTACHMENTS: Attachment[] = [];
+const NO_TERMINAL_CHIPS: TerminalContextChip[] = [];
 const NO_EVENTS: CanonicalEvent[] = [];
 const NO_TURN_ITEMS: TurnBlockRecord[] = [];
 const TIMELINE_PAGE_SIZE = 80;
@@ -177,6 +180,7 @@ export function ChatStage() {
     selectedContextPreview,
     selectedDraft,
     selectedAttachments,
+    selectedPendingTerminalChips,
     sidebarCollapsed,
     inspectorOpen,
     setSidebarCollapsed,
@@ -199,6 +203,7 @@ export function ChatStage() {
     setDraftText,
     addDraftAttachment,
     removeDraftAttachment,
+    removePendingTerminalChip,
     clearDraft,
     pushToast,
     isPluginEnabled,
@@ -223,6 +228,7 @@ export function ChatStage() {
     selectedContextPreview: state.selectedSessionId ? state.contextPreviewBySession[state.selectedSessionId] : undefined,
     selectedDraft: state.selectedSessionId ? state.draftTextBySession[state.selectedSessionId] : undefined,
     selectedAttachments: state.selectedSessionId ? state.draftAttachmentsBySession[state.selectedSessionId] : undefined,
+    selectedPendingTerminalChips: state.selectedSessionId ? state.pendingTerminalChipsBySession[state.selectedSessionId] : undefined,
     sidebarCollapsed: state.sidebarCollapsed,
     inspectorOpen: state.inspectorOpen,
     setSidebarCollapsed: state.setSidebarCollapsed,
@@ -245,6 +251,7 @@ export function ChatStage() {
     setDraftText: state.setDraftText,
     addDraftAttachment: state.addDraftAttachment,
     removeDraftAttachment: state.removeDraftAttachment,
+    removePendingTerminalChip: state.removePendingTerminalChip,
     clearDraft: state.clearDraft,
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
@@ -368,6 +375,7 @@ export function ChatStage() {
 
   const inputText = selectedDraft ?? '';
   const attachments = selectedAttachments ?? NO_ATTACHMENTS;
+  const pendingTerminalChips = selectedPendingTerminalChips ?? NO_TERMINAL_CHIPS;
 
   const [sending, setSending] = useState(false);
   const [visibleHistory, setVisibleHistory] = useState<{ sessionId: string; count: number }>();
@@ -621,7 +629,7 @@ export function ChatStage() {
 
   const handleSend = async (suggestionChoice?: 'apply' | 'original') => {
     const trimmed = inputText.trim();
-    if ((!trimmed && attachments.length === 0) || sending || (isRunning && !isGoalControl) ||
+    if ((!trimmed && attachments.length === 0 && pendingTerminalChips.length === 0) || sending || (isRunning && !isGoalControl) ||
       (activeSuggestion && !suggestionChoice)) return;
     const panelCommand = nativeCommands.some(({ command }) => command === typedCommand) ? undefined
       : panelCommands.find(({ command }) => command === typedCommand);
@@ -679,8 +687,13 @@ export function ChatStage() {
       return;
     }
     setSending(true);
-    const outgoingText = trimmed || '请结合附带的图片/文件进行分析。';
     const outgoingAtts = [...attachments];
+    const outgoingTerminalChips = [...pendingTerminalChips];
+    const outgoingText =
+      trimmed ||
+      (outgoingTerminalChips.length > 0 && outgoingAtts.length === 0
+        ? '请结合附带的终端报错上下文进行分析与修复。'
+        : '请结合附带的图片/文件进行分析。');
     try {
       const turnAttachments = outgoingAtts.length > 0 ? outgoingAtts : undefined;
       const wantsPreview = !pluginMode && !suggestionChoice && plugins.some((plugin) => plugin.hasRuntimeHook && isPluginEnabled(plugin.id));
@@ -706,6 +719,7 @@ export function ChatStage() {
         mode: pluginMode ? 'plugin_development' : undefined,
         turnOptions:
           Object.keys(effectiveTraitValues).length > 0 ? effectiveTraitValues : undefined,
+        terminalContexts: outgoingTerminalChips.length > 0 ? outgoingTerminalChips : undefined,
       });
       setOmitHandoffFor(undefined);
     } finally {
@@ -1328,6 +1342,12 @@ export function ChatStage() {
               </div>
             )}
 
+            {/* Pending Terminal Context Chips */}
+            <ComposerPendingTerminalContexts
+              chips={pendingTerminalChips}
+              onRemove={(chipId) => removePendingTerminalChip(session.id, chipId)}
+            />
+
             {/* Attachment Preview Strip */}
             {attachments.length > 0 && (
               <div className="mb-2 flex flex-wrap gap-2 px-2 pt-1">
@@ -1586,7 +1606,7 @@ export function ChatStage() {
                 {(!isRunning || isGoalControl) && (
                   <button
                     type="button"
-                    disabled={(!inputText.trim() && attachments.length === 0) || sending}
+                    disabled={(!inputText.trim() && attachments.length === 0 && pendingTerminalChips.length === 0) || sending}
                     onClick={() => void handleSend()}
                     className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-xl text-white transition-all disabled:cursor-not-allowed disabled:opacity-35"
                     style={{ backgroundColor: 'var(--accent-indigo)' }}

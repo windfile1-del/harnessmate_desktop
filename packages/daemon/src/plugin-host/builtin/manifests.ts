@@ -216,4 +216,15 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     permissions: ['session:read', 'fs:workspace:read', 'context:compressor'],
     contributes: { uiSlots: ['inspector_tab'] },
   },
+  {
+    id: 'hm.plugin.terminal-workspace',
+    name: '集成交互终端与上下文胶囊',
+    version: '1.0.0',
+    description: '按工作区/Worktree 隔离的持久多 Tab 终端抽屉、后台开发服务监控与 ANSI 清洗上下文胶囊（支持 node-pty 动态探测与零原生依赖 Pipe 降级）（官方可选插件）。',
+    author: 'HarnessMate Core',
+    category: 'tool',
+    provides: ['terminal-workspace'],
+    permissions: ['process:pty:workspace'],
+    contributes: { uiSlots: ['inspector_tab', 'composer_action'] },
+  },
 ];

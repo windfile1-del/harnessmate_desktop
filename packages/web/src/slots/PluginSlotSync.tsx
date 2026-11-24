@@ -22,6 +22,10 @@ import {
 } from '../components/OrchestratorBoard';
 import { PluginDataPanel } from '../components/PluginDataPanel';
 import { SideChatDrawer } from '../components/SideChatDrawer';
+import {
+  TerminalStatusbarBadge,
+  TerminalWorkspaceDrawer,
+} from '../components/TerminalWorkspaceDrawer';
 import { TraitsPicker } from '../components/TraitsPicker';
 import { resolveHarnessMeta, resolveHarnessOptionDescriptors } from '../lib/harness-meta';
 import { listPluginPanels } from '../lib/plugin-panels';
@@ -523,6 +527,37 @@ export function PluginSlotSync() {
           order: 95,
           sourceKind: 'builtin',
           render: ({ session }) => <ContextCompressionPanel session={session} />,
+        }),
+      );
+    }
+
+    // Built-in V5 Optional Integrated PTY Terminal & Context Chips (`inspector.tabs` key: `terminal-workspace` + `statusbar.items`)
+    const terminalWorkspacePlugin = plugins.find((p) => p.id === 'hm.plugin.terminal-workspace');
+    if (terminalWorkspacePlugin && isPluginActive(terminalWorkspacePlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'terminal-workspace',
+          pluginId: 'hm.plugin.terminal-workspace',
+          pluginName: 'Integrated Terminal Workspace',
+          title: '集成终端',
+          key: 'terminal-workspace',
+          order: 85,
+          sourceKind: 'builtin',
+          render: ({ session }) => <TerminalWorkspaceDrawer session={session} />,
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'statusbar.items',
+          id: 'terminal-workspace-count',
+          pluginId: 'hm.plugin.terminal-workspace',
+          pluginName: 'Integrated Terminal Workspace',
+          title: '托管终端计数',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ session }) => <TerminalStatusbarBadge session={session} />,
         }),
       );
     }

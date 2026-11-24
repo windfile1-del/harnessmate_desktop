@@ -1,6 +1,7 @@
 import type {
   GitDryRunMergeResult,
   GitWorktreeEntry,
+  ManagedTerminalTab,
   Workspace,
   WorkspaceSetupScriptInfo,
 } from '@harnessmate/protocol';
@@ -16,11 +17,12 @@ import {
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Terminal,
   Trash2,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
-import { daemonApi } from '../api/client';
+import { ApiHttpError, daemonApi } from '../api/client';
 import { useAppStore } from '../stores/app-store';
 
 export interface WorktreeManagerModalProps {
@@ -30,6 +32,7 @@ export interface WorktreeManagerModalProps {
   initialWorktrees?: GitWorktreeEntry[];
   initialSetupScript?: WorkspaceSetupScriptInfo;
   initialDryRunResult?: GitDryRunMergeResult | null;
+  initialBlockingTerminals?: Record<string, ManagedTerminalTab[]>;
 }
 
 export function WorktreeManagerModal({
@@ -38,6 +41,7 @@ export function WorktreeManagerModal({
   initialWorktrees,
   initialSetupScript,
   initialDryRunResult = null,
+  initialBlockingTerminals = {},
 }: WorktreeManagerModalProps) {
   const storeWorkspaces = useAppStore((s) => s.workspaces);
   const selectedWorkspaceId = useAppStore((s) => s.selectedWorkspaceId);
@@ -64,6 +68,9 @@ export function WorktreeManagerModal({
   );
   const [dryRunTargetBranch, setDryRunTargetBranch] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
+  const [blockingTerminalsByPath, setBlockingTerminalsByPath] = useState<
+    Record<string, ManagedTerminalTab[]>
+  >(initialBlockingTerminals);
 
   const loadWorkspaceWorktrees = useCallback(async () => {
     if (!workspaceId || initialWorktrees) return;
@@ -72,6 +79,7 @@ export function WorktreeManagerModal({
       const res = await daemonApi.listWorktrees(workspaceId);
       setWorktrees(res.worktrees);
       setSetupScript(res.setupScript);
+      setBlockingTerminalsByPath(res.blockingTerminalsByPath ?? {});
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -127,7 +135,43 @@ export function WorktreeManagerModal({
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setRemoveError(msg);
+      if (err instanceof ApiHttpError && err.code === 'E_WORKTREE_BUSY') {
+        const list = err.payload?.blockingTerminals;
+        if (Array.isArray(list)) {
+          setBlockingTerminalsByPath((prev) => ({
+            ...prev,
+            [wt.path]: list as ManagedTerminalTab[],
+          }));
+        }
+      }
       pushToast({ kind: 'error', title: '移除 Worktree 失败', body: msg });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleReleaseBlockingTerminals = async (targetPath: string) => {
+    setBusy(`release:${targetPath}`);
+    try {
+      const res = await daemonApi.releaseTerminalsUnderPath(targetPath);
+      setBlockingTerminalsByPath((prev) => {
+        const next = { ...prev };
+        delete next[targetPath];
+        return next;
+      });
+      setRemoveError(null);
+      pushToast({
+        kind: 'success',
+        title: `已释放 ${res.releasedCount} 个占用终端`,
+        body: '现在可以安全移除 Worktree 目录。',
+      });
+      await loadWorkspaceWorktrees();
+    } catch (err) {
+      pushToast({
+        kind: 'error',
+        title: '释放占用终端失败',
+        body: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setBusy(null);
     }
@@ -231,6 +275,7 @@ export function WorktreeManagerModal({
               setWorkspaceId(e.target.value);
               setDryRunResult(null);
               setRemoveError(null);
+              setBlockingTerminalsByPath({});
             }}
             className="flex-1 rounded-xl px-3 py-2 text-[12px] text-[var(--text-primary)]"
             style={{
@@ -382,6 +427,21 @@ export function WorktreeManagerModal({
                         关联 {wt.linkedSessionIds.length} 个会话
                       </span>
                     )}
+                    {(blockingTerminalsByPath[wt.path]?.length ?? 0) > 0 && (
+                      <span
+                        data-testid="worktree-terminal-busy-badge"
+                        className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9.5px]"
+                        style={{
+                          backgroundColor: 'var(--accent-rose-soft)',
+                          color: 'var(--accent-rose)',
+                        }}
+                      >
+                        <Terminal size={10} />
+                        <span>
+                          占用中 ({blockingTerminalsByPath[wt.path]!.map((t) => t.title).join(', ')})
+                        </span>
+                      </span>
+                    )}
                   </div>
                   <div className="truncate font-mono-code text-[10.5px] text-[var(--text-muted)]">
                     {wt.path} · {(wt.headSha ?? '').slice(0, 8)}
@@ -389,6 +449,25 @@ export function WorktreeManagerModal({
                 </div>
 
                 <div className="flex shrink-0 items-center gap-1.5">
+                  {!wt.isMain && (blockingTerminalsByPath[wt.path]?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      data-testid="release-worktree-terminals-btn"
+                      disabled={busy !== null}
+                      onClick={() => void handleReleaseBlockingTerminals(wt.path)}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-[var(--accent-star)] hover:bg-[var(--bg-hover)] disabled:opacity-45"
+                      style={{
+                        border: '1px solid color-mix(in srgb, var(--accent-star) 38%, transparent)',
+                      }}
+                    >
+                      {busy === `release:${wt.path}` ? (
+                        <Loader2 size={11} className="animate-spin" />
+                      ) : (
+                        <Terminal size={11.5} />
+                      )}
+                      <span>一键释放占用终端</span>
+                    </button>
+                  )}
                   {!wt.isMain && wt.branch && (
                     <button
                       type="button"

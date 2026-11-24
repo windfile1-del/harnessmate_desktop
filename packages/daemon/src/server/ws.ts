@@ -8,6 +8,7 @@ import {
 import { WebSocket, WebSocketServer } from 'ws';
 import type { DaemonEventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
+import type { TerminalWorkspaceService } from '../core/terminal-workspace-service.js';
 import { isLocalBrowserRequest, isLoopbackAddress, type RemoteAuthService } from './auth.js';
 
 export interface WsGatewayDeps {
@@ -16,6 +17,7 @@ export interface WsGatewayDeps {
   auth: RemoteAuthService;
   eventBus: DaemonEventBus;
   sessionManager: SessionManager;
+  terminalWorkspace?: TerminalWorkspaceService;
 }
 
 export class WsGateway {
@@ -76,7 +78,15 @@ export class WsGateway {
   private handleConnection(ws: WebSocket): void {
     const sessionUnsubs = new Map<string, () => void>();
     const commandOutputUnsubs = new Map<string, () => void>();
+    const terminalOutputUnsubs = new Map<string, () => void>();
     let attentionUnsub: (() => void) | null = null;
+    const terminalStatusUnsub = this.deps.terminalWorkspace?.subscribeStatus((ev) => {
+      this.send(ws, {
+        op: 'terminal_status',
+        terminal: ev.terminal,
+        event: ev.event,
+      });
+    });
 
     this.send(ws, {
       op: 'hello',
@@ -195,6 +205,54 @@ export class WsGateway {
           commandOutputUnsubs.delete(key);
           break;
         }
+
+        case 'subscribe_terminal': {
+          if (!this.deps.terminalWorkspace) break;
+          terminalOutputUnsubs.get(frame.terminalId)?.();
+          const unsub = this.deps.terminalWorkspace.subscribeOutput(frame.terminalId, (chunk) => {
+            this.send(ws, {
+              op: 'terminal_output',
+              terminalId: chunk.terminalId,
+              chunk: chunk.chunk,
+              snapshot: chunk.snapshot,
+              truncated: chunk.truncated,
+              ringBufferBytes: chunk.ringBufferBytes,
+              timestamp: chunk.timestamp,
+            });
+          });
+          terminalOutputUnsubs.set(frame.terminalId, unsub);
+          break;
+        }
+
+        case 'unsubscribe_terminal': {
+          terminalOutputUnsubs.get(frame.terminalId)?.();
+          terminalOutputUnsubs.delete(frame.terminalId);
+          break;
+        }
+
+        case 'terminal_input': {
+          if (!this.deps.terminalWorkspace) break;
+          try {
+            this.deps.terminalWorkspace.writeInput(frame.terminalId, frame.data);
+          } catch (err) {
+            this.send(ws, {
+              op: 'error',
+              code: 'TERMINAL_INPUT_ERROR',
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+          break;
+        }
+
+        case 'terminal_resize': {
+          if (!this.deps.terminalWorkspace) break;
+          try {
+            this.deps.terminalWorkspace.resizeTerminal(frame.terminalId, frame.cols, frame.rows);
+          } catch {
+            // ignore stale terminal resize
+          }
+          break;
+        }
       }
     });
 
@@ -203,8 +261,11 @@ export class WsGateway {
       sessionUnsubs.clear();
       for (const unsub of commandOutputUnsubs.values()) unsub();
       commandOutputUnsubs.clear();
+      for (const unsub of terminalOutputUnsubs.values()) unsub();
+      terminalOutputUnsubs.clear();
       attentionUnsub?.();
       attentionUnsub = null;
+      terminalStatusUnsub?.();
     });
   }
 

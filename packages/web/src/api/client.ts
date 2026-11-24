@@ -17,6 +17,7 @@ import type {
   ContextSyncMode,
   CreateCustomRiskRuleRequest,
   CreateSessionRequest,
+  CreateTerminalContextChipRequest,
   CreateWorktreeRequest,
   CustomAcpHarnessConfig,
   CustomRiskRule,
@@ -47,6 +48,7 @@ import type {
   InstalledPluginInfo,
   InstallPluginRequest,
   GeneratePluginDraftRequest,
+  ManagedTerminalTab,
   PluginManifest,
   ImportNativeSessionRequest,
   ImportSessionBundleRequest,
@@ -55,6 +57,7 @@ import type {
   MergeBackRequest,
   MergeBackResult,
   MergeSubagentRequest,
+  OpenTerminalRequest,
   OrchestratorBoardResponse,
   PluginCatalogItem,
   PluginLogEntryDto,
@@ -92,6 +95,7 @@ import type {
   PluginBrowserFrame,
   PluginBrowserStatus,
   SwitchHarnessRequest,
+  TerminalContextChip,
   ToggleMcpServerRequest,
   TrustSetupScriptRequest,
   TurnBlockRecord,
@@ -670,6 +674,7 @@ export const daemonApi = {
       omitHandoff?: boolean;
       literalText?: boolean;
       mode?: 'plugin_development';
+      terminalContexts?: TerminalContextChip[];
     },
   ) =>
     apiFetch<{ turnId: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/turns`, {
@@ -677,6 +682,9 @@ export const daemonApi = {
       body: JSON.stringify({
         text,
         attachments,
+        ...(opts?.terminalContexts && opts.terminalContexts.length > 0
+          ? { terminalContexts: opts.terminalContexts }
+          : {}),
         ...(opts?.harnessId ? { harnessId: opts.harnessId } : {}),
         ...(opts?.model !== undefined ? { model: opts.model } : {}),
         ...(opts?.turnOptions && Object.keys(opts.turnOptions).length > 0
@@ -777,6 +785,66 @@ export const daemonApi = {
         body: JSON.stringify({ command }),
       },
     ),
+
+  listWorkspaceTerminals: (workspaceId: string, cwd?: string) => {
+    const qs = cwd ? `?cwd=${encodeURIComponent(cwd)}` : '';
+    return apiFetch<{ enabled: boolean; ptyAvailable: boolean; terminals: ManagedTerminalTab[] }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/terminals${qs}`,
+    );
+  },
+
+  openWorkspaceTerminal: (workspaceId: string, req: OpenTerminalRequest = {}) =>
+    apiFetch<{ terminal: ManagedTerminalTab; snapshot: string }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/terminals`,
+      {
+        method: 'POST',
+        body: JSON.stringify(req),
+      },
+    ),
+
+  sendTerminalInput: (terminalId: string, data: string) =>
+    apiFetch<{ ok: boolean }>(`/api/v1/terminals/${encodeURIComponent(terminalId)}/input`, {
+      method: 'POST',
+      body: JSON.stringify({ data }),
+    }),
+
+  interruptTerminal: (terminalId: string) =>
+    apiFetch<{ terminal: ManagedTerminalTab }>(
+      `/api/v1/terminals/${encodeURIComponent(terminalId)}/interrupt`,
+      {
+        method: 'POST',
+        body: JSON.stringify({}),
+      },
+    ),
+
+  restartTerminal: (terminalId: string) =>
+    apiFetch<{ terminal: ManagedTerminalTab }>(
+      `/api/v1/terminals/${encodeURIComponent(terminalId)}/restart`,
+      {
+        method: 'POST',
+        body: JSON.stringify({}),
+      },
+    ),
+
+  createTerminalContextChip: (terminalId: string, req: CreateTerminalContextChipRequest = {}) =>
+    apiFetch<{ chip: TerminalContextChip }>(
+      `/api/v1/terminals/${encodeURIComponent(terminalId)}/context-chip`,
+      {
+        method: 'POST',
+        body: JSON.stringify(req),
+      },
+    ),
+
+  closeTerminal: (terminalId: string) =>
+    apiFetch<{ closed: boolean }>(`/api/v1/terminals/${encodeURIComponent(terminalId)}`, {
+      method: 'DELETE',
+    }),
+
+  releaseTerminalsUnderPath: (targetPath: string) =>
+    apiFetch<{ releasedCount: number; terminalIds: string[] }>('/api/v1/terminals/release-path', {
+      method: 'POST',
+      body: JSON.stringify({ targetPath }),
+    }),
 
   handoffSession: (sessionId: string, targetHarnessId: string, targetModel?: string | null) =>
     apiFetch<{ session: Session; handoffPrompt: string }>(
@@ -901,9 +969,11 @@ export const daemonApi = {
     }),
 
   listWorktrees: (workspaceId: string) =>
-    apiFetch<{ worktrees: GitWorktreeEntry[]; setupScript: WorkspaceSetupScriptInfo }>(
-      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees`,
-    ),
+    apiFetch<{
+      worktrees: GitWorktreeEntry[];
+      setupScript: WorkspaceSetupScriptInfo;
+      blockingTerminalsByPath?: Record<string, ManagedTerminalTab[]>;
+    }>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees`),
 
   createWorktree: (workspaceId: string, req: CreateWorktreeRequest) =>
     apiFetch<{ created: { worktreePath: string; branch: string }; worktrees: GitWorktreeEntry[] }>(
@@ -1106,6 +1176,7 @@ export class DaemonWsClient {
   private closed = false;
   private activeSubscription: { sessionId: string; afterSeq: number } | null = null;
   private commandOutputSubscriptions = new Map<string, { sessionId: string; toolCallId: string }>();
+  private terminalSubscriptions = new Set<string>();
 
   constructor(
     private readonly handlers: {
@@ -1137,6 +1208,26 @@ export class DaemonWsClient {
     const key = `${sessionId}::${toolCallId}`;
     this.commandOutputSubscriptions.delete(key);
     this.send({ op: 'unsubscribe_command_output', sessionId, toolCallId });
+  }
+
+  subscribeTerminal(terminalId: string): void {
+    this.terminalSubscriptions.add(terminalId);
+    this.send({ op: 'subscribe_terminal', terminalId });
+  }
+
+  unsubscribeTerminal(terminalId: string): void {
+    this.terminalSubscriptions.delete(terminalId);
+    this.send({ op: 'unsubscribe_terminal', terminalId });
+  }
+
+  sendTerminalInput(terminalId: string, data: string): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    this.send({ op: 'terminal_input', terminalId, data });
+    return true;
+  }
+
+  resizeTerminal(terminalId: string, cols: number, rows: number): void {
+    this.send({ op: 'terminal_resize', terminalId, cols, rows });
   }
 
   updateCursor(sessionId: string, seq: number): void {
@@ -1177,6 +1268,9 @@ export class DaemonWsClient {
             sessionId: sub.sessionId,
             toolCallId: sub.toolCallId,
           });
+        }
+        for (const terminalId of this.terminalSubscriptions) {
+          this.send({ op: 'subscribe_terminal', terminalId });
         }
       };
 

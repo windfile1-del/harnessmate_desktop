@@ -8,6 +8,7 @@ import {
   CheckpointRevertModeSchema,
   ContextSyncModeSchema,
   CustomRiskRuleSchema,
+  ManagedTerminalTabSchema,
   NativeHistorySourceSchema,
   PermissionModeSchema,
   PortableSessionBundleV2Schema,
@@ -16,6 +17,7 @@ import {
   SubagentIsolationSchema,
   TaskStepSchema,
   TaskVerificationSchema,
+  TerminalContextChipSchema,
   UserQuestionAnswerSchema,
   type Session,
 } from './canonical.js';
@@ -236,6 +238,7 @@ export type TurnOptionsMap = z.infer<typeof TurnOptionsMapSchema>;
 export const SendTurnRequestSchema = z.object({
   text: z.string().min(1),
   attachments: z.array(AttachmentSchema).optional(),
+  terminalContexts: z.array(TerminalContextChipSchema).max(12).optional(),
   harnessId: z.string().min(1).optional(),
   model: z.string().nullable().optional(),
   turnOptions: TurnOptionsMapSchema.optional(),
@@ -413,6 +416,25 @@ export const WsClientFrameSchema = z.discriminatedUnion('op', [
     toolCallId: z.string(),
   }),
   z.object({
+    op: z.literal('subscribe_terminal'),
+    terminalId: z.string().min(1),
+  }),
+  z.object({
+    op: z.literal('unsubscribe_terminal'),
+    terminalId: z.string().min(1),
+  }),
+  z.object({
+    op: z.literal('terminal_input'),
+    terminalId: z.string().min(1),
+    data: z.string(),
+  }),
+  z.object({
+    op: z.literal('terminal_resize'),
+    terminalId: z.string().min(1),
+    cols: z.number().int().min(10).max(500),
+    rows: z.number().int().min(4).max(200),
+  }),
+  z.object({
     op: z.literal('ping'),
     ts: z.number().optional(),
   }),
@@ -465,6 +487,20 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
     snapshot: z.boolean().optional(),
     done: z.boolean().optional(),
     timestamp: z.number(),
+  }),
+  z.object({
+    op: z.literal('terminal_output'),
+    terminalId: z.string(),
+    chunk: z.string(),
+    snapshot: z.boolean().optional(),
+    truncated: z.boolean().optional(),
+    ringBufferBytes: z.number().int().nonnegative().optional(),
+    timestamp: z.number(),
+  }),
+  z.object({
+    op: z.literal('terminal_status'),
+    terminal: ManagedTerminalTabSchema,
+    event: z.enum(['opened', 'updated', 'exited', 'restarted', 'closed']),
   }),
   z.object({ op: z.literal('plugins_changed') }),
   z.object({
@@ -537,3 +573,34 @@ export const UpdateCompressionConfigRequestSchema = z.object({
   symbolOutlineMaxChars: z.number().int().min(500).max(20_000).optional(),
 });
 export type UpdateCompressionConfigRequest = z.infer<typeof UpdateCompressionConfigRequestSchema>;
+
+// ── Integrated PTY Terminal & Context Chips REST Schemas ──────────────
+
+export const OpenTerminalRequestSchema = z.object({
+  cwd: z.string().trim().min(1).optional(),
+  title: z.string().trim().min(1).max(80).optional(),
+  cols: z.number().int().min(10).max(500).optional(),
+  rows: z.number().int().min(4).max(200).optional(),
+  initialCommand: z.string().max(4_000).optional(),
+  sessionId: z.string().min(1).optional(),
+});
+export type OpenTerminalRequest = z.infer<typeof OpenTerminalRequestSchema>;
+
+export const TerminalInputRequestSchema = z.object({
+  data: z.string().max(65_536),
+});
+export type TerminalInputRequest = z.infer<typeof TerminalInputRequestSchema>;
+
+export const CreateTerminalContextChipRequestSchema = z.object({
+  lineStart: z.number().int().positive().optional(),
+  lineEnd: z.number().int().positive().optional(),
+  recentLines: z.number().int().min(1).max(500).optional(),
+  selectedText: z.string().max(200_000).optional(),
+  sessionId: z.string().min(1).optional(),
+});
+export type CreateTerminalContextChipRequest = z.infer<typeof CreateTerminalContextChipRequestSchema>;
+
+export const ReleaseTerminalsPathRequestSchema = z.object({
+  targetPath: z.string().trim().min(1),
+});
+export type ReleaseTerminalsPathRequest = z.infer<typeof ReleaseTerminalsPathRequestSchema>;

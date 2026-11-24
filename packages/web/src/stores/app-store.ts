@@ -26,10 +26,12 @@ import type {
   ImportNativeSessionRequest,
   ImportSessionBundleRequest,
   InstallPluginRequest,
+  ManagedTerminalTab,
   McpServerEntry,
   MergeBackRequest,
   MergeBackResult,
   MergeSubagentRequest,
+  OpenTerminalRequest,
   OrchestratorBoardResponse,
   PluginCatalogItem,
   PluginMcpPreset,
@@ -46,6 +48,7 @@ import type {
   SubagentMergeBackResult,
   SubagentRunRecord,
   SwitchHarnessRequest,
+  TerminalContextChip,
   ToggleMcpServerRequest,
   TurnBlockRecord,
   TurnOptionValue,
@@ -153,6 +156,10 @@ interface AppState {
   contextPreviewBySession: Record<string, ContextPreview | null>;
   draftTextBySession: Record<string, string>;
   draftAttachmentsBySession: Record<string, Attachment[]>;
+  pendingTerminalChipsBySession: Record<string, TerminalContextChip[]>;
+  terminalsByWorkspace: Record<string, ManagedTerminalTab[]>;
+  terminalPtyAvailable: boolean;
+  terminalOutputById: Record<string, { text: string; truncated: boolean; ringBufferBytes: number; updatedAt: number }>;
   toasts: ToastNotice[];
 
   // Actions
@@ -172,6 +179,23 @@ interface AppState {
   addDraftAttachment: (sessionId: string, att: Attachment) => void;
   removeDraftAttachment: (sessionId: string, attId: string) => void;
   clearDraft: (sessionId: string) => void;
+
+  // Integrated PTY Terminal Workspace & Context Chips
+  subscribeTerminalOutput: (terminalId: string) => () => void;
+  refreshWorkspaceTerminals: (workspaceId: string, cwd?: string) => Promise<void>;
+  openWorkspaceTerminal: (workspaceId: string, req?: OpenTerminalRequest) => Promise<ManagedTerminalTab | null>;
+  closeTerminal: (workspaceId: string, terminalId: string) => Promise<void>;
+  restartTerminal: (terminalId: string) => Promise<ManagedTerminalTab | null>;
+  interruptTerminal: (terminalId: string) => Promise<void>;
+  sendTerminalInput: (terminalId: string, data: string) => Promise<void>;
+  attachTerminalContextChip: (
+    sessionId: string,
+    terminalId: string,
+    req?: { lineStart?: number; lineEnd?: number; recentLines?: number; selectedText?: string },
+  ) => Promise<TerminalContextChip | null>;
+  addPendingTerminalChip: (sessionId: string, chip: TerminalContextChip) => void;
+  removePendingTerminalChip: (sessionId: string, chipId: string) => void;
+  clearPendingTerminalChips: (sessionId: string) => void;
 
   isPluginEnabled: (pluginId: string) => boolean;
 
@@ -223,6 +247,7 @@ interface AppState {
       literalText?: boolean;
       mode?: 'plugin_development';
       turnOptions?: TurnOptionsMap;
+      terminalContexts?: TerminalContextChip[];
     },
   ) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
@@ -281,6 +306,7 @@ interface AppState {
 
 let wsClient: DaemonWsClient | null = null;
 const commandOutputRefCounts = new Map<string, number>();
+const terminalOutputRefCounts = new Map<string, number>();
 
 function contiguousCursor(events: CanonicalEvent[]): number {
   let seq = 0;
@@ -541,6 +567,10 @@ export const useAppStore = create<AppState>((set, get) => {
     contextPreviewBySession: {},
     draftTextBySession: {},
     draftAttachmentsBySession: {},
+    pendingTerminalChipsBySession: {},
+    terminalsByWorkspace: {},
+    terminalPtyAvailable: false,
+    terminalOutputById: {},
     toasts: [],
 
     init: async () => {
@@ -574,6 +604,50 @@ export const useAppStore = create<AppState>((set, get) => {
                       done: Boolean(frame.done || prev?.done),
                       updatedAt: frame.timestamp,
                     },
+                  },
+                };
+              });
+            } else if (frame.op === 'terminal_output') {
+              set((state) => {
+                const prev = state.terminalOutputById[frame.terminalId];
+                const nextText = frame.snapshot
+                  ? frame.chunk
+                  : `${prev?.text ?? ''}${frame.chunk}`.slice(-524_288);
+                return {
+                  terminalOutputById: {
+                    ...state.terminalOutputById,
+                    [frame.terminalId]: {
+                      text: nextText,
+                      truncated: Boolean(frame.truncated || prev?.truncated),
+                      ringBufferBytes: frame.ringBufferBytes ?? prev?.ringBufferBytes ?? nextText.length,
+                      updatedAt: frame.timestamp,
+                    },
+                  },
+                };
+              });
+            } else if (frame.op === 'terminal_status') {
+              const term = frame.terminal;
+              set((state) => {
+                const existing = state.terminalsByWorkspace[term.workspaceId] ?? [];
+                if (frame.event === 'closed') {
+                  const nextOutput = { ...state.terminalOutputById };
+                  delete nextOutput[term.terminalId];
+                  return {
+                    terminalsByWorkspace: {
+                      ...state.terminalsByWorkspace,
+                      [term.workspaceId]: existing.filter((t) => t.terminalId !== term.terminalId),
+                    },
+                    terminalOutputById: nextOutput,
+                  };
+                }
+                const nextList = [
+                  ...existing.filter((t) => t.terminalId !== term.terminalId),
+                  term,
+                ].sort((a, b) => a.createdAt - b.createdAt);
+                return {
+                  terminalsByWorkspace: {
+                    ...state.terminalsByWorkspace,
+                    [term.workspaceId]: nextList,
                   },
                 };
               });
@@ -644,6 +718,198 @@ export const useAppStore = create<AppState>((set, get) => {
       set((s) => ({
         draftTextBySession: { ...s.draftTextBySession, [sessionId]: '' },
         draftAttachmentsBySession: { ...s.draftAttachmentsBySession, [sessionId]: [] },
+        pendingTerminalChipsBySession: { ...s.pendingTerminalChipsBySession, [sessionId]: [] },
+      })),
+
+    subscribeTerminalOutput: (terminalId) => {
+      const prev = terminalOutputRefCounts.get(terminalId) ?? 0;
+      terminalOutputRefCounts.set(terminalId, prev + 1);
+      if (prev === 0) {
+        wsClient?.subscribeTerminal(terminalId);
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const count = (terminalOutputRefCounts.get(terminalId) ?? 1) - 1;
+        if (count <= 0) {
+          terminalOutputRefCounts.delete(terminalId);
+          wsClient?.unsubscribeTerminal(terminalId);
+        } else {
+          terminalOutputRefCounts.set(terminalId, count);
+        }
+      };
+    },
+
+    refreshWorkspaceTerminals: async (workspaceId, cwd) => {
+      try {
+        const res = await daemonApi.listWorkspaceTerminals(workspaceId, cwd);
+        set((state) => ({
+          terminalPtyAvailable: res.ptyAvailable,
+          terminalsByWorkspace: {
+            ...state.terminalsByWorkspace,
+            [workspaceId]: res.terminals,
+          },
+        }));
+      } catch {
+        // ignore if workspace unavailable
+      }
+    },
+
+    openWorkspaceTerminal: async (workspaceId, req) => {
+      try {
+        const res = await daemonApi.openWorkspaceTerminal(workspaceId, req);
+        set((state) => {
+          const existing = state.terminalsByWorkspace[workspaceId] ?? [];
+          return {
+            terminalsByWorkspace: {
+              ...state.terminalsByWorkspace,
+              [workspaceId]: [...existing.filter((t) => t.terminalId !== res.terminal.terminalId), res.terminal],
+            },
+            terminalOutputById: {
+              ...state.terminalOutputById,
+              [res.terminal.terminalId]: {
+                text: res.snapshot,
+                truncated: false,
+                ringBufferBytes: res.terminal.ringBufferBytes ?? 0,
+                updatedAt: Date.now(),
+              },
+            },
+          };
+        });
+        return res.terminal;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '启动工作区终端失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    closeTerminal: async (workspaceId, terminalId) => {
+      try {
+        await daemonApi.closeTerminal(terminalId);
+        set((state) => {
+          const nextOutput = { ...state.terminalOutputById };
+          delete nextOutput[terminalId];
+          return {
+            terminalsByWorkspace: {
+              ...state.terminalsByWorkspace,
+              [workspaceId]: (state.terminalsByWorkspace[workspaceId] ?? []).filter(
+                (t) => t.terminalId !== terminalId,
+              ),
+            },
+            terminalOutputById: nextOutput,
+          };
+        });
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '关闭终端失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+
+    restartTerminal: async (terminalId) => {
+      try {
+        const { terminal } = await daemonApi.restartTerminal(terminalId);
+        set((state) => ({
+          terminalsByWorkspace: {
+            ...state.terminalsByWorkspace,
+            [terminal.workspaceId]: (state.terminalsByWorkspace[terminal.workspaceId] ?? []).map((t) =>
+              t.terminalId === terminal.terminalId ? terminal : t,
+            ),
+          },
+        }));
+        return terminal;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '重启终端失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    interruptTerminal: async (terminalId) => {
+      try {
+        await daemonApi.interruptTerminal(terminalId);
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '中断终端命令失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+
+    sendTerminalInput: async (terminalId, data) => {
+      if (wsClient?.sendTerminalInput(terminalId, data)) return;
+      try {
+        await daemonApi.sendTerminalInput(terminalId, data);
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '终端输入发送失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+
+    attachTerminalContextChip: async (sessionId, terminalId, req) => {
+      try {
+        const { chip } = await daemonApi.createTerminalContextChip(terminalId, {
+          ...req,
+          sessionId,
+        });
+        get().addPendingTerminalChip(sessionId, chip);
+        get().pushToast({
+          kind: 'success',
+          title: `已附加 ${chip.terminalTitle} (lines ${chip.lineStart}–${chip.lineEnd})`,
+        });
+        return chip;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '提取终端上下文失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    addPendingTerminalChip: (sessionId, chip) =>
+      set((state) => {
+        const curr = state.pendingTerminalChipsBySession[sessionId] ?? [];
+        if (curr.some((item) => item.id === chip.id)) return state;
+        return {
+          pendingTerminalChipsBySession: {
+            ...state.pendingTerminalChipsBySession,
+            [sessionId]: [...curr.slice(-11), chip],
+          },
+        };
+      }),
+
+    removePendingTerminalChip: (sessionId, chipId) =>
+      set((state) => ({
+        pendingTerminalChipsBySession: {
+          ...state.pendingTerminalChipsBySession,
+          [sessionId]: (state.pendingTerminalChipsBySession[sessionId] ?? []).filter(
+            (item) => item.id !== chipId,
+          ),
+        },
+      })),
+
+    clearPendingTerminalChips: (sessionId) =>
+      set((state) => ({
+        pendingTerminalChipsBySession: {
+          ...state.pendingTerminalChipsBySession,
+          [sessionId]: [],
+        },
       })),
 
     isPluginEnabled: (pluginId) => {
@@ -1182,6 +1448,11 @@ export const useAppStore = create<AppState>((set, get) => {
           sessions: state.sessions.map((s) => (s.id === sessionId ? session : s)),
         }));
       } catch (err) {
+        if (options?.terminalContexts?.length) {
+          for (const chip of options.terminalContexts) {
+            get().addPendingTerminalChip(sessionId, chip);
+          }
+        }
         get().pushToast({
           kind: 'error',
           title: '发送失败',
