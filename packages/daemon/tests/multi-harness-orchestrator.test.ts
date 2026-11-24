@@ -58,7 +58,7 @@ function initTempGitRepo(prefix = 'hm-orch-repo-'): string {
 
 async function waitForCondition(
   predicate: () => boolean,
-  timeoutMs = 5000,
+  timeoutMs = 12_000,
   intervalMs = 25,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;

@@ -150,18 +150,26 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   plugins.set('core.task-ledger', {
     provides: ['ledger'],
     apply(ctx) {
+      let disposed = false;
+      ctx.effect(() => () => {
+        disposed = true;
+      });
       const ledger = new TaskLedgerService(store, (cwd) => ctx.get<GitService>('git')?.status(cwd));
       ctx.provide('ledger', ledger);
       ctx.on('session.created', ({ sessionId }) => {
+        if (disposed || !store.isOpen()) return;
         const session = sessionId && store.getSession(sessionId);
         if (session) ledger.syncSession(session);
       });
       const refresh = async ({ sessionId, turnId, data }: PluginEventV4<'turn.completed' | 'turn.failed'>) => {
+        if (disposed || !store.isOpen()) return;
         if (data.maintenance || !sessionId || !turnId) return;
         const session = store.getSession(sessionId);
-        if (!session) return;
+        if (!session || disposed || !store.isOpen()) return;
         const events = store.getEventsAfter(sessionId, Math.max(0, session.lastSeq - 250), 300);
-        ledgerUpdated(await ledger.ingestTurnEvents(session, turnId, data.harnessId ?? session.harnessId, events));
+        const updated = await ledger.ingestTurnEvents(session, turnId, data.harnessId ?? session.harnessId, events);
+        if (disposed || !store.isOpen()) return;
+        ledgerUpdated(updated);
       };
       ctx.on('turn.completed', refresh);
       ctx.on('turn.failed', refresh);

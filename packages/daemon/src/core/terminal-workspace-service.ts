@@ -351,7 +351,17 @@ export function tryLoadNodePty(): NodePtyModule | null {
   if (cachedPtyProbe.checked) return cachedPtyProbe.mod;
   cachedPtyProbe.checked = true;
   try {
-    const req = createRequire(import.meta.url);
+    const requireAnchor =
+      typeof import.meta?.url === 'string' && import.meta.url
+        ? import.meta.url
+        : typeof __filename === 'string'
+          ? __filename
+          : null;
+    if (!requireAnchor) {
+      cachedPtyProbe.mod = null;
+      return null;
+    }
+    const req = createRequire(requireAnchor);
     const dynamicSpecifier = ['node', 'pty'].join('-');
     const loaded = req(dynamicSpecifier) as Partial<NodePtyModule> | undefined;
     if (loaded && typeof loaded.spawn === 'function') {

@@ -38,6 +38,28 @@ await esbuild.build({
   logLevel: 'info',
 });
 
+// 1b. Stage AI Plugin Builder v2 runtime assets alongside daemon.cjs
+const builderContextSrc = path.join(repoDesktopRoot, 'docs/plugin-api/ai-builder-context.md');
+if (fs.existsSync(builderContextSrc)) {
+  fs.copyFileSync(builderContextSrc, path.join(daemonOutDir, 'ai-builder-context.md'));
+}
+
+const sdkTestingSrc = path.join(repoDesktopRoot, 'packages/plugin-sdk/dist/testing.js');
+if (fs.existsSync(sdkTestingSrc)) {
+  await esbuild.build({
+    entryPoints: [sdkTestingSrc],
+    bundle: true,
+    platform: 'node',
+    target: 'node22',
+    format: 'esm',
+    outfile: path.join(daemonOutDir, 'plugin-sdk-testing.mjs'),
+    external: ['node:*'],
+    sourcemap: false,
+    minify: false,
+    logLevel: 'info',
+  });
+}
+
 // 2. Copy built React frontend assets into resources/web-dist
 const webDistSrc = path.join(repoDesktopRoot, 'packages/web/dist');
 if (!fs.existsSync(webDistSrc)) {

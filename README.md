@@ -1,12 +1,17 @@
 # HarnessMate Desktop
 
-统一管理本机 `Codex CLI`、`Antigravity CLI (agy)`、`Claude Code CLI` 及 ACP 兼容 CLI 的桌面控制台。支持共享会话中的跨引擎接力，并通过 `HM-Remote v1` 提供远程会话和跨端审批。
+开放式、插件驱动的多 AI Coding Harness 桌面工作台。统一管理多实例 `Codex CLI`、`Antigravity CLI (agy)`、`Claude Code CLI`、ACP 兼容 CLI 与隔离第三方引擎插件（如 `plugins/hm-adapter-deepseek`、`plugins/hm-adapter-opencode`），支持无损跨引擎上下文接力、多引擎并行编排、`HM-Remote v1` 移动远程控制，以及内置 AI Plugin Builder v2。
 
 ## 核心特性
 
-- **共享会话与上下文接力**。统一保存已接收的会话事件和任务账本。切换引擎时，按上下文预算传入任务状态、近期对话和更早的摘要。历史可在对话里查看或导出。
-- **结构化任务状态账本**：自动沉淀任务目标、步骤清单、修改文件、验证结果与钉选铁律，并同步落盘 `.harnessmate/task-ledger.md`。
-- **模块化插件微内核**：内置引擎插件、图片/文件上下文、跨 CLI MCP 统一管理中心、多账号配额看板、Git Diff/Worktree 检视、限额一键 Failover 等模块，支持目录安装与自定义扩展。
+- **统一多实例 Harness 架构**：通过 `HarnessDriverV2` 三层能力声明、动态 `OptionDescriptor`、被动零副作用探活与环境变量/目录隔离（`CODEX_HOME` / `CLAUDE_CONFIG_DIR`），允许通过 Plugin SDK V5 接入任意第三方非 ACP 引擎而无需修改主程序前后端源码。
+- **Context Handoff Protocol v2 & 结构化任务账本**：自动沉淀任务目标、步骤清单、修改文件、验证结果、钉选铁律与 `failedAttempts`（同步落盘 `.harnessmate/task-ledger.md`）；支持敏感信息出站脱敏、`delivery_status = 'pending'` 崩溃防重入守卫、小窗口预算溢出自动开新线程，以及内置 MCP `hm_session_read` 按需分页回查。
+- **Plugin SDK V5 & AI Plugin Builder v2**：在兼容 V1–V4 的基础上提供 `registerDriver`、`spawnCli`、`net.openStream`、`secrets.resolve`、DAG 环检测与 V5 5 个前端 UI 插槽（`chat.block`、`composer.traits`、`harness.settings`、`inspector.diff`、`session.sidebar.badge`），并配套 `@harnessmate/plugin-sdk/testing` 离线回放测试库、`harness-adapter` 黄金模板、静态安全审计器，以及 Tier 1 快速清单 / Tier 2 隔离工程 4 步沙箱验证与 3 轮自修复闭环。
+- **核心内置与高阶可选插件体系**：
+  - **Git Checkpoints & Diff/Worktree**（`hm.plugin.git-checkpoints`）：隐藏 Git Ref 每轮零污染快照、原子级“先撤对话、后还文件”回滚守卫、`pre_revert` 撤销备份、Unified/Split 按需 Diff、Worktree 全生命周期与 `.harnessmate/setup` SHA-256 信任门禁。
+  - **Session Explorer & Approval Center**（`hm.plugin.session-explorer`、`hm.plugin.approval-center`）：SQLite FTS5 全局检索、zstd 流式外部 CLI 历史导入、原生/便携 Fork 与 `merge_back`、Side Chat、脱敏 Bundle 导入导出，以及带高危命令分级标注、跨端 409 原子锁和 `secret_request` 零落盘通道的全局审批中心。
+  - **Message Studio & Multi-Instance Usage/Failover**（`hm.plugin.message-studio`、`hm.plugin.usage-failover`）：交错时间线 `TurnBlock` + 可折叠 `WorkGroup`、侧信道按需流式输出、双隔离 `html_render` 沙箱卡、动态 `TraitsPicker`、上下文窗口与 Prompt Cache 仪表，以及限额触发一键 Failover。
+  - **多 Harness 并行编排、智能上下文压缩、持久终端与 Triage收件箱（按需启用）**：场景 D 并行委托 + 强制 Worktree 隔离与 `dryRunMerge` 合回（`hm.plugin.multi-harness-orchestrator`）、多语言符号轮廓索引与 8 秒无感回退滚动摘要（`hm.plugin.context-compression`）、零 SQLite 污染 512KB 环形持久终端 + `TerminalContextInlineChip`（`hm.plugin.terminal-workspace`）、4 级 Triage 待办与中文 IME 免疫的 `Ctrl/Cmd+K` 全局命令面板（`hm.plugin.triage-inbox`）。
 - **Star Loom Atelier 界面 & `HM-Remote v1`**：夜织深空 / 暖宣浅色双主题、扫码配对移动端、局域网/Tailscale 远程控制与原子跨端审批。
 
 ## 对话命令与历史导入
@@ -41,10 +46,12 @@ AGY 的额度、压缩和目标等命令通过其 CLI 入口执行。导入的 A
 
 ## 架构概览
 
-- `packages/protocol`: 统一规范事件模型（`CanonicalEvent`）、任务账本/上下文预览契约与 `HM-Remote v1` REST/WebSocket 协议定义。
-- `packages/daemon`: 独立 Node.js 24 守护服务（`node:sqlite` WAL 事件日志 + 三大 CLI 结构化双向适配器 + ContextCompiler + TaskLedgerService + `HM-Remote v1` 网关）。
-- `packages/web`: React 19 + Tailwind v4 **Star Loom Atelier** 统一对话前端。
-- `packages/electron`: 轻量桌面壳（自动托管本地 Daemon、关闭隐藏到系统托盘保活、系统审批通知与原生目录选择器）。
+- `packages/protocol`: 统一规范事件模型（`CanonicalEvent`、`TurnBlock`）、多 Harness / 插件 / 并行编排契约与 `HM-Remote v1` REST/WebSocket 协议定义。
+- `packages/plugin-api` & `packages/plugin-sdk`: Plugin SDK V4/V5 公共契约、`@harnessmate/plugin-sdk/testing` 离线测试夹具库与 5 套黄金脚手架模板（含 `harness-adapter`）。
+- `packages/daemon`: 独立 Node.js 24 守护服务（`node:sqlite` WAL + FTS5 混合投影、`CommandOutputHub`、结构化适配器、ContextCompiler、CheckpointService、SessionExplorer、ApprovalCenter、OrchestratorService、AI Plugin Builder v2 与 `HM-Remote v1` 网关）。
+- `packages/web`: React 19 + Tailwind v4 **Star Loom Atelier** 零硬编码统一前端与 V5 沙箱插槽宿主。
+- `packages/electron`: 轻量桌面壳（自动托管本地 Daemon、关闭隐藏到系统托盘保活、系统审批通知与便携 `.exe` 打包）。
+- `plugins/`: 官方外部隔离非 ACP 适配器标杆（`hm-adapter-deepseek`、`hm-adapter-opencode`）。
 
 ## 快速启动
 

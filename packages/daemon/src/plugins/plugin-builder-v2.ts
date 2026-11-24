@@ -30,10 +30,37 @@ import { buildSandboxedPluginHtml } from './plugin-ui.js';
 
 const execFileAsync = promisify(execFile);
 
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+function resolveModuleDir(): string {
+  try {
+    if (typeof import.meta?.url === 'string' && import.meta.url) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+    // fallback for CommonJS bundle (daemon.cjs)
+  }
+  return typeof __dirname === 'string' ? __dirname : process.cwd();
+}
+
+const MODULE_DIR = resolveModuleDir();
 const REPO_ROOT = path.resolve(MODULE_DIR, '../../../..');
-const DEFAULT_CONTEXT_DOC_PATH = path.join(REPO_ROOT, 'docs', 'plugin-api', 'ai-builder-context.md');
-const SDK_TESTING_ENTRY = path.join(REPO_ROOT, 'packages', 'plugin-sdk', 'dist', 'testing.js');
+
+function resolveDefaultContextDocPath(): string {
+  const candidates = [
+    path.join(REPO_ROOT, 'docs', 'plugin-api', 'ai-builder-context.md'),
+    path.join(MODULE_DIR, 'ai-builder-context.md'),
+  ];
+  return candidates.find((p) => fs.existsSync(p)) ?? candidates[0]!;
+}
+
+function resolveSdkTestingEntry(): string | null {
+  const candidates = [
+    path.join(REPO_ROOT, 'packages', 'plugin-sdk', 'dist', 'testing.js'),
+    path.join(MODULE_DIR, 'plugin-sdk-testing.mjs'),
+  ];
+  return candidates.find((p) => fs.existsSync(p)) ?? null;
+}
+
+const DEFAULT_CONTEXT_DOC_PATH = resolveDefaultContextDocPath();
 
 const FALLBACK_CONTEXT_SUMMARY = [
   '# HarnessMate Plugin SDK Summary',
@@ -641,16 +668,23 @@ export class PluginBuilderV2 {
     tools: string[];
     services: string[];
   }> {
-    if (!fs.existsSync(SDK_TESTING_ENTRY)) {
-      throw new Error(`Missing built @harnessmate/plugin-sdk testing entry at ${SDK_TESTING_ENTRY}`);
+    const sdkTestingEntry = resolveSdkTestingEntry();
+    if (!sdkTestingEntry) {
+      throw new Error(
+        `Missing built @harnessmate/plugin-sdk testing entry (checked ${path.join(REPO_ROOT, 'packages', 'plugin-sdk', 'dist', 'testing.js')} and ${path.join(MODULE_DIR, 'plugin-sdk-testing.mjs')})`,
+      );
     }
 
-    const fsReadAllow = [
-      attemptDir,
+    const fsReadAllow = [attemptDir, path.dirname(sdkTestingEntry)];
+    for (const extraDir of [
       path.join(REPO_ROOT, 'packages'),
       path.join(REPO_ROOT, 'node_modules'),
-    ];
-    if (fs.existsSync(workspaceRoot)) {
+    ]) {
+      if (fs.existsSync(extraDir) && !fsReadAllow.includes(extraDir)) {
+        fsReadAllow.push(extraDir);
+      }
+    }
+    if (fs.existsSync(workspaceRoot) && !fsReadAllow.includes(workspaceRoot)) {
       fsReadAllow.push(workspaceRoot);
     }
 
@@ -713,7 +747,7 @@ export class PluginBuilderV2 {
 
       child.stdin.write(
         JSON.stringify({
-          testingUrl: pathToFileURL(SDK_TESTING_ENTRY).href,
+          testingUrl: pathToFileURL(sdkTestingEntry).href,
           entryUrl: pathToFileURL(entryFull).href,
           pluginId,
           permissions,

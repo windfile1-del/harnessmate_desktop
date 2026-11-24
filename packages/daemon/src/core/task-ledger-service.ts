@@ -202,6 +202,23 @@ export class TaskLedgerService {
     turnHarnessId: string,
     turnEvents: CanonicalEvent[],
   ): Promise<SessionTaskState> {
+    if (!this.store.isOpen()) {
+      return {
+        sessionId: session.id,
+        objective: session.title,
+        steps: [],
+        decisions: [],
+        touchedFiles: [],
+        verifications: [],
+        blockers: [],
+        pinnedFacts: [],
+        rollingSummary: '',
+        summarizedUpToSeq: 0,
+        version: 1,
+        ledgerFilePath: null,
+        updatedAt: Date.now(),
+      };
+    }
     const current = this.getOrCreate(session);
     let objective = current.objective;
     const steps = [...current.steps];
@@ -384,11 +401,17 @@ export class TaskLedgerService {
       updatedAt: Date.now(),
     };
 
+    if (!this.store.isOpen()) {
+      return next;
+    }
     const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
     if (ledgerFilePath) {
       mergedState.ledgerFilePath = ledgerFilePath;
     }
 
+    if (!this.store.isOpen()) {
+      return mergedState;
+    }
     return this.store.upsertTaskState(mergedState);
   }
 

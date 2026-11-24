@@ -216,6 +216,7 @@ export interface LocalInstanceUsageAggregate extends LocalHarnessUsageAggregate 
 
 export class HarnessMateStore {
   private readonly db: DatabaseSync;
+  private closed = false;
 
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
@@ -674,7 +675,13 @@ export class HarnessMateStore {
     }
   }
 
+  isOpen(): boolean {
+    return !this.closed;
+  }
+
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 
