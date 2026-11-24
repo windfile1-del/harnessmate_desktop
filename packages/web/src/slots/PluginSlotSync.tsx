@@ -12,6 +12,13 @@ import {
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
 import { RuntimeRequestReceiptBlock } from '../components/ApprovalCenter';
+import {
+  AgyArtifactReviewPanel,
+  AgyEcosystemPanel,
+} from '../components/agy/AgyArtifactReviewPanel';
+import { AgyComposerControls } from '../components/agy/AgyComposerControls';
+import { AgySettingsSlot } from '../components/agy/AgySettingsSlot';
+import { AgyStudioBlockCard } from '../components/agy/AgyStudioBlocks';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
@@ -574,6 +581,111 @@ export function PluginSlotSync() {
           order: 100,
           sourceKind: 'builtin',
           render: ({ session }) => <TerminalStatusbarBadge session={session} />,
+        }),
+      );
+    }
+
+    // Built-in V5 Antigravity Native Experience & Account Isolation slots
+    const agyHarnessPlugin = plugins.find((p) => p.id === 'core.harness.agy');
+    if (!agyHarnessPlugin || isPluginActive(agyHarnessPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'harness.settings',
+          id: 'agy-account-settings',
+          pluginId: 'core.harness.agy',
+          pluginName: 'Antigravity (AGY)',
+          title: 'AGY 多账号隔离与官方认证',
+          key: 'agy',
+          order: 50,
+          sourceKind: 'builtin',
+          render: ({ harness, onRefresh }) => <AgySettingsSlot harness={harness} onRefresh={onRefresh} />,
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'composer.actions',
+          id: 'agy-composer-controls',
+          pluginId: 'core.harness.agy',
+          pluginName: 'Antigravity (AGY)',
+          title: 'AGY 原生控制条与手动切换',
+          order: 60,
+          sourceKind: 'builtin',
+          render: ({ session, isRunning }) => (
+            <AgyComposerControls session={session} isRunning={isRunning} />
+          ),
+        }),
+      );
+
+      const agyBlockSpecs: ReadonlyArray<{
+        id: string;
+        key:
+          | 'ext:agy.plan'
+          | 'ext:agy.subagent_batch'
+          | 'ext:agy.background_task'
+          | 'ext:agy.artifact_card'
+          | 'ext:agy.goal_status';
+        title: string;
+      }> = [
+        { id: 'agy-block-plan', key: 'ext:agy.plan', title: 'AGY Plan 卡片' },
+        { id: 'agy-block-subagent', key: 'ext:agy.subagent_batch', title: 'AGY 子 Agent 批次卡' },
+        { id: 'agy-block-background', key: 'ext:agy.background_task', title: 'AGY 后台任务卡' },
+        { id: 'agy-block-artifact', key: 'ext:agy.artifact_card', title: 'AGY Artifact 摘要卡' },
+        { id: 'agy-block-goal', key: 'ext:agy.goal_status', title: 'AGY Goal 状态卡' },
+      ];
+
+      for (const spec of agyBlockSpecs) {
+        disposers.push(
+          registry.register({
+            slot: 'chat.block',
+            id: spec.id,
+            pluginId: 'core.harness.agy',
+            pluginName: 'Antigravity (AGY)',
+            title: spec.title,
+            key: spec.key,
+            order: 95,
+            sourceKind: 'builtin',
+            render: ({ session, block }) => {
+              if (
+                block.type !== 'ext:agy.plan' &&
+                block.type !== 'ext:agy.subagent_batch' &&
+                block.type !== 'ext:agy.background_task' &&
+                block.type !== 'ext:agy.artifact_card' &&
+                block.type !== 'ext:agy.goal_status'
+              ) {
+                return null;
+              }
+              return <AgyStudioBlockCard session={session} block={block} />;
+            },
+          }),
+        );
+      }
+
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'agy-artifacts',
+          pluginId: 'core.harness.agy',
+          pluginName: 'Antigravity (AGY)',
+          title: 'Artifact 审阅',
+          key: 'agy-artifacts',
+          order: 85,
+          sourceKind: 'builtin',
+          render: ({ session }) => <AgyArtifactReviewPanel session={session} />,
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'agy-ecosystem',
+          pluginId: 'core.harness.agy',
+          pluginName: 'Antigravity (AGY)',
+          title: 'AGY 生态边界',
+          key: 'agy-ecosystem',
+          order: 88,
+          sourceKind: 'builtin',
+          render: ({ session }) => <AgyEcosystemPanel session={session} />,
         }),
       );
     }

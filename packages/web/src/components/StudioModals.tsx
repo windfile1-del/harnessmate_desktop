@@ -1130,6 +1130,8 @@ export function McpHubModal({ onClose }: { onClose: () => void }) {
 export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
   const {
     harnesses,
+    selectedSessionId,
+    switchHarness,
     accountUsage,
     usageLoading,
     failoverPolicy,
@@ -1403,6 +1405,25 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
 
                 {acc.error && (
                   <div className="text-[11px] text-[var(--accent-rose)]">{acc.error}</div>
+                )}
+                {(acc.driverId === 'agy' || acc.harnessKind === 'agy') && (
+                  <div className="mt-1 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--border-subtle)] pt-1.5 text-[11px] text-[var(--text-muted)]">
+                    <span>多 AGY Google 账号禁止自动额度轮换，仅支持手动一键切换。</span>
+                    {selectedSessionId && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void switchHarness(selectedSessionId, {
+                            targetHarnessId: acc.instanceId ?? acc.harnessId,
+                          });
+                          onClose();
+                        }}
+                        className="rounded border border-[var(--border-subtle)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                      >
+                        手动切换至该账号
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             );

@@ -1,9 +1,12 @@
 import type {
   AddMcpServerRequest,
   AddTrustedPublisherRequest,
+  AgyAuthState,
+  AgyProfileConfig,
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
+  UpsertAgyInstanceRequest,
   BuilderV2AuditRequest,
   BuilderV2GenerateRequest,
   BuilderV2InstallRequest,
@@ -1187,7 +1190,133 @@ export const daemonApi = {
       method: 'PUT',
       body: JSON.stringify(patch),
     }),
+
+  // ── Phase AGY: Native Account Isolation, Auth, Subagents, Artifacts & Ecosystem ──
+
+  listAgyInstances: () =>
+    apiFetch<{ instances: AgyInstanceEntryDto[] }>('/api/v1/harnesses/agy/instances'),
+
+  upsertAgyInstance: (req: Partial<UpsertAgyInstanceRequest> & { instanceId: string; displayName: string }) =>
+    apiFetch<{ profile: AgyProfileConfig; authState: AgyAuthState; harnesses: HarnessInfo[] }>(
+      '/api/v1/harnesses/agy/instances',
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  deleteAgyInstance: (id: string, purgeData = false) =>
+    apiFetch<{ deleted: boolean; instanceId: string; harnesses: HarnessInfo[] }>(
+      `/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}${purgeData ? '?purgeData=1' : ''}`,
+      { method: 'DELETE' },
+    ),
+
+  getAgyAuthState: (id: string) =>
+    apiFetch<{ state: AgyAuthState }>(`/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}/auth/state`),
+
+  startAgyLogin: (id: string) =>
+    apiFetch<{ state: AgyAuthState }>(`/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}/auth/start`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  respondAgyLogin: (id: string, flowId: string, codeOrUrl: string) =>
+    apiFetch<{ state: AgyAuthState; harnesses: HarnessInfo[] }>(
+      `/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}/auth/respond`,
+      { method: 'POST', body: JSON.stringify({ flowId, codeOrUrl }) },
+    ),
+
+  cancelAgyLogin: (id: string, flowId?: string) =>
+    apiFetch<{ state: AgyAuthState }>(
+      `/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}/auth/cancel`,
+      { method: 'POST', body: JSON.stringify(flowId ? { flowId } : {}) },
+    ),
+
+  logoutAgy: (id: string, confirmSharedKeyring?: boolean) =>
+    apiFetch<{ state: AgyAuthState; harnesses: HarnessInfo[] }>(
+      `/api/v1/harnesses/agy/instances/${encodeURIComponent(id)}/auth/logout`,
+      { method: 'POST', body: JSON.stringify(confirmSharedKeyring ? { confirmSharedKeyring } : {}) },
+    ),
+
+  listAgyArtifacts: (sessionId: string) =>
+    apiFetch<{ artifacts: AgyArtifactSummaryDto[] }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/agy/artifacts`,
+    ),
+
+  readAgyArtifact: (sessionId: string, name: string) =>
+    apiFetch<{ artifact: AgyArtifactContentDto }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/agy/artifacts/${encodeURIComponent(name)}`,
+    ),
+
+  getAgyEcosystem: (sessionId: string) =>
+    apiFetch<{ ecosystem: AgyEcosystemSnapshotDto }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/agy/ecosystem`,
+    ),
+
+  listAgySubagents: (sessionId: string) =>
+    apiFetch<{ subagents: AgySubagentRecordDto[] }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/agy/subagents`,
+    ),
+
+  readAgySubagent: (sessionId: string, subagentId: string) =>
+    apiFetch<{ subagent: AgySubagentDetailDto }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/agy/subagents/${encodeURIComponent(subagentId)}`,
+    ),
 };
+
+export interface AgyInstanceEntryDto {
+  profile: AgyProfileConfig;
+  authState: AgyAuthState;
+}
+
+export interface AgyArtifactSummaryDto {
+  name: string;
+  kind: 'markdown' | 'diff' | 'json' | 'text';
+  sizeBytes: number;
+  updatedAt: number;
+}
+
+export interface AgyArtifactContentDto extends AgyArtifactSummaryDto {
+  content: string;
+  truncated: boolean;
+}
+
+export interface AgySubagentRecordDto {
+  id: string;
+  role?: string;
+  typeName?: string;
+  status: string;
+  summary?: string;
+  updatedAt?: number;
+}
+
+export interface AgySubagentDetailDto extends AgySubagentRecordDto {
+  transcriptLines: string[];
+  rawText?: string;
+  truncated: boolean;
+}
+
+export interface AgyEcosystemSnapshotDto {
+  instanceId: string;
+  isolationMode: 'official_default' | 'profile_isolated';
+  geminiDir: string;
+  projects: { workspaceRoot: string; additionalDirectories: string[] };
+  rules: { profileFiles: string[]; workspaceRulesDirPresent: boolean };
+  skills: { profileSkillsLinked: boolean; workspaceSkillsCount: number };
+  mcp: {
+    nativeGlobalConfigPresent: boolean;
+    nativeGlobalConfigPath: string;
+    nativeScope: 'global_shared';
+    harnessMateSessionMcpScope: 'session_isolated';
+    note: string;
+  };
+  hooks: {
+    agyInternalHooksPresent: boolean;
+    agyInternalHooksScope: 'agy_internal';
+    harnessMateV5HooksCount: number;
+  };
+  plugins: {
+    agyPluginCliNote: string;
+    harnessMateActivePluginsCount: number;
+  };
+}
 
 export class DaemonWsClient {
   private ws: WebSocket | null = null;

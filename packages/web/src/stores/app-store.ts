@@ -1,5 +1,6 @@
 import type {
   AddMcpServerRequest,
+  AgyAuthState,
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
@@ -106,6 +107,7 @@ interface AppState {
   explorerInitialQuery: string;
 
   harnesses: HarnessInfo[];
+  agyAuthStates: Record<string, AgyAuthState>;
   workspaces: Workspace[];
   sessions: Session[];
   pendingApprovals: ApprovalRequest[];
@@ -420,6 +422,14 @@ export const useAppStore = create<AppState>((set, get) => {
             typeof event.payload.reason === 'string' && event.payload.reroutedFrom
               ? event.payload.reason
               : null;
+        } else if (event.type === 'session.config_confirmed') {
+          if (typeof event.payload.model === 'string') {
+            actualModel = event.payload.thoughtLevel
+              ? `${event.payload.model} (${String(event.payload.thoughtLevel)})`
+              : event.payload.model;
+          }
+        } else if (event.type === 'session.title_updated' && typeof event.payload.title === 'string') {
+          s = { ...s, title: event.payload.title };
         } else if (event.type === 'approval.requested') {
           pendingApprovalCount += 1;
           status = 'awaiting_approval';
@@ -598,6 +608,7 @@ export const useAppStore = create<AppState>((set, get) => {
     terminalsByWorkspace: {},
     terminalPtyAvailable: false,
     terminalOutputById: {},
+    agyAuthStates: {},
     toasts: [],
 
     init: async () => {
@@ -682,6 +693,13 @@ export const useAppStore = create<AppState>((set, get) => {
               handleAttention(frame.item);
             } else if (frame.op === 'plugins_changed') {
               void get().refreshPlugins().catch(() => {});
+            } else if (frame.op === 'agy_auth_state') {
+              set((state) => ({
+                agyAuthStates: {
+                  ...state.agyAuthStates,
+                  [frame.state.instanceId]: frame.state,
+                },
+              }));
             } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
               ingestTriage([frame.session]);
               if (frame.event) {

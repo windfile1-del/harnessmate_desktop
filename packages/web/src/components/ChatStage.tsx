@@ -547,6 +547,11 @@ export function ChatStage() {
     supportsGoalControl &&
     typedCommand === 'goal' &&
     ['', 'status', 'pause', 'clear'].includes(commandArgs);
+  const canSteerActive = Boolean(
+    isRunning &&
+      session.status === 'running' &&
+      harness?.capabilitiesV2?.supportsActiveSteering,
+  );
   const contextMeter = resolveContextWindowMeter(session.usage);
 
   const handleUploadFiles = async (fileList: FileList | File[]) => {
@@ -629,7 +634,7 @@ export function ChatStage() {
 
   const handleSend = async (suggestionChoice?: 'apply' | 'original') => {
     const trimmed = inputText.trim();
-    if ((!trimmed && attachments.length === 0 && pendingTerminalChips.length === 0) || sending || (isRunning && !isGoalControl) ||
+    if ((!trimmed && attachments.length === 0 && pendingTerminalChips.length === 0) || sending || (isRunning && !isGoalControl && !canSteerActive) ||
       (activeSuggestion && !suggestionChoice)) return;
     const panelCommand = nativeCommands.some(({ command }) => command === typedCommand) ? undefined
       : panelCommands.find(({ command }) => command === typedCommand);
@@ -1604,13 +1609,14 @@ export function ChatStage() {
                     <span>停止</span>
                   </button>
                 )}
-                {(!isRunning || isGoalControl) && (
+                {(!isRunning || isGoalControl || canSteerActive) && (
                   <button
                     type="button"
+                    title={canSteerActive ? '发送运行中引导指令 (Mid-turn Steering)' : '发送'}
                     disabled={(!inputText.trim() && attachments.length === 0 && pendingTerminalChips.length === 0) || sending}
                     onClick={() => void handleSend()}
                     className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-xl text-white transition-all disabled:cursor-not-allowed disabled:opacity-35"
-                    style={{ backgroundColor: 'var(--accent-indigo)' }}
+                    style={{ backgroundColor: canSteerActive ? 'var(--accent-emerald)' : 'var(--accent-indigo)' }}
                   >
                     {sending ? <Loader2 size={14} className="animate-spin" /> : <ArrowUp size={16} />}
                   </button>
