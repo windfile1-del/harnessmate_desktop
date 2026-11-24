@@ -7,6 +7,7 @@ import {
   PLUGIN_API_VERSION,
   PLUGIN_RPC_PROTOCOL_VERSION,
   PluginApiError,
+  pluginErrorCodes,
   type PluginErrorCode,
   type PluginHandshakeRequest,
   type PluginHandshakeResponse,
@@ -31,10 +32,7 @@ export const ISOLATED_TIMEOUTS = {
   dispose: 1_000,
 } as const;
 
-const validErrorCodes = new Set<string>([
-  'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
-  'E_INVALID_INPUT', 'E_LIMIT_EXCEEDED', 'E_CONFLICT', 'E_STALE_RUN',
-]);
+const validErrorCodes = new Set<string>(pluginErrorCodes);
 
 export type IsolatedHostRpcHandler = (
   method: string,
@@ -178,6 +176,18 @@ export class IsolatedPluginProcess {
         reject(error);
       }
     });
+  }
+
+  notify(method: string, params: Record<string, unknown> = {}, expectedRunId?: string): boolean {
+    if (expectedRunId && expectedRunId !== this.runId) return false;
+    if (!this.alive || !this.child.stdin || this.child.stdin.destroyed) return false;
+    try {
+      const frame: PluginRpcMessage = { jsonrpc: '2.0', runId: this.runId, method, params };
+      this.child.stdin.write(JSON.stringify(frame) + '\n');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async dispose(): Promise<void> {

@@ -1,10 +1,29 @@
 import {
+  HOST_SUPPORTED_FEATURES,
   PLUGIN_API_VERSION, PLUGIN_EVENT_VERSION, PluginApiError,
   type Disposer, type PluginContext, type PluginState,
 } from '@harnessmate/plugin-api';
+import type { HarnessRegistry } from '../../harnesses/registry.js';
 import { PluginEvents } from './events.js';
 
+export interface HandoffRedactionRequest {
+  text: string;
+  targetDriverId: string;
+  sessionId?: string;
+  workspaceId: string;
+  targetInstanceId?: string;
+}
+
+export interface HandoffRedactionOutcome {
+  text: string;
+  categories: string[];
+  redactedCount: number;
+}
+
+export type HandoffRedactorFn = (input: HandoffRedactionRequest) => Promise<HandoffRedactionOutcome>;
+
 export interface HostPluginContext extends PluginContext {
+  readonly host?: PluginHost;
   provide(name: string, value: object): Disposer;
 }
 
@@ -30,16 +49,35 @@ interface Instance {
   status: PluginStatus;
   effects: Set<Disposer>;
   run?: symbol;
+  cycleFailed?: boolean;
 }
 
 export class PluginHost {
   private readonly instances = new Map<string, Instance>();
   private readonly services = new Map<string, { owner: Instance; value: object }>();
   private readonly serviceListeners = new Set<(services: string[]) => void>();
+  private registryBridge?: HarnessRegistry;
+  private handoffRedactor?: HandoffRedactorFn;
   readonly events: PluginEvents;
 
   constructor(private readonly report: (error: unknown) => void = () => {}) {
     this.events = new PluginEvents(report);
+  }
+
+  setRegistryBridge(registry: HarnessRegistry): void {
+    this.registryBridge = registry;
+  }
+
+  getRegistryBridge(): HarnessRegistry | undefined {
+    return this.registryBridge;
+  }
+
+  setHandoffRedactor(fn: HandoffRedactorFn): void {
+    this.handoffRedactor = fn;
+  }
+
+  getHandoffRedactor(): HandoffRedactorFn | undefined {
+    return this.handoffRedactor;
   }
 
   get<Service = unknown>(name: string): Service | undefined {
@@ -112,7 +150,7 @@ export class PluginHost {
     for (const [id, instance] of this.instances) {
       const next = desired.get(id);
       if (!next || next.revision !== instance.definition.revision || next.enabled !== instance.definition.enabled
-        || next.error !== instance.definition.error) {
+        || next.error !== instance.definition.error || (instance.cycleFailed && next.enabled && !next.error)) {
         this.stop(instance, 'DISPOSED');
         this.instances.delete(id);
       }
@@ -123,6 +161,81 @@ export class PluginHost {
       this.instances.set(definition.id, instance);
       if (definition.error) this.transition(instance, 'FAILED', [], definition.error);
       else if (definition.enabled) this.transition(instance, 'PENDING', this.missing(instance));
+    }
+    this.detectCircularDependencies();
+  }
+
+  private detectCircularDependencies(): void {
+    const candidates = new Map<string, Instance>();
+    const providersByService = new Map<string, string[]>();
+    for (const instance of this.instances.values()) {
+      const { definition, status } = instance;
+      if (!definition.enabled || definition.error) continue;
+      if (status.state === 'PENDING') {
+        candidates.set(definition.id, instance);
+      }
+      if (status.state === 'PENDING' || status.state === 'LOADING' || status.state === 'ACTIVE') {
+        for (const svc of definition.provides ?? []) {
+          const list = providersByService.get(svc) ?? [];
+          list.push(definition.id);
+          providersByService.set(svc, list);
+        }
+      }
+    }
+    if (candidates.size === 0) return;
+
+    const edges = new Map<string, string[]>();
+    for (const [id, instance] of candidates) {
+      const deps: string[] = [];
+      for (const svc of instance.definition.inject ?? []) {
+        for (const providerId of providersByService.get(svc) ?? []) {
+          if (candidates.has(providerId)) deps.push(providerId);
+        }
+      }
+      edges.set(id, deps);
+    }
+
+    const color = new Map<string, 0 | 1 | 2>();
+    for (const id of candidates.keys()) color.set(id, 0);
+    const stack: string[] = [];
+    const failedCycles = new Map<string, string>();
+
+    const dfs = (u: string): void => {
+      color.set(u, 1);
+      stack.push(u);
+      for (const v of edges.get(u) ?? []) {
+        const c = color.get(v);
+        if (c === 1) {
+          const idx = stack.indexOf(v);
+          const cycle = [...stack.slice(idx), v];
+          const message = `E_CIRCULAR_DEPENDENCY: 检测到循环依赖 ${cycle.join(' -> ')}`;
+          for (const memberId of cycle.slice(0, -1)) {
+            if (!failedCycles.has(memberId)) failedCycles.set(memberId, message);
+          }
+        } else if (c === 0) {
+          dfs(v);
+        }
+      }
+      stack.pop();
+      color.set(u, 2);
+    };
+
+    for (const id of candidates.keys()) {
+      if (color.get(id) === 0) dfs(id);
+    }
+
+    if (failedCycles.size > 0) {
+      const reportedMessages = new Set<string>();
+      for (const [id, message] of failedCycles) {
+        const instance = candidates.get(id);
+        if (!instance) continue;
+        instance.cycleFailed = true;
+        this.transition(instance, 'FAILED', [], message);
+        if (!reportedMessages.has(message)) {
+          reportedMessages.add(message);
+          this.report(new PluginApiError('E_CIRCULAR_DEPENDENCY', message));
+        }
+      }
     }
   }
 
@@ -153,7 +266,14 @@ export class PluginHost {
       return undo;
     };
     return {
-      api: { version: PLUGIN_API_VERSION, has: (name) => { assertCurrent(); return this.services.has(name); } },
+      host: this,
+      api: {
+        version: PLUGIN_API_VERSION,
+        has: (name) => {
+          assertCurrent();
+          return (HOST_SUPPORTED_FEATURES as readonly string[]).includes(name) || this.services.has(name);
+        },
+      },
       effect,
       get: (name) => { assertCurrent(); return this.get(name); },
       on: (name, listener) => effect(() => this.events.on(name, listener)),

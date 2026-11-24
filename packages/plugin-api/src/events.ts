@@ -11,6 +11,8 @@ export interface PluginEventData {
   'approval.requested': { approvalId: string; toolName: string };
   'session.created': { title: string; harnessId: string };
   'session.closing': { title: string; harnessId: string };
+  'session.harness_switched': { previousHarnessId: string | null; targetHarnessId: string; driverId?: string; reason?: string };
+  'handoff.delivered': { handoffId: string; toInstanceId: string; deliveryChannel: string; deliveryStatus: string };
   'plugin.state': { pluginId: string; state: PluginState; missingServices: readonly string[] };
 }
 
@@ -28,7 +30,7 @@ export type PluginEventV4<Name extends PluginEventName = PluginEventName> = {
   }
 }[Name];
 
-export type PluginHookEventName = 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate';
+export type PluginHookEventName = 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate' | 'handoff.redact';
 
 export interface HandoffComposeEvent {
   sessionId: string;
@@ -75,6 +77,19 @@ export interface HandoffOfferDecision {
   reason?: string;
 }
 
+export interface HandoffRedactEvent {
+  text: string;
+  targetDriverId: string;
+  sessionId?: string;
+  workspaceId?: string;
+  targetInstanceId?: string;
+}
+
+export interface HandoffRedactResult {
+  text: string;
+  categories: string[];
+}
+
 export const pluginEventContracts = {
   'turn.started': { mode: 'emit', permission: 'events:turn' },
   'turn.completed': { mode: 'emit', permission: 'events:turn' },
@@ -86,9 +101,12 @@ export const pluginEventContracts = {
   'approval.requested': { mode: 'emit', permission: 'events:approval' },
   'session.created': { mode: 'serial', permission: 'session:read' },
   'session.closing': { mode: 'parallel', permission: 'session:read' },
+  'session.harness_switched': { mode: 'emit', permission: 'session:read' },
+  'handoff.delivered': { mode: 'emit', permission: 'session:read' },
   'plugin.state': { mode: 'emit', permission: null },
   'handoff.compose': { mode: 'waterfall', permission: 'handoff:section' },
   'handoff.shouldOffer': { mode: 'bail', permission: 'session:read' },
   'approval.annotate': { mode: 'waterfall', permission: 'approvals:annotate' },
+  'handoff.redact': { mode: 'waterfall', permission: 'handoff:redact' },
 } as const satisfies Record<PluginEventName | PluginHookEventName,
   { mode: 'emit' | 'serial' | 'parallel' | 'waterfall' | 'bail'; permission: string | null }>;

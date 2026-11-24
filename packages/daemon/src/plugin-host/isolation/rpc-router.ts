@@ -1,27 +1,49 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
   PluginApiError,
   pluginEventContracts,
+  type ContextHandoffPreviewV2,
+  type ForkSessionOptions,
+  type GetSessionItemOptions,
+  type ListSessionItemsOptions,
   type PluginEventName,
   type PluginEventV4,
   type PublicApprovalAnnotationInput,
   type PublicComposerSuggestion,
   type PublicFsEntry,
   type PublicFsStat,
+  type PublicHarnessBinding,
+  type PublicHarnessDriverDescriptor,
+  type PublicHarnessInstanceInfo,
   type PublicNetInit,
   type PublicNetResponse,
   type PublicSession,
   type PublicSessionCapabilities,
+  type PublicSessionNotice,
   type PublicTaskLedger,
   type PublicTaskLedgerAppend,
+  type PublicTurnBlock,
+  type SpawnCliSpec,
+  type SwitchSessionInstanceOptions,
 } from '@harnessmate/plugin-api';
-import { PluginNativeCommandSchema, type InstalledPluginInfo, type Session, type SessionTaskState } from '@harnessmate/protocol';
-import type { HarnessMateStore } from '../../db/sqlite.js';
+import {
+  PluginNativeCommandSchema,
+  type InstalledPluginInfo,
+  type Session,
+  type SessionHarnessBinding,
+  type SessionTaskState,
+  type TurnBlockRecord,
+} from '@harnessmate/protocol';
+import type { ContextCompiler } from '../../core/context-compiler.js';
 import type { TaskLedgerService } from '../../core/task-ledger-service.js';
+import type { HarnessMateStore } from '../../db/sqlite.js';
+import { handoffRedactionMap, type GitService } from '../builtin/services.js';
 import type { PluginPermissionService } from '../permissions/permissions.js';
 import type { PluginHost } from '../runtime/lifecycle.js';
 import { toPluginEvent } from '../runtime/map-event.js';
+import type { CliProcessManager } from './cli-process-manager.js';
 
 const MAX_FS_BYTES = 2 * 1024 * 1024;
 const MAX_NET_BYTES = 2 * 1024 * 1024;
@@ -43,12 +65,58 @@ export interface PluginRouterDeps {
   permissions: PluginPermissionService;
   getPluginInfo: (pluginId: string) => InstalledPluginInfo | undefined;
   isCurrentRun: (pluginId: string, runId: string) => boolean;
+  cliProcesses?: CliProcessManager;
+  onCliOutput?: (pluginId: string, runId: string, processId: string, stream: 'stdout' | 'stderr', chunk: string) => void;
+  onCliExit?: (pluginId: string, runId: string, processId: string, code: number | null, signal: string | null) => void;
+  onDriverRegister?: (pluginId: string, runId: string, driver: PublicHarnessDriverDescriptor) => void;
+  onDriverUnregister?: (pluginId: string, runId: string, driverId: string) => void;
+  onDriverSessionEvent?: (pluginId: string, runId: string, handleId: string, event: Record<string, unknown>) => void;
   onSubscriptionChange?: (pluginId: string, runId: string, event: string, subscribed: boolean) => void;
   onComposerSuggest?: (pluginId: string, sessionId: string, suggestion: PublicComposerSuggestion) => void;
   onNotify?: (pluginId: string, input: { title: string; body?: string; level?: 'info' | 'warn' | 'error' }) => void;
   onClipboardWrite?: (pluginId: string, text: string) => void;
   runNativeCommand?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
   onDynamicUnregister?: (pluginId: string, runId: string, kind: 'service' | 'command' | 'tool' | 'section' | 'slot', name: string) => void;
+}
+
+function toPublicTurnBlock(item: TurnBlockRecord, truncateOmitted = false): PublicTurnBlock {
+  const textBody = truncateOmitted && item.outputOmitted && item.textBody.length > 512
+    ? item.textBody.slice(0, 512)
+    : item.textBody;
+  return {
+    itemId: item.itemId,
+    schemaVersion: item.schemaVersion,
+    sessionId: item.sessionId,
+    turnId: item.turnId,
+    seq: item.seq,
+    instanceId: item.instanceId,
+    driverId: item.driverId,
+    blockType: item.blockType,
+    status: item.status,
+    title: item.title,
+    textBody,
+    payload: item.payload,
+    outputOmitted: item.outputOmitted,
+    omittedBytes: item.omittedBytes,
+    rawRef: item.rawRef ?? null,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
+
+function toPublicBinding(binding: SessionHarnessBinding): PublicHarnessBinding {
+  return {
+    sessionId: binding.sessionId,
+    harnessId: binding.harnessId,
+    harnessKind: binding.harnessKind,
+    nativeSessionId: binding.nativeSessionId,
+    lastModel: binding.lastModel ?? null,
+    lastActualModel: binding.lastActualModel ?? null,
+    lastEffort: binding.lastEffort ?? null,
+    syncedUpToSeq: binding.syncedUpToSeq,
+    driverUsed: binding.driverUsed ?? null,
+    updatedAt: binding.updatedAt,
+  };
 }
 
 function toPublicSession(session: Session): PublicSession {
@@ -330,6 +398,366 @@ export class IsolatedPluginRpcRouter {
         if (!this.deps.runNativeCommand) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用原生命令桥接');
         const args = typeof params.args === 'string' ? params.args.slice(0, 2_000) : undefined;
         return await this.deps.runNativeCommand(session.id, parsedCmd.data, args);
+      }
+
+      case 'sessions.listItems': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        const opts = params as unknown as ListSessionItemsOptions;
+        const afterSeq = typeof opts.afterSeq === 'number' && Number.isFinite(opts.afterSeq)
+          ? Math.max(0, Math.floor(opts.afterSeq))
+          : undefined;
+        const beforeSeq = typeof opts.beforeSeq === 'number' && Number.isFinite(opts.beforeSeq)
+          ? Math.max(0, Math.floor(opts.beforeSeq))
+          : undefined;
+        const types = Array.isArray(opts.types)
+          ? opts.types.filter((t): t is string => typeof t === 'string' && t.length > 0)
+          : undefined;
+        const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit)
+          ? Math.min(200, Math.max(1, Math.floor(opts.limit)))
+          : 50;
+        const includeOmittedBodies = opts.includeOmittedBodies === true;
+        const raw = this.deps.store.listTurnItems(session.id, {
+          afterSeq,
+          blockTypes: types && types.length > 0 ? types : undefined,
+          limit: 2000,
+        });
+        const filtered = beforeSeq !== undefined ? raw.filter((item) => item.seq < beforeSeq) : raw;
+        const sliced = filtered.slice(0, limit);
+        const nextSeq = filtered.length > limit && sliced.length > 0 ? sliced[sliced.length - 1]!.seq : null;
+        return {
+          items: sliced.map((item) => toPublicTurnBlock(item, !includeOmittedBodies)),
+          nextSeq,
+        };
+      }
+
+      case 'sessions.getItem': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        const itemId = typeof params.itemId === 'string' ? params.itemId : '';
+        if (!itemId) throw new PluginApiError('E_INVALID_INPUT', '缺少 itemId');
+        const item = this.deps.store.getTurnItem(itemId);
+        if (!item) return null;
+        if (item.sessionId !== session.id) {
+          throw new PluginApiError('E_PERMISSION_DENIED', '无权读取其他会话的 TurnItem');
+        }
+        const opts = params as unknown as GetSessionItemOptions;
+        const hasSliceOpts = opts.textOffset !== undefined || opts.maxChars !== undefined;
+        const offset = typeof opts.textOffset === 'number' && Number.isFinite(opts.textOffset)
+          ? Math.max(0, Math.floor(opts.textOffset))
+          : 0;
+        const maxChars = typeof opts.maxChars === 'number' && Number.isFinite(opts.maxChars)
+          ? Math.min(64_000, Math.max(1, Math.floor(opts.maxChars)))
+          : 16_000;
+        if (hasSliceOpts) {
+          const bodyChunk = item.textBody.slice(offset, offset + maxChars);
+          const nextTextOffset = offset + maxChars < item.textBody.length ? offset + maxChars : null;
+          return {
+            item: toPublicTurnBlock(item, false),
+            bodyChunk,
+            nextTextOffset,
+          };
+        }
+        return {
+          item: toPublicTurnBlock(item, false),
+          bodyChunk: item.textBody,
+          nextTextOffset: null,
+        };
+      }
+
+      case 'sessions.getBindings': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        return this.deps.store.listSessionBindings(session.id).map(toPublicBinding);
+      }
+
+      case 'sessions.fork': {
+        const source = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:fork', source.workspaceId);
+        const opts = params as unknown as ForkSessionOptions;
+        const targetId = typeof opts.targetInstanceId === 'string' && opts.targetInstanceId.trim()
+          ? opts.targetInstanceId.trim()
+          : source.harnessId;
+        const registry = this.deps.host.getRegistryBridge();
+        const targetAdapter = registry?.get(targetId);
+        if (registry && !targetAdapter) {
+          throw new PluginApiError('E_INVALID_INPUT', `目标 Harness 实例不存在: ${targetId}`);
+        }
+        const targetKind = targetAdapter?.kind ?? (targetId === source.harnessId ? source.harnessKind : null);
+        if (!targetKind) {
+          throw new PluginApiError('E_INVALID_INPUT', `无法解析目标 Harness 类型: ${targetId}`);
+        }
+        let cwd = source.cwd;
+        let worktreeBranch = source.worktreeBranch ?? null;
+        if (opts.createWorktree === true) {
+          this.deps.permissions.assertGranted(plugin, 'workspace:git:write', source.workspaceId);
+          const workspace = this.deps.store.getWorkspace(source.workspaceId);
+          const git = this.deps.host.get<GitService>('git');
+          if (!workspace || !git?.worktree) {
+            throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'git worktree 服务不可用');
+          }
+          const wt = await git.worktree(workspace.rootPath, `fork-${Date.now()}`);
+          cwd = wt.worktreePath;
+          worktreeBranch = wt.branch;
+        }
+        const now = Date.now();
+        const forkedTitle = typeof opts.title === 'string' && opts.title.trim()
+          ? opts.title.trim().slice(0, 120)
+          : `分支 · ${source.title}`;
+        const forked = this.deps.store.createSession({
+          id: randomUUID(),
+          workspaceId: source.workspaceId,
+          harnessId: targetId,
+          harnessKind: targetKind,
+          nativeSessionId: null,
+          participatingHarnesses: [targetId],
+          contextSyncMode: source.contextSyncMode,
+          cwd,
+          worktreeBranch,
+          title: forkedTitle,
+          status: 'idle',
+          model: targetId === source.harnessId ? source.model : null,
+          actualModel: null,
+          modelReroutedReason: null,
+          reasoningEffort: targetId === source.harnessId ? source.reasoningEffort : null,
+          permissionMode: source.permissionMode,
+          lastSeq: 0,
+          usage: null,
+          pendingApprovalCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
+        const sourceLedger = this.deps.store.getTaskState(source.id);
+        if (sourceLedger) {
+          this.deps.store.upsertTaskState({
+            ...sourceLedger,
+            sessionId: forked.id,
+            version: 1,
+            ledgerFilePath: null,
+            updatedAt: now,
+          });
+        }
+        return toPublicSession(this.deps.store.getSession(forked.id)!);
+      }
+
+      case 'sessions.switchInstance': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:switch', session.workspaceId);
+        if (session.status === 'running' || session.status === 'awaiting_approval') {
+          throw new PluginApiError('E_CONFLICT', '会话正在运行或等待审批，无法切换实例');
+        }
+        const opts = params as unknown as SwitchSessionInstanceOptions;
+        const targetId = typeof opts.targetInstanceId === 'string' ? opts.targetInstanceId.trim() : '';
+        if (!targetId) throw new PluginApiError('E_INVALID_INPUT', '缺少 targetInstanceId');
+        const registry = this.deps.host.getRegistryBridge();
+        const targetAdapter = registry?.get(targetId);
+        if (!targetAdapter) {
+          throw new PluginApiError('E_INVALID_INPUT', `目标 Harness 实例不存在: ${targetId}`);
+        }
+        const forceFresh = opts.forceFreshNativeSession === true;
+        const existingBinding = this.deps.store.getSessionBinding(session.id, targetAdapter.id);
+        const nextNativeSessionId = forceFresh ? null : (existingBinding?.nativeSessionId ?? null);
+        const participating = Array.from(
+          new Set([...(session.participatingHarnesses ?? []), session.harnessId, targetAdapter.id]),
+        );
+        this.deps.store.updateSession(session.id, {
+          harnessId: targetAdapter.id,
+          harnessKind: targetAdapter.kind,
+          nativeSessionId: nextNativeSessionId,
+          participatingHarnesses: participating,
+          status: session.status === 'error' ? 'idle' : session.status,
+        });
+        if (existingBinding) {
+          if (forceFresh) {
+            this.deps.store.setSessionBindingExact(session.id, targetAdapter.id, {
+              nativeSessionId: null,
+              syncedUpToSeq: 0,
+              driverUsed: null,
+            });
+          } else {
+            this.deps.store.upsertSessionBinding({
+              ...existingBinding,
+              harnessKind: targetAdapter.kind,
+              updatedAt: Date.now(),
+            });
+          }
+        } else {
+          this.deps.store.upsertSessionBinding({
+            sessionId: session.id,
+            harnessId: targetAdapter.id,
+            harnessKind: targetAdapter.kind,
+            nativeSessionId: null,
+            lastModel: session.model,
+            lastActualModel: null,
+            lastEffort: session.reasoningEffort,
+            syncedUpToSeq: 0,
+            driverUsed: null,
+            updatedAt: Date.now(),
+          });
+        }
+        this.deps.store.appendEvent(session.id, 'session.harness_switched', {
+          fromHarnessId: session.harnessId,
+          fromHarnessKind: session.harnessKind,
+          toHarnessId: targetAdapter.id,
+          toHarnessKind: targetAdapter.kind,
+          forceFreshNativeSession: forceFresh,
+          initiatedByPlugin: meta.pluginId,
+        });
+        return { ok: true };
+      }
+
+      case 'sessions.postNotice': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:orchestrate', session.workspaceId);
+        const notice = (params.notice ?? {}) as Partial<PublicSessionNotice>;
+        if (notice.level !== 'info' && notice.level !== 'warn' && notice.level !== 'error') {
+          throw new PluginApiError('E_INVALID_INPUT', '通知 level 必须为 info、warn 或 error');
+        }
+        const message = typeof notice.message === 'string' ? notice.message.trim() : '';
+        if (!message || message.length > 2_000) {
+          throw new PluginApiError('E_INVALID_INPUT', '通知内容必须为 1-2000 个字符');
+        }
+        const code = typeof notice.code === 'string' && notice.code.trim()
+          ? notice.code.trim().slice(0, 80)
+          : undefined;
+        this.deps.store.appendEvent(session.id, 'handoff.system_notice', {
+          level: notice.level,
+          message,
+          ...(code ? { code } : {}),
+          pluginId: meta.pluginId,
+        });
+        return { ok: true };
+      }
+
+      case 'handoff.preview': {
+        const session = this.getSessionOrThrow(params.sessionId);
+        this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        const targetInstanceId = typeof params.targetInstanceId === 'string' && params.targetInstanceId.trim()
+          ? params.targetInstanceId.trim()
+          : session.harnessId;
+        const registry = this.deps.host.getRegistryBridge();
+        const targetAdapter = registry?.get(targetInstanceId);
+        const targetKind = targetAdapter?.kind ?? (targetInstanceId === session.harnessId ? session.harnessKind : null);
+        if (!targetKind) {
+          throw new PluginApiError('E_INVALID_INPUT', `目标 Harness 实例不存在: ${targetInstanceId}`);
+        }
+        const compiler = this.deps.host.get<ContextCompiler>('handoff');
+        if (!compiler) {
+          throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'handoff 服务不可用');
+        }
+        const binding = this.deps.store.getSessionBinding(session.id, targetInstanceId);
+        const packet = await compiler.compile({
+          session,
+          targetHarnessId: targetInstanceId,
+          targetHarnessKind: targetKind,
+          binding,
+        });
+        const redactionSummary = handoffRedactionMap.get(packet);
+        const result: ContextHandoffPreviewV2 = {
+          sessionId: session.id,
+          mode: packet.preview.isWarmBinding ? 'delta_since_target_last_seen' : 'full_session_summary',
+          deliveryChannel: packet.preview.driverPlanned,
+          sourceInstanceId: session.harnessId,
+          targetInstanceId,
+          coveredSeqRange: {
+            fromSeq: packet.preview.syncedUpToSeq,
+            toSeq: packet.coveredUpToSeq,
+          },
+          unsyncedTurnCount: packet.preview.unsyncedTurnCount,
+          estimatedChars: packet.preview.compiledMarkdown.length,
+          estimatedTokens: packet.preview.estimatedTokens,
+          budgetTokens: packet.preview.budgetTokens,
+          syncNeeded: packet.syncNeeded,
+          ...(redactionSummary ? { redactionSummary } : {}),
+          renderedPayload: packet.preview.compiledMarkdown,
+        };
+        return result;
+      }
+
+      case 'harnesses.listInstances': {
+        const registry = this.deps.host.getRegistryBridge();
+        if (!registry) return [];
+        const instances = registry.listInstances();
+        const result: PublicHarnessInstanceInfo[] = instances.map((inst) => {
+          const adapter = registry.get(inst.instanceId);
+          return {
+            id: inst.instanceId,
+            driverId: inst.driverId,
+            displayName: inst.displayName,
+            description: inst.description ?? adapter?.description ?? '',
+            protocolLabel: adapter?.protocolLabel ?? inst.driverId,
+            enabled: inst.enabled,
+            isCustom: adapter?.isCustom,
+          };
+        });
+        return result;
+      }
+
+      case 'harnesses.registerDriver': {
+        const driver = params.driver as PublicHarnessDriverDescriptor | undefined;
+        if (!driver || typeof driver.driverId !== 'string') {
+          throw new PluginApiError('E_INVALID_INPUT', '驱动描述符无效');
+        }
+        this.deps.onDriverRegister?.(meta.pluginId, meta.runId, driver);
+        return { ok: true };
+      }
+
+      case 'harnesses.unregisterDriver': {
+        if (typeof params.driverId === 'string') {
+          this.deps.onDriverUnregister?.(meta.pluginId, meta.runId, params.driverId);
+        }
+        return { ok: true };
+      }
+
+      case 'driver.session.event': {
+        const handleId = typeof params.handleId === 'string' ? params.handleId : '';
+        const event = params.event && typeof params.event === 'object' ? params.event as Record<string, unknown> : null;
+        if (handleId && event) {
+          this.deps.onDriverSessionEvent?.(meta.pluginId, meta.runId, handleId, event);
+        }
+        return { ok: true };
+      }
+
+      case 'runtime.spawnCli': {
+        if (!this.deps.cliProcesses) {
+          throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
+        }
+        return await this.deps.cliProcesses.spawn(
+          plugin,
+          meta.runId,
+          params as unknown as SpawnCliSpec,
+          {
+            onOutput: (processId, stream, chunk) => {
+              this.deps.onCliOutput?.(meta.pluginId, meta.runId, processId, stream, chunk);
+            },
+            onExit: (processId, code, signal) => {
+              this.deps.onCliExit?.(meta.pluginId, meta.runId, processId, code, signal);
+            },
+          },
+        );
+      }
+
+      case 'runtime.cli.writeStdin': {
+        if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
+        const processId = typeof params.processId === 'string' ? params.processId : '';
+        const data = typeof params.data === 'string' ? params.data : '';
+        this.deps.cliProcesses.writeStdin(meta.pluginId, meta.runId, processId, data);
+        return { ok: true };
+      }
+
+      case 'runtime.cli.closeStdin': {
+        if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
+        const processId = typeof params.processId === 'string' ? params.processId : '';
+        this.deps.cliProcesses.closeStdin(meta.pluginId, meta.runId, processId);
+        return { ok: true };
+      }
+
+      case 'runtime.cli.kill': {
+        if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
+        const processId = typeof params.processId === 'string' ? params.processId : '';
+        const signal = params.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM';
+        await this.deps.cliProcesses.kill(meta.pluginId, meta.runId, processId, signal);
+        return { ok: true };
       }
 
       case 'ledger.get': {
