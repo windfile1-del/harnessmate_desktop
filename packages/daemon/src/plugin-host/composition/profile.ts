@@ -62,12 +62,17 @@ function writeAtomic(file: string, content: string): void {
 }
 
 const defaultBundle = 'harnessmate-core';
+const OPTIONAL_BUILTIN_PLUGINS = new Set<string>(['hm.plugin.multi-harness-orchestrator']);
 const stableIds: Record<string, string> = {
   'core.task-ledger': 'ledger', 'core.context-bridge': 'handoff', 'core.git-inspector': 'git',
   'core.account-usage': 'usage', 'core.harness.codex': 'harness-codex', 'core.harness.claude': 'harness-claude',
   'core.harness.agy': 'harness-agy', 'core.harness.acp': 'harness-acp',
 };
 const entryId = (name: string) => stableIds[name] ?? name;
+const defaultBuiltinEntry = (name: string): LayerEntry =>
+  OPTIONAL_BUILTIN_PLUGINS.has(name)
+    ? { name, id: entryId(name), disabled: true }
+    : { name, id: entryId(name) };
 
 export class PluginComposition {
   private readonly profileFile: string;
@@ -79,7 +84,7 @@ export class PluginComposition {
   constructor(private readonly directory: string, private readonly builtin: readonly string[]) {
     this.profileFile = path.join(directory, 'profile.json');
     this.patchFile = path.join(directory, 'patch.yml');
-    this.layers = [{ source: defaultBundle, entries: builtin.map((name) => ({ name, id: entryId(name) })) }];
+    this.layers = [{ source: defaultBundle, entries: builtin.map(defaultBuiltinEntry) }];
   }
 
   reload(legacyDisabled: readonly string[]): void {
@@ -88,7 +93,7 @@ export class PluginComposition {
     if (new Set(bundles).size !== bundles.length) throw new PluginApiError('E_CONFLICT', '组合包列表含有重复项');
     const layers = bundles.map((bundle) => {
       if (bundle === defaultBundle) {
-        return { source: bundle, entries: this.builtin.map((name) => ({ name, id: entryId(name) })) };
+        return { source: bundle, entries: this.builtin.map(defaultBuiltinEntry) };
       }
       const content = readFile(path.join(this.directory, 'bundles', `${bundle}.yml`));
       if (content === undefined) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `找不到组合包 ${bundle}`);

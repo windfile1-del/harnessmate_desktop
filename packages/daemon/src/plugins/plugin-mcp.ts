@@ -1,6 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { DelegateSubagentRequestSchema } from '@harnessmate/protocol';
 import { HandoffRedactionError, HandoffRedactor } from '../core/handoff-redactor.js';
+import { ORCHESTRATOR_PLUGIN_ID, type OrchestratorService } from '../core/orchestrator-service.js';
 import type { HarnessMateStore } from '../db/sqlite.js';
 import { isLoopbackAddress } from '../server/auth.js';
 import type { PluginCapabilities } from './plugin-capabilities.js';
@@ -84,13 +86,147 @@ function shouldExposeRenderHtml(
   if (!store) return false;
   // Expose in tools/list when hm.plugin.message-studio is explicitly installed & enabled,
   // or when the session already contains an html_render block (preserves strict V3/V4 tools/list counts).
-  const manager = (capabilities as unknown as {
+  const cap = capabilities as unknown as {
     pluginManager?: { listInstalled?: () => Array<{ id: string; enabled: boolean }> };
-  }).pluginManager;
+    plugins?: { isPluginEnabled?: (id: string) => boolean; listInstalled?: () => Array<{ id: string; enabled: boolean }> };
+  };
+  if (cap.plugins?.isPluginEnabled?.('hm.plugin.message-studio')) {
+    return true;
+  }
+  const manager = cap.pluginManager ?? cap.plugins;
   if (manager?.listInstalled?.().some((p) => p.id === 'hm.plugin.message-studio' && p.enabled)) {
     return true;
   }
   return store.listTurnItems(sessionId, { blockTypes: ['html_render'], limit: 1 }).length > 0;
+}
+
+// ── Multi-Harness Parallel Orchestrator MCP Toolkit (Conditional Exposure) ──
+
+const hmDelegateTaskDescriptor = {
+  name: 'hm_delegate_task',
+  description:
+    'Delegate a parallel subtask to a target harness instance. Write tasks (isolation: "worktree_write") require a Git repository and are strictly isolated in a dedicated Git Worktree; approval policy is strictly capped by the parent session.',
+  annotations: { readOnlyHint: false },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      targetInstanceId: { type: 'string', minLength: 1 },
+      roleTitle: { type: 'string', minLength: 1, maxLength: 160 },
+      prompt: { type: 'string', minLength: 1, maxLength: 40000 },
+      isolation: { type: 'string', enum: ['read_only', 'worktree_write'], default: 'read_only' },
+      cohortId: { type: 'string', minLength: 1, maxLength: 96 },
+      requestedApprovalPolicy: { type: 'string', minLength: 1, maxLength: 32 },
+      model: { type: ['string', 'null'] },
+      timeoutMs: { type: 'integer', minimum: 200, maximum: 3600000 },
+      failFast: { type: 'boolean', default: false },
+      baseBranch: { type: 'string', minLength: 1, maxLength: 120 },
+    },
+    required: ['targetInstanceId', 'roleTitle', 'prompt'],
+    additionalProperties: false,
+  },
+};
+
+const hmListSubagentsDescriptor = {
+  name: 'hm_list_subagents',
+  description:
+    'List parallel subagents spawned by the current parent session, including concurrency quota, status, worktree branch, and diffstat.',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      cohortId: { type: 'string', minLength: 1 },
+      status: {
+        type: 'string',
+        enum: ['queued', 'running', 'awaiting_approval', 'completed', 'failed', 'stopped'],
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+const hmGetSubagentResultDescriptor = {
+  name: 'hm_get_subagent_result',
+  description:
+    'Fetch the latest summary, diffstat, worktree branch, and pending approvals for a specific subagent.',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      subagentId: { type: 'string', minLength: 1 },
+    },
+    required: ['subagentId'],
+    additionalProperties: false,
+  },
+};
+
+const hmSendToSubagentDescriptor = {
+  name: 'hm_send_to_subagent',
+  description:
+    'Send a follow-up clarification or additional instruction to an existing idle subagent.',
+  annotations: { readOnlyHint: false },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      subagentId: { type: 'string', minLength: 1 },
+      text: { type: 'string', minLength: 1, maxLength: 40000 },
+    },
+    required: ['subagentId', 'text'],
+    additionalProperties: false,
+  },
+};
+
+const hmStopSubagentDescriptor = {
+  name: 'hm_stop_subagent',
+  description:
+    'Stop a running subagent while preserving its isolated Git worktree and branch for inspection or manual merge-back.',
+  annotations: { readOnlyHint: false },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      subagentId: { type: 'string', minLength: 1 },
+      reason: { type: 'string', maxLength: 400 },
+    },
+    required: ['subagentId'],
+    additionalProperties: false,
+  },
+};
+
+export const ORCHESTRATOR_MCP_DESCRIPTORS = [
+  hmDelegateTaskDescriptor,
+  hmListSubagentsDescriptor,
+  hmGetSubagentResultDescriptor,
+  hmSendToSubagentDescriptor,
+  hmStopSubagentDescriptor,
+] as const;
+
+const ORCHESTRATOR_TOOL_NAMES = new Set<string>(ORCHESTRATOR_MCP_DESCRIPTORS.map((d) => d.name));
+
+const listSubagentsArgsSchema = z
+  .object({
+    cohortId: z.string().min(1).optional(),
+    status: z.enum(['queued', 'running', 'awaiting_approval', 'completed', 'failed', 'stopped']).optional(),
+  })
+  .strict();
+
+const getSubagentResultArgsSchema = z.object({ subagentId: z.string().min(1) }).strict();
+const sendToSubagentArgsSchema = z.object({ subagentId: z.string().min(1), text: z.string().min(1).max(40_000) }).strict();
+const stopSubagentArgsSchema = z
+  .object({ subagentId: z.string().min(1), reason: z.string().max(400).optional() })
+  .strict();
+
+function shouldExposeOrchestratorTools(
+  capabilities: PluginCapabilities,
+  isOrchestratorEnabled?: () => boolean,
+): boolean {
+  if (isOrchestratorEnabled) return isOrchestratorEnabled();
+  const cap = capabilities as unknown as {
+    plugins?: { isPluginEnabled?: (id: string) => boolean };
+    pluginManager?: { isPluginEnabled?: (id: string) => boolean };
+  };
+  return Boolean(
+    cap.plugins?.isPluginEnabled?.(ORCHESTRATOR_PLUGIN_ID) ??
+      cap.pluginManager?.isPluginEnabled?.(ORCHESTRATOR_PLUGIN_ID),
+  );
 }
 
 function shouldExposeSessionRead(store: HarnessMateStore | undefined, sessionId: string): boolean {
@@ -160,7 +296,11 @@ export function registerPluginMcp(
   app: FastifyInstance,
   capabilities: PluginCapabilities,
   store?: HarnessMateStore,
-  opts?: { redactor?: HandoffRedactor },
+  opts?: {
+    redactor?: HandoffRedactor;
+    getOrchestrator?: () => OrchestratorService | undefined;
+    isOrchestratorEnabled?: () => boolean;
+  },
 ) {
   const resolvedStore = store ?? (capabilities as unknown as { store?: HarnessMateStore }).store;
   const redactor = opts?.redactor ?? new HandoffRedactor();
@@ -198,11 +338,43 @@ export function registerPluginMcp(
         if (shouldExposeRenderHtml(capabilities, resolvedStore, lease.sessionId)) {
           tools.push(hmRenderHtmlDescriptor);
         }
+        if (shouldExposeOrchestratorTools(capabilities, opts?.isOrchestratorEnabled)) {
+          tools.push(...ORCHESTRATOR_MCP_DESCRIPTORS);
+        }
         return respond({ tools });
       }
       case 'tools/call': {
         const call = callSchema.safeParse(params);
         if (!call.success) return failure(-32602, 'Invalid tool arguments');
+        if (ORCHESTRATOR_TOOL_NAMES.has(call.data.name)) {
+          if (!shouldExposeOrchestratorTools(capabilities, opts?.isOrchestratorEnabled)) {
+            return respond({
+              content: [{ type: 'text', text: 'Multi-Harness Parallel Orchestrator plugin is disabled' }],
+              isError: true,
+            });
+          }
+          const orchestrator = opts?.getOrchestrator?.();
+          if (!orchestrator) {
+            return respond({
+              content: [{ type: 'text', text: 'Orchestrator service is unavailable' }],
+              isError: true,
+            });
+          }
+          try {
+            const text = await handleOrchestratorToolCall(
+              orchestrator,
+              lease.sessionId,
+              call.data.name,
+              call.data.arguments,
+            );
+            return respond({ content: [{ type: 'text', text }] });
+          } catch (error) {
+            return respond({
+              content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+              isError: true,
+            });
+          }
+        }
         if (call.data.name === 'hm_render_html') {
           try {
             const text = handleRenderHtml(resolvedStore, lease.sessionId, lease.harnessId, call.data.arguments);
@@ -465,4 +637,79 @@ async function handleSessionRead(
     redactedCount,
     redactedCategories: [...redactedCategories],
   });
+}
+
+async function handleOrchestratorToolCall(
+  orchestrator: OrchestratorService,
+  parentSessionId: string,
+  toolName: string,
+  rawArgs: Record<string, unknown>,
+): Promise<string> {
+  switch (toolName) {
+    case 'hm_delegate_task': {
+      const parsed = DelegateSubagentRequestSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new Error(
+          `Invalid hm_delegate_task arguments: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`,
+        );
+      }
+      const subagent = await orchestrator.delegateTask(parentSessionId, parsed.data);
+      return JSON.stringify({
+        ok: true,
+        subagent,
+      });
+    }
+    case 'hm_list_subagents': {
+      const parsed = listSubagentsArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new Error(`Invalid hm_list_subagents arguments: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+      }
+      const board = orchestrator.getBoard(parentSessionId);
+      const subagents = orchestrator.listSubagents(parentSessionId, parsed.data);
+      return JSON.stringify({
+        parentSessionId,
+        activeCount: board.activeCount,
+        maxConcurrent: board.maxConcurrent,
+        maxDepth: board.maxDepth,
+        subagents,
+      });
+    }
+    case 'hm_get_subagent_result': {
+      const parsed = getSubagentResultArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new Error(`Invalid hm_get_subagent_result arguments: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+      }
+      const result = orchestrator.getSubagentResult(parsed.data.subagentId);
+      if (result.subagent.parentSessionId !== parentSessionId) {
+        throw new Error(`Subagent ${parsed.data.subagentId} does not belong to parent session ${parentSessionId}`);
+      }
+      return JSON.stringify(result);
+    }
+    case 'hm_send_to_subagent': {
+      const parsed = sendToSubagentArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new Error(`Invalid hm_send_to_subagent arguments: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+      }
+      const existing = orchestrator.getSubagentResult(parsed.data.subagentId);
+      if (existing.subagent.parentSessionId !== parentSessionId) {
+        throw new Error(`Subagent ${parsed.data.subagentId} does not belong to parent session ${parentSessionId}`);
+      }
+      const res = await orchestrator.sendToSubagent(parsed.data.subagentId, parsed.data.text);
+      return JSON.stringify({ ok: true, ...res });
+    }
+    case 'hm_stop_subagent': {
+      const parsed = stopSubagentArgsSchema.safeParse(rawArgs);
+      if (!parsed.success) {
+        throw new Error(`Invalid hm_stop_subagent arguments: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+      }
+      const existing = orchestrator.getSubagentResult(parsed.data.subagentId);
+      if (existing.subagent.parentSessionId !== parentSessionId) {
+        throw new Error(`Subagent ${parsed.data.subagentId} does not belong to parent session ${parentSessionId}`);
+      }
+      const subagent = await orchestrator.stopSubagent(parsed.data.subagentId, parsed.data.reason);
+      return JSON.stringify({ ok: true, subagent });
+    }
+    default:
+      throw new Error(`Unknown orchestrator tool: ${toolName}`);
+  }
 }

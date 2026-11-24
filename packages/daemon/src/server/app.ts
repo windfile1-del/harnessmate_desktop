@@ -9,7 +9,9 @@ import {
   CreateWorkspaceRequestSchema,
   CreateWorktreeRequestSchema,
   CustomAcpHarnessConfigSchema,
+  DelegateSubagentRequestSchema,
   DryRunMergeRequestSchema,
+  DryRunSubagentMergeRequestSchema,
   FailoverPolicySchema,
   FailoverRequestSchema,
   ForkSessionRequestSchema,
@@ -25,6 +27,7 @@ import {
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
   MergeBackRequestSchema,
+  MergeSubagentRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
   RemoveWorktreeRequestSchema,
@@ -32,6 +35,7 @@ import {
   RevertCheckpointRequestSchema,
   RunHarnessCommandRequestSchema,
   ScaffoldPluginRequestSchema,
+  SendToSubagentRequestSchema,
   SendTurnRequestSchema,
   SideChatPromoteRequestSchema,
   SideChatRequestSchema,
@@ -79,6 +83,7 @@ import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
 import type { UsageService } from '../core/usage-service.js';
 import type { FailoverCoordinator } from '../core/failover-service.js';
+import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
@@ -379,7 +384,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
   app.get('/api/v1/plugins/composition', async () => pluginManager.getComposition());
-  registerPluginMcp(app, pluginCapabilities);
+  registerPluginMcp(app, pluginCapabilities, store, {
+    getOrchestrator: () => sessionManager.getOrchestratorService(),
+    isOrchestratorEnabled: () => pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID),
+  });
 
   app.get('/api/v1/plugins/:id/permissions', async (request, reply) => {
     const { id } = request.params as { id: string };
@@ -1217,6 +1225,128 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return result;
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ── Multi-Harness Parallel Orchestrator (Scenario D) ─────────────────
+
+  app.get('/api/v1/sessions/:id/subagents', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
+    return sessionManager.getOrchestratorService().getBoard(id);
+  });
+
+  app.post('/api/v1/sessions/:id/subagents', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = DelegateSubagentRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid delegation payload' });
+    }
+    try {
+      const subagent = await sessionManager.getOrchestratorService().delegateTask(id, parsed.data);
+      return reply.code(201).send({ subagent });
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : 'E_DELEGATE_FAILED';
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SESSION_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.get('/api/v1/subagents/:subagentId', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    try {
+      return sessionManager.getOrchestratorService().getSubagentResult(subagentId);
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : 'E_SUBAGENT_NOT_FOUND';
+      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/subagents/:subagentId/send', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    const parsed = SendToSubagentRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid subagent message' });
+    }
+    try {
+      return await sessionManager.getOrchestratorService().sendToSubagent(subagentId, parsed.data.text);
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : 'E_SUBAGENT_SEND_FAILED';
+      const status = code === 'E_SUBAGENT_NOT_FOUND' ? 404 : code === 'E_PLUGIN_DISABLED' || code === 'E_SUBAGENT_BUSY' ? 409 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/subagents/:subagentId/stop', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    const body = (request.body ?? {}) as { reason?: string };
+    try {
+      const subagent = await sessionManager.getOrchestratorService().stopSubagent(subagentId, body.reason);
+      return { subagent };
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : 'E_SUBAGENT_STOP_FAILED';
+      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/subagents/:subagentId/dry-run-merge', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    const parsed = DryRunSubagentMergeRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid dry-run merge request' });
+    }
+    try {
+      return await sessionManager.getOrchestratorService().dryRunMergeSubagent(subagentId, parsed.data.baseBranch);
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_MERGE_PRECHECK_FAILED';
+      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/subagents/:subagentId/merge-back', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    const parsed = MergeSubagentRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid merge-back request' });
+    }
+    try {
+      return await sessionManager.getOrchestratorService().mergeBackSubagent(subagentId, parsed.data);
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_MERGE_FAILED';
+      const status = code === 'E_MERGE_CONFLICT' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+        ...(err instanceof OrchestratorError && err.conflictFiles ? { conflictFiles: err.conflictFiles } : {}),
+      });
+    }
+  });
+
+  app.delete('/api/v1/subagents/:subagentId/worktree', async (request, reply) => {
+    const { subagentId } = request.params as { subagentId: string };
+    const q = request.query as { force?: string; deleteBranch?: string };
+    const body = (request.body && typeof request.body === 'object' ? request.body : {}) as {
+      force?: boolean;
+      deleteBranch?: boolean;
+    };
+    try {
+      return await sessionManager.getOrchestratorService().cleanupSubagentWorktree(subagentId, {
+        force: body.force ?? (q.force === '1' || q.force === 'true'),
+        deleteBranch: body.deleteBranch ?? (q.deleteBranch === '1' || q.deleteBranch === 'true'),
+      });
+    } catch (err) {
+      const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_WORKTREE_REMOVE_FAILED';
+      const status = code === 'E_WORKTREE_BUSY' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
     }
   });
 

@@ -13,6 +13,7 @@ import {
   PortableSessionBundleV2Schema,
   GeneratedPluginManifestSchema,
   ReasoningEffortSchema,
+  SubagentIsolationSchema,
   TaskStepSchema,
   TaskVerificationSchema,
   UserQuestionAnswerSchema,
@@ -477,3 +478,38 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
   }),
 ]);
 export type WsServerFrame = z.infer<typeof WsServerFrameSchema>;
+
+// ── Multi-Harness Parallel Orchestrator REST Schemas ───────────────────
+
+export const DelegateSubagentRequestSchema = z.object({
+  targetInstanceId: z.string().min(1),
+  roleTitle: z.string().trim().min(1).max(160),
+  prompt: z.string().trim().min(1).max(40_000),
+  isolation: SubagentIsolationSchema.default('read_only'),
+  cohortId: z.string().trim().min(1).max(96).optional(),
+  requestedApprovalPolicy: z.string().trim().min(1).max(32).optional(),
+  model: z.string().nullable().optional(),
+  timeoutMs: z.number().int().min(200).max(3_600_000).optional(),
+  failFast: z.boolean().optional(),
+  baseBranch: z.string().trim().min(1).max(120).optional(),
+});
+export type DelegateSubagentRequest = z.infer<typeof DelegateSubagentRequestSchema>;
+
+export const SendToSubagentRequestSchema = z.object({
+  text: z.string().trim().min(1).max(40_000),
+});
+export type SendToSubagentRequest = z.infer<typeof SendToSubagentRequestSchema>;
+
+export const DryRunSubagentMergeRequestSchema = z.object({
+  baseBranch: z.string().trim().min(1).max(120).optional(),
+});
+export type DryRunSubagentMergeRequest = z.infer<typeof DryRunSubagentMergeRequestSchema>;
+
+export const MergeSubagentRequestSchema = z.object({
+  baseBranch: z.string().trim().min(1).max(120).optional(),
+  confirmMerge: z.boolean(),
+  cleanupWorktree: z.boolean().default(false),
+  deleteBranch: z.boolean().default(false),
+  commitMessage: z.string().trim().min(1).max(240).optional(),
+});
+export type MergeSubagentRequest = z.infer<typeof MergeSubagentRequestSchema>;

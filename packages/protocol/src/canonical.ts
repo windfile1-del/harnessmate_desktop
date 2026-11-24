@@ -498,6 +498,10 @@ export const CanonicalEventTypeSchema = z.enum([
   'runtime_request.updated',
   'checkpoint.captured',
   'checkpoint.reverted',
+  'subagent.spawned',
+  'subagent.updated',
+  'subagent.cohort_completed',
+  'subagent.merged',
   'usage.updated',
   'diagnostic.log',
 ]);
@@ -1018,3 +1022,99 @@ export const PortableSessionBundleV2Schema = z.object({
     .default([]),
 });
 export type PortableSessionBundleV2 = z.infer<typeof PortableSessionBundleV2Schema>;
+
+// ── Multi-Harness Parallel Orchestrator (Scenario D) ───────────────────
+
+export const SubagentIsolationSchema = z.enum(['read_only', 'worktree_write']);
+export type SubagentIsolation = z.infer<typeof SubagentIsolationSchema>;
+
+export const SubagentStatusSchema = z.enum([
+  'queued',
+  'running',
+  'awaiting_approval',
+  'completed',
+  'failed',
+  'stopped',
+]);
+export type SubagentStatus = z.infer<typeof SubagentStatusSchema>;
+
+export const SubagentDiffStatSchema = z.object({
+  filesChanged: z.number().int().nonnegative().default(0),
+  insertions: z.number().int().nonnegative().default(0),
+  deletions: z.number().int().nonnegative().default(0),
+  changedFiles: z.array(z.string()).default([]),
+});
+export type SubagentDiffStat = z.infer<typeof SubagentDiffStatSchema>;
+
+export const SubagentRunRecordSchema = z.object({
+  subagentId: z.string(),
+  cohortId: z.string(),
+  parentSessionId: z.string(),
+  childSessionId: z.string(),
+  targetInstanceId: z.string(),
+  targetDriverId: z.string().optional(),
+  roleTitle: z.string(),
+  prompt: z.string().default(''),
+  isolation: SubagentIsolationSchema,
+  worktreePath: z.string().nullable().optional(),
+  branchName: z.string().nullable().optional(),
+  baseBranch: z.string().nullable().optional(),
+  effectiveApprovalPolicy: PermissionModeSchema,
+  requestedApprovalPolicy: PermissionModeSchema.nullable().optional(),
+  depth: z.number().int().min(1).default(1),
+  timeoutMs: z.number().int().positive().default(15 * 60 * 1000),
+  failFast: z.boolean().default(false),
+  status: SubagentStatusSchema,
+  pendingApprovalCount: z.number().int().nonnegative().optional(),
+  diffStat: SubagentDiffStatSchema.nullable().optional(),
+  summary: z.string().nullable().optional(),
+  error: z.string().nullable().optional(),
+  mergedAt: z.number().nullable().optional(),
+  mergedIntoBranch: z.string().nullable().optional(),
+  worktreeCleaned: z.boolean().optional(),
+  createdAt: z.number(),
+  finishedAt: z.number().nullable().optional(),
+});
+export type SubagentRunRecord = z.infer<typeof SubagentRunRecordSchema>;
+
+export const SubagentCohortSummarySchema = z.object({
+  cohortId: z.string(),
+  parentSessionId: z.string(),
+  status: z.enum(['running', 'completed', 'failed', 'partial']),
+  total: z.number().int().nonnegative(),
+  completedCount: z.number().int().nonnegative(),
+  failedCount: z.number().int().nonnegative(),
+  stoppedCount: z.number().int().nonnegative(),
+  runningCount: z.number().int().nonnegative(),
+  wakeupDelivered: z.boolean(),
+  wakeupQueued: z.boolean(),
+  subagents: z.array(SubagentRunRecordSchema),
+  createdAt: z.number(),
+  completedAt: z.number().nullable().optional(),
+});
+export type SubagentCohortSummary = z.infer<typeof SubagentCohortSummarySchema>;
+
+export const OrchestratorBoardResponseSchema = z.object({
+  parentSessionId: z.string(),
+  enabled: z.boolean(),
+  activeCount: z.number().int().nonnegative(),
+  maxConcurrent: z.number().int().positive(),
+  maxDepth: z.number().int().positive(),
+  currentDepth: z.number().int().nonnegative(),
+  subagents: z.array(SubagentRunRecordSchema),
+  cohorts: z.array(SubagentCohortSummarySchema),
+});
+export type OrchestratorBoardResponse = z.infer<typeof OrchestratorBoardResponseSchema>;
+
+export const SubagentMergeBackResultSchema = z.object({
+  subagentId: z.string(),
+  branchName: z.string(),
+  baseBranch: z.string(),
+  merged: z.boolean(),
+  commitSha: z.string().nullable(),
+  worktreeCleaned: z.boolean(),
+  branchDeleted: z.boolean(),
+  dryRun: GitDryRunMergeResultSchema,
+  message: z.string(),
+});
+export type SubagentMergeBackResult = z.infer<typeof SubagentMergeBackResultSchema>;

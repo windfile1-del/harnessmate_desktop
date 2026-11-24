@@ -22,6 +22,7 @@ import { useAppStore } from '../stores/app-store';
 import { RiskRulesModal } from './ApprovalCenter';
 import { HarnessBadge } from './BrandMark';
 import { ModelPicker } from './ModelPicker';
+import { MergeBackReviewModal } from './OrchestratorBoard';
 import { SessionExplorerModal } from './SessionExplorerModal';
 import {
   CommandPaletteModal,
@@ -44,7 +45,8 @@ export function ModalHost() {
     activeModal === 'context_preview' ||
     activeModal === 'worktrees' ||
     activeModal === 'session_explorer' ||
-    activeModal === 'risk_rules';
+    activeModal === 'risk_rules' ||
+    activeModal === 'subagent_merge_back';
 
   return (
     <div
@@ -78,6 +80,9 @@ export function ModalHost() {
         {activeModal === 'worktrees' && <WorktreeManagerModal onClose={() => openModal(null)} />}
         {activeModal === 'session_explorer' && <SessionExplorerModal onClose={() => openModal(null)} />}
         {activeModal === 'risk_rules' && <RiskRulesModal onClose={() => openModal(null)} />}
+        {activeModal === 'subagent_merge_back' && (
+          <MergeBackReviewModal onClose={() => openModal(null)} />
+        )}
       </div>
     </div>
   );

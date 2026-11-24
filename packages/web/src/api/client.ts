@@ -14,8 +14,10 @@ import type {
   CreateWorktreeRequest,
   CustomAcpHarnessConfig,
   CustomRiskRule,
+  DelegateSubagentRequest,
   DiscoveredCliSession,
   DryRunMergeRequest,
+  DryRunSubagentMergeRequest,
   FailoverPolicy,
   FailoverRecommendation,
   FailoverRequest,
@@ -45,6 +47,8 @@ import type {
   McpServerEntry,
   MergeBackRequest,
   MergeBackResult,
+  MergeSubagentRequest,
+  OrchestratorBoardResponse,
   PluginCatalogItem,
   PluginLogEntryDto,
   PluginMcpPreset,
@@ -63,6 +67,9 @@ import type {
   Session,
   SessionCheckpointRecord,
   SessionModelPluginTools,
+  SubagentDiffStat,
+  SubagentMergeBackResult,
+  SubagentRunRecord,
   SessionPluginAction,
   SessionSearchResponse,
   SetPluginPermissionRequest,
@@ -952,6 +959,67 @@ export const daemonApi = {
   revokePairedDevice: (id: string) =>
     apiFetch<{ revoked: boolean }>(`/api/v1/remote/devices/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    }),
+
+  // ── Multi-Harness Parallel Orchestrator (Scenario D) ─────────────────
+
+  listSubagents: (parentSessionId: string) =>
+    apiFetch<OrchestratorBoardResponse>(
+      `/api/v1/sessions/${encodeURIComponent(parentSessionId)}/subagents`,
+    ),
+
+  delegateSubagent: (parentSessionId: string, req: DelegateSubagentRequest) =>
+    apiFetch<{ subagent: SubagentRunRecord }>(
+      `/api/v1/sessions/${encodeURIComponent(parentSessionId)}/subagents`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  getSubagent: (subagentId: string) =>
+    apiFetch<{
+      subagent: SubagentRunRecord;
+      pendingApprovals: ApprovalRequest[];
+      recentOutput: string;
+    }>(`/api/v1/subagents/${encodeURIComponent(subagentId)}`),
+
+  sendToSubagent: (subagentId: string, text: string) =>
+    apiFetch<{ subagent: SubagentRunRecord; turnId: string }>(
+      `/api/v1/subagents/${encodeURIComponent(subagentId)}/send`,
+      { method: 'POST', body: JSON.stringify({ text }) },
+    ),
+
+  stopSubagent: (subagentId: string, reason?: string) =>
+    apiFetch<{ subagent: SubagentRunRecord }>(
+      `/api/v1/subagents/${encodeURIComponent(subagentId)}/stop`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+    ),
+
+  dryRunMergeSubagent: (subagentId: string, req?: DryRunSubagentMergeRequest) =>
+    apiFetch<{
+      subagent: SubagentRunRecord;
+      dryRun: GitDryRunMergeResult;
+      diffStat: SubagentDiffStat;
+    }>(`/api/v1/subagents/${encodeURIComponent(subagentId)}/dry-run-merge`, {
+      method: 'POST',
+      body: JSON.stringify(req ?? {}),
+    }),
+
+  mergeBackSubagent: (subagentId: string, req: MergeSubagentRequest) =>
+    apiFetch<SubagentMergeBackResult>(
+      `/api/v1/subagents/${encodeURIComponent(subagentId)}/merge-back`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  cleanupSubagentWorktree: (
+    subagentId: string,
+    opts?: { force?: boolean; deleteBranch?: boolean },
+  ) =>
+    apiFetch<{
+      subagent: SubagentRunRecord;
+      worktreeCleaned: boolean;
+      branchDeleted: boolean;
+    }>(`/api/v1/subagents/${encodeURIComponent(subagentId)}/worktree`, {
+      method: 'DELETE',
+      body: JSON.stringify(opts ?? {}),
     }),
 };
 

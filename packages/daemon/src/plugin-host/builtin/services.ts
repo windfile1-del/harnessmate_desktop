@@ -6,9 +6,13 @@ import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointService } from '../../core/checkpoint-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { FailoverCoordinator } from '../../core/failover-service.js';
+import { OrchestratorService } from '../../core/orchestrator-service.js';
 import { SessionExplorerService } from '../../core/session-explorer-service.js';
 import {
+  commitWorktreeChangesIfDirty,
+  computeBranchDiffStat,
   createGitWorktree,
+  deleteLocalBranch,
   discardFile,
   dryRunMerge,
   executeTrustedSetupScript,
@@ -23,6 +27,7 @@ import {
   inspectGitRepo,
   inspectSetupScript,
   listGitWorktrees,
+  mergeBranchExplicit,
   removeGitWorktree,
   setSetupScriptTrust,
   workspaceTruthDigest,
@@ -54,6 +59,10 @@ export const gitService = {
   listWorktrees: listGitWorktrees,
   removeWorktree: removeGitWorktree,
   dryRunMerge,
+  commitWorktreeChangesIfDirty,
+  computeBranchDiffStat,
+  mergeBranchExplicit,
+  deleteLocalBranch,
   inspectSetupScript,
   setSetupScriptTrust,
   executeTrustedSetupScript,
@@ -282,6 +291,23 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     apply(ctx) {
       const approvalCenter = new ApprovalCenterService(store);
       ctx.provide('approval-center', approvalCenter);
+    },
+  });
+  plugins.set('hm.plugin.multi-harness-orchestrator', {
+    inject: ['git'],
+    provides: ['orchestrator'],
+    apply(ctx, settings) {
+      const cfg = settings as { maxDepth?: number; maxConcurrent?: number; defaultTimeoutMs?: number };
+      const orchestrator = new OrchestratorService(store, registry, {
+        maxDepth: typeof cfg.maxDepth === 'number' ? cfg.maxDepth : undefined,
+        maxConcurrent: typeof cfg.maxConcurrent === 'number' ? cfg.maxConcurrent : undefined,
+        defaultTimeoutMs: typeof cfg.defaultTimeoutMs === 'number' ? cfg.defaultTimeoutMs : undefined,
+      });
+      orchestrator.recoverOrphanedRuns();
+      ctx.provide('orchestrator', orchestrator);
+      ctx.effect(() => () => {
+        void orchestrator.onPluginDisabled().catch(() => {});
+      });
     },
   });
   return plugins;

@@ -192,4 +192,16 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     category: 'ui',
     contributes: { uiSlots: ['composer_action', 'modal'] },
   },
+  {
+    id: 'hm.plugin.multi-harness-orchestrator',
+    name: '多引擎并行编排中心',
+    version: '1.0.0',
+    description: '承接场景 D 多引擎并行协作：支持 MCP 子任务委托、强制 Git Worktree 物理隔离、权限不提权天花板、批次聚合唤醒与无副作用冲突预检人工合回（官方可选插件）。',
+    author: 'HarnessMate Core',
+    category: 'workflow',
+    inject: ['git'],
+    optional: ['ledger'],
+    permissions: ['session:orchestrate', 'workspace:git:write', 'tools:model'],
+    contributes: { uiSlots: ['inspector_tab', 'modal'] },
+  },
 ];

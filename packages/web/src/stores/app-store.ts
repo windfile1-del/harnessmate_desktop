@@ -10,11 +10,13 @@ import type {
   ContextSyncMode,
   CreateSessionRequest,
   CustomAcpHarnessConfig,
+  DelegateSubagentRequest,
   DiscoveredCliSession,
   FailoverPolicy,
   FailoverRequest,
   ForkSessionRequest,
   ForkSessionResult,
+  GitDryRunMergeResult,
   GitStatusSummary,
   HarnessAccountUsage,
   HarnessCommandResult,
@@ -27,6 +29,8 @@ import type {
   McpServerEntry,
   MergeBackRequest,
   MergeBackResult,
+  MergeSubagentRequest,
+  OrchestratorBoardResponse,
   PluginCatalogItem,
   PluginMcpPreset,
   PluginSlashCommand,
@@ -38,6 +42,9 @@ import type {
   Session,
   SessionCheckpointRecord,
   SessionTaskState,
+  SubagentDiffStat,
+  SubagentMergeBackResult,
+  SubagentRunRecord,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
   TurnBlockRecord,
@@ -65,6 +72,7 @@ export type ActiveModal =
   | 'worktrees'
   | 'session_explorer'
   | 'risk_rules'
+  | 'subagent_merge_back'
   | null;
 
 export type InspectorTab = 'task' | 'git' | 'files' | 'terminal' | 'diagnostics' | 'info' | 'plugins';
@@ -128,6 +136,14 @@ interface AppState {
   checkpointsBySession: Record<string, SessionCheckpointRecord[]>;
   supportsNativeRollbackBySession: Record<string, boolean>;
   lastRevertBySession: Record<string, CheckpointRevertResult | null>;
+  orchestratorBoardBySession: Record<string, OrchestratorBoardResponse | undefined>;
+  mergeBackReviewTarget: {
+    subagent: SubagentRunRecord;
+    dryRun: GitDryRunMergeResult | null;
+    diffStat: SubagentDiffStat | null;
+    loading: boolean;
+    error: string | null;
+  } | null;
   focusedCheckpointDiff: {
     sessionId: string;
     fromCheckpointId: string;
@@ -232,6 +248,25 @@ interface AppState {
     fromCheckpointId: string,
     toCheckpointId?: string,
   ) => void;
+
+  // Multi-Harness Parallel Orchestrator
+  refreshOrchestratorBoard: (parentSessionId: string) => Promise<void>;
+  delegateSubagent: (
+    parentSessionId: string,
+    req: DelegateSubagentRequest,
+  ) => Promise<SubagentRunRecord | null>;
+  stopSubagent: (subagentId: string, parentSessionId: string, reason?: string) => Promise<void>;
+  openSubagentMergeReview: (subagent: SubagentRunRecord) => Promise<void>;
+  closeSubagentMergeReview: () => void;
+  confirmSubagentMergeBack: (
+    subagentId: string,
+    req: MergeSubagentRequest,
+  ) => Promise<SubagentMergeBackResult | null>;
+  cleanupSubagentWorktree: (
+    subagentId: string,
+    parentSessionId: string,
+    opts?: { force?: boolean; deleteBranch?: boolean },
+  ) => Promise<void>;
 
   registerCustomHarness: (cfg: CustomAcpHarnessConfig) => Promise<void>;
   deleteCustomHarness: (id: string) => Promise<void>;
@@ -380,6 +415,17 @@ export const useAppStore = create<AppState>((set, get) => {
     const relevant = accepted.filter(({ sessionId }) => sessionId === currentSelected);
     if (!currentSelected) return;
     const turnEnded = relevant.some(({ type }) => type === 'turn.completed' || type === 'turn.failed' || type === 'turn.cancelled');
+    const orchestratorChanged = relevant.some(({ type }) => type.startsWith('subagent.'));
+    if (orchestratorChanged) {
+      void get().refreshOrchestratorBoard(currentSelected);
+      void get().refreshTurnItems(currentSelected);
+      if (relevant.some(({ type }) => type === 'subagent.spawned')) {
+        void daemonApi.listSessions().then(({ sessions }) => set({ sessions })).catch(() => {});
+      }
+      if (relevant.some(({ type }) => type === 'subagent.merged')) {
+        void get().refreshGitStatus(currentSelected);
+      }
+    }
     if (get().inspectorOpen && (turnEnded || relevant.some(({ type }) => type === 'tool.call.completed'))) {
       void get().refreshGitStatus(currentSelected);
     }
@@ -488,6 +534,8 @@ export const useAppStore = create<AppState>((set, get) => {
     checkpointsBySession: {},
     supportsNativeRollbackBySession: {},
     lastRevertBySession: {},
+    orchestratorBoardBySession: {},
+    mergeBackReviewTarget: null,
     focusedCheckpointDiff: null,
     taskStateBySession: {},
     contextPreviewBySession: {},
@@ -1340,6 +1388,153 @@ export const useAppStore = create<AppState>((set, get) => {
         inspectorTab: 'git',
         focusedCheckpointDiff: { sessionId, fromCheckpointId, toCheckpointId },
       }),
+
+    refreshOrchestratorBoard: async (parentSessionId) => {
+      try {
+        const board = await daemonApi.listSubagents(parentSessionId);
+        set((state) => ({
+          orchestratorBoardBySession: {
+            ...state.orchestratorBoardBySession,
+            [parentSessionId]: board,
+          },
+        }));
+      } catch {
+        // ignore transient refresh failure
+      }
+    },
+
+    delegateSubagent: async (parentSessionId, req) => {
+      try {
+        const { subagent } = await daemonApi.delegateSubagent(parentSessionId, req);
+        await Promise.all([
+          get().refreshOrchestratorBoard(parentSessionId),
+          daemonApi.listSessions().then(({ sessions }) => set({ sessions })).catch(() => {}),
+        ]);
+        get().pushToast({
+          kind: 'success',
+          title: `已派生并行子任务：${subagent.roleTitle}`,
+          body: subagent.branchName ? `隔离分支 ${subagent.branchName}` : '只读并行模式',
+        });
+        return subagent;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '派生并行子任务失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    stopSubagent: async (subagentId, parentSessionId, reason) => {
+      try {
+        await daemonApi.stopSubagent(subagentId, reason);
+        await get().refreshOrchestratorBoard(parentSessionId);
+        get().pushToast({
+          kind: 'info',
+          title: '已停止子任务',
+          body: '未合回的 Worktree 分支已完整保留。',
+        });
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '停止子任务失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+
+    openSubagentMergeReview: async (subagent) => {
+      set({
+        activeModal: 'subagent_merge_back',
+        mergeBackReviewTarget: {
+          subagent,
+          dryRun: null,
+          diffStat: subagent.diffStat ?? null,
+          loading: true,
+          error: null,
+        },
+      });
+      try {
+        const res = await daemonApi.dryRunMergeSubagent(subagent.subagentId);
+        set({
+          mergeBackReviewTarget: {
+            subagent: res.subagent,
+            dryRun: res.dryRun,
+            diffStat: res.diffStat,
+            loading: false,
+            error: null,
+          },
+        });
+      } catch (err) {
+        set((state) => ({
+          mergeBackReviewTarget: state.mergeBackReviewTarget
+            ? {
+                ...state.mergeBackReviewTarget,
+                loading: false,
+                error: err instanceof Error ? err.message : String(err),
+              }
+            : null,
+        }));
+      }
+    },
+
+    closeSubagentMergeReview: () =>
+      set((state) => ({
+        activeModal: state.activeModal === 'subagent_merge_back' ? null : state.activeModal,
+        mergeBackReviewTarget: null,
+      })),
+
+    confirmSubagentMergeBack: async (subagentId, req) => {
+      try {
+        const res = await daemonApi.mergeBackSubagent(subagentId, req);
+        const parentSessionId = get().mergeBackReviewTarget?.subagent.parentSessionId ?? get().selectedSessionId;
+        if (parentSessionId) {
+          await Promise.all([
+            get().refreshOrchestratorBoard(parentSessionId),
+            get().refreshTurnItems(parentSessionId),
+            get().refreshGitStatus(parentSessionId),
+          ]);
+        }
+        set({
+          activeModal: null,
+          mergeBackReviewTarget: null,
+        });
+        get().pushToast({
+          kind: 'success',
+          title: '子任务分支合回成功',
+          body: res.message,
+        });
+        return res;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        set((state) => ({
+          mergeBackReviewTarget: state.mergeBackReviewTarget
+            ? { ...state.mergeBackReviewTarget, error: message }
+            : null,
+        }));
+        get().pushToast({
+          kind: 'error',
+          title: '合回被阻断或失败',
+          body: message,
+        });
+        return null;
+      }
+    },
+
+    cleanupSubagentWorktree: async (subagentId, parentSessionId, opts) => {
+      try {
+        await daemonApi.cleanupSubagentWorktree(subagentId, opts);
+        await get().refreshOrchestratorBoard(parentSessionId);
+        get().pushToast({ kind: 'success', title: '已安全清理子任务 Worktree' });
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '清理 Worktree 失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
 
     registerCustomHarness: async (cfg) => {
       const { harnesses } = await daemonApi.registerCustomHarness(cfg);

@@ -15,6 +15,7 @@
 - `harness.codex`
 - `ledger`
 - `native-commands`
+- `orchestrator`
 - `session-search`
 - `usage`
 

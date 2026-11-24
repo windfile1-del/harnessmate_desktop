@@ -64,6 +64,7 @@ import {
   SECRET_RECEIPT_LABEL,
   type ExternalApprovalAnnotator,
 } from './approval-center-service.js';
+import { ORCHESTRATOR_PLUGIN_ID, OrchestratorService } from './orchestrator-service.js';
 import { CheckpointError, type CheckpointDiffResult, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
@@ -127,6 +128,7 @@ export class SessionManager {
   private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private fallbackExplorer?: SessionExplorerService;
   private fallbackApprovalCenter?: ApprovalCenterService;
+  private fallbackOrchestrator?: OrchestratorService;
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
@@ -540,6 +542,75 @@ export class SessionManager {
     );
   }
 
+  getOrchestratorService(): OrchestratorService {
+    const svc =
+      this.pluginManager.host.get<OrchestratorService>('orchestrator') ??
+      (this.fallbackOrchestrator ??= new OrchestratorService(this.store, this.registry));
+    svc.attachHooks({
+      createChildSession: async ({
+        parentSession,
+        targetInstanceId,
+        roleTitle,
+        cwd,
+        worktreeBranch,
+        permissionMode,
+        model,
+      }) => {
+        const adapter = this.registry.get(targetInstanceId);
+        if (!adapter) {
+          throw new Error(`Target harness instance not registered: ${targetInstanceId}`);
+        }
+        const now = Date.now();
+        const child = this.store.createSession({
+          id: `sess_${crypto.randomBytes(6).toString('hex')}`,
+          workspaceId: parentSession.workspaceId,
+          harnessId: adapter.id,
+          harnessKind: adapter.kind,
+          nativeSessionId: null,
+          parentSessionId: parentSession.id,
+          participatingHarnesses: [adapter.id],
+          contextSyncMode: parentSession.contextSyncMode,
+          cwd,
+          worktreeBranch,
+          title: `[子任务] ${roleTitle}`.slice(0, 160),
+          status: 'idle',
+          model: model ?? null,
+          actualModel: null,
+          modelReroutedReason: null,
+          reasoningEffort: parentSession.reasoningEffort,
+          permissionMode,
+          lastSeq: 0,
+          usage: null,
+          pendingApprovalCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
+        this.emitCanonical(child.id, 'session.status', { status: 'idle' });
+        await this.pluginManager.dispatchLifecycleEvent(
+          sessionPluginEvent('session.created', child),
+          child.workspaceId,
+        );
+        return this.store.getSession(child.id)!;
+      },
+      sendTurn: (sessionId, text, opts) => this.sendTurn(sessionId, text, undefined, opts),
+      interruptSession: (sessionId) => this.interruptSession(sessionId),
+      disposeSessionHandles: (sessionId) => this.disposeSessionHandles(sessionId),
+      emitCanonical: (sessionId, type, payload, turnId) =>
+        this.emitCanonical(sessionId, type, payload, turnId ?? null),
+      publishAttention: (item) => this.eventBus.publishAttention(item),
+      getGitService: () => this.pluginManager.host.get<GitService>('git'),
+      getTaskLedger: () => this.pluginManager.host.get<TaskLedgerService>('ledger'),
+      isOrchestratorEnabled: () => this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID),
+    });
+    return svc;
+  }
+
+  private getActiveOrchestrator(): OrchestratorService | null {
+    if (!this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID)) return null;
+    if (!this.pluginManager.host.get<OrchestratorService>('orchestrator')) return null;
+    return this.getOrchestratorService();
+  }
+
   searchSessions(opts: SessionExplorerQueryOptions): SessionSearchResponse {
     return this.getExplorerService().query(opts);
   }
@@ -844,6 +915,9 @@ export class SessionManager {
     });
 
     if (req.archived !== undefined) {
+      if (req.archived === true) {
+        await this.getActiveOrchestrator()?.cascadeStopChildren(id, 'Parent session archived');
+      }
       await this.disposeSessionHandles(id);
     } else if (configChanged && current.status === 'idle') {
       const live = this.liveHandles.get(this.handleKey(id, updated.harnessId));
@@ -873,6 +947,7 @@ export class SessionManager {
 
   async deleteSession(id: string): Promise<boolean> {
     const session = this.store.getSession(id);
+    await this.getActiveOrchestrator()?.cascadeStopChildren(id, 'Parent session deleted');
     if (session) await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
     await this.disposeSessionHandles(id);
     return this.store.deleteSession(id);
@@ -1710,6 +1785,11 @@ export class SessionManager {
     this.activeTurnMeta.delete(sessionId);
     this.cancelSessionApprovals(sessionId, '轮次已中断');
     this.setSessionStatus(sessionId, 'idle');
+    const orch = this.getActiveOrchestrator();
+    if (orch) {
+      await orch.cascadeStopChildren(sessionId, 'Parent session interrupted');
+      await orch.handleChildTurnCancelled(sessionId);
+    }
   }
 
   // ── Atomic Approval, Question & Secret Broker ────────────────────────
@@ -1940,6 +2020,7 @@ export class SessionManager {
       if (sess && sess.status === 'awaiting_approval') {
         this.setSessionStatus(sessionId, this.activeTurnMeta.has(sessionId) ? 'running' : 'idle');
       }
+      this.getActiveOrchestrator()?.handleChildApprovalResolved(sessionId);
     }
   }
 
@@ -2075,7 +2156,10 @@ export class SessionManager {
           this.activeTurnMeta.get(sessionId)?.turnId);
       },
     };
-    let lease = tools.length ? this.pluginCapabilities?.openLease(session, harnessId, tools) : undefined;
+    const shouldAttachMcpLease =
+      Boolean(adapter.pluginMcpTransport) &&
+      (tools.length > 0 || this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID));
+    let lease = shouldAttachMcpLease ? this.pluginCapabilities?.openLease(session, harnessId, tools) : undefined;
     let handle: AdapterSessionHandle;
     try {
       handle = await adapter.createSession({ ...config, pluginMcp: lease?.connection });
@@ -2320,6 +2404,12 @@ export class SessionManager {
         this.setSessionStatus(sessionId, 'idle');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
 
+        const orchCompleted = this.getActiveOrchestrator();
+        if (orchCompleted) {
+          void orchCompleted.handleChildTurnCompleted(sessionId).catch(() => {});
+          orchCompleted.onParentSessionIdle(sessionId);
+        }
+
         this.eventBus.publishAttention({
           kind: 'turn_completed',
           sessionId,
@@ -2347,6 +2437,11 @@ export class SessionManager {
         this.activeTurnMeta.delete(sessionId);
         this.setSessionStatus(sessionId, 'idle');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
+        const orchCancelled = this.getActiveOrchestrator();
+        if (orchCancelled) {
+          void orchCancelled.handleChildTurnCancelled(sessionId).catch(() => {});
+          orchCancelled.onParentSessionIdle(sessionId);
+        }
         break;
       }
 
@@ -2388,6 +2483,11 @@ export class SessionManager {
         }
         this.setSessionStatus(sessionId, 'error');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
+
+        const orchFailed = this.getActiveOrchestrator();
+        if (orchFailed) {
+          void orchFailed.handleChildTurnFailed(sessionId, ev.message).catch(() => {});
+        }
 
         this.eventBus.publishAttention({
           kind: 'turn_failed',
@@ -2710,6 +2810,7 @@ export class SessionManager {
         this.setSessionStatus(sessionId, 'awaiting_approval');
         this.emitCanonical(sessionId, 'approval.requested', { approval }, ev.turnId);
         this.emitCanonical(sessionId, 'runtime_request.updated', { request: approval }, ev.turnId);
+        this.getActiveOrchestrator()?.handleChildApprovalRequested(sessionId, approvalId, ev.toolName);
         void this.annotatePendingApproval(session, approval);
         this.eventBus.publishAttention({
           kind: 'approval_needed',

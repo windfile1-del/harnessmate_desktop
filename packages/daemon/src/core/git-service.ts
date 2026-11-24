@@ -11,6 +11,7 @@ import type {
   GitStatusSummary,
   GitWorkspaceTruthDigest,
   GitWorktreeEntry,
+  SubagentDiffStat,
   WorkspaceSetupScriptInfo,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
@@ -924,4 +925,153 @@ export async function gitCreatePr(
       String(e.stderr || e.stdout || e.message || '创建 PR 失败').trim(),
     );
   }
+}
+
+// ── Subagent Worktree Commit, DiffStat & Explicit Human-Confirmed Merge ─
+
+/**
+ * Stages and commits any uncommitted/untracked changes inside an isolated subagent
+ * worktree onto its isolated branch so dry-run merge and diffstat accurately reflect
+ * all edits made by the subagent. Never touches the main repository working tree.
+ */
+export async function commitWorktreeChangesIfDirty(
+  worktreePath: string,
+  message: string,
+): Promise<{ committed: boolean; commitSha: string | null }> {
+  if (!fs.existsSync(worktreePath)) {
+    return { committed: false, commitSha: null };
+  }
+  // Exclude HarnessMate's own internal runtime metadata (.harnessmate/) so parallel subagents
+  // never pollute feature branches or spuriously conflict on task-ledger files.
+  const pathspec = ['--', '.', ':!.harnessmate', ':!.harnessmate/'];
+  const porcelain = await runGit(worktreePath, ['status', '--porcelain=v1', ...pathspec], 5000);
+  if (porcelain && porcelain.trim().length > 0) {
+    const addRes = await runGitFull(worktreePath, ['add', '-A', ...pathspec], { timeoutMs: 10_000 });
+    if (!addRes.ok) {
+      throw new GitOperationError(
+        'E_GIT_ADD_FAILED',
+        addRes.stderr.trim() || `暂存子任务 Worktree 变更失败: ${worktreePath}`,
+      );
+    }
+    const commitRes = await runGitFull(
+      worktreePath,
+      [
+        '-c',
+        'user.name=HarnessMate Orchestrator',
+        '-c',
+        'user.email=orchestrator@harnessmate.local',
+        'commit',
+        '-m',
+        message.trim() || 'chore(subagent): snapshot isolated worktree edits',
+      ],
+      { timeoutMs: 15_000 },
+    );
+    if (!commitRes.ok && !/nothing to commit/i.test(`${commitRes.stdout}\n${commitRes.stderr}`)) {
+      throw new GitOperationError(
+        'E_GIT_COMMIT_FAILED',
+        commitRes.stderr.trim() || commitRes.stdout.trim() || '子任务 Worktree 自动提交失败',
+      );
+    }
+    const sha = (await runGit(worktreePath, ['rev-parse', 'HEAD'], 3000))?.trim();
+    return { committed: true, commitSha: sha || null };
+  }
+  const sha = (await runGit(worktreePath, ['rev-parse', 'HEAD'], 3000))?.trim();
+  return { committed: false, commitSha: sha || null };
+}
+
+/**
+ * Computes branch diffstat (`baseBranch...headBranch`) without modifying any working tree.
+ */
+export async function computeBranchDiffStat(
+  repoRoot: string,
+  baseBranch: string,
+  headBranch: string,
+): Promise<SubagentDiffStat> {
+  const res = await runGitFull(repoRoot, ['diff', '--numstat', `${baseBranch}...${headBranch}`], {
+    timeoutMs: 8000,
+  });
+  if (!res.ok) {
+    return { filesChanged: 0, insertions: 0, deletions: 0, changedFiles: [] };
+  }
+  let filesChanged = 0;
+  let insertions = 0;
+  let deletions = 0;
+  const changedFiles: string[] = [];
+  for (const raw of res.stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const parts = line.split('\t');
+    if (parts.length < 3) continue;
+    const add = Number.parseInt(parts[0]!, 10);
+    const del = Number.parseInt(parts[1]!, 10);
+    const filePath = parts.slice(2).join('\t').trim();
+    if (!filePath) continue;
+    filesChanged += 1;
+    if (Number.isFinite(add)) insertions += add;
+    if (Number.isFinite(del)) deletions += del;
+    changedFiles.push(filePath);
+  }
+  return { filesChanged, insertions, deletions, changedFiles };
+}
+
+/**
+ * Explicit human-confirmed merge of a child branch into the main repository's baseBranch.
+ * Always executes `dryRunMerge` first and aborts before touching the working tree if any
+ * conflict is detected.
+ */
+export async function mergeBranchExplicit(
+  repoRoot: string,
+  baseBranch: string,
+  headBranch: string,
+  opts?: { commitMessage?: string },
+): Promise<{ commitSha: string | null; dryRun: GitDryRunMergeResult }> {
+  const dryRun = await dryRunMerge(repoRoot, baseBranch, headBranch);
+  if (dryRun.hasConflicts) {
+    throw new GitOperationError(
+      'E_MERGE_CONFLICT',
+      `检测到 ${dryRun.conflictFiles.length} 个合并冲突文件，已阻止合并以保护主工作区: ${dryRun.conflictFiles.join(', ')}`,
+    );
+  }
+
+  const currentBranch = (await runGit(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], 3000))?.trim();
+  if (currentBranch && currentBranch !== baseBranch) {
+    throw new GitOperationError(
+      'E_BASE_BRANCH_MISMATCH',
+      `主工作区当前分支为 ${currentBranch}，与目标合回分支 ${baseBranch} 不一致，请先切换分支后重试`,
+    );
+  }
+
+  const msg = opts?.commitMessage?.trim() || `Merge subagent branch '${headBranch}' into ${baseBranch}`;
+  const mergeRes = await runGitFull(
+    repoRoot,
+    [
+      '-c',
+      'user.name=HarnessMate Orchestrator',
+      '-c',
+      'user.email=orchestrator@harnessmate.local',
+      'merge',
+      '--no-ff',
+      '-m',
+      msg,
+      headBranch,
+    ],
+    { timeoutMs: 15_000 },
+  );
+
+  if (!mergeRes.ok) {
+    // Guarantee main working tree is never left in a conflicted/half-merged state
+    await runGitFull(repoRoot, ['merge', '--abort'], { timeoutMs: 5000 });
+    throw new GitOperationError(
+      'E_MERGE_FAILED',
+      mergeRes.stderr.trim() || mergeRes.stdout.trim() || `合并分支 ${headBranch} 失败，已自动回滚合并状态`,
+    );
+  }
+
+  const commitSha = (await runGit(repoRoot, ['rev-parse', 'HEAD'], 3000))?.trim();
+  return { commitSha: commitSha || null, dryRun };
+}
+
+export async function deleteLocalBranch(repoRoot: string, branchName: string): Promise<boolean> {
+  const res = await runGitFull(repoRoot, ['branch', '-d', branchName], { timeoutMs: 5000 });
+  return res.ok;
 }

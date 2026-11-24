@@ -33,6 +33,10 @@ import type {
   SessionSearchHit,
   SessionStatus,
   SessionTaskState,
+  SubagentDiffStat,
+  SubagentIsolation,
+  SubagentRunRecord,
+  SubagentStatus,
   TaskFailedAttempt,
   TaskStep,
   TaskVerification,
@@ -165,6 +169,35 @@ interface DeviceRow {
   created_at: number;
   last_seen_at: number | null;
   revoked_at: number | null;
+}
+
+interface SubagentRunRow {
+  subagent_id: string;
+  cohort_id: string;
+  parent_session_id: string;
+  child_session_id: string;
+  target_instance_id: string;
+  target_driver_id: string | null;
+  role_title: string;
+  prompt: string;
+  isolation: string;
+  worktree_path: string | null;
+  branch_name: string | null;
+  base_branch: string | null;
+  effective_approval_policy: string;
+  requested_approval_policy: string | null;
+  depth: number;
+  timeout_ms: number;
+  fail_fast: number;
+  status: string;
+  diff_stat_json: string | null;
+  summary: string | null;
+  error: string | null;
+  merged_at: number | null;
+  merged_into_branch: string | null;
+  worktree_cleaned: number;
+  created_at: number;
+  finished_at: number | null;
 }
 
 export interface LocalHarnessUsageAggregate {
@@ -453,6 +486,42 @@ export class HarnessMateStore {
 
       CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session_turn
         ON session_checkpoints(session_id, turn_seq DESC);
+
+      CREATE TABLE IF NOT EXISTS subagent_runs (
+        subagent_id TEXT PRIMARY KEY,
+        cohort_id TEXT NOT NULL,
+        parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        child_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        target_instance_id TEXT NOT NULL,
+        target_driver_id TEXT,
+        role_title TEXT NOT NULL,
+        prompt TEXT NOT NULL DEFAULT '',
+        isolation TEXT NOT NULL,
+        worktree_path TEXT,
+        branch_name TEXT,
+        base_branch TEXT,
+        effective_approval_policy TEXT NOT NULL,
+        requested_approval_policy TEXT,
+        depth INTEGER NOT NULL DEFAULT 1,
+        timeout_ms INTEGER NOT NULL DEFAULT 900000,
+        fail_fast INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        diff_stat_json TEXT,
+        summary TEXT,
+        error TEXT,
+        merged_at INTEGER,
+        merged_into_branch TEXT,
+        worktree_cleaned INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent
+        ON subagent_runs(parent_session_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_subagent_runs_cohort
+        ON subagent_runs(cohort_id, created_at ASC);
+      CREATE INDEX IF NOT EXISTS idx_subagent_runs_child
+        ON subagent_runs(child_session_id);
 
       CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
         session_id UNINDEXED,
@@ -2062,6 +2131,7 @@ export class HarnessMateStore {
     cancelledProcessBoundEffects: number;
     requeuedReplaySafeEffects: number;
     expiredApprovals: number;
+    settledSubagents: number;
   } {
     const now = Date.now();
     this.db.exec('BEGIN IMMEDIATE');
@@ -2107,6 +2177,18 @@ export class HarnessMateStore {
           .prepare("UPDATE approvals SET status = 'expired', resolved_at = ? WHERE status = 'pending'")
           .run(now).changes,
       );
+      // Converge orphaned running/queued/awaiting_approval subagent runs to stopped while preserving worktree_path & branch_name
+      const settledSubagents = Number(
+        this.db
+          .prepare(
+            `UPDATE subagent_runs
+             SET status = 'stopped',
+                 error = COALESCE(error, 'Daemon restarted; subagent stopped and worktree preserved'),
+                 finished_at = COALESCE(finished_at, ?)
+             WHERE status IN ('queued', 'running', 'awaiting_approval')`,
+          )
+          .run(now).changes,
+      );
       this.db.exec('COMMIT');
       return {
         settledRuns,
@@ -2114,6 +2196,7 @@ export class HarnessMateStore {
         cancelledProcessBoundEffects,
         requeuedReplaySafeEffects,
         expiredApprovals,
+        settledSubagents,
       };
     } catch (err) {
       this.db.exec('ROLLBACK');
@@ -2229,6 +2312,167 @@ export class HarnessMateStore {
       .prepare('DELETE FROM session_checkpoints WHERE session_id = ?')
       .run(sessionId);
     return Number(res.changes);
+  }
+
+  // ── Multi-Harness Parallel Subagent Runs ────────────────────────────
+
+  createSubagentRun(record: SubagentRunRecord): SubagentRunRecord {
+    this.db
+      .prepare(
+        `INSERT INTO subagent_runs (
+          subagent_id, cohort_id, parent_session_id, child_session_id,
+          target_instance_id, target_driver_id, role_title, prompt,
+          isolation, worktree_path, branch_name, base_branch,
+          effective_approval_policy, requested_approval_policy,
+          depth, timeout_ms, fail_fast, status,
+          diff_stat_json, summary, error,
+          merged_at, merged_into_branch, worktree_cleaned,
+          created_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.subagentId,
+        record.cohortId,
+        record.parentSessionId,
+        record.childSessionId,
+        record.targetInstanceId,
+        record.targetDriverId ?? null,
+        record.roleTitle,
+        record.prompt ?? '',
+        record.isolation,
+        record.worktreePath ?? null,
+        record.branchName ?? null,
+        record.baseBranch ?? null,
+        record.effectiveApprovalPolicy,
+        record.requestedApprovalPolicy ?? null,
+        record.depth ?? 1,
+        record.timeoutMs ?? 15 * 60 * 1000,
+        record.failFast ? 1 : 0,
+        record.status,
+        record.diffStat ? JSON.stringify(record.diffStat) : null,
+        record.summary ?? null,
+        record.error ?? null,
+        record.mergedAt ?? null,
+        record.mergedIntoBranch ?? null,
+        record.worktreeCleaned ? 1 : 0,
+        record.createdAt,
+        record.finishedAt ?? null,
+      );
+    return this.getSubagentRun(record.subagentId)!;
+  }
+
+  getSubagentRun(subagentId: string): SubagentRunRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM subagent_runs WHERE subagent_id = ?')
+      .get(subagentId) as unknown as SubagentRunRow | undefined;
+    return row ? mapSubagentRunRow(row) : null;
+  }
+
+  getSubagentRunByChildSession(childSessionId: string): SubagentRunRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM subagent_runs WHERE child_session_id = ?')
+      .get(childSessionId) as unknown as SubagentRunRow | undefined;
+    return row ? mapSubagentRunRow(row) : null;
+  }
+
+  listSubagentRuns(filter?: {
+    parentSessionId?: string;
+    cohortId?: string;
+    statuses?: SubagentStatus[];
+    limit?: number;
+  }): SubagentRunRecord[] {
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter?.parentSessionId) {
+      where.push('parent_session_id = ?');
+      params.push(filter.parentSessionId);
+    }
+    if (filter?.cohortId) {
+      where.push('cohort_id = ?');
+      params.push(filter.cohortId);
+    }
+    if (filter?.statuses && filter.statuses.length > 0) {
+      where.push(`status IN (${filter.statuses.map(() => '?').join(', ')})`);
+      params.push(...filter.statuses);
+    }
+    const sql = `SELECT * FROM subagent_runs ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at ASC LIMIT ?`;
+    params.push(filter?.limit ?? 200);
+    const rows = this.db.prepare(sql).all(...params) as unknown as SubagentRunRow[];
+    return rows.map(mapSubagentRunRow);
+  }
+
+  updateSubagentRun(
+    subagentId: string,
+    patch: Partial<
+      Pick<
+        SubagentRunRecord,
+        | 'status'
+        | 'diffStat'
+        | 'summary'
+        | 'error'
+        | 'mergedAt'
+        | 'mergedIntoBranch'
+        | 'worktreeCleaned'
+        | 'finishedAt'
+      >
+    >,
+  ): SubagentRunRecord | null {
+    const current = this.getSubagentRun(subagentId);
+    if (!current) return null;
+    const fields: string[] = [];
+    const params: Array<string | number | null> = [];
+    if (patch.status !== undefined) {
+      fields.push('status = ?');
+      params.push(patch.status);
+    }
+    if (patch.diffStat !== undefined) {
+      fields.push('diff_stat_json = ?');
+      params.push(patch.diffStat ? JSON.stringify(patch.diffStat) : null);
+    }
+    if (patch.summary !== undefined) {
+      fields.push('summary = ?');
+      params.push(patch.summary ?? null);
+    }
+    if (patch.error !== undefined) {
+      fields.push('error = ?');
+      params.push(patch.error ?? null);
+    }
+    if (patch.mergedAt !== undefined) {
+      fields.push('merged_at = ?');
+      params.push(patch.mergedAt ?? null);
+    }
+    if (patch.mergedIntoBranch !== undefined) {
+      fields.push('merged_into_branch = ?');
+      params.push(patch.mergedIntoBranch ?? null);
+    }
+    if (patch.worktreeCleaned !== undefined) {
+      fields.push('worktree_cleaned = ?');
+      params.push(patch.worktreeCleaned ? 1 : 0);
+    }
+    if (patch.finishedAt !== undefined) {
+      fields.push('finished_at = ?');
+      params.push(patch.finishedAt ?? null);
+    }
+    if (fields.length === 0) return current;
+    params.push(subagentId);
+    this.db.prepare(`UPDATE subagent_runs SET ${fields.join(', ')} WHERE subagent_id = ?`).run(...params);
+    return this.getSubagentRun(subagentId);
+  }
+
+  settleActiveSubagentRuns(reason = 'Recovered on startup; worktree preserved'): SubagentRunRecord[] {
+    const active = this.listSubagentRuns({ statuses: ['queued', 'running', 'awaiting_approval'] });
+    if (active.length === 0) return [];
+    const now = Date.now();
+    this.db
+      .prepare(
+        `UPDATE subagent_runs
+         SET status = 'stopped',
+             error = COALESCE(error, ?),
+             finished_at = COALESCE(finished_at, ?)
+         WHERE status IN ('queued', 'running', 'awaiting_approval')`,
+      )
+      .run(reason, now);
+    return active.map((r) => this.getSubagentRun(r.subagentId)!).filter(Boolean);
   }
 
   indexSearchItem(entry: {
@@ -2865,5 +3109,36 @@ function mapCheckpointRow(row: CheckpointRow): SessionCheckpointRecord {
     deletions: row.deletions,
     skippedLargeFiles: safeJsonParse<string[]>(row.skipped_large_files_json, []),
     createdAt: row.created_at,
+  };
+}
+
+function mapSubagentRunRow(row: SubagentRunRow): SubagentRunRecord {
+  return {
+    subagentId: row.subagent_id,
+    cohortId: row.cohort_id,
+    parentSessionId: row.parent_session_id,
+    childSessionId: row.child_session_id,
+    targetInstanceId: row.target_instance_id,
+    targetDriverId: row.target_driver_id ?? undefined,
+    roleTitle: row.role_title,
+    prompt: row.prompt ?? '',
+    isolation: row.isolation as SubagentIsolation,
+    worktreePath: row.worktree_path,
+    branchName: row.branch_name,
+    baseBranch: row.base_branch,
+    effectiveApprovalPolicy: row.effective_approval_policy as PermissionMode,
+    requestedApprovalPolicy: (row.requested_approval_policy as PermissionMode | null) ?? null,
+    depth: row.depth,
+    timeoutMs: row.timeout_ms,
+    failFast: row.fail_fast === 1,
+    status: row.status as SubagentStatus,
+    diffStat: row.diff_stat_json ? safeJsonParse<SubagentDiffStat | null>(row.diff_stat_json, null) : null,
+    summary: row.summary,
+    error: row.error,
+    mergedAt: row.merged_at,
+    mergedIntoBranch: row.merged_into_branch,
+    worktreeCleaned: row.worktree_cleaned === 1,
+    createdAt: row.created_at,
+    finishedAt: row.finished_at,
   };
 }

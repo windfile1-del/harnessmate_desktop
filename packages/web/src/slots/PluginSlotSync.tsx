@@ -15,6 +15,10 @@ import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
 import { HtmlRenderCard } from '../components/HtmlRenderCard';
 import { FailoverInlineBanner } from '../components/MessageStudio';
+import {
+  OrchestratorCohortBlockCard,
+  ParallelExecutionBoard,
+} from '../components/OrchestratorBoard';
 import { PluginDataPanel } from '../components/PluginDataPanel';
 import { SideChatDrawer } from '../components/SideChatDrawer';
 import { TraitsPicker } from '../components/TraitsPicker';
@@ -454,6 +458,49 @@ export function PluginSlotSync() {
                 receiptText={block.receiptText}
                 requestStatus={block.requestStatus}
                 resolvedBy={block.resolvedBy}
+              />
+            );
+          },
+        }),
+      );
+    }
+
+    // Built-in V5 Optional Multi-Harness Parallel Orchestrator (`inspector.tabs` key: `orchestrator-board` + `chat.block` key: `ext:orchestrator.cohort`)
+    const orchestratorPlugin = plugins.find((p) => p.id === 'hm.plugin.multi-harness-orchestrator');
+    if (orchestratorPlugin && isPluginActive(orchestratorPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'orchestrator-board',
+          pluginId: 'hm.plugin.multi-harness-orchestrator',
+          pluginName: 'Multi-Harness Orchestrator',
+          title: '并行编排看板',
+          key: 'orchestrator-board',
+          order: 90,
+          sourceKind: 'builtin',
+          render: ({ session }) => <ParallelExecutionBoard session={session} />,
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'chat.block',
+          id: 'orchestrator-cohort-card',
+          pluginId: 'hm.plugin.multi-harness-orchestrator',
+          pluginName: 'Multi-Harness Orchestrator',
+          title: '并行协作批次摘要卡',
+          key: 'ext:orchestrator.cohort',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ block }) => {
+            if (block.type !== 'ext:orchestrator.cohort' || !('payload' in block)) return null;
+            const store = useAppStore.getState();
+            return (
+              <OrchestratorCohortBlockCard
+                block={block}
+                harnesses={store.harnesses}
+                onReviewMerge={(sub) => void store.openSubagentMergeReview(sub)}
+                onOpenChildSession={(childId) => void store.selectSession(childId)}
               />
             );
           },
