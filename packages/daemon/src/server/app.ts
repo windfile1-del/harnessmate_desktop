@@ -205,6 +205,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
       terminalWorkspace,
       { service: triageInbox, bus: eventBus },
+      paths.agyProfilesDir,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy,
       onDevReload: () => wsGateway.notifyPluginsChanged() },

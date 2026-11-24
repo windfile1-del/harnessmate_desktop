@@ -2,7 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CustomAcpHarnessConfig, HarnessInstanceConfig } from '@harnessmate/protocol';
+import type {
+  AgyProfileConfig,
+  CustomAcpHarnessConfig,
+  HarnessInstanceConfig,
+} from '@harnessmate/protocol';
 
 export interface DaemonPersistedConfig {
   desktopId: string;
@@ -12,6 +16,7 @@ export interface DaemonPersistedConfig {
   localToken: string;
   customAcpHarnesses: CustomAcpHarnessConfig[];
   harnessInstances: HarnessInstanceConfig[];
+  agyProfiles: AgyProfileConfig[];
   binaryOverrides: Record<string, string>;
   disabledPlugins: string[];
 }
@@ -22,6 +27,7 @@ export interface DaemonRuntimePaths {
   dbPath: string;
   pluginsDir: string;
   attachmentsDir: string;
+  agyProfilesDir: string;
   webDistDir: string | null;
 }
 
@@ -32,6 +38,7 @@ export function resolveRuntimePaths(dataDirOverride?: string): DaemonRuntimePath
     path.join(os.homedir(), '.harnessmate-desktop');
   const pluginsDir = path.join(dataDir, 'plugins');
   const attachmentsDir = path.join(dataDir, 'attachments');
+  const agyProfilesDir = path.join(dataDir, 'agy-profiles');
 
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(pluginsDir, { recursive: true });
@@ -46,6 +53,7 @@ export function resolveRuntimePaths(dataDirOverride?: string): DaemonRuntimePath
     dbPath: path.join(dataDir, 'harnessmate.db'),
     pluginsDir,
     attachmentsDir,
+    agyProfilesDir,
     webDistDir,
   };
 }
@@ -59,6 +67,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
     localToken: crypto.randomBytes(24).toString('hex'),
     customAcpHarnesses: [],
     harnessInstances: [],
+    agyProfiles: [],
     binaryOverrides: {},
     disabledPlugins: [],
   };
@@ -72,6 +81,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
         port: portOverride ?? raw.port ?? defaults.port,
         customAcpHarnesses: Array.isArray(raw.customAcpHarnesses) ? raw.customAcpHarnesses : [],
         harnessInstances: Array.isArray(raw.harnessInstances) ? raw.harnessInstances : [],
+        agyProfiles: Array.isArray(raw.agyProfiles) ? raw.agyProfiles : [],
         binaryOverrides:
           raw.binaryOverrides && typeof raw.binaryOverrides === 'object' ? raw.binaryOverrides : {},
         disabledPlugins: Array.isArray(raw.disabledPlugins) ? raw.disabledPlugins : [],

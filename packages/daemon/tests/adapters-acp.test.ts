@@ -106,13 +106,18 @@ describe('AcpAdapter (hm.adapter.acp: strict_acp & antigravity) V2 & Offline NDJ
       tagline: 'Antigravity · Native ACP',
     });
 
-    // Verify StrictAcpFlavorPolicy & AcpSessionHandle contain zero agy/antigravity conditionals
-    const acpSrc = fs.readFileSync(
-      path.resolve(import.meta.dirname, '../src/harnesses/acp-adapter.ts'),
+    // Verify strict-acp-adapter.ts runtime & flavor policy contain zero agy/antigravity conditionals
+    const strictAcpSrc = fs.readFileSync(
+      path.resolve(import.meta.dirname, '../src/harnesses/acp/strict-acp-adapter.ts'),
       'utf8',
     );
-    const runtimeSlice = acpSrc.slice(acpSrc.indexOf('export class AcpSessionHandle'));
-    expect(runtimeSlice).not.toMatch(/\bagyBinary\b|\bantigravity\b|\bagyDataDirectory\b/);
+    expect(strictAcpSrc).not.toMatch(
+      /\bagyBinary\b|\bagyDataDirectory\b|\brunAgyCommand\b|\bprobeAgyModelsCli\b/i,
+    );
+    const strictRuntimeSlice = strictAcpSrc.slice(
+      strictAcpSrc.indexOf('export class StrictAcpFlavorPolicy'),
+    );
+    expect(strictRuntimeSlice).not.toMatch(/\bantigravity\b|\bagy\b/i);
 
     const descriptors = mapAcpConfigOptionsToDescriptors([
       {
@@ -219,10 +224,9 @@ describe('AcpAdapter (hm.adapter.acp: strict_acp & antigravity) V2 & Offline NDJ
       expect(calls[0]?.CUSTOM_ENV).toBe('acp-val');
       expect(calls[0]?.HARNESSMATE_LOCAL_TOKEN).toBeNull();
 
-      // Verify agy-commands.ts passes isolated env + --app-data-dir
+      // Verify agy-commands.ts passes isolated env and omits --app-data-dir / --gemini-dir on top-level agy CLI
       const agyUsage = await inspectAgyCommand(mockBin, tmp, '/usage', {
         env: { CUSTOM_ACP_KEY: 'agy-isolated' },
-        appDataDir: 'antigravity-alt',
       });
       expect(agyUsage).toEqual({ description: 'OK' });
       const allCalls = fs
@@ -230,8 +234,10 @@ describe('AcpAdapter (hm.adapter.acp: strict_acp & antigravity) V2 & Offline NDJ
         .trim()
         .split('\n')
         .map((l) => JSON.parse(l) as Record<string, unknown>);
-      expect(allCalls[1]?.args as string[]).toContain('--app-data-dir');
-      expect(allCalls[1]?.args as string[]).toContain('antigravity-alt');
+      const usageArgs = allCalls[1]?.args as string[];
+      expect(usageArgs).not.toContain('--app-data-dir');
+      expect(usageArgs).not.toContain('--gemini-dir');
+      expect(usageArgs).toContain('/usage');
       expect(allCalls[1]?.CUSTOM_ENV).toBe('agy-isolated');
     } finally {
       if (prevToken === undefined) delete process.env.HARNESSMATE_LOCAL_TOKEN;

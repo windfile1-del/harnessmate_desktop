@@ -1014,9 +1014,9 @@ export class TerminalWorkspaceService {
     entry.pendingChars = 0;
     entry.unsubData();
     entry.unsubExit();
+    this.terminals.delete(terminalId);
     await entry.backend.kill();
     entry.outputListeners.clear();
-    this.terminals.delete(terminalId);
     this.emitStatus(entry, 'closed');
     return true;
   }

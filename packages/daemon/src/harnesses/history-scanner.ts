@@ -139,16 +139,15 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-export function readAgyIndexedHistory(session: DiscoveredCliSession): HistoryMessage[] {
-  if (session.source !== 'agy_desktop' && session.source !== 'agy_cli') return [];
-  const dbPath = path.join(os.homedir(), '.gemini', agySources[session.source], 'conversation_summaries.db');
+export function readAgyIndexedHistoryFromRoot(root: string, nativeSessionId: string): HistoryMessage[] {
+  const dbPath = path.join(root, 'conversation_summaries.db');
   return openReadOnlySqliteWithBackoff(
     dbPath,
     (db) => {
       const messages = new Map<string, HistoryMessage & { index: number }>();
       const rows = db.prepare(`SELECT user_body, agent_body, user_step_byte_offsets, agent_step_byte_offsets
         FROM conversations_fts WHERE conversation_id = ? AND chunk_index >= 0 ORDER BY chunk_index`)
-        .iterate(session.nativeSessionId);
+        .iterate(nativeSessionId);
       for (const row of rows) {
         for (const [role, body, offsets] of [
           ['user', row.user_body, row.user_step_byte_offsets],
@@ -177,6 +176,12 @@ export function readAgyIndexedHistory(session: DiscoveredCliSession): HistoryMes
     },
     [],
   );
+}
+
+export function readAgyIndexedHistory(session: DiscoveredCliSession): HistoryMessage[] {
+  if (session.source !== 'agy_desktop' && session.source !== 'agy_cli') return [];
+  const root = path.join(os.homedir(), '.gemini', agySources[session.source]);
+  return readAgyIndexedHistoryFromRoot(root, session.nativeSessionId);
 }
 
 export async function scanLocalCliSessions(
@@ -505,8 +510,13 @@ async function scanClaude(limit: number, id?: string): Promise<DiscoveredCliSess
   return scanClaudeFromHome(claudeHome(), limit, id);
 }
 
-function scanAgy(dir: string, source: keyof typeof agySources, limit: number, id?: string): DiscoveredCliSession[] {
-  const root = path.join(os.homedir(), '.gemini', dir);
+export function scanAgyRoot(
+  root: string,
+  source: keyof typeof agySources,
+  limit: number,
+  id?: string,
+  scannerId?: string,
+): DiscoveredCliSession[] {
   const dbPath = path.join(root, 'conversation_summaries.db');
   const found = new Map<string, DiscoveredCliSession>();
 
@@ -534,7 +544,7 @@ function scanAgy(dir: string, source: keyof typeof agySources, limit: number, id
     found.set(nativeSessionId, {
       harnessKind: 'agy',
       source,
-      scannerId: source,
+      scannerId: scannerId ?? source,
       nativeSessionId,
       cwd,
       title: String(row.title || `AGY · ${nativeSessionId.slice(0, 12)}`),
@@ -551,7 +561,7 @@ function scanAgy(dir: string, source: keyof typeof agySources, limit: number, id
       if (!found.has(nativeSessionId)) found.set(nativeSessionId, {
         harnessKind: 'agy',
         source,
-        scannerId: source,
+        scannerId: scannerId ?? source,
         nativeSessionId,
         cwd: null,
         title: `AGY · ${nativeSessionId.slice(0, 12)}`,
@@ -562,6 +572,11 @@ function scanAgy(dir: string, source: keyof typeof agySources, limit: number, id
     }
   }
   return [...found.values()];
+}
+
+function scanAgy(dir: string, source: keyof typeof agySources, limit: number, id?: string): DiscoveredCliSession[] {
+  const root = path.join(os.homedir(), '.gemini', dir);
+  return scanAgyRoot(root, source, limit, id);
 }
 
 function messageText(content: unknown): string {

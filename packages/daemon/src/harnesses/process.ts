@@ -202,6 +202,7 @@ export interface ExecCliQuickOptions {
   signal?: AbortSignal;
   env?: Record<string, string | undefined>;
   unsetEnv?: readonly string[];
+  onStderrChunk?: (chunk: string) => void;
 }
 
 export async function execCliQuick(
@@ -223,14 +224,22 @@ export async function execCliQuick(
     let stdout = '';
     let stderr = '';
     let settled = false;
-    const abort = () => { void killProcessTree(child); };
+    let timer: NodeJS.Timeout | undefined;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      void killProcessTree(child).finally(() => {
+        resolve({ stdout, stderr: stderr || 'Cancelled', exitCode: -1 });
+      });
+    };
     opts.signal?.addEventListener('abort', abort, { once: true });
     if (opts.input !== undefined) {
       child.stdin?.on('error', () => {});
       child.stdin?.end(opts.input, 'utf8');
     }
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       if (!settled) {
         settled = true;
         opts.signal?.removeEventListener('abort', abort);
@@ -244,6 +253,7 @@ export async function execCliQuick(
     });
     child.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
       stderr += chunk;
+      opts.onStderrChunk?.(chunk);
     });
     child.on('error', (err) => {
       if (!settled) {
@@ -268,7 +278,9 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
   if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
   try {
     if (process.platform === 'win32') {
-      await execFileAsync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+      const taskkillBin = path.join(systemRoot, 'System32', 'taskkill.exe');
+      await execFileAsync(fs.existsSync(taskkillBin) ? taskkillBin : 'taskkill', ['/PID', String(child.pid), '/T', '/F'], {
         timeout: 4000,
         windowsHide: true,
       });

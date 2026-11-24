@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
 import { TRIAGE_INBOX_PLUGIN_ID, type Attachment, type SessionTaskState } from '@harnessmate/protocol';
@@ -43,7 +45,7 @@ import type { TriageInboxService } from '../../core/triage-inbox-service.js';
 import type { DaemonEventBus } from '../../core/event-bus.js';
 import { UsageService } from '../../core/usage-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
-import { AcpAdapter } from '../../harnesses/acp-adapter.js';
+import { createAgyDriverFactory } from '../../harnesses/agy/agy-driver.js';
 import { ClaudeStreamJsonAdapter } from '../../harnesses/claude-adapter.js';
 import { CodexAppServerAdapter } from '../../harnesses/codex-adapter.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
@@ -100,7 +102,10 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   overrides: readonly HarnessAdapter[] = [],
   collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
   terminalWorkspace?: TerminalWorkspaceService,
-  triage?: { service: TriageInboxService; bus: DaemonEventBus }) {
+  triage?: { service: TriageInboxService; bus: DaemonEventBus },
+  agyProfilesDir?: string) {
+  const resolvedAgyProfilesDir =
+    agyProfilesDir ?? path.join(os.homedir(), '.harnessmate-desktop', 'agy-profiles');
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
   const adapterPlugin = (id: string, create: () => HarnessAdapter) => {
     const service = `harness.${id}`;
@@ -119,11 +124,69 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   };
   adapterPlugin('codex', () => new CodexAppServerAdapter(config.binaryOverrides.codex));
   adapterPlugin('claude', () => new ClaudeStreamJsonAdapter(config.binaryOverrides.claude));
-  adapterPlugin('agy', () => new AcpAdapter({
-    id: 'agy', kind: 'agy', displayName: 'Antigravity CLI',
-    description: 'Google Antigravity CLI via native Agent Client Protocol (ACP)',
-    command: 'agy', args: ['acp', '--stdio'], binaryOverride: config.binaryOverrides.agy,
-  }));
+  plugins.set('core.harness.agy', {
+    provides: ['harness.agy'],
+    apply(ctx) {
+      ctx.host?.setRegistryBridge(registry);
+      const profiles = config.agyProfiles ?? [];
+      const driverFactory = createAgyDriverFactory({
+        profilesRootDir: resolvedAgyProfilesDir,
+        binaryOverride: config.binaryOverrides.agy,
+        getProfileConfig: (instanceId) => profiles.find((p) => p.instanceId === instanceId),
+      });
+      registry.registerDriver('agy', driverFactory);
+
+      const registered: Array<{ id: string; adapter: HarnessAdapter }> = [];
+      const overrideAgy = overrides.find((candidate) => candidate.id === 'agy');
+      const primaryProfile = profiles.find((p) => p.instanceId === 'agy');
+      let primaryAdapter: HarnessAdapter;
+      if (overrideAgy) {
+        registry.register(overrideAgy);
+        primaryAdapter = overrideAgy;
+      } else {
+        primaryAdapter = registry.registerInstance({
+          instanceId: 'agy',
+          driverId: 'agy',
+          displayName: primaryProfile?.displayName ?? 'Antigravity CLI',
+          description:
+            primaryProfile?.description ?? 'Google Antigravity CLI via native Agent Client Protocol (ACP)',
+          binaryPath: primaryProfile?.binaryPath ?? config.binaryOverrides.agy,
+          homeDir: primaryProfile?.geminiDir,
+          enabled: primaryProfile?.enabled ?? true,
+        });
+      }
+      registered.push({ id: 'agy', adapter: primaryAdapter });
+
+      for (const profile of profiles) {
+        if (profile.instanceId === 'agy' || !profile.enabled) continue;
+        const adapter = registry.registerInstance({
+          instanceId: profile.instanceId,
+          driverId: 'agy',
+          displayName: profile.displayName,
+          description: profile.description,
+          binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
+          homeDir: profile.geminiDir,
+          enabled: profile.enabled,
+        });
+        registered.push({ id: profile.instanceId, adapter });
+      }
+
+      for (const instance of config.harnessInstances ?? []) {
+        if (instance.driverId !== 'agy' || !instance.enabled) continue;
+        if (registered.some((r) => r.id === instance.instanceId)) continue;
+        const adapter = registry.registerInstance(instance);
+        registered.push({ id: instance.instanceId, adapter });
+      }
+
+      ctx.effect(() => () => {
+        for (const { id, adapter } of registered) {
+          if (registry.get(id) === adapter) registry.unregister(id);
+        }
+        registry.unregisterDriver('agy');
+      });
+      ctx.provide('harness.agy', primaryAdapter);
+    },
+  });
   plugins.set('core.harness.acp', {
     provides: ['harness.acp'],
     apply(ctx) {

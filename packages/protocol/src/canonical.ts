@@ -1304,3 +1304,81 @@ export const TerminalContextChipSchema = z.object({
   exitCode: z.number().int().nullable().optional(),
 });
 export type TerminalContextChip = z.infer<typeof TerminalContextChipSchema>;
+
+// ── Phase AGY: Native Account Isolation & Profile Schemas ──────────────
+
+export const AgyAuthMethodSchema = z.enum([
+  'oauth-personal',
+  'oauth-business',
+  'gemini-api-key',
+  'agent-platform',
+]);
+export type AgyAuthMethod = z.infer<typeof AgyAuthMethodSchema>;
+
+export const AgyIsolationModeSchema = z.enum([
+  'official_default',
+  'profile_isolated',
+]);
+export type AgyIsolationMode = z.infer<typeof AgyIsolationModeSchema>;
+
+export const AgyAccountDefaultsSchema = z.object({
+  defaultModel: z.string().nullable().optional(),
+  defaultEffort: ReasoningEffortSchema.nullable().optional(),
+  defaultPermissionMode: PermissionModeSchema.optional(),
+  enableSandbox: z.boolean().optional(),
+  linkGlobalSkills: z.boolean().default(true),
+  syncGlobalRules: z.boolean().default(true),
+  additionalDirectories: z.array(z.string()).default([]),
+});
+export type AgyAccountDefaults = z.infer<typeof AgyAccountDefaultsSchema>;
+
+export const AgyAccountIdentitySchema = z.object({
+  accountFingerprint: z.string().nullable().optional(),
+  emailLabel: z.string().nullable().optional(),
+  tierName: z.string().nullable().optional(),
+  tierId: z.string().nullable().optional(),
+  verifiedAt: z.number().nullable().optional(),
+});
+export type AgyAccountIdentity = z.infer<typeof AgyAccountIdentitySchema>;
+
+export const AgyProfileConfigSchema = z.object({
+  instanceId: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_.:-]*$/i),
+  displayName: z.string().trim().min(1).max(80),
+  description: z.string().max(300).optional(),
+  isolationMode: AgyIsolationModeSchema.default('official_default'),
+  authMethod: AgyAuthMethodSchema.default('oauth-personal'),
+  geminiDir: z.string().optional(),
+  appDataDirName: z.string().trim().min(1).max(80).default('antigravity-cli'),
+  binaryPath: z.string().optional(),
+  gcpProject: z.string().optional(),
+  gcpLocation: z.string().optional(),
+  defaults: AgyAccountDefaultsSchema.default({}),
+  identity: AgyAccountIdentitySchema.optional(),
+  enabled: z.boolean().default(true),
+});
+export type AgyProfileConfig = z.infer<typeof AgyProfileConfigSchema>;
+
+export const AgyAuthPhaseSchema = z.enum([
+  'idle',
+  'starting',
+  'waiting_code',
+  'verifying',
+  'authenticated',
+  'unauthenticated',
+  'failed',
+  'cancelled',
+]);
+export type AgyAuthPhase = z.infer<typeof AgyAuthPhaseSchema>;
+
+export const AgyAuthStateSchema = z.object({
+  instanceId: z.string(),
+  phase: AgyAuthPhaseSchema,
+  flowId: z.string().nullable().default(null),
+  authorizationUrl: z.string().nullable().default(null),
+  expiresAt: z.number().nullable().default(null),
+  message: z.string().nullable().default(null),
+  isolationMode: AgyIsolationModeSchema.optional(),
+  authMethod: AgyAuthMethodSchema.optional(),
+  identity: AgyAccountIdentitySchema.nullable().optional(),
+});
+export type AgyAuthState = z.infer<typeof AgyAuthStateSchema>;
