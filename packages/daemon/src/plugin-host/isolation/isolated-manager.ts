@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import {
   PluginApiError,
   isBuiltinPublicService,
   isReservedServiceName,
   isSafePluginUiPath,
   isValidPluginSlotKey,
-  normalizePluginSlotKey,
+  normalizeAnyPluginSlotKey,
   pluginEventContracts,
   type ApprovalAnnotateEvent,
   type ApprovalAnnotation,
@@ -15,11 +16,30 @@ import {
   type PluginHandshakeResponse,
   type PluginRuntimeSlotDescriptor,
   type PublicCommandResult,
+  type PublicHarnessDriverDescriptor,
+  type PublicHarnessProbeResult,
 } from '@harnessmate/plugin-api';
-import type { InstalledPluginInfo, Session } from '@harnessmate/protocol';
+import type {
+  ApprovalDecision,
+  ContextInjectionDriver,
+  HarnessHealth,
+  HarnessInfo,
+  InstalledPluginInfo,
+  Session,
+} from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../../db/sqlite.js';
+import type { HarnessRegistry } from '../../harnesses/registry.js';
+import type {
+  AdapterSessionConfig,
+  AdapterSessionHandle,
+  ContextSyncPayload,
+  HarnessAdapter,
+  NormalizedAdapterEvent,
+  TurnInput,
+} from '../../harnesses/types.js';
 import { GLOBAL_WORKSPACE_SCOPE, type PluginPermissionService } from '../permissions/permissions.js';
-import type { HostPlugin, PluginHost } from '../runtime/lifecycle.js';
+import type { HandoffRedactionOutcome, HandoffRedactionRequest, HostPlugin, PluginHost } from '../runtime/lifecycle.js';
+import { CliProcessManager } from './cli-process-manager.js';
 import {
   CrashBackoffTracker,
   ISOLATED_TIMEOUTS,
@@ -48,6 +68,13 @@ export interface IsolatedCommandDescriptor {
   argumentHint?: string;
 }
 
+interface ProxyDriverSessionEntry {
+  driverId: string;
+  handleId: string;
+  nativeSessionId: string | null;
+  listeners: Set<(event: NormalizedAdapterEvent) => void>;
+}
+
 export interface ActiveIsolatedPlugin {
   pluginId: string;
   runId: string;
@@ -59,9 +86,13 @@ export interface ActiveIsolatedPlugin {
   tools: Map<string, { name: string; description: string; inputSchema: Record<string, unknown>; readOnly?: boolean }>;
   slots: Map<string, PluginRuntimeSlotDescriptor>;
   sections: Map<string, { id: string; order?: number; text: string }>;
+  declaredDrivers: Map<string, PublicHarnessDriverDescriptor>;
+  registeredDrivers: Map<string, HarnessAdapter>;
+  driverSessions: Map<string, ProxyDriverSessionEntry>;
   hasHandoffCompose: boolean;
   hasHandoffShouldOffer: boolean;
   hasApprovalAnnotate: boolean;
+  hasHandoffRedact: boolean;
 }
 
 export interface IsolatedManagerOptions {
@@ -70,6 +101,7 @@ export interface IsolatedManagerOptions {
   permissions: PluginPermissionService;
   getPluginInfo: (pluginId: string) => InstalledPluginInfo | undefined;
   requestRestart: (pluginId: string) => Promise<void>;
+  registry?: HarnessRegistry;
   crashPolicy?: CrashPolicy;
   runNativeCommand?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
 }
@@ -81,17 +113,62 @@ export class IsolatedPluginManager {
   private readonly lastCrashReason = new Map<string, string>();
   private readonly pendingDisposals = new Set<Promise<void>>();
   private readonly serviceUnsubscribe: () => void;
+  private readonly permissionUnsubscribe: () => void;
+  private readonly cliProcesses: CliProcessManager;
   private nativeCommandRunner?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
   readonly router: IsolatedPluginRpcRouter;
 
   constructor(private readonly opts: IsolatedManagerOptions) {
     this.nativeCommandRunner = opts.runNativeCommand;
+    this.cliProcesses = new CliProcessManager(opts.store, opts.permissions);
+    if (opts.registry) {
+      opts.host.setRegistryBridge(opts.registry);
+    }
+    opts.host.setHandoffRedactor((input) => this.redactHandoff(input));
     this.router = new IsolatedPluginRpcRouter({
       store: opts.store,
       host: opts.host,
       permissions: opts.permissions,
       getPluginInfo: (pluginId) => this.active.get(pluginId)?.info ?? opts.getPluginInfo(pluginId),
       isCurrentRun: (pluginId, runId) => this.active.get(pluginId)?.runId === runId,
+      cliProcesses: this.cliProcesses,
+      onCliOutput: (pluginId, runId, processId, stream, chunk) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.process.notify('host.cli.output', { processId, stream, chunk }, runId);
+      },
+      onCliExit: (pluginId, runId, processId, code, signal) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.process.notify('host.cli.exit', { processId, code, signal }, runId);
+      },
+      onDriverRegister: (pluginId, runId, driver) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        this.validateDriverDeclaration(entry, driver);
+        entry.declaredDrivers.set(driver.driverId, driver);
+        this.opts.permissions.assertGranted(entry.info, 'harness:driver:register', GLOBAL_WORKSPACE_SCOPE);
+        this.syncPluginDrivers(entry);
+      },
+      onDriverUnregister: (pluginId, runId, driverId) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.declaredDrivers.delete(driverId);
+        this.unregisterSinglePluginDriver(entry, driverId);
+      },
+      onDriverSessionEvent: (pluginId, runId, handleId, rawEvent) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        const sess = entry.driverSessions.get(handleId);
+        if (!sess) return;
+        const event = rawEvent as NormalizedAdapterEvent;
+        if (event.type === 'native_session_ready' && typeof event.nativeSessionId === 'string') {
+          sess.nativeSessionId = event.nativeSessionId;
+        }
+        for (const listener of [...sess.listeners]) {
+          try { listener(event); } catch { /* listener isolation */ }
+        }
+      },
       onSubscriptionChange: (pluginId, runId, event, subscribed) => {
         const entry = this.active.get(pluginId);
         if (!entry || entry.runId !== runId) return;
@@ -115,6 +192,16 @@ export class IsolatedPluginManager {
     });
     this.serviceUnsubscribe = opts.host.onServicesChanged((services) => {
       this.syncServices(services);
+    });
+    this.permissionUnsubscribe = opts.permissions.onChange((event) => {
+      if (event.capability !== 'harness:driver:register') return;
+      const entry = this.active.get(event.pluginId);
+      if (!entry || !entry.process.alive) return;
+      try {
+        this.syncPluginDrivers(entry);
+      } catch {
+        // Conflicts are handled when activating or invoking
+      }
     });
   }
 
@@ -244,13 +331,21 @@ export class IsolatedPluginManager {
           tools: new Map(),
           slots: new Map(),
           sections: new Map(),
+          declaredDrivers: new Map(),
+          registeredDrivers: new Map(),
+          driverSessions: new Map(),
           hasHandoffCompose: false,
           hasHandoffShouldOffer: false,
           hasApprovalAnnotate: false,
+          hasHandoffRedact: false,
         };
         this.active.set(info.id, placeholder);
 
         ctx.effect(() => () => {
+          this.cleanupPluginDrivers(placeholder);
+          const cliTask = this.cliProcesses.killAllForRun(info.id, proc.runId)
+            .finally(() => { this.pendingDisposals.delete(cliTask); });
+          this.pendingDisposals.add(cliTask);
           if (this.active.get(info.id)?.runId === proc.runId) {
             this.active.delete(info.id);
           }
@@ -262,6 +357,8 @@ export class IsolatedPluginManager {
         try {
           handshake = await proc.handshake();
         } catch (error) {
+          this.cleanupPluginDrivers(placeholder);
+          await this.cliProcesses.killAllForRun(info.id, proc.runId);
           if (this.active.get(info.id)?.runId === proc.runId) this.active.delete(info.id);
           await proc.dispose();
           throw error;
@@ -273,7 +370,7 @@ export class IsolatedPluginManager {
         for (const tool of handshake.tools ?? []) placeholder.tools.set(tool.name, tool);
         for (const slotDef of handshake.slots ?? []) {
           if (isValidPluginSlotKey(slotDef.slot) && isSafePluginUiPath(slotDef.ui)) {
-            const normalized = normalizePluginSlotKey(slotDef.slot);
+            const normalized = normalizeAnyPluginSlotKey(slotDef.slot);
             placeholder.slots.set(`${normalized}:${slotDef.id}`, { ...slotDef, slot: normalized });
           }
         }
@@ -281,6 +378,15 @@ export class IsolatedPluginManager {
         placeholder.hasHandoffCompose = Boolean(handshake.hasHandoffCompose);
         placeholder.hasHandoffShouldOffer = Boolean(handshake.hasHandoffShouldOffer);
         placeholder.hasApprovalAnnotate = Boolean(handshake.hasApprovalAnnotate);
+        placeholder.hasHandoffRedact = Boolean(handshake.hasHandoffRedact);
+
+        for (const driver of handshake.registeredDrivers ?? []) {
+          this.validateDriverDeclaration(placeholder, driver);
+          placeholder.declaredDrivers.set(driver.driverId, driver);
+        }
+        if (placeholder.declaredDrivers.size > 0) {
+          this.syncPluginDrivers(placeholder);
+        }
 
         // Register all services provided by the isolated plugin as runId-validated RPC proxies
         const capturedRunId = proc.runId;
@@ -330,6 +436,10 @@ export class IsolatedPluginManager {
   ): void {
     const current = this.active.get(pluginId);
     if (!current || current.runId !== crashedRunId) return;
+    this.cleanupPluginDrivers(current);
+    const cliTask = this.cliProcesses.killAllForRun(pluginId, crashedRunId)
+      .finally(() => { this.pendingDisposals.delete(cliTask); });
+    this.pendingDisposals.add(cliTask);
     this.active.delete(pluginId);
 
     const tracker = this.crashTrackers.get(pluginId) ?? new CrashBackoffTracker(this.opts.crashPolicy);
@@ -558,6 +668,297 @@ export class IsolatedPluginManager {
     return undefined;
   }
 
+  async redactHandoff(input: HandoffRedactionRequest): Promise<HandoffRedactionOutcome> {
+    let currentText = input.text;
+    const allCategories: string[] = [];
+    let redactedCount = 0;
+
+    for (const entry of this.active.values()) {
+      if (!entry.process.alive || !entry.hasHandoffRedact) continue;
+      if (!this.opts.permissions.isGranted(entry.info, 'handoff:redact', input.workspaceId)) continue;
+      const res = await entry.process.call<{ text?: unknown; categories?: unknown }>(
+        'host.handoff.redact',
+        {
+          text: currentText,
+          targetDriverId: input.targetDriverId,
+          sessionId: input.sessionId,
+          workspaceId: input.workspaceId,
+          targetInstanceId: input.targetInstanceId,
+        },
+        ISOLATED_TIMEOUTS.waterfall,
+        entry.runId,
+      );
+      if (!res || typeof res.text !== 'string') {
+        throw new PluginApiError('E_INVALID_INPUT', `插件 ${entry.pluginId} 脱敏器返回无效结果`);
+      }
+      const cats = Array.isArray(res.categories)
+        ? res.categories.filter((c): c is string => typeof c === 'string' && c.length > 0)
+        : [];
+      for (const cat of cats) allCategories.push(cat);
+      if (cats.length > 0) redactedCount += cats.length;
+      else if (res.text !== currentText) redactedCount += 1;
+      currentText = res.text;
+    }
+
+    return {
+      text: currentText,
+      categories: [...new Set(allCategories)],
+      redactedCount,
+    };
+  }
+
+  private getRegistry(): HarnessRegistry | undefined {
+    return this.opts.registry ?? this.opts.host.getRegistryBridge();
+  }
+
+  private validateDriverDeclaration(entry: ActiveIsolatedPlugin, driver: PublicHarnessDriverDescriptor): void {
+    const driverId = typeof driver?.driverId === 'string' ? driver.driverId.trim() : '';
+    if (!driverId || !/^[a-z][a-z0-9_.-]{0,63}$/i.test(driverId)) {
+      throw new PluginApiError('E_INVALID_INPUT', `非法的 Harness 驱动 ID: ${String(driver?.driverId ?? '')}`);
+    }
+    const registry = this.getRegistry();
+    if (registry?.isReserved(driverId) || driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
+      throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 Harness 驱动: ${driverId}`);
+    }
+    const existing = entry.registeredDrivers.get(driverId);
+    if (registry && !existing && (registry.hasDriver(driverId) || registry.get(driverId))) {
+      throw new PluginApiError('E_CONFLICT', `Harness 驱动 ID 已被占用: ${driverId}`);
+    }
+  }
+
+  private syncPluginDrivers(entry: ActiveIsolatedPlugin): void {
+    const registry = this.getRegistry();
+    if (!registry) return;
+    const granted = this.opts.permissions.isGranted(entry.info, 'harness:driver:register', GLOBAL_WORKSPACE_SCOPE);
+    if (!granted) {
+      this.cleanupPluginDrivers(entry);
+      return;
+    }
+    for (const [driverId, desc] of entry.declaredDrivers) {
+      if (entry.registeredDrivers.has(driverId)) continue;
+      if (registry.hasDriver(driverId) || registry.get(driverId)) {
+        throw new PluginApiError('E_CONFLICT', `Harness 驱动 ID 已被占用: ${driverId}`);
+      }
+      const adapter = this.createProxyHarnessAdapter(entry, desc);
+      registry.registerDriver(driverId, () => adapter);
+      registry.register(adapter);
+      entry.registeredDrivers.set(driverId, adapter);
+    }
+  }
+
+  private unregisterSinglePluginDriver(entry: ActiveIsolatedPlugin, driverId: string): void {
+    for (const [handleId, sess] of [...entry.driverSessions.entries()]) {
+      if (sess.driverId !== driverId) continue;
+      entry.driverSessions.delete(handleId);
+      sess.listeners.clear();
+    }
+    const adapter = entry.registeredDrivers.get(driverId);
+    entry.registeredDrivers.delete(driverId);
+    const registry = this.getRegistry();
+    if (!registry) return;
+    for (const inst of registry.listInstances()) {
+      if (inst.driverId === driverId) {
+        registry.unregister(inst.instanceId);
+      }
+    }
+    if (adapter && registry.get(driverId) === adapter) {
+      registry.unregister(driverId);
+    }
+    registry.unregisterDriver(driverId);
+  }
+
+  private cleanupPluginDrivers(entry: ActiveIsolatedPlugin): void {
+    for (const driverId of [...entry.registeredDrivers.keys()]) {
+      this.unregisterSinglePluginDriver(entry, driverId);
+    }
+    for (const sess of entry.driverSessions.values()) {
+      sess.listeners.clear();
+    }
+    entry.driverSessions.clear();
+  }
+
+  private createProxyHarnessAdapter(
+    entry: ActiveIsolatedPlugin,
+    desc: PublicHarnessDriverDescriptor,
+  ): HarnessAdapter {
+    const mapProbe = (res: PublicHarnessProbeResult): HarnessInfo => ({
+      id: desc.driverId,
+      kind: desc.driverId,
+      driverId: desc.driverId,
+      instanceId: desc.driverId,
+      continuationKey: `${desc.driverId}:instance:${desc.driverId}`,
+      displayName: desc.displayName,
+      description: desc.description,
+      protocolLabel: desc.protocolLabel,
+      binaryPath: res?.binaryPath ?? null,
+      version: res?.version ?? null,
+      health: (res?.health ?? 'unavailable') as HarnessHealth,
+      healthMessage: res?.healthMessage,
+      capabilities: desc.capabilities,
+      capabilitiesV2: res?.capabilitiesV2 ?? desc.capabilitiesV2,
+      presentation: res?.presentation ?? desc.presentation,
+      models: res?.models ?? [],
+      defaultModelId: res?.defaultModelId ?? null,
+      accountSummary: res?.accountSummary ?? null,
+      isCustom: true,
+    });
+
+    const capturedRunId = entry.runId;
+    return {
+      id: desc.driverId,
+      kind: desc.driverId,
+      driverId: desc.driverId,
+      continuationKey: `${desc.driverId}:instance:${desc.driverId}`,
+      displayName: desc.displayName,
+      description: desc.description,
+      protocolLabel: desc.protocolLabel,
+      capabilities: desc.capabilities,
+      capabilitiesV2: desc.capabilitiesV2,
+      presentation: desc.presentation,
+      isCustom: true,
+      pluginMcpTransport: desc.pluginMcpTransport,
+      probePassive: async () => {
+        const res = await entry.process.call<PublicHarnessProbeResult>(
+          'host.driver.probePassive',
+          { driverId: desc.driverId },
+          ISOLATED_TIMEOUTS.command,
+          capturedRunId,
+        );
+        return mapProbe(res);
+      },
+      probe: async () => {
+        const res = await entry.process.call<PublicHarnessProbeResult>(
+          'host.driver.probe',
+          { driverId: desc.driverId },
+          ISOLATED_TIMEOUTS.command,
+          capturedRunId,
+        );
+        return mapProbe(res);
+      },
+      createSession: async (config: AdapterSessionConfig): Promise<AdapterSessionHandle> => {
+        const handleId = randomUUID();
+        const sanitizedConfig = {
+          cwd: config.cwd,
+          model: config.model,
+          reasoningEffort: config.reasoningEffort,
+          permissionMode: config.permissionMode,
+          nativeSessionId: config.nativeSessionId,
+          requireNativeResume: config.requireNativeResume,
+          handoffContinuity: config.handoffContinuity,
+          pluginMcp: config.pluginMcp,
+        };
+        const created = await entry.process.call<{ nativeSessionId?: string | null; pluginMcpAvailable?: boolean }>(
+          'host.driver.createSession',
+          { driverId: desc.driverId, handleId, config: sanitizedConfig },
+          ISOLATED_TIMEOUTS.command,
+          capturedRunId,
+        );
+        const sessionEntry: ProxyDriverSessionEntry = {
+          driverId: desc.driverId,
+          handleId,
+          nativeSessionId: created?.nativeSessionId ?? null,
+          listeners: new Set(),
+        };
+        entry.driverSessions.set(handleId, sessionEntry);
+
+        return {
+          get nativeSessionId() {
+            return sessionEntry.nativeSessionId;
+          },
+          pluginMcpAvailable: created?.pluginMcpAvailable ?? false,
+          sendTurn: async (input: TurnInput) => {
+            const { contextSync, ...rest } = input;
+            const sanitizedContextSync = contextSync
+              ? {
+                  deltaMarkdown: contextSync.deltaMarkdown,
+                  portableItems: contextSync.portableItems,
+                  objective: contextSync.objective,
+                  isWarmBinding: contextSync.isWarmBinding,
+                }
+              : null;
+            const res = await entry.process.call<{ driverUsed?: ContextInjectionDriver } | undefined>(
+              'host.driver.sendTurn',
+              { handleId, input: { ...rest, contextSync: sanitizedContextSync } },
+              ISOLATED_TIMEOUTS.tool,
+              capturedRunId,
+            );
+            if (contextSync?.onDispatch && res?.driverUsed) {
+              contextSync.onDispatch(
+                res.driverUsed,
+                res.driverUsed === 'codex_inject_items' ? contextSync.portableItems : contextSync.deltaMarkdown,
+              );
+            }
+            return res;
+          },
+          listSkills: async () => entry.process.call(
+            'host.driver.listSkills',
+            { handleId },
+            ISOLATED_TIMEOUTS.command,
+            capturedRunId,
+          ),
+          runNativeCommand: async (command: string, args: string) => entry.process.call<string>(
+            'host.driver.runNativeCommand',
+            { handleId, command, args },
+            ISOLATED_TIMEOUTS.command,
+            capturedRunId,
+          ),
+          injectContext: async (payload: ContextSyncPayload) => {
+            const sanitizedPayload = {
+              deltaMarkdown: payload.deltaMarkdown,
+              portableItems: payload.portableItems,
+              objective: payload.objective,
+              isWarmBinding: payload.isWarmBinding,
+            };
+            const res = await entry.process.call<{ driverUsed: ContextInjectionDriver }>(
+              'host.driver.injectContext',
+              { handleId, payload: sanitizedPayload },
+              ISOLATED_TIMEOUTS.command,
+              capturedRunId,
+            );
+            if (payload.onDispatch) {
+              payload.onDispatch(
+                res.driverUsed,
+                res.driverUsed === 'codex_inject_items' ? payload.portableItems : payload.deltaMarkdown,
+              );
+            }
+            return res.driverUsed;
+          },
+          interrupt: async () => {
+            await entry.process.call('host.driver.interrupt', { handleId }, ISOLATED_TIMEOUTS.command, capturedRunId);
+          },
+          resolveApproval: async (nativeRequestId: string, decision: ApprovalDecision, comment?: string) => {
+            await entry.process.call(
+              'host.driver.resolveApproval',
+              { handleId, nativeRequestId, decision, comment },
+              ISOLATED_TIMEOUTS.command,
+              capturedRunId,
+            );
+          },
+          updateConfig: async (patch: Partial<AdapterSessionConfig>) => {
+            await entry.process.call(
+              'host.driver.updateConfig',
+              { handleId, patch },
+              ISOLATED_TIMEOUTS.command,
+              capturedRunId,
+            );
+          },
+          dispose: async () => {
+            entry.driverSessions.delete(handleId);
+            sessionEntry.listeners.clear();
+            if (entry.process.alive) {
+              await entry.process.call('host.driver.dispose', { handleId }, ISOLATED_TIMEOUTS.dispose, capturedRunId)
+                .catch(() => {});
+            }
+          },
+          onEvent: (listener: (event: NormalizedAdapterEvent) => void) => {
+            sessionEntry.listeners.add(listener);
+            return () => { sessionEntry.listeners.delete(listener); };
+          },
+        };
+      },
+    };
+  }
+
   async awaitPendingDisposals(): Promise<void> {
     if (this.pendingDisposals.size) {
       await Promise.allSettled([...this.pendingDisposals]);
@@ -566,10 +967,14 @@ export class IsolatedPluginManager {
 
   async close(): Promise<void> {
     this.serviceUnsubscribe();
+    this.permissionUnsubscribe();
     for (const timer of this.restartTimers.values()) clearTimeout(timer);
     this.restartTimers.clear();
+    for (const entry of this.active.values()) {
+      this.cleanupPluginDrivers(entry);
+    }
     const disposals = [...this.active.values()].map(({ process }) => process.dispose());
     this.active.clear();
-    await Promise.allSettled([...disposals, ...this.pendingDisposals]);
+    await Promise.allSettled([this.cliProcesses.killAll(), ...disposals, ...this.pendingDisposals]);
   }
 }

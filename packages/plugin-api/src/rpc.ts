@@ -1,7 +1,17 @@
-import type { PluginErrorCode } from './context.js';
+import type { PluginErrorCode, PublicHarnessDriverDescriptor } from './context.js';
 import type { PluginRuntimeSlotDescriptor } from './slots.js';
 
 export const PLUGIN_RPC_PROTOCOL_VERSION = 1;
+
+export const HOST_FEATURES_V5 = [
+  'harness.driver.v2',
+  'runtime.spawnCli',
+  'handoff.protocol.v2',
+  'sessions.items.read',
+  'sessions.fork',
+  'ui.slots.v5',
+] as const;
+export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
 
 export const HOST_SUPPORTED_FEATURES = [
   'rpc.v1',
@@ -17,7 +27,9 @@ export const HOST_SUPPORTED_FEATURES = [
   'fs.workspace',
   'net.fetch',
   'ui.slots',
+  ...HOST_FEATURES_V5,
 ] as const;
+export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 
 export interface PluginHandshakeRequest {
   protocolVersion: number;
@@ -47,6 +59,8 @@ export interface PluginHandshakeResponse {
   hasHandoffCompose?: boolean;
   hasHandoffShouldOffer?: boolean;
   hasApprovalAnnotate?: boolean;
+  hasHandoffRedact?: boolean;
+  registeredDrivers?: PublicHarnessDriverDescriptor[];
 }
 
 export interface PluginRpcErrorPayload {

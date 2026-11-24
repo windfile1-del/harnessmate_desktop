@@ -2,6 +2,7 @@ import {
   PluginApiError,
   isBuiltinPublicService,
   isReservedServiceName,
+  type Disposer,
   type PluginManifest,
 } from '@harnessmate/plugin-api';
 import type { InstalledPluginInfo, PluginPermission, SetPluginPermissionRequest } from '@harnessmate/protocol';
@@ -23,13 +24,23 @@ const STATIC_PERMISSION_META: Record<string, PermissionMeta> = {
   'session:read': { description: '读取会话列表、元数据、历史与任务账本', risk: 'medium', scope: 'workspace' },
   'session:command': { description: '运行白名单原生 Harness 命令', risk: 'medium', scope: 'workspace' },
   'session:send': { description: '准备一轮待用户确认发送的对话', risk: 'medium', scope: 'workspace' },
+  'session:fork': { description: '基于现有会话分叉创建新会话', risk: 'medium', scope: 'workspace' },
+  'session:switch': { description: '切换会话的活跃 Harness 实例', risk: 'medium', scope: 'workspace' },
+  'session:orchestrate': { description: '向会话时间线写入系统通知与编排状态', risk: 'medium', scope: 'workspace' },
   'composer:suggest': { description: '向输入区提议文本或附加块', risk: 'low', scope: 'workspace' },
   'handoff:section': { description: '向交接快照追加用户侧上下文段落', risk: 'low', scope: 'workspace' },
+  'handoff:redact': { description: '在跨引擎交接快照外发前执行敏感信息脱敏', risk: 'high', scope: 'workspace' },
+  'context:compressor': { description: '注册自定义上下文滚动摘要与压缩器', risk: 'medium', scope: 'workspace' },
   'approvals:annotate': { description: '为审批项添加风险标注（不能替用户审批）', risk: 'low', scope: 'workspace' },
   'storage:plugin': { description: '读写插件私有持久化存储', risk: 'low', scope: 'global' },
   'storage:workspace': { description: '读写按工作区隔离的插件存储', risk: 'low', scope: 'workspace' },
   'fs:workspace:read': { description: '读取工作区内的文件与目录', risk: 'medium', scope: 'workspace' },
   'fs:workspace:write': { description: '写入工作区内的文件', risk: 'high', scope: 'workspace' },
+  'fs:cli_histories:read': { description: '只读访问本机 CLI 历史会话目录', risk: 'medium', scope: 'global' },
+  'workspace:git:read': { description: '读取工作区 Git 状态与 Diff 信息', risk: 'low', scope: 'workspace' },
+  'workspace:git:write': { description: '在工作区内执行受控 Git 写操作或创建 Worktree', risk: 'high', scope: 'workspace' },
+  'process:pty:workspace': { description: '在工作区沙箱内申请受控伪终端会话', risk: 'high', scope: 'workspace' },
+  'harness:driver:register': { description: '注册第三方 Harness 引擎驱动', risk: 'high', scope: 'global' },
   notify: { description: '发送桌面通知', risk: 'low', scope: 'global' },
   'clipboard:write': { description: '写入系统剪贴板', risk: 'low', scope: 'global' },
   'browser:preview': { description: '在独立 Chromium 中显示和操作 HTTP(S) 页面，包括本机开发页面', risk: 'medium', scope: 'global' },
@@ -48,6 +59,14 @@ export function describePermission(capability: string): PermissionMeta {
       ? `作为公共服务 ${service} 的提供方（可替换内置提供方）`
       : `提供第三方服务 ${service}`;
     return { description: label, risk: 'medium', scope: 'global' };
+  }
+  if (capability.startsWith('process:spawn:')) {
+    const binary = capability.slice('process:spawn:'.length);
+    return { description: `受控启动外部 CLI 进程 ${binary}`, risk: 'high', scope: 'workspace' };
+  }
+  if (capability.startsWith('secrets:read:')) {
+    const ns = capability.slice('secrets:read:'.length);
+    return { description: `读取命名空间 ${ns} 的受控凭据`, risk: 'high', scope: 'global' };
   }
   if (capability.startsWith('action:')) {
     return { description: `执行声明式动作 /${capability.slice(7)}`, risk: 'medium', scope: 'workspace' };
@@ -145,8 +164,22 @@ function matchesLegacyMigration(
   return currentDeclared.every((item) => migratedSet.has(item));
 }
 
+export interface PermissionChangeEvent {
+  pluginId: string;
+  capability: string;
+  workspaceId: string;
+  granted: boolean;
+}
+
 export class PluginPermissionService {
+  private readonly changeListeners = new Set<(event: PermissionChangeEvent) => void>();
+
   constructor(private readonly store: HarnessMateStore) {}
+
+  onChange(listener: (event: PermissionChangeEvent) => void): Disposer {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
+  }
 
   private matchGrant(
     grants: readonly StoredPluginPermission[],
@@ -255,6 +288,15 @@ export class PluginPermissionService {
       }
     } else {
       this.store.setPluginPermission(request.workspaceId, plugin.id, request.digest, request.capability, request.granted, opts);
+    }
+    const event: PermissionChangeEvent = {
+      pluginId: plugin.id,
+      capability: request.capability,
+      workspaceId: request.workspaceId,
+      granted: request.granted,
+    };
+    for (const listener of [...this.changeListeners]) {
+      listener(event);
     }
     return this.resolveForPlugin(plugin, request.workspaceId);
   }

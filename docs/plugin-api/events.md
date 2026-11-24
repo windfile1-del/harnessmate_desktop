@@ -14,7 +14,10 @@
 | `approval.requested` | emit | `events:approval` | plugin-host/runtime/map-event.ts | — |
 | `session.created` | serial | `session:read` | core/session-manager.ts | plugin-host/builtin/services.ts |
 | `session.closing` | parallel | `session:read` | core/session-manager.ts | — |
+| `session.harness_switched` | emit | `session:read` | plugin-host/runtime/map-event.ts | — |
+| `handoff.delivered` | emit | `session:read` | plugin-host/runtime/map-event.ts | — |
 | `plugin.state` | emit | — | plugin-host/runtime/lifecycle.ts | — |
 | `handoff.compose` | waterfall | `handoff:section` | core/context-compiler.ts | — |
 | `handoff.shouldOffer` | bail | `session:read` | core/session-manager.ts | — |
 | `approval.annotate` | waterfall | `approvals:annotate` | core/session-manager.ts | — |
+| `handoff.redact` | waterfall | `handoff:redact` | 契约预留 | — |

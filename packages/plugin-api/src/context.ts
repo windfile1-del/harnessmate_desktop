@@ -3,6 +3,8 @@ import type {
   HandoffComposeEvent,
   HandoffComposeSection,
   HandoffOfferDecision,
+  HandoffRedactEvent,
+  HandoffRedactResult,
   HandoffShouldOfferEvent,
   PluginEventName,
   PluginEventV4,
@@ -13,6 +15,7 @@ import type { PublicSlotRegistration } from './slots.js';
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
   'E_INVALID_INPUT', 'E_LIMIT_EXCEEDED', 'E_CONFLICT', 'E_STALE_RUN',
+  'E_CIRCULAR_DEPENDENCY',
 ] as const;
 export type PluginErrorCode = typeof pluginErrorCodes[number];
 
@@ -233,13 +236,382 @@ export interface IsolatedPluginContext extends PluginContext {
   onConfigUpdated?(listener: (config: Readonly<Record<string, unknown>>) => void | Promise<void>): Disposer;
 }
 
-export type Context = IsolatedPluginContext;
+export type PublicReasoningEffort = 'none' | 'disabled' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+export type PublicPermissionMode = 'plan' | 'accept_edits' | 'auto' | 'manual';
+export type PublicToolKind = 'shell' | 'file_read' | 'file_edit' | 'search' | 'mcp' | 'subagent' | 'web' | 'other';
+export type PublicRiskLevel = 'low' | 'medium' | 'high';
+export type PublicApprovalDecision = 'allow_once' | 'allow_session' | 'deny';
+export type PublicContextInjectionDriver = 'codex_inject_items' | 'acp_embedded_context' | 'claude_sysfile_delta' | 'prompt_envelope' | 'native_warm';
+export type PublicHarnessHealth = 'ready' | 'degraded' | 'unavailable' | 'unauthenticated';
+export type PublicHarnessTransportKind = 'jsonrpc_stdio' | 'stream_json' | 'acp_stdio' | 'http_sse' | 'sdk' | 'custom';
+export type PublicHarnessHistoryInjectionMode = 'native_items' | 'embedded_context' | 'sysfile_delta' | 'inline';
 
-export interface PluginModule {
+export type PublicProviderOptionDescriptor =
+  | {
+      key: string;
+      label: string;
+      description?: string;
+      kind: 'select';
+      defaultValue?: string;
+      options: Array<{ value: string; label: string; description?: string }>;
+    }
+  | {
+      key: string;
+      label: string;
+      description?: string;
+      kind: 'boolean';
+      defaultValue?: boolean;
+    }
+  | {
+      key: string;
+      label: string;
+      description?: string;
+      kind: 'number';
+      min?: number;
+      max?: number;
+      step?: number;
+      defaultValue?: number;
+    };
+
+export interface PublicHarnessPresentationMeta {
+  shortLabel: string;
+  accentColor: string;
+  softBg: string;
+  tagline: string;
+  iconSvg?: string;
+}
+
+export interface PublicHarnessCapabilities {
+  streaming: boolean;
+  interactiveApproval: boolean;
+  reasoningEfforts: PublicReasoningEffort[];
+  permissionModes: PublicPermissionMode[];
+  sessionResume: boolean;
+  sessionFork: boolean;
+  imageInput: boolean;
+  subagents: boolean;
+}
+
+export interface PublicHarnessCapabilitiesV2 extends PublicHarnessCapabilities {
+  transport: PublicHarnessTransportKind;
+  historyInjectionMode: PublicHarnessHistoryInjectionMode;
+  supportsNativeRollback: boolean;
+  supportsActiveSteering: boolean;
+  supportsUsageLimits: boolean;
+  supportsDynamicOptions: boolean;
+  nativeCommands: string[];
+  optionDescriptors: PublicProviderOptionDescriptor[];
+}
+
+export interface PublicHarnessModelInfo {
+  id: string;
+  displayName: string;
+  description?: string;
+  group?: string;
+  isDefault?: boolean;
+  defaultEffort?: PublicReasoningEffort;
+  supportedEfforts?: PublicReasoningEffort[];
+  inputModalities?: string[];
+}
+
+export interface PublicHarnessDriverDescriptor {
+  driverId: string;
+  displayName: string;
+  description: string;
+  protocolLabel: string;
+  capabilities: PublicHarnessCapabilities;
+  capabilitiesV2?: PublicHarnessCapabilitiesV2;
+  presentation?: PublicHarnessPresentationMeta;
+  pluginMcpTransport?: 'http' | 'acp';
+}
+
+export interface PublicHarnessInstanceInfo {
+  id: string;
+  driverId: string;
+  displayName: string;
+  description: string;
+  protocolLabel: string;
+  enabled: boolean;
+  isCustom?: boolean;
+}
+
+export interface PublicAdapterSessionConfig {
+  cwd: string;
+  model?: string | null;
+  reasoningEffort?: PublicReasoningEffort | null;
+  permissionMode: PublicPermissionMode;
+  nativeSessionId?: string | null;
+  requireNativeResume?: boolean;
+  handoffContinuity?: boolean;
+  pluginMcp?: { url: string; token: string };
+}
+
+export interface PublicHarnessProbeResult {
+  binaryPath: string | null;
+  version: string | null;
+  health: PublicHarnessHealth;
+  healthMessage?: string;
+  models: PublicHarnessModelInfo[];
+  defaultModelId?: string | null;
+  accountSummary?: string | null;
+  capabilitiesV2?: PublicHarnessCapabilitiesV2;
+  presentation?: PublicHarnessPresentationMeta;
+}
+
+export interface PublicPortableHistoryMessage {
+  type: 'message';
+  role: 'user' | 'assistant';
+  content: Array<{ type: 'input_text' | 'output_text'; text: string }>;
+}
+
+export interface PublicDriverContextSyncPayload {
+  deltaMarkdown: string;
+  portableItems: PublicPortableHistoryMessage[];
+  objective?: string;
+  isWarmBinding: boolean;
+}
+
+export interface PublicDriverTurnInput {
+  turnId: string;
+  text: string;
+  attachments?: Array<{
+    id: string;
+    kind: 'file_ref' | 'image';
+    name: string;
+    path?: string;
+    relativePath?: string;
+    mimeType?: string;
+    sizeBytes?: number;
+  }>;
+  model?: string | null;
+  reasoningEffort?: PublicReasoningEffort | null;
+  permissionMode?: PublicPermissionMode;
+  contextSync?: PublicDriverContextSyncPayload | null;
+  cliCommand?: string;
+  nativeSkill?: { name: string; path: string };
+}
+
+export type PublicNormalizedAdapterEvent =
+  | { type: 'native_session_ready'; nativeSessionId: string }
+  | { type: 'model.confirmed'; actualModel: string; reroutedFrom?: string; reason?: string }
+  | { type: 'turn.started'; turnId: string; continuation?: boolean }
+  | { type: 'turn.completed'; turnId: string; stopReason?: string }
+  | { type: 'turn.failed'; turnId: string; message: string; code?: string }
+  | { type: 'turn.cancelled'; turnId: string }
+  | { type: 'message.assistant.delta'; turnId: string; text: string; messageId?: string; parentToolUseId?: string }
+  | { type: 'message.assistant.completed'; turnId: string; text: string; messageId?: string; parentToolUseId?: string }
+  | { type: 'thinking.delta'; turnId: string; text: string }
+  | { type: 'thinking.completed'; turnId: string; text: string }
+  | {
+      type: 'tool.call.started';
+      turnId: string;
+      toolCallId: string;
+      toolName: string;
+      toolKind: PublicToolKind;
+      summary: string;
+      input?: unknown;
+      parentToolUseId?: string;
+    }
+  | {
+      type: 'tool.call.delta';
+      turnId: string;
+      toolCallId: string;
+      outputDelta: string;
+      diffDelta?: string;
+    }
+  | {
+      type: 'tool.call.completed';
+      turnId: string;
+      toolCallId: string;
+      toolName: string;
+      status: 'success' | 'error' | 'cancelled';
+      output?: string;
+      diff?: string;
+    }
+  | {
+      type: 'approval.requested';
+      turnId: string;
+      nativeRequestId: string;
+      toolName: string;
+      toolKind: PublicToolKind;
+      summary: string;
+      input: unknown;
+      diffPreview?: string;
+      riskLevel: PublicRiskLevel;
+    }
+  | {
+      type: 'command.output.delta';
+      turnId: string;
+      toolCallId: string;
+      chunk: string;
+      stream?: 'stdout' | 'stderr';
+    }
+  | {
+      type: 'turn_block.ext';
+      turnId: string;
+      itemId: string;
+      blockType: `ext:${string}`;
+      title: string;
+      fallbackSummary: string;
+      status?: 'pending' | 'running' | 'completed' | 'failed';
+      payload: Record<string, unknown>;
+    }
+  | { type: 'usage.updated'; turnId: string | null; usage: { inputTokens: number; outputTokens: number; cachedTokens?: number; costUsd?: number } }
+  | { type: 'diagnostic.log'; level: 'info' | 'warn' | 'error'; stream: 'stdout' | 'stderr' | 'protocol'; message: string };
+
+export interface PluginHarnessSessionHandle {
+  readonly nativeSessionId?: string | null;
+  readonly pluginMcpAvailable?: boolean;
+  sendTurn(input: PublicDriverTurnInput): Promise<{ driverUsed?: PublicContextInjectionDriver } | void>;
+  listSkills?(): Promise<Array<{ name: string; path?: string; description?: string; enabled?: boolean }>>;
+  runNativeCommand?(command: string, args: string): Promise<string>;
+  injectContext?(payload: PublicDriverContextSyncPayload): Promise<PublicContextInjectionDriver>;
+  interrupt(): Promise<void>;
+  resolveApproval(nativeRequestId: string, decision: PublicApprovalDecision, comment?: string): Promise<void>;
+  updateConfig?(patch: Partial<PublicAdapterSessionConfig>): Promise<void>;
+  dispose(): Promise<void>;
+  onEvent(listener: (event: PublicNormalizedAdapterEvent) => void): Disposer;
+}
+
+export interface PluginHarnessDriverRegistration extends PublicHarnessDriverDescriptor {
+  probe(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
+  probePassive?(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
+  createSession(config: PublicAdapterSessionConfig): Promise<PluginHarnessSessionHandle> | PluginHarnessSessionHandle;
+}
+
+export interface SpawnCliSpec {
+  command: string;
+  args: string[];
+  cwdWorkspaceId: string;
+  cwdRelativePath?: string;
+  extraEnv?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+export interface ManagedCliProcessHandle {
+  readonly processId: string;
+  readonly pid: number;
+  writeStdin(data: string): Promise<void>;
+  closeStdin(): Promise<void>;
+  kill(signal?: 'SIGTERM' | 'SIGKILL'): Promise<void>;
+  onStdout(listener: (chunk: string) => void): Disposer;
+  onStderr(listener: (chunk: string) => void): Disposer;
+  onExit(listener: (info: { code: number | null; signal: string | null }) => void): Disposer;
+  wait(): Promise<{ code: number | null; signal: string | null }>;
+}
+
+export interface PublicTurnBlock {
+  itemId: string;
+  schemaVersion: number;
+  sessionId: string;
+  turnId: string | null;
+  seq: number;
+  instanceId: string;
+  driverId: string;
+  blockType: string;
+  status: string;
+  title: string;
+  textBody: string;
+  payload: Record<string, unknown>;
+  outputOmitted: boolean;
+  omittedBytes: number;
+  rawRef?: { eventSeq: number; vendorType: string } | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PublicHarnessBinding {
+  sessionId: string;
+  harnessId: string;
+  harnessKind: string;
+  nativeSessionId: string | null;
+  lastModel?: string | null;
+  lastActualModel?: string | null;
+  lastEffort?: string | null;
+  syncedUpToSeq: number;
+  driverUsed?: string | null;
+  updatedAt: number;
+}
+
+export interface ListSessionItemsOptions {
+  afterSeq?: number;
+  beforeSeq?: number;
+  types?: string[];
+  limit?: number;
+  includeOmittedBodies?: boolean;
+}
+
+export interface GetSessionItemOptions {
+  textOffset?: number;
+  maxChars?: number;
+}
+
+export interface ForkSessionOptions {
+  targetInstanceId?: string;
+  title?: string;
+  createWorktree?: boolean;
+}
+
+export interface SwitchSessionInstanceOptions {
+  targetInstanceId: string;
+  forceFreshNativeSession?: boolean;
+}
+
+export interface PublicSessionNotice {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  code?: string;
+}
+
+export interface ContextHandoffPreviewV2 {
+  sessionId: string;
+  mode: 'full_session_summary' | 'delta_since_target_last_seen';
+  deliveryChannel: string;
+  sourceInstanceId: string;
+  targetInstanceId: string;
+  coveredSeqRange: { fromSeq: number; toSeq: number };
+  unsyncedTurnCount: number;
+  estimatedChars: number;
+  estimatedTokens: number;
+  budgetTokens: number;
+  syncNeeded: boolean;
+  redactionSummary?: { categories: string[]; redactedCount: number };
+  renderedPayload: string;
+}
+
+export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
+  readonly harnesses: {
+    registerDriver(driver: PluginHarnessDriverRegistration): Disposer;
+    listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
+  };
+  readonly runtime: {
+    spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
+  };
+  readonly sessions: IsolatedPluginContext['sessions'] & {
+    listItems(sessionId: string, opts?: ListSessionItemsOptions): Promise<{ items: PublicTurnBlock[]; nextSeq: number | null }>;
+    getItem(sessionId: string, itemId: string, opts?: GetSessionItemOptions): Promise<{
+      item: PublicTurnBlock;
+      bodyChunk?: string;
+      nextTextOffset?: number | null;
+    } | null>;
+    getBindings(sessionId: string): Promise<ReadonlyArray<PublicHarnessBinding>>;
+    fork(sessionId: string, opts?: ForkSessionOptions): Promise<PublicSession>;
+    switchInstance(sessionId: string, opts: SwitchSessionInstanceOptions): Promise<void>;
+    postNotice(sessionId: string, notice: PublicSessionNotice): Promise<void>;
+  };
+  readonly handoff: IsolatedPluginContext['handoff'] & {
+    onRedact(listener: (input: HandoffRedactEvent) => Promise<HandoffRedactResult> | HandoffRedactResult): Disposer;
+    preview(sessionId: string, targetInstanceId: string): Promise<ContextHandoffPreviewV2>;
+  };
+}
+
+export type Context = IsolatedPluginContextV5;
+
+export interface PluginModule<Ctx extends IsolatedPluginContext = IsolatedPluginContextV5> {
   readonly name?: string;
   readonly inject?: readonly string[];
   readonly optional?: readonly string[];
   readonly provides?: readonly string[];
   readonly requires?: readonly string[];
-  apply(ctx: IsolatedPluginContext, config: Readonly<Record<string, unknown>>): void | Promise<void>;
+  apply(ctx: Ctx, config: Readonly<Record<string, unknown>>): void | Promise<void>;
 }

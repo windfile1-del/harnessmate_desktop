@@ -16,6 +16,8 @@ import type { HarnessAdapter } from '../../harnesses/types.js';
 import type { HostPlugin } from '../runtime/lifecycle.js';
 import type { PluginEvents } from '../runtime/events.js';
 
+export const handoffRedactionMap = new WeakMap<object, { categories: string[]; redactedCount: number }>();
+
 export const gitService = { status: getGitStatusSummary, inspect: inspectGitRepo, worktree: createGitWorktree };
 export type GitService = typeof gitService;
 export type NativeCommandsService = { list: typeof listHarnessCommands; tools: HarnessCommandTools };
@@ -38,6 +40,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     plugins.set(`core.harness.${id}`, {
       provides: [service],
       apply(ctx) {
+        ctx.host?.setRegistryBridge(registry);
         const adapter = overrides.find((candidate) => candidate.id === id) ?? create();
         ctx.effect(() => {
           registry.register(adapter);
@@ -98,9 +101,81 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     inject: ['ledger'],
     provides: ['handoff'],
     apply(ctx, settings) {
+      ctx.host?.setRegistryBridge(registry);
       const ledger = ctx.get<TaskLedgerService>('ledger')!;
       const options = handoffConfigSchema.parse(settings);
-      ctx.provide('handoff', new ContextCompiler(store, ledger, options, (cwd) => ctx.get<GitService>('git')?.status(cwd), events(), collectIsolatedSections));
+      const compiler = new ContextCompiler(store, ledger, options, (cwd) => ctx.get<GitService>('git')?.status(cwd), events(), collectIsolatedSections);
+      const baseCompile = compiler.compile.bind(compiler);
+      compiler.compile = async (compileOpts) => {
+        const packet = await baseCompile(compileOpts);
+        const redactor = ctx.host?.getHandoffRedactor();
+        if (!redactor || !packet.syncNeeded) {
+          return packet;
+        }
+        const targetDriverId = compileOpts.targetHarnessKind || compileOpts.targetHarnessId;
+        const deltaRes = await redactor({
+          text: packet.deltaMarkdown,
+          targetDriverId,
+          sessionId: compileOpts.session.id,
+          workspaceId: compileOpts.session.workspaceId,
+          targetInstanceId: compileOpts.targetHarnessId,
+        });
+        const allCategories = new Set<string>(deltaRes.categories);
+        let totalRedacted = deltaRes.redactedCount;
+        const redactText = async (inputText: string): Promise<string> => {
+          if (!inputText) return inputText;
+          const r = await redactor({
+            text: inputText,
+            targetDriverId,
+            sessionId: compileOpts.session.id,
+            workspaceId: compileOpts.session.workspaceId,
+            targetInstanceId: compileOpts.targetHarnessId,
+          });
+          for (const cat of r.categories) allCategories.add(cat);
+          totalRedacted = Math.max(totalRedacted, r.redactedCount);
+          return r.text;
+        };
+        const redactedPortableItems = await Promise.all(
+          packet.portableItems.map(async (item) => ({
+            ...item,
+            content: await Promise.all(
+              item.content.map(async (part) => ({
+                ...part,
+                text: await redactText(part.text),
+              })),
+            ),
+          })),
+        );
+        const redactedCompiledMarkdown = packet.preview.compiledMarkdown === packet.deltaMarkdown
+          ? deltaRes.text
+          : await redactText(packet.preview.compiledMarkdown);
+        const redactedLedgerMarkdown = packet.preview.ledgerMarkdown
+          ? await redactText(packet.preview.ledgerMarkdown)
+          : packet.preview.ledgerMarkdown;
+        const redactedObjective = packet.objective
+          ? await redactText(packet.objective)
+          : packet.objective;
+        const updated = {
+          ...packet,
+          deltaMarkdown: deltaRes.text,
+          objective: redactedObjective,
+          portableItems: redactedPortableItems,
+          preview: {
+            ...packet.preview,
+            compiledMarkdown: redactedCompiledMarkdown,
+            ledgerMarkdown: redactedLedgerMarkdown,
+            estimatedTokens: Math.max(1, Math.ceil(redactedCompiledMarkdown.length / 4)),
+          },
+        };
+        if (allCategories.size > 0 || totalRedacted > 0) {
+          handoffRedactionMap.set(updated, {
+            categories: [...allCategories],
+            redactedCount: totalRedacted,
+          });
+        }
+        return updated;
+      };
+      ctx.provide('handoff', compiler);
     },
   });
   plugins.set('core.account-usage', {

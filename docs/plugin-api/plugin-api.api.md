@@ -5,10 +5,10 @@
 清单与声明式贡献点见同目录 JSON Schema。公共错误码见类型声明。
 
 ```ts
-import type { ApprovalAnnotateEvent, HandoffComposeEvent, HandoffComposeSection, HandoffOfferDecision, HandoffShouldOfferEvent, PluginEventName, PluginEventV4 } from './events.js';
+import type { ApprovalAnnotateEvent, HandoffComposeEvent, HandoffComposeSection, HandoffOfferDecision, HandoffRedactEvent, HandoffRedactResult, HandoffShouldOfferEvent, PluginEventName, PluginEventV4 } from './events.js';
 import type { PLUGIN_API_VERSION } from './manifest.js';
 import type { PublicSlotRegistration } from './slots.js';
-export declare const pluginErrorCodes: readonly ["E_PERMISSION_DENIED", "E_SERVICE_UNAVAILABLE", "E_NOT_SUPPORTED", "E_TIMEOUT", "E_INVALID_INPUT", "E_LIMIT_EXCEEDED", "E_CONFLICT", "E_STALE_RUN"];
+export declare const pluginErrorCodes: readonly ["E_PERMISSION_DENIED", "E_SERVICE_UNAVAILABLE", "E_NOT_SUPPORTED", "E_TIMEOUT", "E_INVALID_INPUT", "E_LIMIT_EXCEEDED", "E_CONFLICT", "E_STALE_RUN", "E_CIRCULAR_DEPENDENCY"];
 export type PluginErrorCode = typeof pluginErrorCodes[number];
 export declare class PluginApiError extends Error {
     readonly code: PluginErrorCode;
@@ -248,14 +248,431 @@ export interface IsolatedPluginContext extends PluginContext {
     };
     onConfigUpdated?(listener: (config: Readonly<Record<string, unknown>>) => void | Promise<void>): Disposer;
 }
-export type Context = IsolatedPluginContext;
-export interface PluginModule {
+export type PublicReasoningEffort = 'none' | 'disabled' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+export type PublicPermissionMode = 'plan' | 'accept_edits' | 'auto' | 'manual';
+export type PublicToolKind = 'shell' | 'file_read' | 'file_edit' | 'search' | 'mcp' | 'subagent' | 'web' | 'other';
+export type PublicRiskLevel = 'low' | 'medium' | 'high';
+export type PublicApprovalDecision = 'allow_once' | 'allow_session' | 'deny';
+export type PublicContextInjectionDriver = 'codex_inject_items' | 'acp_embedded_context' | 'claude_sysfile_delta' | 'prompt_envelope' | 'native_warm';
+export type PublicHarnessHealth = 'ready' | 'degraded' | 'unavailable' | 'unauthenticated';
+export type PublicHarnessTransportKind = 'jsonrpc_stdio' | 'stream_json' | 'acp_stdio' | 'http_sse' | 'sdk' | 'custom';
+export type PublicHarnessHistoryInjectionMode = 'native_items' | 'embedded_context' | 'sysfile_delta' | 'inline';
+export type PublicProviderOptionDescriptor = {
+    key: string;
+    label: string;
+    description?: string;
+    kind: 'select';
+    defaultValue?: string;
+    options: Array<{
+        value: string;
+        label: string;
+        description?: string;
+    }>;
+} | {
+    key: string;
+    label: string;
+    description?: string;
+    kind: 'boolean';
+    defaultValue?: boolean;
+} | {
+    key: string;
+    label: string;
+    description?: string;
+    kind: 'number';
+    min?: number;
+    max?: number;
+    step?: number;
+    defaultValue?: number;
+};
+export interface PublicHarnessPresentationMeta {
+    shortLabel: string;
+    accentColor: string;
+    softBg: string;
+    tagline: string;
+    iconSvg?: string;
+}
+export interface PublicHarnessCapabilities {
+    streaming: boolean;
+    interactiveApproval: boolean;
+    reasoningEfforts: PublicReasoningEffort[];
+    permissionModes: PublicPermissionMode[];
+    sessionResume: boolean;
+    sessionFork: boolean;
+    imageInput: boolean;
+    subagents: boolean;
+}
+export interface PublicHarnessCapabilitiesV2 extends PublicHarnessCapabilities {
+    transport: PublicHarnessTransportKind;
+    historyInjectionMode: PublicHarnessHistoryInjectionMode;
+    supportsNativeRollback: boolean;
+    supportsActiveSteering: boolean;
+    supportsUsageLimits: boolean;
+    supportsDynamicOptions: boolean;
+    nativeCommands: string[];
+    optionDescriptors: PublicProviderOptionDescriptor[];
+}
+export interface PublicHarnessModelInfo {
+    id: string;
+    displayName: string;
+    description?: string;
+    group?: string;
+    isDefault?: boolean;
+    defaultEffort?: PublicReasoningEffort;
+    supportedEfforts?: PublicReasoningEffort[];
+    inputModalities?: string[];
+}
+export interface PublicHarnessDriverDescriptor {
+    driverId: string;
+    displayName: string;
+    description: string;
+    protocolLabel: string;
+    capabilities: PublicHarnessCapabilities;
+    capabilitiesV2?: PublicHarnessCapabilitiesV2;
+    presentation?: PublicHarnessPresentationMeta;
+    pluginMcpTransport?: 'http' | 'acp';
+}
+export interface PublicHarnessInstanceInfo {
+    id: string;
+    driverId: string;
+    displayName: string;
+    description: string;
+    protocolLabel: string;
+    enabled: boolean;
+    isCustom?: boolean;
+}
+export interface PublicAdapterSessionConfig {
+    cwd: string;
+    model?: string | null;
+    reasoningEffort?: PublicReasoningEffort | null;
+    permissionMode: PublicPermissionMode;
+    nativeSessionId?: string | null;
+    requireNativeResume?: boolean;
+    handoffContinuity?: boolean;
+    pluginMcp?: {
+        url: string;
+        token: string;
+    };
+}
+export interface PublicHarnessProbeResult {
+    binaryPath: string | null;
+    version: string | null;
+    health: PublicHarnessHealth;
+    healthMessage?: string;
+    models: PublicHarnessModelInfo[];
+    defaultModelId?: string | null;
+    accountSummary?: string | null;
+    capabilitiesV2?: PublicHarnessCapabilitiesV2;
+    presentation?: PublicHarnessPresentationMeta;
+}
+export interface PublicPortableHistoryMessage {
+    type: 'message';
+    role: 'user' | 'assistant';
+    content: Array<{
+        type: 'input_text' | 'output_text';
+        text: string;
+    }>;
+}
+export interface PublicDriverContextSyncPayload {
+    deltaMarkdown: string;
+    portableItems: PublicPortableHistoryMessage[];
+    objective?: string;
+    isWarmBinding: boolean;
+}
+export interface PublicDriverTurnInput {
+    turnId: string;
+    text: string;
+    attachments?: Array<{
+        id: string;
+        kind: 'file_ref' | 'image';
+        name: string;
+        path?: string;
+        relativePath?: string;
+        mimeType?: string;
+        sizeBytes?: number;
+    }>;
+    model?: string | null;
+    reasoningEffort?: PublicReasoningEffort | null;
+    permissionMode?: PublicPermissionMode;
+    contextSync?: PublicDriverContextSyncPayload | null;
+    cliCommand?: string;
+    nativeSkill?: {
+        name: string;
+        path: string;
+    };
+}
+export type PublicNormalizedAdapterEvent = {
+    type: 'native_session_ready';
+    nativeSessionId: string;
+} | {
+    type: 'model.confirmed';
+    actualModel: string;
+    reroutedFrom?: string;
+    reason?: string;
+} | {
+    type: 'turn.started';
+    turnId: string;
+    continuation?: boolean;
+} | {
+    type: 'turn.completed';
+    turnId: string;
+    stopReason?: string;
+} | {
+    type: 'turn.failed';
+    turnId: string;
+    message: string;
+    code?: string;
+} | {
+    type: 'turn.cancelled';
+    turnId: string;
+} | {
+    type: 'message.assistant.delta';
+    turnId: string;
+    text: string;
+    messageId?: string;
+    parentToolUseId?: string;
+} | {
+    type: 'message.assistant.completed';
+    turnId: string;
+    text: string;
+    messageId?: string;
+    parentToolUseId?: string;
+} | {
+    type: 'thinking.delta';
+    turnId: string;
+    text: string;
+} | {
+    type: 'thinking.completed';
+    turnId: string;
+    text: string;
+} | {
+    type: 'tool.call.started';
+    turnId: string;
+    toolCallId: string;
+    toolName: string;
+    toolKind: PublicToolKind;
+    summary: string;
+    input?: unknown;
+    parentToolUseId?: string;
+} | {
+    type: 'tool.call.delta';
+    turnId: string;
+    toolCallId: string;
+    outputDelta: string;
+    diffDelta?: string;
+} | {
+    type: 'tool.call.completed';
+    turnId: string;
+    toolCallId: string;
+    toolName: string;
+    status: 'success' | 'error' | 'cancelled';
+    output?: string;
+    diff?: string;
+} | {
+    type: 'approval.requested';
+    turnId: string;
+    nativeRequestId: string;
+    toolName: string;
+    toolKind: PublicToolKind;
+    summary: string;
+    input: unknown;
+    diffPreview?: string;
+    riskLevel: PublicRiskLevel;
+} | {
+    type: 'command.output.delta';
+    turnId: string;
+    toolCallId: string;
+    chunk: string;
+    stream?: 'stdout' | 'stderr';
+} | {
+    type: 'turn_block.ext';
+    turnId: string;
+    itemId: string;
+    blockType: `ext:${string}`;
+    title: string;
+    fallbackSummary: string;
+    status?: 'pending' | 'running' | 'completed' | 'failed';
+    payload: Record<string, unknown>;
+} | {
+    type: 'usage.updated';
+    turnId: string | null;
+    usage: {
+        inputTokens: number;
+        outputTokens: number;
+        cachedTokens?: number;
+        costUsd?: number;
+    };
+} | {
+    type: 'diagnostic.log';
+    level: 'info' | 'warn' | 'error';
+    stream: 'stdout' | 'stderr' | 'protocol';
+    message: string;
+};
+export interface PluginHarnessSessionHandle {
+    readonly nativeSessionId?: string | null;
+    readonly pluginMcpAvailable?: boolean;
+    sendTurn(input: PublicDriverTurnInput): Promise<{
+        driverUsed?: PublicContextInjectionDriver;
+    } | void>;
+    listSkills?(): Promise<Array<{
+        name: string;
+        path?: string;
+        description?: string;
+        enabled?: boolean;
+    }>>;
+    runNativeCommand?(command: string, args: string): Promise<string>;
+    injectContext?(payload: PublicDriverContextSyncPayload): Promise<PublicContextInjectionDriver>;
+    interrupt(): Promise<void>;
+    resolveApproval(nativeRequestId: string, decision: PublicApprovalDecision, comment?: string): Promise<void>;
+    updateConfig?(patch: Partial<PublicAdapterSessionConfig>): Promise<void>;
+    dispose(): Promise<void>;
+    onEvent(listener: (event: PublicNormalizedAdapterEvent) => void): Disposer;
+}
+export interface PluginHarnessDriverRegistration extends PublicHarnessDriverDescriptor {
+    probe(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
+    probePassive?(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
+    createSession(config: PublicAdapterSessionConfig): Promise<PluginHarnessSessionHandle> | PluginHarnessSessionHandle;
+}
+export interface SpawnCliSpec {
+    command: string;
+    args: string[];
+    cwdWorkspaceId: string;
+    cwdRelativePath?: string;
+    extraEnv?: Record<string, string>;
+    timeoutMs?: number;
+}
+export interface ManagedCliProcessHandle {
+    readonly processId: string;
+    readonly pid: number;
+    writeStdin(data: string): Promise<void>;
+    closeStdin(): Promise<void>;
+    kill(signal?: 'SIGTERM' | 'SIGKILL'): Promise<void>;
+    onStdout(listener: (chunk: string) => void): Disposer;
+    onStderr(listener: (chunk: string) => void): Disposer;
+    onExit(listener: (info: {
+        code: number | null;
+        signal: string | null;
+    }) => void): Disposer;
+    wait(): Promise<{
+        code: number | null;
+        signal: string | null;
+    }>;
+}
+export interface PublicTurnBlock {
+    itemId: string;
+    schemaVersion: number;
+    sessionId: string;
+    turnId: string | null;
+    seq: number;
+    instanceId: string;
+    driverId: string;
+    blockType: string;
+    status: string;
+    title: string;
+    textBody: string;
+    payload: Record<string, unknown>;
+    outputOmitted: boolean;
+    omittedBytes: number;
+    rawRef?: {
+        eventSeq: number;
+        vendorType: string;
+    } | null;
+    createdAt: number;
+    updatedAt: number;
+}
+export interface PublicHarnessBinding {
+    sessionId: string;
+    harnessId: string;
+    harnessKind: string;
+    nativeSessionId: string | null;
+    lastModel?: string | null;
+    lastActualModel?: string | null;
+    lastEffort?: string | null;
+    syncedUpToSeq: number;
+    driverUsed?: string | null;
+    updatedAt: number;
+}
+export interface ListSessionItemsOptions {
+    afterSeq?: number;
+    beforeSeq?: number;
+    types?: string[];
+    limit?: number;
+    includeOmittedBodies?: boolean;
+}
+export interface GetSessionItemOptions {
+    textOffset?: number;
+    maxChars?: number;
+}
+export interface ForkSessionOptions {
+    targetInstanceId?: string;
+    title?: string;
+    createWorktree?: boolean;
+}
+export interface SwitchSessionInstanceOptions {
+    targetInstanceId: string;
+    forceFreshNativeSession?: boolean;
+}
+export interface PublicSessionNotice {
+    level: 'info' | 'warn' | 'error';
+    message: string;
+    code?: string;
+}
+export interface ContextHandoffPreviewV2 {
+    sessionId: string;
+    mode: 'full_session_summary' | 'delta_since_target_last_seen';
+    deliveryChannel: string;
+    sourceInstanceId: string;
+    targetInstanceId: string;
+    coveredSeqRange: {
+        fromSeq: number;
+        toSeq: number;
+    };
+    unsyncedTurnCount: number;
+    estimatedChars: number;
+    estimatedTokens: number;
+    budgetTokens: number;
+    syncNeeded: boolean;
+    redactionSummary?: {
+        categories: string[];
+        redactedCount: number;
+    };
+    renderedPayload: string;
+}
+export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
+    readonly harnesses: {
+        registerDriver(driver: PluginHarnessDriverRegistration): Disposer;
+        listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
+    };
+    readonly runtime: {
+        spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
+    };
+    readonly sessions: IsolatedPluginContext['sessions'] & {
+        listItems(sessionId: string, opts?: ListSessionItemsOptions): Promise<{
+            items: PublicTurnBlock[];
+            nextSeq: number | null;
+        }>;
+        getItem(sessionId: string, itemId: string, opts?: GetSessionItemOptions): Promise<{
+            item: PublicTurnBlock;
+            bodyChunk?: string;
+            nextTextOffset?: number | null;
+        } | null>;
+        getBindings(sessionId: string): Promise<ReadonlyArray<PublicHarnessBinding>>;
+        fork(sessionId: string, opts?: ForkSessionOptions): Promise<PublicSession>;
+        switchInstance(sessionId: string, opts: SwitchSessionInstanceOptions): Promise<void>;
+        postNotice(sessionId: string, notice: PublicSessionNotice): Promise<void>;
+    };
+    readonly handoff: IsolatedPluginContext['handoff'] & {
+        onRedact(listener: (input: HandoffRedactEvent) => Promise<HandoffRedactResult> | HandoffRedactResult): Disposer;
+        preview(sessionId: string, targetInstanceId: string): Promise<ContextHandoffPreviewV2>;
+    };
+}
+export type Context = IsolatedPluginContextV5;
+export interface PluginModule<Ctx extends IsolatedPluginContext = IsolatedPluginContextV5> {
     readonly name?: string;
     readonly inject?: readonly string[];
     readonly optional?: readonly string[];
     readonly provides?: readonly string[];
     readonly requires?: readonly string[];
-    apply(ctx: IsolatedPluginContext, config: Readonly<Record<string, unknown>>): void | Promise<void>;
+    apply(ctx: Ctx, config: Readonly<Record<string, unknown>>): void | Promise<void>;
 }
 
 export declare const PLUGIN_EVENT_VERSION = 4;
@@ -299,6 +716,18 @@ export interface PluginEventData {
         title: string;
         harnessId: string;
     };
+    'session.harness_switched': {
+        previousHarnessId: string | null;
+        targetHarnessId: string;
+        driverId?: string;
+        reason?: string;
+    };
+    'handoff.delivered': {
+        handoffId: string;
+        toInstanceId: string;
+        deliveryChannel: string;
+        deliveryStatus: string;
+    };
     'plugin.state': {
         pluginId: string;
         state: PluginState;
@@ -318,7 +747,7 @@ export type PluginEventV4<Name extends PluginEventName = PluginEventName> = {
         data: Readonly<PluginEventData[Type]>;
     };
 }[Name];
-export type PluginHookEventName = 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate';
+export type PluginHookEventName = 'handoff.compose' | 'handoff.shouldOffer' | 'approval.annotate' | 'handoff.redact';
 export interface HandoffComposeEvent {
     sessionId: string;
     workspaceId: string;
@@ -357,6 +786,17 @@ export interface HandoffOfferDecision {
     offer: boolean;
     targetHarnessId?: string;
     reason?: string;
+}
+export interface HandoffRedactEvent {
+    text: string;
+    targetDriverId: string;
+    sessionId?: string;
+    workspaceId?: string;
+    targetInstanceId?: string;
+}
+export interface HandoffRedactResult {
+    text: string;
+    categories: string[];
 }
 export declare const pluginEventContracts: {
     readonly 'turn.started': {
@@ -399,6 +839,14 @@ export declare const pluginEventContracts: {
         readonly mode: "parallel";
         readonly permission: "session:read";
     };
+    readonly 'session.harness_switched': {
+        readonly mode: "emit";
+        readonly permission: "session:read";
+    };
+    readonly 'handoff.delivered': {
+        readonly mode: "emit";
+        readonly permission: "session:read";
+    };
     readonly 'plugin.state': {
         readonly mode: "emit";
         readonly permission: null;
@@ -415,12 +863,19 @@ export declare const pluginEventContracts: {
         readonly mode: "waterfall";
         readonly permission: "approvals:annotate";
     };
+    readonly 'handoff.redact': {
+        readonly mode: "waterfall";
+        readonly permission: "handoff:redact";
+    };
 };
 
-import type { PluginErrorCode } from './context.js';
+import type { PluginErrorCode, PublicHarnessDriverDescriptor } from './context.js';
 import type { PluginRuntimeSlotDescriptor } from './slots.js';
 export declare const PLUGIN_RPC_PROTOCOL_VERSION = 1;
-export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots"];
+export declare const HOST_FEATURES_V5: readonly ["harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
+export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
+export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
+export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 export interface PluginHandshakeRequest {
     protocolVersion: number;
     pluginApi: string;
@@ -457,6 +912,8 @@ export interface PluginHandshakeResponse {
     hasHandoffCompose?: boolean;
     hasHandoffShouldOffer?: boolean;
     hasApprovalAnnotate?: boolean;
+    hasHandoffRedact?: boolean;
+    registeredDrivers?: PublicHarnessDriverDescriptor[];
 }
 export interface PluginRpcErrorPayload {
     code: PluginErrorCode | 'E_INTERNAL';
@@ -542,12 +999,116 @@ export declare const PLUGIN_UI_SLOTS: {
 };
 export type PluginSlotKey = keyof typeof PLUGIN_UI_SLOTS;
 export declare const PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper"];
+export declare const PLUGIN_UI_SLOTS_V5: {
+    readonly 'chat.block': {
+        readonly cardinality: "keyed";
+        readonly scope: "session";
+        readonly description: "按块类型渲染专有消息块（ext:<vendor>.*）或扩展标准块";
+    };
+    readonly 'composer.traits': {
+        readonly cardinality: "list";
+        readonly scope: "session";
+        readonly description: "输入栏动态参数与工作流 Trait 快捷控件";
+    };
+    readonly 'harness.settings': {
+        readonly cardinality: "keyed";
+        readonly scope: "root";
+        readonly description: "按 driverId 渲染 Harness 插件自定义认证与高级设置面板";
+    };
+    readonly 'inspector.diff': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧 Diff 与检查点视图";
+    };
+    readonly 'session.sidebar.badge': {
+        readonly cardinality: "list";
+        readonly scope: "session-maybe";
+        readonly description: "侧栏会话行轻量状态徽标";
+    };
+};
+export type PluginSlotKeyV5 = keyof typeof PLUGIN_UI_SLOTS_V5;
+export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5;
+export declare const PLUGIN_SLOT_KEYS_V5: readonly ["chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
+export declare const ALL_PLUGIN_UI_SLOTS: {
+    readonly 'chat.block': {
+        readonly cardinality: "keyed";
+        readonly scope: "session";
+        readonly description: "按块类型渲染专有消息块（ext:<vendor>.*）或扩展标准块";
+    };
+    readonly 'composer.traits': {
+        readonly cardinality: "list";
+        readonly scope: "session";
+        readonly description: "输入栏动态参数与工作流 Trait 快捷控件";
+    };
+    readonly 'harness.settings': {
+        readonly cardinality: "keyed";
+        readonly scope: "root";
+        readonly description: "按 driverId 渲染 Harness 插件自定义认证与高级设置面板";
+    };
+    readonly 'inspector.diff': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧 Diff 与检查点视图";
+    };
+    readonly 'session.sidebar.badge': {
+        readonly cardinality: "list";
+        readonly scope: "session-maybe";
+        readonly description: "侧栏会话行轻量状态徽标";
+    };
+    readonly 'session.header.title': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "会话顶栏标题区域（按 order 最小者优先）";
+    };
+    readonly 'sidebar.tools': {
+        readonly cardinality: "list";
+        readonly scope: "session-maybe";
+        readonly description: "左侧栏快捷工具区";
+    };
+    readonly 'composer.actions': {
+        readonly cardinality: "list";
+        readonly scope: "session";
+        readonly description: "输入区操作栏";
+    };
+    readonly 'inspector.tabs': {
+        readonly cardinality: "list";
+        readonly scope: "session";
+        readonly description: "右侧检视抽屉标签页与面板";
+    };
+    readonly 'statusbar.items': {
+        readonly cardinality: "list";
+        readonly scope: "session-maybe";
+        readonly description: "状态栏扩展项";
+    };
+    readonly 'chat.node': {
+        readonly cardinality: "keyed";
+        readonly scope: "session";
+        readonly description: "按事件或节点类型渲染自定义聊天节点";
+    };
+    readonly 'tool.result': {
+        readonly cardinality: "keyed";
+        readonly scope: "session";
+        readonly description: "按工具名渲染自定义工具结果视图";
+    };
+    readonly 'approval.detail': {
+        readonly cardinality: "chain";
+        readonly scope: "session";
+        readonly description: "按审批类型链式选择审批详情渲染器";
+    };
+    readonly 'chat.message.wrapper': {
+        readonly cardinality: "hoc";
+        readonly scope: "session";
+        readonly description: "包裹聊天消息内容的容器组件";
+    };
+};
+export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
 export declare function normalizePluginSlotKey(key: string): PluginSlotKey;
-export declare function isValidPluginSlotKey(key: string): key is PluginSlotKey;
+export declare function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey;
+export declare function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey;
 export declare function isSafePluginUiPath(value: string): boolean;
-export declare const PluginSlotKeyInputSchema: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper"]>;
+export declare const PluginSlotKeyInputSchema: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
 export declare const PluginSlotContributionSchema: z.ZodObject<{
-    slot: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper"]>;
+    slot: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
     id: z.ZodString;
     title: z.ZodString;
     ui: z.ZodEffects<z.ZodString, string, string>;
@@ -557,7 +1118,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -565,7 +1126,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -573,7 +1134,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }>;
 export type PluginSlotContribution = z.infer<typeof PluginSlotContributionSchema>;
 export interface PluginRuntimeSlotDescriptor {
-    slot: PluginSlotKey;
+    slot: AnyPluginSlotKey;
     id: string;
     title: string;
     ui: string;

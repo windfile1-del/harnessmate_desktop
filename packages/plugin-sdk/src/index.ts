@@ -7,25 +7,39 @@ import {
   PluginApiError,
   isSafePluginUiPath,
   isValidPluginSlotKey,
-  normalizePluginSlotKey,
+  normalizeAnyPluginSlotKey,
   type Disposer,
+  type HandoffRedactEvent,
+  type HandoffRedactResult,
   type IsolatedPluginContext,
+  type IsolatedPluginContextV5,
+  type ManagedCliProcessHandle,
   type PluginErrorCode,
   type PluginEventName,
   type PluginEventV4,
   type PluginHandshakeRequest,
   type PluginHandshakeResponse,
+  type PluginHarnessDriverRegistration,
+  type PluginHarnessSessionHandle,
   type PluginModule,
   type PluginRpcMessage,
   type PluginRpcResponse,
   type PluginRuntimeSlotDescriptor,
+  type PublicAdapterSessionConfig,
+  type PublicApprovalDecision,
+  type PublicDriverContextSyncPayload,
+  type PublicDriverTurnInput,
+  type PublicHarnessDriverDescriptor,
   type PublicSlotRegistration,
   type ServiceImplementation,
+  type SpawnCliSpec,
 } from '@harnessmate/plugin-api';
 
 export const PLUGIN_SDK_VERSION = '4.0.0';
 
-export function definePlugin(module: PluginModule): PluginModule {
+export function definePlugin<Ctx extends IsolatedPluginContext = IsolatedPluginContextV5>(
+  module: PluginModule<Ctx>,
+): PluginModule<Ctx> {
   return module;
 }
 
@@ -37,9 +51,13 @@ export interface RpcTransport {
 /**
  * Transport-agnostic isolated plugin RPC session (usable in Node child processes and future WASM hosts).
  */
-export function createIsolatedPluginSession(transport: RpcTransport, loadModule: () => Promise<PluginModule>) {
+export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = IsolatedPluginContextV5>(
+  transport: RpcTransport,
+  loadModule: () => Promise<PluginModule<Ctx>>,
+) {
   let activeRunId = '';
   let disposed = false;
+  let handshakeCompleted = false;
   let seq = 0;
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const effects = new Set<Disposer>();
@@ -52,7 +70,32 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
   const composeListeners = new Set<(event: never) => unknown>();
   const offerListeners = new Set<(event: never) => unknown>();
   const annotateListeners = new Set<(event: never) => unknown>();
+  const redactListeners = new Set<(input: HandoffRedactEvent) => Promise<HandoffRedactResult> | HandoffRedactResult>();
   const configListeners = new Set<(config: Readonly<Record<string, unknown>>) => void | Promise<void>>();
+  const driverHandlers = new Map<string, {
+    descriptor: PublicHarnessDriverDescriptor;
+    driver: PluginHarnessDriverRegistration;
+  }>();
+  const driverSessions = new Map<string, {
+    driverId: string;
+    handle: PluginHarnessSessionHandle;
+    unsubscribeEvent: Disposer;
+  }>();
+  const cliProcesses = new Map<string, {
+    stdoutListeners: Set<(chunk: string) => void>;
+    stderrListeners: Set<(chunk: string) => void>;
+    exitListeners: Set<(info: { code: number | null; signal: string | null }) => void>;
+    waiters: Array<{ resolve: (info: { code: number | null; signal: string | null }) => void; reject: (err: Error) => void }>;
+    stdoutBuffer: string[];
+    stderrBuffer: string[];
+    exitInfo?: { code: number | null; signal: string | null };
+  }>();
+  const earlyCliEvents = new Map<string, Array<{
+    type: 'stdout' | 'stderr' | 'exit';
+    chunk?: string;
+    code?: number | null;
+    signal?: string | null;
+  }>>();
   let availableServices = new Set<string>();
   let hostFeatures = new Set<string>();
 
@@ -91,7 +134,18 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
     },
   });
 
-  const buildContext = (handshake: PluginHandshakeRequest): IsolatedPluginContext => {
+  const toDriverDescriptor = (driver: PluginHarnessDriverRegistration): PublicHarnessDriverDescriptor => ({
+    driverId: driver.driverId,
+    displayName: driver.displayName,
+    description: driver.description,
+    protocolLabel: driver.protocolLabel,
+    capabilities: driver.capabilities,
+    ...(driver.capabilitiesV2 ? { capabilitiesV2: driver.capabilitiesV2 } : {}),
+    ...(driver.presentation ? { presentation: driver.presentation } : {}),
+    ...(driver.pluginMcpTransport ? { pluginMcpTransport: driver.pluginMcpTransport } : {}),
+  });
+
+  const buildContext = (handshake: PluginHandshakeRequest): IsolatedPluginContextV5 => {
     const subscribe = <Name extends PluginEventName>(
       name: Name,
       listener: (event: PluginEventV4<Name>) => void | Promise<void>,
@@ -161,6 +215,143 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
         capabilities: (sessionId) => rpcCall('sessions.capabilities', { sessionId }),
         prepareTurn: (sessionId, input) => rpcCall('sessions.prepareTurn', { sessionId, ...input }),
         runNative: (sessionId, command, args) => rpcCall('sessions.runNative', { sessionId, command, args }),
+        listItems: (sessionId, opts) => rpcCall('sessions.listItems', { sessionId, ...(opts ?? {}) }),
+        getItem: (sessionId, itemId, opts) => rpcCall('sessions.getItem', { sessionId, itemId, ...(opts ?? {}) }),
+        getBindings: (sessionId) => rpcCall('sessions.getBindings', { sessionId }),
+        fork: (sessionId, opts) => rpcCall('sessions.fork', { sessionId, ...(opts ?? {}) }),
+        switchInstance: async (sessionId, opts) => {
+          await rpcCall('sessions.switchInstance', { sessionId, ...opts });
+        },
+        postNotice: async (sessionId, notice) => {
+          await rpcCall('sessions.postNotice', { sessionId, notice });
+        },
+      },
+      harnesses: {
+        registerDriver: (driver) => registerEffect(() => {
+          const driverId = typeof driver?.driverId === 'string' ? driver.driverId.trim() : '';
+          if (!driverId) {
+            throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
+          }
+          if (driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
+            throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 Harness 驱动: ${driverId}`);
+          }
+          if (driverHandlers.has(driverId)) {
+            throw new PluginApiError('E_CONFLICT', `驱动 ${driverId} 已注册`);
+          }
+          if (typeof driver.probe !== 'function' || typeof driver.createSession !== 'function') {
+            throw new PluginApiError('E_INVALID_INPUT', `驱动 ${driverId} 缺少 probe 或 createSession 方法`);
+          }
+          const descriptor = toDriverDescriptor(driver);
+          driverHandlers.set(driverId, { descriptor, driver });
+          if (handshakeCompleted) {
+            rpcNotify('harnesses.registerDriver', { driver: descriptor });
+          }
+          return () => {
+            driverHandlers.delete(driverId);
+            for (const [handleId, sess] of [...driverSessions.entries()]) {
+              if (sess.driverId !== driverId) continue;
+              driverSessions.delete(handleId);
+              try { sess.unsubscribeEvent(); } catch { /* ignore */ }
+              void Promise.resolve(sess.handle.dispose()).catch(() => {});
+            }
+            rpcNotify('harnesses.unregisterDriver', { driverId });
+          };
+        }),
+        listInstances: () => rpcCall('harnesses.listInstances', {}),
+      },
+      runtime: {
+        spawnCli: async (spec: SpawnCliSpec): Promise<ManagedCliProcessHandle> => {
+          const spawned = await rpcCall<{ processId: string; pid: number }>(
+            'runtime.spawnCli',
+            spec as unknown as Record<string, unknown>,
+          );
+          const processId = spawned.processId;
+          const entry = {
+            stdoutListeners: new Set<(chunk: string) => void>(),
+            stderrListeners: new Set<(chunk: string) => void>(),
+            exitListeners: new Set<(info: { code: number | null; signal: string | null }) => void>(),
+            waiters: [] as Array<{ resolve: (info: { code: number | null; signal: string | null }) => void; reject: (err: Error) => void }>,
+            stdoutBuffer: [] as string[],
+            stderrBuffer: [] as string[],
+            exitInfo: undefined as { code: number | null; signal: string | null } | undefined,
+          };
+          cliProcesses.set(processId, entry);
+
+          const early = earlyCliEvents.get(processId);
+          if (early) {
+            earlyCliEvents.delete(processId);
+            for (const ev of early) {
+              if (ev.type === 'stdout' && ev.chunk !== undefined) {
+                entry.stdoutBuffer.push(ev.chunk);
+              } else if (ev.type === 'stderr' && ev.chunk !== undefined) {
+                entry.stderrBuffer.push(ev.chunk);
+              } else if (ev.type === 'exit') {
+                entry.exitInfo = { code: ev.code ?? null, signal: ev.signal ?? null };
+              }
+            }
+          }
+
+          registerEffect(() => () => {
+            const current = cliProcesses.get(processId);
+            if (current) {
+              cliProcesses.delete(processId);
+              for (const waiter of current.waiters) {
+                waiter.reject(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
+              }
+              current.waiters.length = 0;
+            }
+            if (!disposed && activeRunId) {
+              rpcNotify('runtime.cli.kill', { processId, signal: 'SIGKILL' });
+            }
+          });
+
+          return {
+            processId,
+            pid: spawned.pid,
+            writeStdin: async (data) => {
+              await rpcCall('runtime.cli.writeStdin', { processId, data });
+            },
+            closeStdin: async () => {
+              await rpcCall('runtime.cli.closeStdin', { processId });
+            },
+            kill: async (signal) => {
+              await rpcCall('runtime.cli.kill', { processId, signal });
+            },
+            onStdout: (listener) => {
+              entry.stdoutListeners.add(listener);
+              if (entry.stdoutBuffer.length > 0) {
+                const buffered = entry.stdoutBuffer.splice(0, entry.stdoutBuffer.length);
+                for (const chunk of buffered) listener(chunk);
+              }
+              return () => { entry.stdoutListeners.delete(listener); };
+            },
+            onStderr: (listener) => {
+              entry.stderrListeners.add(listener);
+              if (entry.stderrBuffer.length > 0) {
+                const buffered = entry.stderrBuffer.splice(0, entry.stderrBuffer.length);
+                for (const chunk of buffered) listener(chunk);
+              }
+              return () => { entry.stderrListeners.delete(listener); };
+            },
+            onExit: (listener) => {
+              entry.exitListeners.add(listener);
+              if (entry.exitInfo) {
+                const info = entry.exitInfo;
+                void Promise.resolve().then(() => listener(info));
+              }
+              return () => { entry.exitListeners.delete(listener); };
+            },
+            wait: () => {
+              if (entry.exitInfo) return Promise.resolve(entry.exitInfo);
+              if (disposed || !activeRunId) {
+                return Promise.reject(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
+              }
+              return new Promise((resolve, reject) => {
+                entry.waiters.push({ resolve, reject });
+              });
+            },
+          };
+        },
       },
       ledger: {
         get: (sessionId) => rpcCall('ledger.get', { sessionId }),
@@ -182,6 +373,11 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
           offerListeners.add(listener as (event: never) => unknown);
           return () => { offerListeners.delete(listener as (event: never) => unknown); };
         }),
+        onRedact: (listener) => registerEffect(() => {
+          redactListeners.add(listener);
+          return () => { redactListeners.delete(listener); };
+        }),
+        preview: (sessionId, targetInstanceId) => rpcCall('handoff.preview', { sessionId, targetInstanceId }),
       },
       composer: {
         suggest: (sessionId, suggestion) => rpcCall('composer.suggest', { sessionId, suggestion }),
@@ -214,7 +410,7 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
           if (!isSafePluginUiPath(def.ui)) {
             throw new PluginApiError('E_INVALID_INPUT', `无效的 UI 入口路径 ${String(def.ui)}`);
           }
-          const normalizedSlot = normalizePluginSlotKey(def.slot);
+          const normalizedSlot = normalizeAnyPluginSlotKey(def.slot);
           const slotKey = `${normalizedSlot}:${def.id}`;
           if (slotHandlers.has(slotKey)) throw new PluginApiError('E_CONFLICT', `插槽项 ${slotKey} 已注册`);
           slotHandlers.set(slotKey, {
@@ -328,7 +524,8 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
           throw new PluginApiError('E_NOT_SUPPORTED', `宿主不支持插件要求的特性: ${unsupported.join(', ')}`);
         }
         const ctx = buildContext(handshake);
-        await mod.apply(ctx, handshake.config);
+        await mod.apply(ctx as unknown as Ctx, handshake.config);
+        handshakeCompleted = true;
         const serviceMethods: Record<string, string[]> = {};
         for (const [serviceName, impl] of providedServices) {
           serviceMethods[serviceName] = Object.keys(impl).filter((key) => typeof impl[key] === 'function');
@@ -349,6 +546,8 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
           hasHandoffCompose: composeListeners.size > 0,
           hasHandoffShouldOffer: offerListeners.size > 0,
           hasApprovalAnnotate: annotateListeners.size > 0,
+          hasHandoffRedact: redactListeners.size > 0,
+          registeredDrivers: [...driverHandlers.values()].map(({ descriptor }) => descriptor),
         } satisfies PluginHandshakeResponse;
       } else if (method === 'host.services.sync') {
         availableServices = new Set(Array.isArray(params.services) ? params.services as string[] : []);
@@ -400,6 +599,21 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
           }
         }
         result = { decision };
+      } else if (method === 'host.handoff.redact') {
+        const event = params as unknown as HandoffRedactEvent;
+        let currentText = typeof event.text === 'string' ? event.text : '';
+        const categories: string[] = [];
+        for (const listener of [...redactListeners]) {
+          const out = await listener({ ...event, text: currentText });
+          if (!out || typeof out.text !== 'string' || !Array.isArray(out.categories)) {
+            throw new PluginApiError('E_INVALID_INPUT', 'handoff.onRedact 必须返回 { text, categories }');
+          }
+          currentText = out.text;
+          for (const cat of out.categories) {
+            if (typeof cat === 'string' && cat) categories.push(cat);
+          }
+        }
+        result = { text: currentText, categories };
       } else if (method === 'host.approval.annotate') {
         const annotations: unknown[] = [];
         for (const listener of [...annotateListeners]) {
@@ -409,7 +623,7 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
         result = { annotations };
       } else if (method === 'host.slot.message') {
         const slotId = String(params.slotId ?? '');
-        const slotName = params.slot ? normalizePluginSlotKey(String(params.slot)) : '';
+        const slotName = params.slot ? normalizeAnyPluginSlotKey(String(params.slot)) : '';
         const entry = (slotName ? slotHandlers.get(`${slotName}:${slotId}`) : undefined)
           ?? [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
         if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未注册插槽项 ${slotId}`);
@@ -424,6 +638,112 @@ export function createIsolatedPluginSession(transport: RpcTransport, loadModule:
       } else if (method === 'host.config.updated') {
         const config = (params.config ?? {}) as Readonly<Record<string, unknown>>;
         for (const listener of [...configListeners]) await listener(config);
+        result = { ok: true };
+      } else if (method === 'host.cli.output') {
+        const processId = String(params.processId ?? '');
+        const stream = params.stream === 'stderr' ? 'stderr' : 'stdout';
+        const chunk = typeof params.chunk === 'string' ? params.chunk : '';
+        const entry = cliProcesses.get(processId);
+        if (!entry) {
+          const buf = earlyCliEvents.get(processId) ?? [];
+          buf.push({ type: stream, chunk });
+          earlyCliEvents.set(processId, buf);
+        } else if (stream === 'stdout') {
+          if (entry.stdoutListeners.size === 0) entry.stdoutBuffer.push(chunk);
+          else for (const listener of [...entry.stdoutListeners]) listener(chunk);
+        } else {
+          if (entry.stderrListeners.size === 0) entry.stderrBuffer.push(chunk);
+          else for (const listener of [...entry.stderrListeners]) listener(chunk);
+        }
+        result = { ok: true };
+      } else if (method === 'host.cli.exit') {
+        const processId = String(params.processId ?? '');
+        const info = {
+          code: typeof params.code === 'number' ? params.code : null,
+          signal: typeof params.signal === 'string' ? params.signal : null,
+        };
+        const entry = cliProcesses.get(processId);
+        if (!entry) {
+          const buf = earlyCliEvents.get(processId) ?? [];
+          buf.push({ type: 'exit', ...info });
+          earlyCliEvents.set(processId, buf);
+        } else if (!entry.exitInfo) {
+          entry.exitInfo = info;
+          for (const listener of [...entry.exitListeners]) listener(info);
+          for (const waiter of entry.waiters.splice(0, entry.waiters.length)) waiter.resolve(info);
+        }
+        result = { ok: true };
+      } else if (method === 'host.driver.probe' || method === 'host.driver.probePassive') {
+        const driverId = String(params.driverId ?? '');
+        const entry = driverHandlers.get(driverId);
+        if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未注册驱动 ${driverId}`);
+        if (method === 'host.driver.probePassive' && typeof entry.driver.probePassive === 'function') {
+          result = await entry.driver.probePassive();
+        } else {
+          result = await entry.driver.probe();
+        }
+      } else if (method === 'host.driver.createSession') {
+        const driverId = String(params.driverId ?? '');
+        const handleId = String(params.handleId ?? '');
+        const entry = driverHandlers.get(driverId);
+        if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未注册驱动 ${driverId}`);
+        const handle = await entry.driver.createSession((params.config ?? {}) as PublicAdapterSessionConfig);
+        const unsubscribeEvent = handle.onEvent((event) => {
+          rpcNotify('driver.session.event', { handleId, event });
+        });
+        driverSessions.set(handleId, { driverId, handle, unsubscribeEvent });
+        result = {
+          nativeSessionId: handle.nativeSessionId ?? null,
+          pluginMcpAvailable: handle.pluginMcpAvailable ?? false,
+        };
+      } else if (method === 'host.driver.sendTurn') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        result = (await sess.handle.sendTurn((params.input ?? {}) as PublicDriverTurnInput)) ?? {};
+      } else if (method === 'host.driver.injectContext') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        if (!sess.handle.injectContext) throw new PluginApiError('E_NOT_SUPPORTED', '驱动不支持 injectContext');
+        const driverUsed = await sess.handle.injectContext((params.payload ?? {}) as PublicDriverContextSyncPayload);
+        result = { driverUsed };
+      } else if (method === 'host.driver.interrupt') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        await sess.handle.interrupt();
+        result = { ok: true };
+      } else if (method === 'host.driver.resolveApproval') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        await sess.handle.resolveApproval(
+          String(params.nativeRequestId ?? ''),
+          params.decision as PublicApprovalDecision,
+          typeof params.comment === 'string' ? params.comment : undefined,
+        );
+        result = { ok: true };
+      } else if (method === 'host.driver.updateConfig') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        if (sess.handle.updateConfig) {
+          await sess.handle.updateConfig((params.patch ?? {}) as Partial<PublicAdapterSessionConfig>);
+        }
+        result = { ok: true };
+      } else if (method === 'host.driver.listSkills') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        result = sess.handle.listSkills ? await sess.handle.listSkills() : [];
+      } else if (method === 'host.driver.runNativeCommand') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        if (!sess.handle.runNativeCommand) throw new PluginApiError('E_NOT_SUPPORTED', '驱动不支持 runNativeCommand');
+        result = await sess.handle.runNativeCommand(String(params.command ?? ''), String(params.args ?? ''));
+      } else if (method === 'host.driver.dispose') {
+        const handleId = String(params.handleId ?? '');
+        const sess = driverSessions.get(handleId);
+        if (sess) {
+          driverSessions.delete(handleId);
+          try { sess.unsubscribeEvent(); } catch { /* ignore */ }
+          await sess.handle.dispose();
+        }
         result = { ok: true };
       } else {
         throw new PluginApiError('E_NOT_SUPPORTED', `未知 RPC 方法 ${method}`);

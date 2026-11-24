@@ -30,13 +30,23 @@ export const STATIC_PLUGIN_PERMISSIONS = [
   'session:read',
   'session:command',
   'session:send',
+  'session:fork',
+  'session:switch',
+  'session:orchestrate',
   'composer:suggest',
   'handoff:section',
+  'handoff:redact',
+  'context:compressor',
   'approvals:annotate',
   'storage:plugin',
   'storage:workspace',
   'fs:workspace:read',
   'fs:workspace:write',
+  'fs:cli_histories:read',
+  'workspace:git:read',
+  'workspace:git:write',
+  'process:pty:workspace',
+  'harness:driver:register',
   'notify',
   'clipboard:write',
   'browser:preview',
@@ -46,6 +56,7 @@ export type StaticPluginPermission = typeof STATIC_PLUGIN_PERMISSIONS[number];
 
 const staticPermissionSet = new Set<string>(STATIC_PLUGIN_PERMISSIONS);
 const netHostPattern = /^net:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i;
+const safeTokenPattern = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 
 export function isValidPluginPermission(value: string): boolean {
   if (staticPermissionSet.has(value)) return true;
@@ -55,6 +66,14 @@ export function isValidPluginPermission(value: string): boolean {
   if (value.startsWith('service:provide:')) {
     const service = value.slice('service:provide:'.length);
     return PluginServiceNameSchema.safeParse(service).success && !isReservedServiceName(service);
+  }
+  if (value.startsWith('process:spawn:')) {
+    const binary = value.slice('process:spawn:'.length);
+    return safeTokenPattern.test(binary) && !binary.includes('..');
+  }
+  if (value.startsWith('secrets:read:')) {
+    const ns = value.slice('secrets:read:'.length);
+    return safeTokenPattern.test(ns) && !ns.includes('..');
   }
   return false;
 }

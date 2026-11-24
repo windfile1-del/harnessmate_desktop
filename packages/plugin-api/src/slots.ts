@@ -72,19 +72,73 @@ export const PLUGIN_SLOT_KEYS = [
   'chat.message.wrapper',
 ] as const satisfies readonly PluginSlotKey[];
 
-const SLOT_ALIASES: Readonly<Record<string, PluginSlotKey>> = {
+export const PLUGIN_UI_SLOTS_V5 = {
+  'chat.block': {
+    cardinality: 'keyed',
+    scope: 'session',
+    description: '按块类型渲染专有消息块（ext:<vendor>.*）或扩展标准块',
+  },
+  'composer.traits': {
+    cardinality: 'list',
+    scope: 'session',
+    description: '输入栏动态参数与工作流 Trait 快捷控件',
+  },
+  'harness.settings': {
+    cardinality: 'keyed',
+    scope: 'root',
+    description: '按 driverId 渲染 Harness 插件自定义认证与高级设置面板',
+  },
+  'inspector.diff': {
+    cardinality: 'single',
+    scope: 'session',
+    description: '接管或增强右侧 Diff 与检查点视图',
+  },
+  'session.sidebar.badge': {
+    cardinality: 'list',
+    scope: 'session-maybe',
+    description: '侧栏会话行轻量状态徽标',
+  },
+} as const satisfies Record<string, PluginSlotContract>;
+
+export type PluginSlotKeyV5 = keyof typeof PLUGIN_UI_SLOTS_V5;
+export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5;
+
+export const PLUGIN_SLOT_KEYS_V5 = [
+  'chat.block',
+  'composer.traits',
+  'harness.settings',
+  'inspector.diff',
+  'session.sidebar.badge',
+] as const satisfies readonly PluginSlotKeyV5[];
+
+export const ALL_PLUGIN_UI_SLOTS = {
+  ...PLUGIN_UI_SLOTS,
+  ...PLUGIN_UI_SLOTS_V5,
+} as const satisfies Record<AnyPluginSlotKey, PluginSlotContract>;
+
+export const ALL_PLUGIN_SLOT_KEYS = [
+  ...PLUGIN_SLOT_KEYS,
+  ...PLUGIN_SLOT_KEYS_V5,
+] as const satisfies readonly AnyPluginSlotKey[];
+
+const SLOT_ALIASES: Readonly<Record<string, AnyPluginSlotKey>> = {
   'inspector.tab': 'inspector.tabs',
 };
 
-const validSlotSet = new Set<string>(PLUGIN_SLOT_KEYS);
+const allValidSlotSet = new Set<string>(ALL_PLUGIN_SLOT_KEYS);
 
 export function normalizePluginSlotKey(key: string): PluginSlotKey {
   const mapped = SLOT_ALIASES[key] ?? key;
   return mapped as PluginSlotKey;
 }
 
-export function isValidPluginSlotKey(key: string): key is PluginSlotKey {
-  return validSlotSet.has(normalizePluginSlotKey(key));
+export function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey {
+  const mapped = SLOT_ALIASES[key] ?? key;
+  return mapped as AnyPluginSlotKey;
+}
+
+export function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey {
+  return allValidSlotSet.has(normalizeAnyPluginSlotKey(key));
 }
 
 export function isSafePluginUiPath(value: string): boolean {
@@ -107,6 +161,11 @@ export const PluginSlotKeyInputSchema = z.enum([
   'tool.result',
   'approval.detail',
   'chat.message.wrapper',
+  'chat.block',
+  'composer.traits',
+  'harness.settings',
+  'inspector.diff',
+  'session.sidebar.badge',
 ]);
 
 export const PluginSlotContributionSchema = z.object({
@@ -121,7 +180,7 @@ export const PluginSlotContributionSchema = z.object({
 export type PluginSlotContribution = z.infer<typeof PluginSlotContributionSchema>;
 
 export interface PluginRuntimeSlotDescriptor {
-  slot: PluginSlotKey;
+  slot: AnyPluginSlotKey;
   id: string;
   title: string;
   ui: string;
