@@ -4,10 +4,13 @@ import type {
   ContextInjectionDriver,
   DiscoveredCliSession,
   HarnessCapabilities,
+  HarnessCapabilitiesV2,
+  HarnessDriverId,
   HarnessHealth,
   HarnessInfo,
   HarnessKind,
   HarnessModelInfo,
+  HarnessPresentationMeta,
   PermissionMode,
   ReasoningEffort,
   RiskLevel,
@@ -15,16 +18,19 @@ import type {
   ToolKind,
 } from '@harnessmate/protocol';
 
+export interface PortableHistoryMessage {
+  type: 'message';
+  role: 'user' | 'assistant';
+  content: Array<{ type: 'input_text' | 'output_text'; text: string }>;
+}
+
 export interface ContextSyncPayload {
   deltaMarkdown: string;
-  codexInjectItems: Array<{
-    type: 'message';
-    role: 'user' | 'assistant';
-    content: Array<{ type: 'input_text' | 'output_text'; text: string }>;
-  }>;
+  /** Vendor-neutral portable structured history items for drivers supporting native_items injection. */
+  portableItems: PortableHistoryMessage[];
   objective?: string;
   isWarmBinding: boolean;
-  onDispatch?: (driver: ContextInjectionDriver, content: string | ContextSyncPayload['codexInjectItems']) => void;
+  onDispatch?: (driver: ContextInjectionDriver, content: string | PortableHistoryMessage[]) => void;
 }
 
 export interface HarnessProbeResult {
@@ -127,6 +133,23 @@ export type NormalizedAdapterEvent =
       diffPreview?: string;
       riskLevel: RiskLevel;
     }
+  | {
+      type: 'command.output.delta';
+      turnId: string;
+      toolCallId: string;
+      chunk: string;
+      stream?: 'stdout' | 'stderr';
+    }
+  | {
+      type: 'turn_block.ext';
+      turnId: string;
+      itemId: string;
+      blockType: `ext:${string}`;
+      title: string;
+      fallbackSummary: string;
+      status?: 'pending' | 'running' | 'completed' | 'failed';
+      payload: Record<string, unknown>;
+    }
   | { type: 'usage.updated'; turnId: string | null; usage: TokenUsage }
   | { type: 'diagnostic.log'; level: 'info' | 'warn' | 'error'; stream: 'stdout' | 'stderr' | 'protocol'; message: string };
 
@@ -135,7 +158,8 @@ export interface AdapterSessionHandle {
   readonly pluginMcpAvailable?: boolean;
   sendTurn(input: TurnInput): Promise<{ driverUsed?: ContextInjectionDriver } | void>;
   listSkills?(): Promise<NativeSkill[]>;
-  runCodexGoal?(args: string): Promise<string>;
+  /** Vendor-neutral native command execution (replaces vendor-specific handle methods such as runCodexGoal). */
+  runNativeCommand?(command: string, args: string): Promise<string>;
   injectContext?(payload: ContextSyncPayload): Promise<ContextInjectionDriver>;
   interrupt(): Promise<void>;
   resolveApproval(nativeRequestId: string, decision: ApprovalDecision, comment?: string): Promise<void>;
@@ -147,13 +171,19 @@ export interface AdapterSessionHandle {
 export interface HarnessAdapter {
   readonly id: string;
   readonly kind: HarnessKind;
+  readonly driverId?: HarnessDriverId;
+  readonly continuationKey?: string;
   readonly displayName: string;
   readonly description: string;
   readonly protocolLabel: string;
   readonly capabilities: HarnessCapabilities;
+  readonly capabilitiesV2?: HarnessCapabilitiesV2;
+  readonly presentation?: HarnessPresentationMeta;
   readonly isCustom?: boolean;
   readonly pluginMcpTransport?: 'http' | 'acp';
 
+  /** Passive health check: must NOT spawn stateful sessions or create side effects. */
+  probePassive?(): Promise<HarnessInfo>;
   probe(): Promise<HarnessInfo>;
   createSession(config: AdapterSessionConfig): Promise<AdapterSessionHandle>;
 }

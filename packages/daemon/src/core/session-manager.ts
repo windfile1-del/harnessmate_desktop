@@ -19,9 +19,11 @@ import type {
   RunPluginActionRequest,
   Session,
   SessionPluginAction,
+  SessionRunRecord,
   SessionStatus,
   SessionTaskState,
   SwitchHarnessRequest,
+  TurnBlockRecord,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
   Workspace,
@@ -40,9 +42,11 @@ import type {
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
+import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
+import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
 import type { FailoverService, GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
@@ -63,6 +67,7 @@ interface LiveHandleEntry {
 }
 
 interface ActiveTurnMeta {
+  runId: string;
   turnId: string;
   harnessId: string;
   harnessKind: HarnessKind;
@@ -74,9 +79,12 @@ interface ActiveTurnMeta {
 }
 
 const MAX_WARM_HANDLES = 6;
+const MAX_STORED_TOOL_OUTPUT_CHARS = 16_384;
 type TurnOptions = { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' };
 
 export class SessionManager {
+  readonly commandOutputHub: CommandOutputHub;
+  private readonly deltaCoalescer: TextDeltaCoalescer;
   private readonly liveHandles = new Map<string, LiveHandleEntry>();
   private readonly activeTurnMeta = new Map<string, ActiveTurnMeta>();
   private readonly startingSessions = new Set<string>();
@@ -88,7 +96,30 @@ export class SessionManager {
     private readonly eventBus: DaemonEventBus,
     private readonly pluginManager: PluginManager,
     private readonly pluginCapabilities?: PluginCapabilities,
+    commandOutputHub?: CommandOutputHub,
   ) {
+    this.commandOutputHub = commandOutputHub ?? new CommandOutputHub();
+    this.deltaCoalescer = new TextDeltaCoalescer({
+      windowMs: 50,
+      onFlush: (batch) => {
+        if (batch.channel === 'assistant') {
+          this.emitCanonical(
+            batch.sessionId,
+            'message.assistant.delta',
+            {
+              text: batch.text,
+              messageId: batch.messageId,
+              parentToolUseId: batch.parentToolUseId,
+              harnessId: batch.harnessId,
+              actualModel: batch.actualModel,
+            },
+            batch.turnId,
+          );
+        } else {
+          this.emitCanonical(batch.sessionId, 'thinking.delta', { text: batch.text }, batch.turnId);
+        }
+      },
+    });
     this.recoverStaleSessions();
   }
 
@@ -107,7 +138,7 @@ export class SessionManager {
   }
 
   private recoverStaleSessions(): void {
-    this.store.expirePendingApprovals();
+    this.store.recoverCrashStateOnStartup();
     for (const approval of this.store.listUnpublishedExpiredApprovals()) {
       this.publishExpiredApproval(approval);
     }
@@ -116,6 +147,41 @@ export class SessionManager {
       if (s.status === 'running' || s.status === 'awaiting_approval') {
         this.setSessionStatus(s.id, 'idle');
       }
+    }
+  }
+
+  getSessionTurnItems(
+    sessionId: string,
+    opts?: { afterSeq?: number; turnId?: string; blockTypes?: string[]; limit?: number },
+  ): TurnBlockRecord[] {
+    return this.store.listTurnItems(sessionId, opts);
+  }
+
+  getSessionRuns(sessionId: string, limit = 100): SessionRunRecord[] {
+    return this.store.listSessionRuns(sessionId, limit);
+  }
+
+  settleOrphanedSession(sessionId: string, reason = 'Adapter process exited unexpectedly'): void {
+    this.deltaCoalescer.flushSession(sessionId);
+    const meta = this.activeTurnMeta.get(sessionId);
+    if (meta) {
+      this.store.finishSessionRun(meta.runId, {
+        status: 'interrupted',
+        failureClass: 'process_exit',
+      });
+      this.activeTurnMeta.delete(sessionId);
+    }
+    this.store.settleRunningTurnItems(sessionId, 'interrupted');
+    this.expireSessionApprovals(sessionId);
+    const session = this.store.getSession(sessionId);
+    if (session && (session.status === 'running' || session.status === 'awaiting_approval')) {
+      this.emitCanonical(sessionId, 'diagnostic.log', {
+        level: 'warn',
+        stream: 'protocol',
+        message: reason,
+        harnessId: session.harnessId,
+      });
+      this.setSessionStatus(sessionId, 'error');
     }
   }
 
@@ -910,8 +976,8 @@ export class SessionManager {
       case 'goal': {
         if (session.harnessKind === 'codex') {
           const handle = await getHandle();
-          if (!handle.runCodexGoal) throw new Error('此 Codex 适配器未提供目标接口');
-          const output = await handle.runCodexGoal(args);
+          if (!handle.runNativeCommand) throw new Error('此 Codex 适配器未提供目标接口');
+          const output = await handle.runNativeCommand('goal', args);
           return result(output);
         }
         if (session.harnessKind === 'agy' && !args) throw new Error('用法 /goal <目标>');
@@ -1004,8 +1070,10 @@ export class SessionManager {
       }
     }
 
-    // Track per-turn attribution before emitting events
+    // Track per-turn attribution and durable session run before emitting events
+    const runId = `run_${crypto.randomBytes(6).toString('hex')}`;
     this.activeTurnMeta.set(sessionId, {
+      runId,
       turnId,
       harnessId: session.harnessId,
       harnessKind: session.harnessKind,
@@ -1015,8 +1083,18 @@ export class SessionManager {
       reloadHandle: session.harnessKind === 'agy' && Boolean(native?.cliCommand),
       maintenance: ['/compact', '/usage', '/reload-plugins'].includes(native?.cliCommand?.split(/\s+/)[0] ?? ''),
     });
+    this.store.startSessionRun({
+      runId,
+      sessionId,
+      turnId,
+      instanceId: session.harnessId,
+      driverId: session.harnessKind,
+      model: session.model,
+      status: 'running',
+      startedAt: Date.now(),
+    });
 
-    this.emitCanonical(
+    const userEvent = this.emitCanonical(
       sessionId,
       'message.user',
       {
@@ -1040,6 +1118,33 @@ export class SessionManager {
       },
       turnId,
     );
+    const userItemId = `${turnId}:user`;
+    this.store.upsertTurnItem({
+      itemId: userItemId,
+      schemaVersion: 2,
+      sessionId,
+      turnId,
+      seq: userEvent.seq,
+      instanceId: session.harnessId,
+      driverId: session.harnessKind,
+      blockType: 'user_message',
+      status: 'completed',
+      title: 'User',
+      textBody: text,
+      payload: { expandedCommand: expandedCommand ?? null },
+      outputOmitted: false,
+      omittedBytes: 0,
+      createdAt: userEvent.createdAt,
+      updatedAt: userEvent.createdAt,
+    });
+    this.store.indexSearchItem({
+      sessionId,
+      itemId: userItemId,
+      turnId,
+      driverId: session.harnessKind,
+      title: session.title,
+      body: text,
+    });
     this.setSessionStatus(sessionId, 'running');
 
     try {
@@ -1120,7 +1225,12 @@ export class SessionManager {
       return { turnId };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      this.deltaCoalescer.flushSession(sessionId);
       const meta = this.activeTurnMeta.get(sessionId);
+      if (meta) {
+        this.store.finishSessionRun(meta.runId, { status: 'failed', failureClass: 'dispatch_error' });
+      }
+      this.store.settleRunningTurnItems(sessionId, 'interrupted');
       this.activeTurnMeta.delete(sessionId);
       this.emitCanonical(
         sessionId,
@@ -1139,6 +1249,7 @@ export class SessionManager {
   }
 
   async interruptSession(sessionId: string): Promise<void> {
+    this.deltaCoalescer.flushSession(sessionId);
     const session = this.store.getSession(sessionId);
     const meta = this.activeTurnMeta.get(sessionId);
     const targetHarnessId = meta?.harnessId ?? session?.harnessId;
@@ -1148,6 +1259,10 @@ export class SessionManager {
         await entry.handle.interrupt();
       }
     }
+    if (meta) {
+      this.store.finishSessionRun(meta.runId, { status: 'cancelled' });
+    }
+    this.store.settleRunningTurnItems(sessionId, 'interrupted');
     this.activeTurnMeta.delete(sessionId);
     this.expireSessionApprovals(sessionId);
     this.setSessionStatus(sessionId, 'idle');
@@ -1237,6 +1352,9 @@ export class SessionManager {
   }
 
   async shutdown(): Promise<void> {
+    this.deltaCoalescer.flushAll();
+    this.deltaCoalescer.dispose();
+    this.store.settleRunningTurnItems(undefined, 'interrupted');
     this.expireSessionApprovals();
     const entries = Array.from(this.liveHandles.values());
     this.liveHandles.clear();
@@ -1474,11 +1592,24 @@ export class SessionManager {
       }
 
       case 'turn.started': {
+        this.deltaCoalescer.flushSession(sessionId);
         if (ev.continuation && !meta) {
+          const contRunId = `run_${crypto.randomBytes(6).toString('hex')}`;
           this.activeTurnMeta.set(sessionId, {
+            runId: contRunId,
             turnId: ev.turnId, harnessId: eventHarnessId, harnessKind: eventHarnessKind,
             model: activeTurnModel, actualModel: activeTurnActualModel,
             advanceWatermark: false,
+          });
+          this.store.startSessionRun({
+            runId: contRunId,
+            sessionId,
+            turnId: ev.turnId,
+            instanceId: eventHarnessId,
+            driverId: eventHarnessKind,
+            model: activeTurnModel,
+            status: 'running',
+            startedAt: Date.now(),
           });
         }
         this.emitCanonical(
@@ -1497,7 +1628,12 @@ export class SessionManager {
       }
 
       case 'turn.completed': {
+        this.deltaCoalescer.flushSession(sessionId);
         this.expireSessionApprovals(sessionId);
+        if (meta) {
+          this.store.finishSessionRun(meta.runId, { status: 'completed' });
+        }
+        this.store.settleRunningTurnItems(sessionId, 'completed');
         const completedEv = this.emitCanonical(
           sessionId,
           'turn.completed',
@@ -1542,7 +1678,12 @@ export class SessionManager {
       }
 
       case 'turn.cancelled': {
+        this.deltaCoalescer.flushSession(sessionId);
         this.expireSessionApprovals(sessionId);
+        if (meta) {
+          this.store.finishSessionRun(meta.runId, { status: 'cancelled' });
+        }
+        this.store.settleRunningTurnItems(sessionId, 'interrupted');
         this.emitCanonical(
           sessionId,
           'turn.cancelled',
@@ -1556,7 +1697,15 @@ export class SessionManager {
       }
 
       case 'turn.failed': {
+        this.deltaCoalescer.flushSession(sessionId);
         this.expireSessionApprovals(sessionId);
+        if (meta) {
+          this.store.finishSessionRun(meta.runId, {
+            status: 'failed',
+            failureClass: ev.code ?? (/rate.?limit|quota|429/i.test(ev.message) ? 'usage_limit' : 'provider_error'),
+          });
+        }
+        this.store.settleRunningTurnItems(sessionId, 'interrupted');
         this.emitCanonical(
           sessionId,
           'turn.failed',
@@ -1587,23 +1736,22 @@ export class SessionManager {
       }
 
       case 'message.assistant.delta': {
-        this.emitCanonical(
+        this.deltaCoalescer.push({
           sessionId,
-          'message.assistant.delta',
-          {
-            text: ev.text,
-            messageId: ev.messageId ?? null,
-            parentToolUseId: ev.parentToolUseId ?? null,
-            harnessId: activeTurnHarness,
-            actualModel: activeTurnActualModel,
-          },
-          ev.turnId,
-        );
+          turnId: ev.turnId,
+          channel: 'assistant',
+          text: ev.text,
+          messageId: ev.messageId ?? null,
+          parentToolUseId: ev.parentToolUseId ?? null,
+          harnessId: activeTurnHarness,
+          actualModel: activeTurnActualModel,
+        });
         break;
       }
 
       case 'message.assistant.completed': {
-        this.emitCanonical(
+        this.deltaCoalescer.flushSession(sessionId);
+        const completed = this.emitCanonical(
           sessionId,
           'message.assistant.completed',
           {
@@ -1615,21 +1763,79 @@ export class SessionManager {
           },
           ev.turnId,
         );
+        const itemId = `${ev.turnId}:assistant:${ev.messageId ?? 'main'}`;
+        this.store.upsertTurnItem({
+          itemId,
+          schemaVersion: 2,
+          sessionId,
+          turnId: ev.turnId,
+          seq: completed.seq,
+          instanceId: activeTurnHarness,
+          driverId: eventHarnessKind,
+          blockType: 'assistant_text',
+          status: 'completed',
+          title: 'Assistant',
+          textBody: ev.text,
+          payload: {
+            messageId: ev.messageId ?? null,
+            parentToolUseId: ev.parentToolUseId ?? null,
+            actualModel: activeTurnActualModel,
+          },
+          outputOmitted: false,
+          omittedBytes: 0,
+          createdAt: completed.createdAt,
+          updatedAt: completed.createdAt,
+        });
+        this.store.indexSearchItem({
+          sessionId,
+          itemId,
+          turnId: ev.turnId,
+          driverId: eventHarnessKind,
+          title: session.title,
+          body: ev.text,
+        });
         break;
       }
 
       case 'thinking.delta': {
-        this.emitCanonical(sessionId, 'thinking.delta', { text: ev.text }, ev.turnId);
+        this.deltaCoalescer.push({
+          sessionId,
+          turnId: ev.turnId,
+          channel: 'thinking',
+          text: ev.text,
+          harnessId: activeTurnHarness,
+          actualModel: activeTurnActualModel,
+        });
         break;
       }
 
       case 'thinking.completed': {
-        this.emitCanonical(sessionId, 'thinking.completed', { text: ev.text }, ev.turnId);
+        this.deltaCoalescer.flushSession(sessionId);
+        const thoughtEv = this.emitCanonical(sessionId, 'thinking.completed', { text: ev.text }, ev.turnId);
+        this.store.upsertTurnItem({
+          itemId: `${ev.turnId}:reasoning`,
+          schemaVersion: 2,
+          sessionId,
+          turnId: ev.turnId,
+          seq: thoughtEv.seq,
+          instanceId: activeTurnHarness,
+          driverId: eventHarnessKind,
+          blockType: 'reasoning',
+          status: 'completed',
+          title: 'Reasoning',
+          textBody: ev.text,
+          payload: {},
+          outputOmitted: false,
+          omittedBytes: 0,
+          createdAt: thoughtEv.createdAt,
+          updatedAt: thoughtEv.createdAt,
+        });
         break;
       }
 
       case 'tool.call.started': {
-        this.emitCanonical(
+        this.deltaCoalescer.flushSession(sessionId);
+        const toolStartEv = this.emitCanonical(
           sessionId,
           'tool.call.started',
           {
@@ -1643,41 +1849,130 @@ export class SessionManager {
           },
           ev.turnId,
         );
+        this.store.upsertTurnItem({
+          itemId: `tool:${ev.toolCallId}`,
+          schemaVersion: 2,
+          sessionId,
+          turnId: ev.turnId,
+          seq: toolStartEv.seq,
+          instanceId: activeTurnHarness,
+          driverId: eventHarnessKind,
+          blockType: ev.toolKind === 'shell' ? 'command_execution' : 'tool_call',
+          status: 'running',
+          title: ev.toolName,
+          textBody: ev.summary,
+          payload: {
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName,
+            toolKind: ev.toolKind,
+            summary: ev.summary,
+            input: ev.input ?? null,
+            parentToolUseId: ev.parentToolUseId ?? null,
+          },
+          outputOmitted: false,
+          omittedBytes: 0,
+          createdAt: toolStartEv.createdAt,
+          updatedAt: toolStartEv.createdAt,
+        });
         break;
       }
 
       case 'tool.call.delta': {
-        this.emitCanonical(
-          sessionId,
-          'tool.call.delta',
-          {
-            toolCallId: ev.toolCallId,
-            outputDelta: ev.outputDelta,
-            diffDelta: ev.diffDelta ?? null,
-          },
-          ev.turnId,
-        );
+        // Phase 0 side-channel: stream raw stdout/diff deltas via CommandOutputHub without bloating SQLite session_events
+        if (ev.outputDelta) {
+          this.commandOutputHub.append(sessionId, ev.toolCallId, ev.outputDelta, 'stdout');
+        }
+        if (ev.diffDelta) {
+          this.commandOutputHub.append(sessionId, ev.toolCallId, ev.diffDelta, 'stdout');
+        }
+        break;
+      }
+
+      case 'command.output.delta': {
+        this.commandOutputHub.append(sessionId, ev.toolCallId, ev.chunk, ev.stream ?? 'stdout');
         break;
       }
 
       case 'tool.call.completed': {
-        this.emitCanonical(
+        this.deltaCoalescer.flushSession(sessionId);
+        this.commandOutputHub.complete(sessionId, ev.toolCallId);
+        const hubSnap = this.commandOutputHub.getSnapshot(sessionId, ev.toolCallId);
+        const rawOutput = ev.output ?? hubSnap?.text ?? null;
+        const outputBytes = rawOutput ? Buffer.byteLength(rawOutput, 'utf8') : 0;
+        const outputOmitted = Boolean(rawOutput && rawOutput.length > MAX_STORED_TOOL_OUTPUT_CHARS);
+        const storedOutput = outputOmitted && rawOutput
+          ? rawOutput.slice(0, MAX_STORED_TOOL_OUTPUT_CHARS)
+          : rawOutput;
+
+        const toolDoneEv = this.emitCanonical(
           sessionId,
           'tool.call.completed',
           {
             toolCallId: ev.toolCallId,
             toolName: ev.toolName,
             status: ev.status,
-            output: ev.output ?? null,
+            output: storedOutput,
             diff: ev.diff ?? null,
+            outputOmitted,
+            omittedBytes: outputOmitted ? outputBytes : 0,
             harnessId: activeTurnHarness,
           },
           ev.turnId,
         );
+        const existingItem = this.store.getTurnItem(`tool:${ev.toolCallId}`);
+        this.store.upsertTurnItem({
+          itemId: `tool:${ev.toolCallId}`,
+          schemaVersion: 2,
+          sessionId,
+          turnId: ev.turnId,
+          seq: existingItem?.seq ?? toolDoneEv.seq,
+          instanceId: activeTurnHarness,
+          driverId: eventHarnessKind,
+          blockType: existingItem?.blockType ?? 'tool_call',
+          status: ev.status === 'success' ? 'completed' : ev.status === 'cancelled' ? 'cancelled' : 'failed',
+          title: ev.toolName,
+          textBody: storedOutput ?? existingItem?.textBody ?? '',
+          payload: {
+            ...(existingItem?.payload ?? {}),
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName,
+            status: ev.status,
+            diff: ev.diff ?? null,
+          },
+          outputOmitted,
+          omittedBytes: outputOmitted ? outputBytes : 0,
+          createdAt: existingItem?.createdAt ?? toolDoneEv.createdAt,
+          updatedAt: toolDoneEv.createdAt,
+        });
+        break;
+      }
+
+      case 'turn_block.ext': {
+        this.deltaCoalescer.flushSession(sessionId);
+        const now = Date.now();
+        this.store.upsertTurnItem({
+          itemId: ev.itemId,
+          schemaVersion: 2,
+          sessionId,
+          turnId: ev.turnId,
+          seq: session.lastSeq,
+          instanceId: activeTurnHarness,
+          driverId: eventHarnessKind,
+          blockType: ev.blockType,
+          status: ev.status ?? 'completed',
+          title: ev.title,
+          textBody: ev.fallbackSummary,
+          payload: ev.payload,
+          outputOmitted: false,
+          omittedBytes: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
         break;
       }
 
       case 'approval.requested': {
+        this.deltaCoalescer.flushSession(sessionId);
         const approvalId = `appr_${crypto.randomBytes(6).toString('hex')}`;
         nativeToGlobalApprovalId.set(ev.nativeRequestId, approvalId);
         const approval: ApprovalRequest = {

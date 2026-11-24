@@ -118,12 +118,18 @@ export class AcpAdapter implements HarnessAdapter {
     this.isCustom = opts.isCustom;
   }
 
-  async probe(): Promise<HarnessInfo> {
+  /**
+   * Passive probe: checks binary availability and `--version` (plus cached or CLI-only model list)
+   * without ever spawning a stateful `session/new` RPC session.
+   */
+  async probePassive(): Promise<HarnessInfo> {
     const binaryPath = await resolveBinary(this.command, this.binaryOverride);
     if (!binaryPath) {
       return {
         id: this.id,
         kind: this.kind,
+        driverId: this.kind,
+        instanceId: this.id,
         displayName: this.displayName,
         description: this.description,
         protocolLabel: this.protocolLabel,
@@ -147,22 +153,23 @@ export class AcpAdapter implements HarnessAdapter {
     let defaultModelId: string | null = null;
     let accountSummary: string | null = null;
 
-    if (this.kind === 'agy') {
-      try {
-        const live = await this.probeAcpSessionMetadata(binaryPath);
-        models = live.models;
-        defaultModelId = live.defaultModelId;
-        accountSummary = live.tierName;
-        if (!version && live.serverVersion) version = live.serverVersion;
-      } catch {
-        models = await probeAgyModelsCli(binaryPath);
-        defaultModelId = models[0]?.id ?? null;
+    if (this.cachedSessionProbe) {
+      models = this.cachedSessionProbe.snapshot.models;
+      defaultModelId = this.cachedSessionProbe.snapshot.defaultModelId;
+      accountSummary = this.cachedSessionProbe.snapshot.tierName;
+      if (!version && this.cachedSessionProbe.snapshot.serverVersion) {
+        version = this.cachedSessionProbe.snapshot.serverVersion;
       }
+    } else if (this.kind === 'agy') {
+      models = await probeAgyModelsCli(binaryPath);
+      defaultModelId = models[0]?.id ?? null;
     }
 
     return {
       id: this.id,
       kind: this.kind,
+      driverId: this.kind,
+      instanceId: this.id,
       displayName: this.displayName,
       description: this.description,
       protocolLabel: this.protocolLabel,
@@ -176,6 +183,12 @@ export class AcpAdapter implements HarnessAdapter {
       accountSummary,
       isCustom: this.isCustom,
     };
+  }
+
+  async probe(): Promise<HarnessInfo> {
+    // Phase 0 invariant: default probe() is strictly passive (never calls `session/new`).
+    // Explicit deep catalog refresh uses `probeAcpSessionMetadata()` on demand.
+    return this.probePassive();
   }
 
   async probeAcpSessionMetadata(

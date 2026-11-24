@@ -49,11 +49,21 @@ export interface CodexLiveProbeSnapshot {
   mcpServers: unknown[];
 }
 
+export interface CodexAdapterInstanceOptions {
+  instanceId?: string;
+  displayName?: string;
+  codexHome?: string;
+  continuationKey?: string;
+  envWhitelist?: Record<string, string>;
+}
+
 export class CodexAppServerAdapter implements HarnessAdapter {
-  readonly id = 'codex';
+  readonly id: string;
+  readonly driverId = 'codex' as const;
+  readonly continuationKey: string;
   readonly pluginMcpTransport = 'http' as const;
   readonly kind = 'codex' as const;
-  readonly displayName = 'Codex CLI';
+  readonly displayName: string;
   readonly description = 'OpenAI Codex CLI via bidirectional app-server JSON-RPC 2.0';
   readonly protocolLabel = 'codex app-server (JSON-RPC 2.0)';
   readonly capabilities: HarnessCapabilities = {
@@ -67,10 +77,22 @@ export class CodexAppServerAdapter implements HarnessAdapter {
     subagents: true,
   };
 
+  private readonly codexHome?: string;
+  private readonly envWhitelist?: Record<string, string>;
+
   constructor(
     private readonly binaryOverride?: string,
     private readonly extraArgs: string[] = ['app-server', '--stdio'],
-  ) {}
+    instanceOpts?: CodexAdapterInstanceOptions,
+  ) {
+    this.id = instanceOpts?.instanceId ?? 'codex';
+    this.displayName = instanceOpts?.displayName ?? 'Codex CLI';
+    this.codexHome = instanceOpts?.codexHome;
+    this.envWhitelist = instanceOpts?.envWhitelist;
+    this.continuationKey =
+      instanceOpts?.continuationKey ??
+      (this.codexHome ? `codex:home:${this.codexHome}` : `codex:instance:${this.id}`);
+  }
 
   async probe(): Promise<HarnessInfo> {
     const binaryPath = await resolveBinary('codex', this.binaryOverride);
@@ -255,12 +277,18 @@ export class CodexAppServerAdapter implements HarnessAdapter {
     }
 
     const store = config.nativeHistoryPath ? getCodexRolloutStore(config.nativeHistoryPath) : undefined;
+    const resolvedCodexHome = store?.home ?? this.codexHome;
     const mcp = config.pluginMcp;
     const prefix = `mcp_servers.${pluginMcpServerName}`;
     const args = mcp ? [...this.extraArgs, '-c', `${prefix}.url=${mcp.url}`,
       '-c', `${prefix}.bearer_token_env_var=${pluginMcpTokenEnv}`, '-c', `${prefix}.startup_timeout_sec=3`] : this.extraArgs;
     const child = spawnCliProcess(binaryPath, args, {
-      cwd: config.cwd, env: { ...(store ? { CODEX_HOME: store.home } : {}), ...(mcp ? { [pluginMcpTokenEnv]: mcp.token } : {}) },
+      cwd: config.cwd,
+      env: {
+        ...(this.envWhitelist ?? {}),
+        ...(resolvedCodexHome ? { CODEX_HOME: resolvedCodexHome } : {}),
+        ...(mcp ? { [pluginMcpTokenEnv]: mcp.token } : {}),
+      },
     });
     const handle = new CodexSessionHandle(child, config);
     try {
@@ -425,16 +453,16 @@ class CodexSessionHandle implements AdapterSessionHandle {
   }
 
   async injectContext(payload: import('./types.js').ContextSyncPayload): Promise<import('@harnessmate/protocol').ContextInjectionDriver> {
-    if (!this._nativeSessionId || payload.codexInjectItems.length === 0) {
+    if (!this._nativeSessionId || payload.portableItems.length === 0) {
       return 'prompt_envelope';
     }
-    payload.onDispatch?.('codex_inject_items', payload.codexInjectItems);
+    payload.onDispatch?.('codex_inject_items', payload.portableItems);
     try {
       await this.rpc.request(
         'thread/inject_items',
         {
           threadId: this._nativeSessionId,
-          items: payload.codexInjectItems,
+          items: payload.portableItems,
         },
         10_000,
       );
@@ -442,7 +470,7 @@ class CodexSessionHandle implements AdapterSessionHandle {
         type: 'diagnostic.log',
         level: 'info',
         stream: 'protocol',
-        message: `Codex native thread/inject_items succeeded (${payload.codexInjectItems.length} items)`,
+        message: `Codex native thread/inject_items succeeded (${payload.portableItems.length} items)`,
       });
       return 'codex_inject_items';
     } catch (err) {
@@ -462,7 +490,10 @@ class CodexSessionHandle implements AdapterSessionHandle {
     return (result.data ?? []).flatMap((entry) => entry.skills ?? []);
   }
 
-  async runCodexGoal(args: string): Promise<string> {
+  async runNativeCommand(command: string, args: string): Promise<string> {
+    if (command !== 'goal') {
+      throw new Error(`Unsupported Codex native command: ${command}`);
+    }
     const threadId = this._nativeSessionId;
     if (!threadId) throw new Error('Codex thread is not initialized');
     if (args === 'clear') {

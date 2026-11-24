@@ -51,6 +51,8 @@ import {
   readWorkspaceFilePreview,
   searchWorkspaceFiles,
 } from '../core/attachment-service.js';
+import { CommandOutputHub } from '../core/command-output-hub.js';
+import { EffectOutboxWorker } from '../core/effect-outbox.js';
 import { DaemonEventBus } from '../core/event-bus.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
@@ -89,6 +91,8 @@ export interface DaemonInstance {
   registry: HarnessRegistry;
   pluginManager: PluginManager;
   sessionManager: SessionManager;
+  commandOutputHub: CommandOutputHub;
+  outboxWorker: EffectOutboxWorker;
   auth: RemoteAuthService;
   config: DaemonPersistedConfig;
   paths: DaemonRuntimePaths;
@@ -140,8 +144,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const mcpService = new McpService(registry, config.binaryOverrides);
 
   let boundPort = config.port;
+  const commandOutputHub = new CommandOutputHub();
+  const outboxWorker = new EffectOutboxWorker(store);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities);
+  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub);
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
     const session = store.getSession(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
@@ -1221,12 +1227,34 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     wsGateway.handleUpgrade(req, socket, head);
   });
 
+  app.get('/api/v1/sessions/:id/items', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const q = request.query as { afterSeq?: string; turnId?: string; limit?: string };
+    const items = sessionManager.getSessionTurnItems(id, {
+      afterSeq: q.afterSeq !== undefined ? Number(q.afterSeq) : undefined,
+      turnId: q.turnId || undefined,
+      limit: q.limit !== undefined ? Number(q.limit) : undefined,
+    });
+    return { items };
+  });
+
+  app.get('/api/v1/sessions/:id/runs', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    return { runs: sessionManager.getSessionRuns(id) };
+  });
+
   return {
     app,
     store,
     registry,
     pluginManager,
     sessionManager,
+    commandOutputHub,
+    outboxWorker,
     auth,
     config,
     paths,

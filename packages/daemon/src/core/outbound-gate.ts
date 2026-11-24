@@ -18,7 +18,7 @@ export async function dispatchTurn(
   let recordedDriver: ContextInjectionDriver | undefined;
   const payload: ContextSyncPayload = {
     deltaMarkdown: context.deltaMarkdown,
-    codexInjectItems: context.codexInjectItems,
+    portableItems: context.portableItems,
     objective: context.objective,
     isWarmBinding: preview.isWarmBinding,
     onDispatch(driver, content) {
@@ -30,10 +30,12 @@ export async function dispatchTurn(
       recordedDriver = driver;
     },
   };
-  const injected = harness.kind === 'codex' && handle.injectContext
-    ? await handle.injectContext(payload) === 'codex_inject_items' : false;
+  const injectedDriver = handle.injectContext && payload.portableItems.length > 0
+    ? await handle.injectContext(payload)
+    : null;
+  const injected = injectedDriver !== null && injectedDriver !== 'prompt_envelope';
   const result = await handle.sendTurn({ ...turn, contextSync: injected ? null : payload });
-  const finalDriver = injected ? 'codex_inject_items' : (result?.driverUsed ?? 'prompt_envelope');
+  const finalDriver = injected ? injectedDriver : (result?.driverUsed ?? 'prompt_envelope');
   if (recordedDriver === finalDriver) {
     record('handoff.snapshot_delivered', { ...attribution, driver: finalDriver, sectionHashes: snapshot.sectionHashes });
   }

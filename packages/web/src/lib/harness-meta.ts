@@ -1,4 +1,4 @@
-import type { HarnessKind, PermissionMode } from '@harnessmate/protocol';
+import type { BuiltinHarnessKind, HarnessPresentationMeta, PermissionMode } from '@harnessmate/protocol';
 
 export interface HarnessVisualMeta {
   shortLabel: string;
@@ -7,7 +7,11 @@ export interface HarnessVisualMeta {
   tagline: string;
 }
 
-export const HARNESS_META: Record<HarnessKind, HarnessVisualMeta> = {
+export type HarnessMetaMap = Record<BuiltinHarnessKind, HarnessVisualMeta> & {
+  [driverId: string]: HarnessVisualMeta | undefined;
+};
+
+export const HARNESS_META: HarnessMetaMap = {
   codex: {
     shortLabel: 'Codex',
     accentColor: 'var(--accent-emerald)',
@@ -33,6 +37,28 @@ export const HARNESS_META: Record<HarnessKind, HarnessVisualMeta> = {
     tagline: 'Custom ACP Agent',
   },
 };
+
+export function getHarnessMeta(
+  kind: string,
+  presentation?: HarnessPresentationMeta | null,
+): HarnessVisualMeta {
+  if (presentation) {
+    return {
+      shortLabel: presentation.shortLabel,
+      accentColor: presentation.accentColor,
+      softBg: presentation.softBg,
+      tagline: presentation.tagline,
+    };
+  }
+  return (
+    HARNESS_META[kind] ?? {
+      shortLabel: kind.slice(0, 12).toUpperCase(),
+      accentColor: 'var(--accent-star)',
+      softBg: 'var(--accent-star-soft)',
+      tagline: `Plugin Harness · ${kind}`,
+    }
+  );
+}
 
 export const PERMISSION_MODE_LABELS: Record<PermissionMode, { label: string; desc: string }> = {
   plan: { label: 'Plan', desc: '只读分析与规划，不修改文件' },

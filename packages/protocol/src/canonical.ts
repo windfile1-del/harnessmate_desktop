@@ -1,8 +1,20 @@
 import { z } from 'zod';
 import { PluginContributesSchema, PluginManifestSchema, PluginSlotContributionSchema } from '@harnessmate/plugin-api';
 
-export const HarnessKindSchema = z.enum(['codex', 'agy', 'claude', 'acp']);
-export type HarnessKind = z.infer<typeof HarnessKindSchema>;
+export const BuiltinHarnessKindSchema = z.enum(['codex', 'agy', 'claude', 'acp']);
+export type BuiltinHarnessKind = z.infer<typeof BuiltinHarnessKindSchema>;
+
+/** Open driver identifier: supports built-in ('codex'|'agy'|'claude'|'acp') and third-party plugin drivers. */
+export const HarnessDriverIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z][a-z0-9_.-]*$/i, 'Invalid harness driver id');
+export type HarnessDriverId = z.infer<typeof HarnessDriverIdSchema>;
+
+export const HarnessKindSchema = HarnessDriverIdSchema;
+export type HarnessKind = HarnessDriverId;
 
 export const PermissionModeSchema = z.enum(['plan', 'accept_edits', 'auto', 'manual']);
 export type PermissionMode = z.infer<typeof PermissionModeSchema>;
@@ -73,12 +85,103 @@ export const HarnessCapabilitiesSchema = z.object({
 });
 export type HarnessCapabilities = z.infer<typeof HarnessCapabilitiesSchema>;
 
+export const HarnessHistoryInjectionModeSchema = z.enum([
+  'native_items',
+  'embedded_context',
+  'sysfile_delta',
+  'inline',
+]);
+export type HarnessHistoryInjectionMode = z.infer<typeof HarnessHistoryInjectionModeSchema>;
+
+export const HarnessTransportKindSchema = z.enum([
+  'jsonrpc_stdio',
+  'stream_json',
+  'acp_stdio',
+  'http_sse',
+  'sdk',
+  'custom',
+]);
+export type HarnessTransportKind = z.infer<typeof HarnessTransportKindSchema>;
+
+export const ProviderOptionDescriptorSchema = z.discriminatedUnion('kind', [
+  z.object({
+    key: z.string().min(1),
+    label: z.string().min(1),
+    description: z.string().optional(),
+    kind: z.literal('select'),
+    defaultValue: z.string().optional(),
+    options: z.array(
+      z.object({
+        value: z.string(),
+        label: z.string(),
+        description: z.string().optional(),
+      }),
+    ),
+  }),
+  z.object({
+    key: z.string().min(1),
+    label: z.string().min(1),
+    description: z.string().optional(),
+    kind: z.literal('boolean'),
+    defaultValue: z.boolean().optional(),
+  }),
+  z.object({
+    key: z.string().min(1),
+    label: z.string().min(1),
+    description: z.string().optional(),
+    kind: z.literal('number'),
+    min: z.number().optional(),
+    max: z.number().optional(),
+    step: z.number().optional(),
+    defaultValue: z.number().optional(),
+  }),
+]);
+export type ProviderOptionDescriptor = z.infer<typeof ProviderOptionDescriptorSchema>;
+
+export const HarnessPresentationMetaSchema = z.object({
+  shortLabel: z.string().min(1).max(32),
+  accentColor: z.string().min(1),
+  softBg: z.string().min(1),
+  tagline: z.string().max(160),
+  iconSvg: z.string().optional(),
+});
+export type HarnessPresentationMeta = z.infer<typeof HarnessPresentationMetaSchema>;
+
+export const HarnessCapabilitiesV2Schema = HarnessCapabilitiesSchema.extend({
+  transport: HarnessTransportKindSchema.default('custom'),
+  historyInjectionMode: HarnessHistoryInjectionModeSchema.default('inline'),
+  supportsNativeRollback: z.boolean().default(false),
+  supportsActiveSteering: z.boolean().default(false),
+  supportsUsageLimits: z.boolean().default(false),
+  supportsDynamicOptions: z.boolean().default(false),
+  nativeCommands: z.array(z.string()).default([]),
+  optionDescriptors: z.array(ProviderOptionDescriptorSchema).default([]),
+});
+export type HarnessCapabilitiesV2 = z.infer<typeof HarnessCapabilitiesV2Schema>;
+
+export const HarnessInstanceConfigSchema = z.object({
+  instanceId: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_.:-]*$/i),
+  driverId: HarnessDriverIdSchema,
+  displayName: z.string().trim().min(1).max(80),
+  description: z.string().max(300).optional(),
+  continuationKey: z.string().trim().min(1).max(200).optional(),
+  binaryPath: z.string().optional(),
+  homeDir: z.string().optional(),
+  extraArgs: z.array(z.string()).optional(),
+  envWhitelist: z.record(z.string()).optional(),
+  enabled: z.boolean().default(true),
+});
+export type HarnessInstanceConfig = z.infer<typeof HarnessInstanceConfigSchema>;
+
 export const HarnessHealthSchema = z.enum(['ready', 'degraded', 'unavailable', 'unauthenticated']);
 export type HarnessHealth = z.infer<typeof HarnessHealthSchema>;
 
 export const HarnessInfoSchema = z.object({
   id: z.string(),
   kind: HarnessKindSchema,
+  driverId: HarnessDriverIdSchema.optional(),
+  instanceId: z.string().optional(),
+  continuationKey: z.string().optional(),
   displayName: z.string(),
   description: z.string(),
   protocolLabel: z.string(),
@@ -87,6 +190,9 @@ export const HarnessInfoSchema = z.object({
   health: HarnessHealthSchema,
   healthMessage: z.string().optional(),
   capabilities: HarnessCapabilitiesSchema,
+  capabilitiesV2: HarnessCapabilitiesV2Schema.optional(),
+  presentation: HarnessPresentationMetaSchema.optional(),
+  optionDescriptors: z.array(ProviderOptionDescriptorSchema).optional(),
   models: z.array(HarnessModelInfoSchema),
   defaultModelId: z.string().nullable().optional(),
   accountSummary: z.string().nullable().optional(),
@@ -159,6 +265,16 @@ export const TaskVerificationSchema = z.object({
 });
 export type TaskVerification = z.infer<typeof TaskVerificationSchema>;
 
+export const TaskFailedAttemptSchema = z.object({
+  id: z.string(),
+  summary: z.string().max(300),
+  failureReason: z.string().max(500),
+  relatedFiles: z.array(z.string()).optional(),
+  harnessInstanceId: z.string().nullable().optional(),
+  recordedAt: z.number(),
+});
+export type TaskFailedAttempt = z.infer<typeof TaskFailedAttemptSchema>;
+
 export const SessionTaskStateSchema = z.object({
   sessionId: z.string(),
   objective: z.string().default(''),
@@ -168,6 +284,7 @@ export const SessionTaskStateSchema = z.object({
   verifications: z.array(TaskVerificationSchema).default([]),
   blockers: z.array(z.string()).default([]),
   pinnedFacts: z.array(z.string()).default([]),
+  failedAttempts: z.array(TaskFailedAttemptSchema).optional(),
   rollingSummary: z.string().default(''),
   summarizedUpToSeq: z.number().int().nonnegative().default(0),
   version: z.number().int().positive().default(1),
@@ -442,3 +559,130 @@ export const HarnessAccountUsageSchema = z.object({
   error: z.string().nullable().optional(),
 });
 export type HarnessAccountUsage = z.infer<typeof HarnessAccountUsageSchema>;
+
+// ── V2 Materialized TurnBlock, Runs, Outbox, Handoff & Checkpoint Schemas ─
+
+export const TurnBlockStatusSchema = z.enum([
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+export type TurnBlockStatus = z.infer<typeof TurnBlockStatusSchema>;
+
+export const TurnBlockRawRefSchema = z.object({
+  eventSeq: z.number().int().nonnegative(),
+  vendorType: z.string(),
+});
+export type TurnBlockRawRef = z.infer<typeof TurnBlockRawRefSchema>;
+
+export const TurnBlockRecordSchema = z.object({
+  itemId: z.string(),
+  schemaVersion: z.literal(2).default(2),
+  sessionId: z.string(),
+  turnId: z.string().nullable(),
+  seq: z.number().int().nonnegative(),
+  instanceId: z.string(),
+  driverId: HarnessDriverIdSchema,
+  blockType: z.string().min(1),
+  status: TurnBlockStatusSchema,
+  title: z.string().default(''),
+  textBody: z.string().default(''),
+  payload: z.record(z.unknown()).default({}),
+  outputOmitted: z.boolean().default(false),
+  omittedBytes: z.number().int().nonnegative().default(0),
+  rawRef: TurnBlockRawRefSchema.nullable().optional(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+export type TurnBlockRecord = z.infer<typeof TurnBlockRecordSchema>;
+
+export const SessionRunStatusSchema = z.enum([
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+export type SessionRunStatus = z.infer<typeof SessionRunStatusSchema>;
+
+export const SessionRunRecordSchema = z.object({
+  runId: z.string(),
+  sessionId: z.string(),
+  turnId: z.string(),
+  instanceId: z.string(),
+  driverId: HarnessDriverIdSchema,
+  model: z.string().nullable().optional(),
+  status: SessionRunStatusSchema,
+  failureClass: z.string().nullable().optional(),
+  usage: TokenUsageSchema.nullable().optional(),
+  startedAt: z.number(),
+  endedAt: z.number().nullable().optional(),
+});
+export type SessionRunRecord = z.infer<typeof SessionRunRecordSchema>;
+
+export const EffectOutboxDurabilitySchema = z.enum(['REPLAY_SAFE', 'PROCESS_BOUND']);
+export type EffectOutboxDurability = z.infer<typeof EffectOutboxDurabilitySchema>;
+
+export const EffectOutboxStatusSchema = z.enum([
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+]);
+export type EffectOutboxStatus = z.infer<typeof EffectOutboxStatusSchema>;
+
+export const EffectOutboxRecordSchema = z.object({
+  effectId: z.string(),
+  sessionId: z.string(),
+  effectType: z.string(),
+  durability: EffectOutboxDurabilitySchema,
+  payload: z.record(z.unknown()),
+  status: EffectOutboxStatusSchema,
+  attempts: z.number().int().nonnegative().default(0),
+  lastError: z.string().nullable().optional(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+export type EffectOutboxRecord = z.infer<typeof EffectOutboxRecordSchema>;
+
+export const HandoffDeliveryStatusSchema = z.enum(['pending', 'confirmed', 'failed']);
+export type HandoffDeliveryStatus = z.infer<typeof HandoffDeliveryStatusSchema>;
+
+export const SessionHandoffRecordSchema = z.object({
+  handoffId: z.string(),
+  sessionId: z.string(),
+  turnId: z.string().nullable().optional(),
+  fromInstanceId: z.string().nullable().optional(),
+  toInstanceId: z.string(),
+  mode: z.enum(['full_session_summary', 'delta_since_target_last_seen']),
+  deliveryChannel: HarnessHistoryInjectionModeSchema,
+  deliveryStatus: HandoffDeliveryStatusSchema,
+  coveredUpToSeq: z.number().int().nonnegative(),
+  estimatedChars: z.number().int().nonnegative().default(0),
+  redactedCount: z.number().int().nonnegative().default(0),
+  forceFreshReason: z.string().nullable().optional(),
+  snapshot: z.record(z.unknown()).default({}),
+  createdAt: z.number(),
+  confirmedAt: z.number().nullable().optional(),
+});
+export type SessionHandoffRecord = z.infer<typeof SessionHandoffRecordSchema>;
+
+export const SessionCheckpointRecordSchema = z.object({
+  checkpointId: z.string(),
+  sessionId: z.string(),
+  turnSeq: z.number().int().nonnegative(),
+  phase: z.enum(['turn_pre', 'turn_post', 'pre_revert', 'manual']),
+  gitRef: z.string(),
+  treeSha: z.string(),
+  baseHeadSha: z.string().nullable().optional(),
+  filesChanged: z.number().int().nonnegative().default(0),
+  insertions: z.number().int().nonnegative().default(0),
+  deletions: z.number().int().nonnegative().default(0),
+  skippedLargeFiles: z.array(z.string()).default([]),
+  createdAt: z.number(),
+});
+export type SessionCheckpointRecord = z.infer<typeof SessionCheckpointRecordSchema>;

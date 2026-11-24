@@ -272,6 +272,16 @@ export const WsClientFrameSchema = z.discriminatedUnion('op', [
     op: z.literal('subscribe_attention'),
   }),
   z.object({
+    op: z.literal('subscribe_command_output'),
+    sessionId: z.string(),
+    toolCallId: z.string(),
+  }),
+  z.object({
+    op: z.literal('unsubscribe_command_output'),
+    sessionId: z.string(),
+    toolCallId: z.string(),
+  }),
+  z.object({
     op: z.literal('ping'),
     ts: z.number().optional(),
   }),
@@ -314,6 +324,16 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
   z.object({
     op: z.literal('attention'),
     item: AttentionItemSchema,
+  }),
+  z.object({
+    op: z.literal('command_output'),
+    sessionId: z.string(),
+    toolCallId: z.string(),
+    chunk: z.string(),
+    stream: z.enum(['stdout', 'stderr']).default('stdout'),
+    snapshot: z.boolean().optional(),
+    done: z.boolean().optional(),
+    timestamp: z.number(),
   }),
   z.object({ op: z.literal('plugins_changed') }),
   z.object({

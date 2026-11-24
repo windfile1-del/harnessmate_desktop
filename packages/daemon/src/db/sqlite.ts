@@ -8,6 +8,10 @@ import type {
   ContextInjectionDriver,
   ContextSyncMode,
   DiscoveredCliSession,
+  EffectOutboxDurability,
+  EffectOutboxRecord,
+  EffectOutboxStatus,
+  HandoffDeliveryStatus,
   HarnessKind,
   PairedDevice,
   PluginPanelQuery,
@@ -17,13 +21,20 @@ import type {
   ReasoningEffort,
   RiskLevel,
   Session,
+  SessionCheckpointRecord,
+  SessionHandoffRecord,
   SessionHarnessBinding,
+  SessionRunRecord,
+  SessionRunStatus,
   SessionStatus,
   SessionTaskState,
+  TaskFailedAttempt,
   TaskStep,
   TaskVerification,
   TokenUsage,
   ToolKind,
+  TurnBlockRecord,
+  TurnBlockStatus,
   Workspace,
 } from '@harnessmate/protocol';
 
@@ -82,6 +93,7 @@ interface TaskStateRow {
   verifications_json: string;
   blockers_json: string;
   pinned_facts_json: string;
+  failed_attempts_json?: string | null;
   rolling_summary: string;
   summarized_up_to_seq: number;
   version: number;
@@ -300,11 +312,130 @@ export class HarnessMateStore {
         verifications_json TEXT NOT NULL DEFAULT '[]',
         blockers_json TEXT NOT NULL DEFAULT '[]',
         pinned_facts_json TEXT NOT NULL DEFAULT '[]',
+        failed_attempts_json TEXT NOT NULL DEFAULT '[]',
         rolling_summary TEXT NOT NULL DEFAULT '',
         summarized_up_to_seq INTEGER NOT NULL DEFAULT 0,
         version INTEGER NOT NULL DEFAULT 1,
         ledger_file_path TEXT,
         updated_at INTEGER NOT NULL
+      );
+
+      -- ── Phase 0 V2 Materialized Projection, Runs, Outbox, Handoff, Checkpoints & FTS5 ──
+
+      CREATE TABLE IF NOT EXISTS session_runs (
+        run_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        driver_id TEXT NOT NULL,
+        model TEXT,
+        status TEXT NOT NULL,
+        failure_class TEXT,
+        usage_json TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_runs_session_started
+        ON session_runs(session_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS session_turn_items (
+        item_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_id TEXT,
+        seq INTEGER NOT NULL,
+        instance_id TEXT NOT NULL,
+        driver_id TEXT NOT NULL,
+        block_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        text_body TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        output_omitted INTEGER NOT NULL DEFAULT 0,
+        omitted_bytes INTEGER NOT NULL DEFAULT 0,
+        raw_ref_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_turn_items_session_seq
+        ON session_turn_items(session_id, seq ASC);
+      CREATE INDEX IF NOT EXISTS idx_turn_items_session_turn
+        ON session_turn_items(session_id, turn_id, seq ASC);
+
+      CREATE TABLE IF NOT EXISTS command_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        command_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS effect_outbox (
+        effect_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        effect_type TEXT NOT NULL,
+        durability TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_effect_outbox_status
+        ON effect_outbox(status, durability, created_at ASC);
+
+      CREATE TABLE IF NOT EXISTS session_handoffs (
+        handoff_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_id TEXT,
+        from_instance_id TEXT,
+        to_instance_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        delivery_channel TEXT NOT NULL,
+        delivery_status TEXT NOT NULL,
+        covered_up_to_seq INTEGER NOT NULL DEFAULT 0,
+        estimated_chars INTEGER NOT NULL DEFAULT 0,
+        redacted_count INTEGER NOT NULL DEFAULT 0,
+        force_fresh_reason TEXT,
+        snapshot_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        confirmed_at INTEGER
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_handoffs_session_target
+        ON session_handoffs(session_id, to_instance_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS session_checkpoints (
+        checkpoint_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        turn_seq INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        git_ref TEXT NOT NULL,
+        tree_sha TEXT NOT NULL,
+        base_head_sha TEXT,
+        files_changed INTEGER NOT NULL DEFAULT 0,
+        insertions INTEGER NOT NULL DEFAULT 0,
+        deletions INTEGER NOT NULL DEFAULT 0,
+        skipped_large_files_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session_turn
+        ON session_checkpoints(session_id, turn_seq DESC);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
+        session_id UNINDEXED,
+        item_id UNINDEXED,
+        turn_id UNINDEXED,
+        driver_id UNINDEXED,
+        title,
+        body
       );
     `);
 
@@ -334,6 +465,20 @@ export class HarnessMateStore {
     const approvalCols = new Set((this.db.prepare('PRAGMA table_info(approvals)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!approvalCols.has('annotations_json')) {
       this.db.exec('ALTER TABLE approvals ADD COLUMN annotations_json TEXT;');
+    }
+    const taskCols = new Set((this.db.prepare('PRAGMA table_info(session_task_state)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
+    if (!taskCols.has('failed_attempts_json')) {
+      this.db.exec("ALTER TABLE session_task_state ADD COLUMN failed_attempts_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    const bindingCols = new Set((this.db.prepare('PRAGMA table_info(session_harness_bindings)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
+    if (!bindingCols.has('continuation_key')) {
+      this.db.exec('ALTER TABLE session_harness_bindings ADD COLUMN continuation_key TEXT;');
+    }
+    if (!bindingCols.has('last_handoff_id')) {
+      this.db.exec('ALTER TABLE session_harness_bindings ADD COLUMN last_handoff_id TEXT;');
+    }
+    if (!bindingCols.has('last_delivery_status')) {
+      this.db.exec('ALTER TABLE session_harness_bindings ADD COLUMN last_delivery_status TEXT;');
     }
 
     // Idempotent backfill for existing v0.1/v0.2 sessions -> unified multi-harness bindings + task ledger
@@ -1126,9 +1271,9 @@ export class HarnessMateStore {
       .prepare(
         `INSERT INTO session_task_state (
           session_id, objective, steps_json, decisions_json, touched_files_json,
-          verifications_json, blockers_json, pinned_facts_json,
+          verifications_json, blockers_json, pinned_facts_json, failed_attempts_json,
           rolling_summary, summarized_up_to_seq, version, ledger_file_path, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           objective = excluded.objective,
           steps_json = excluded.steps_json,
@@ -1137,6 +1282,7 @@ export class HarnessMateStore {
           verifications_json = excluded.verifications_json,
           blockers_json = excluded.blockers_json,
           pinned_facts_json = excluded.pinned_facts_json,
+          failed_attempts_json = excluded.failed_attempts_json,
           rolling_summary = excluded.rolling_summary,
           summarized_up_to_seq = excluded.summarized_up_to_seq,
           version = excluded.version,
@@ -1152,6 +1298,7 @@ export class HarnessMateStore {
         JSON.stringify(state.verifications ?? []),
         JSON.stringify(state.blockers ?? []),
         JSON.stringify(state.pinnedFacts ?? []),
+        JSON.stringify(state.failedAttempts ?? []),
         state.rollingSummary ?? '',
         state.summarizedUpToSeq ?? 0,
         state.version ?? 1,
@@ -1323,6 +1470,503 @@ export class HarnessMateStore {
       .run(Date.now(), id);
     return Number(res.changes) > 0;
   }
+
+  // ── Phase 0 V2 Materialized Turn Items, Runs, Outbox, Handoffs, Checkpoints & FTS5 ──
+
+  upsertTurnItem(item: TurnBlockRecord): TurnBlockRecord {
+    this.db
+      .prepare(
+        `INSERT INTO session_turn_items (
+          item_id, session_id, turn_id, seq, instance_id, driver_id, block_type,
+          status, title, text_body, payload_json, output_omitted, omitted_bytes,
+          raw_ref_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+          status = excluded.status,
+          title = CASE WHEN excluded.title != '' THEN excluded.title ELSE session_turn_items.title END,
+          text_body = excluded.text_body,
+          payload_json = excluded.payload_json,
+          output_omitted = excluded.output_omitted,
+          omitted_bytes = excluded.omitted_bytes,
+          raw_ref_json = COALESCE(excluded.raw_ref_json, session_turn_items.raw_ref_json),
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        item.itemId,
+        item.sessionId,
+        item.turnId ?? null,
+        item.seq,
+        item.instanceId,
+        item.driverId,
+        item.blockType,
+        item.status,
+        item.title ?? '',
+        item.textBody ?? '',
+        JSON.stringify(item.payload ?? {}),
+        item.outputOmitted ? 1 : 0,
+        item.omittedBytes ?? 0,
+        item.rawRef ? JSON.stringify(item.rawRef) : null,
+        item.createdAt,
+        item.updatedAt,
+      );
+    return this.getTurnItem(item.itemId)!;
+  }
+
+  getTurnItem(itemId: string): TurnBlockRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM session_turn_items WHERE item_id = ?')
+      .get(itemId) as unknown as TurnItemRow | undefined;
+    return row ? mapTurnItem(row) : null;
+  }
+
+  listTurnItems(
+    sessionId: string,
+    opts?: { afterSeq?: number; turnId?: string; blockTypes?: string[]; limit?: number },
+  ): TurnBlockRecord[] {
+    const clauses = ['session_id = ?'];
+    const params: (string | number)[] = [sessionId];
+    if (opts?.afterSeq !== undefined) {
+      clauses.push('seq > ?');
+      params.push(opts.afterSeq);
+    }
+    if (opts?.turnId) {
+      clauses.push('turn_id = ?');
+      params.push(opts.turnId);
+    }
+    if (opts?.blockTypes && opts.blockTypes.length > 0) {
+      clauses.push(`block_type IN (${opts.blockTypes.map(() => '?').join(', ')})`);
+      params.push(...opts.blockTypes);
+    }
+    const limit = Math.min(2000, Math.max(1, opts?.limit ?? 500));
+    params.push(limit);
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM session_turn_items
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY seq ASC, created_at ASC
+         LIMIT ?`,
+      )
+      .all(...params) as unknown as TurnItemRow[];
+    return rows.map(mapTurnItem);
+  }
+
+  settleRunningTurnItems(sessionId?: string, status: TurnBlockStatus = 'interrupted'): number {
+    const now = Date.now();
+    const res = sessionId
+      ? this.db
+          .prepare(
+            `UPDATE session_turn_items
+             SET status = ?, updated_at = ?
+             WHERE session_id = ? AND status IN ('pending', 'running')`,
+          )
+          .run(status, now, sessionId)
+      : this.db
+          .prepare(
+            `UPDATE session_turn_items
+             SET status = ?, updated_at = ?
+             WHERE status IN ('pending', 'running')`,
+          )
+          .run(status, now);
+    return Number(res.changes);
+  }
+
+  startSessionRun(run: SessionRunRecord): SessionRunRecord {
+    this.db
+      .prepare(
+        `INSERT INTO session_runs (
+          run_id, session_id, turn_id, instance_id, driver_id, model,
+          status, failure_class, usage_json, started_at, ended_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        run.runId,
+        run.sessionId,
+        run.turnId,
+        run.instanceId,
+        run.driverId,
+        run.model ?? null,
+        run.status,
+        run.failureClass ?? null,
+        run.usage ? JSON.stringify(run.usage) : null,
+        run.startedAt,
+        run.endedAt ?? null,
+      );
+    return run;
+  }
+
+  finishSessionRun(
+    runId: string,
+    patch: { status: SessionRunStatus; failureClass?: string | null; usage?: TokenUsage | null; endedAt?: number },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE session_runs
+         SET status = ?, failure_class = COALESCE(?, failure_class),
+             usage_json = COALESCE(?, usage_json), ended_at = ?
+         WHERE run_id = ?`,
+      )
+      .run(
+        patch.status,
+        patch.failureClass ?? null,
+        patch.usage ? JSON.stringify(patch.usage) : null,
+        patch.endedAt ?? Date.now(),
+        runId,
+      );
+  }
+
+  listSessionRuns(sessionId: string, limit = 100): SessionRunRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM session_runs WHERE session_id = ? ORDER BY started_at DESC LIMIT ?')
+      .all(sessionId, limit) as unknown as SessionRunRow[];
+    return rows.map(mapSessionRun);
+  }
+
+  recordCommandReceipt(receipt: {
+    receiptId: string;
+    sessionId: string;
+    idempotencyKey: string;
+    commandType: string;
+    status: string;
+    result?: Record<string, unknown> | null;
+  }): boolean {
+    const now = Date.now();
+    const res = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO command_receipts (
+          receipt_id, session_id, idempotency_key, command_type, status, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        receipt.receiptId,
+        receipt.sessionId,
+        receipt.idempotencyKey,
+        receipt.commandType,
+        receipt.status,
+        receipt.result ? JSON.stringify(receipt.result) : null,
+        now,
+        now,
+      );
+    return Number(res.changes) === 1;
+  }
+
+  getCommandReceiptByKey(idempotencyKey: string): {
+    receiptId: string;
+    sessionId: string;
+    commandType: string;
+    status: string;
+    result: Record<string, unknown> | null;
+  } | null {
+    const row = this.db
+      .prepare('SELECT * FROM command_receipts WHERE idempotency_key = ?')
+      .get(idempotencyKey) as
+      | { receipt_id: string; session_id: string; command_type: string; status: string; result_json: string | null }
+      | undefined;
+    if (!row) return null;
+    return {
+      receiptId: row.receipt_id,
+      sessionId: row.session_id,
+      commandType: row.command_type,
+      status: row.status,
+      result: safeJsonParse<Record<string, unknown> | null>(row.result_json, null),
+    };
+  }
+
+  enqueueOutboxEffect(effect: {
+    effectId: string;
+    sessionId: string;
+    effectType: string;
+    durability: EffectOutboxDurability;
+    payload: Record<string, unknown>;
+  }): EffectOutboxRecord {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO effect_outbox (
+          effect_id, session_id, effect_type, durability, payload_json, status, attempts, last_error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`,
+      )
+      .run(
+        effect.effectId,
+        effect.sessionId,
+        effect.effectType,
+        effect.durability,
+        JSON.stringify(effect.payload ?? {}),
+        now,
+        now,
+      );
+    return {
+      ...effect,
+      status: 'pending',
+      attempts: 0,
+      lastError: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  claimPendingOutboxEffects(limit = 32): EffectOutboxRecord[] {
+    const now = Date.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM effect_outbox
+           WHERE status = 'pending'
+           ORDER BY created_at ASC
+           LIMIT ?`,
+        )
+        .all(limit) as unknown as EffectOutboxRow[];
+      const mark = this.db.prepare(
+        "UPDATE effect_outbox SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE effect_id = ?",
+      );
+      for (const row of rows) {
+        mark.run(now, row.effect_id);
+      }
+      this.db.exec('COMMIT');
+      return rows.map((row) => ({ ...mapOutboxRow(row), status: 'running', attempts: row.attempts + 1, updatedAt: now }));
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  completeOutboxEffect(effectId: string): void {
+    this.db
+      .prepare("UPDATE effect_outbox SET status = 'completed', updated_at = ? WHERE effect_id = ?")
+      .run(Date.now(), effectId);
+  }
+
+  failOutboxEffect(effectId: string, error: string, retryable = false): void {
+    const nextStatus: EffectOutboxStatus = retryable ? 'pending' : 'failed';
+    this.db
+      .prepare('UPDATE effect_outbox SET status = ?, last_error = ?, updated_at = ? WHERE effect_id = ?')
+      .run(nextStatus, error.slice(0, 1000), Date.now(), effectId);
+  }
+
+  listOutboxEffects(status?: EffectOutboxStatus): EffectOutboxRecord[] {
+    const rows = status
+      ? (this.db
+          .prepare('SELECT * FROM effect_outbox WHERE status = ? ORDER BY created_at ASC')
+          .all(status) as unknown as EffectOutboxRow[])
+      : (this.db
+          .prepare('SELECT * FROM effect_outbox ORDER BY created_at ASC')
+          .all() as unknown as EffectOutboxRow[]);
+    return rows.map(mapOutboxRow);
+  }
+
+  /**
+   * Atomic crash recovery on daemon startup:
+   * - Settles any orphaned 'running' session_runs and 'pending'/'running' session_turn_items to 'interrupted'
+   * - Cancels PROCESS_BOUND outbox effects (must NEVER replay across dead OS processes)
+   * - Resets interrupted REPLAY_SAFE outbox effects back to 'pending' so EffectWorker resumes them
+   * - Expires orphaned pending approvals
+   */
+  recoverCrashStateOnStartup(): {
+    settledRuns: number;
+    settledItems: number;
+    cancelledProcessBoundEffects: number;
+    requeuedReplaySafeEffects: number;
+    expiredApprovals: number;
+  } {
+    const now = Date.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const settledRuns = Number(
+        this.db
+          .prepare(
+            `UPDATE session_runs
+             SET status = 'interrupted', failure_class = COALESCE(failure_class, 'process_restart'), ended_at = ?
+             WHERE status = 'running'`,
+          )
+          .run(now).changes,
+      );
+      const settledItems = Number(
+        this.db
+          .prepare(
+            `UPDATE session_turn_items
+             SET status = 'interrupted', updated_at = ?
+             WHERE status IN ('pending', 'running')`,
+          )
+          .run(now).changes,
+      );
+      const cancelledProcessBoundEffects = Number(
+        this.db
+          .prepare(
+            `UPDATE effect_outbox
+             SET status = 'cancelled', last_error = 'Cancelled on restart (PROCESS_BOUND)', updated_at = ?
+             WHERE durability = 'PROCESS_BOUND' AND status IN ('pending', 'running')`,
+          )
+          .run(now).changes,
+      );
+      const requeuedReplaySafeEffects = Number(
+        this.db
+          .prepare(
+            `UPDATE effect_outbox
+             SET status = 'pending', updated_at = ?
+             WHERE durability = 'REPLAY_SAFE' AND status = 'running'`,
+          )
+          .run(now).changes,
+      );
+      const expiredApprovals = Number(
+        this.db
+          .prepare("UPDATE approvals SET status = 'expired', resolved_at = ? WHERE status = 'pending'")
+          .run(now).changes,
+      );
+      this.db.exec('COMMIT');
+      return {
+        settledRuns,
+        settledItems,
+        cancelledProcessBoundEffects,
+        requeuedReplaySafeEffects,
+        expiredApprovals,
+      };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  createHandoffRecord(record: SessionHandoffRecord): SessionHandoffRecord {
+    this.db
+      .prepare(
+        `INSERT INTO session_handoffs (
+          handoff_id, session_id, turn_id, from_instance_id, to_instance_id, mode,
+          delivery_channel, delivery_status, covered_up_to_seq, estimated_chars,
+          redacted_count, force_fresh_reason, snapshot_json, created_at, confirmed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.handoffId,
+        record.sessionId,
+        record.turnId ?? null,
+        record.fromInstanceId ?? null,
+        record.toInstanceId,
+        record.mode,
+        record.deliveryChannel,
+        record.deliveryStatus,
+        record.coveredUpToSeq,
+        record.estimatedChars ?? 0,
+        record.redactedCount ?? 0,
+        record.forceFreshReason ?? null,
+        JSON.stringify(record.snapshot ?? {}),
+        record.createdAt,
+        record.confirmedAt ?? null,
+      );
+    return record;
+  }
+
+  updateHandoffDeliveryStatus(
+    handoffId: string,
+    status: HandoffDeliveryStatus,
+    confirmedAt?: number | null,
+  ): void {
+    this.db
+      .prepare('UPDATE session_handoffs SET delivery_status = ?, confirmed_at = COALESCE(?, confirmed_at) WHERE handoff_id = ?')
+      .run(status, status === 'confirmed' ? (confirmedAt ?? Date.now()) : null, handoffId);
+  }
+
+  getLatestHandoffRecord(sessionId: string, toInstanceId: string): SessionHandoffRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM session_handoffs
+         WHERE session_id = ? AND to_instance_id = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(sessionId, toInstanceId) as unknown as HandoffRow | undefined;
+    return row ? mapHandoffRow(row) : null;
+  }
+
+  listHandoffRecords(sessionId: string, limit = 50): SessionHandoffRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM session_handoffs WHERE session_id = ? ORDER BY created_at DESC LIMIT ?')
+      .all(sessionId, limit) as unknown as HandoffRow[];
+    return rows.map(mapHandoffRow);
+  }
+
+  createCheckpointRecord(record: SessionCheckpointRecord): SessionCheckpointRecord {
+    this.db
+      .prepare(
+        `INSERT INTO session_checkpoints (
+          checkpoint_id, session_id, turn_seq, phase, git_ref, tree_sha, base_head_sha,
+          files_changed, insertions, deletions, skipped_large_files_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.checkpointId,
+        record.sessionId,
+        record.turnSeq,
+        record.phase,
+        record.gitRef,
+        record.treeSha,
+        record.baseHeadSha ?? null,
+        record.filesChanged ?? 0,
+        record.insertions ?? 0,
+        record.deletions ?? 0,
+        JSON.stringify(record.skippedLargeFiles ?? []),
+        record.createdAt,
+      );
+    return record;
+  }
+
+  listCheckpointRecords(sessionId: string, limit = 100): SessionCheckpointRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM session_checkpoints WHERE session_id = ? ORDER BY turn_seq DESC, created_at DESC LIMIT ?')
+      .all(sessionId, limit) as unknown as CheckpointRow[];
+    return rows.map(mapCheckpointRow);
+  }
+
+  indexSearchItem(entry: {
+    sessionId: string;
+    itemId: string;
+    turnId: string | null;
+    driverId: string;
+    title: string;
+    body: string;
+  }): void {
+    this.db.prepare('DELETE FROM session_search_fts WHERE item_id = ?').run(entry.itemId);
+    this.db
+      .prepare(
+        'INSERT INTO session_search_fts (session_id, item_id, turn_id, driver_id, title, body) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(entry.sessionId, entry.itemId, entry.turnId ?? '', entry.driverId, entry.title, entry.body);
+  }
+
+  searchSessionFts(query: string, limit = 25): Array<{
+    sessionId: string;
+    itemId: string;
+    turnId: string;
+    driverId: string;
+    title: string;
+    snippet: string;
+  }> {
+    const cleaned = query.trim().replace(/["*]/g, ' ');
+    if (!cleaned) return [];
+    const safeQuery = `"${cleaned.replace(/\s+/g, '" "')}"`;
+    const rows = this.db
+      .prepare(
+        `SELECT session_id, item_id, turn_id, driver_id, title,
+                snippet(session_search_fts, 5, '[', ']', '...', 18) AS snippet
+         FROM session_search_fts
+         WHERE session_search_fts MATCH ?
+         LIMIT ?`,
+      )
+      .all(safeQuery, Math.min(100, Math.max(1, limit))) as unknown as Array<{
+      session_id: string;
+      item_id: string;
+      turn_id: string;
+      driver_id: string;
+      title: string;
+      snippet: string;
+    }>;
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      itemId: r.item_id,
+      turnId: r.turn_id,
+      driverId: r.driver_id,
+      title: r.title,
+      snippet: r.snippet,
+    }));
+  }
 }
 
 function safeJsonParse<T>(raw: string | null, fallback: T): T {
@@ -1397,6 +2041,7 @@ function mapBinding(row: BindingRow): SessionHarnessBinding {
 }
 
 function mapTaskState(row: TaskStateRow): SessionTaskState {
+  const failedAttempts = safeJsonParse<TaskFailedAttempt[]>(row.failed_attempts_json ?? null, []);
   return {
     sessionId: row.session_id,
     objective: row.objective ?? '',
@@ -1406,6 +2051,7 @@ function mapTaskState(row: TaskStateRow): SessionTaskState {
     verifications: safeJsonParse<TaskVerification[]>(row.verifications_json, []),
     blockers: safeJsonParse<string[]>(row.blockers_json, []),
     pinnedFacts: safeJsonParse<string[]>(row.pinned_facts_json, []),
+    ...(failedAttempts.length > 0 ? { failedAttempts } : {}),
     rollingSummary: row.rolling_summary ?? '',
     summarizedUpToSeq: row.summarized_up_to_seq ?? 0,
     version: row.version ?? 1,
@@ -1444,5 +2090,174 @@ function mapDevice(row: DeviceRow): PairedDevice {
     createdAt: row.created_at,
     lastSeenAt: row.last_seen_at,
     revokedAt: row.revoked_at,
+  };
+}
+
+interface TurnItemRow {
+  item_id: string;
+  session_id: string;
+  turn_id: string | null;
+  seq: number;
+  instance_id: string;
+  driver_id: string;
+  block_type: string;
+  status: string;
+  title: string;
+  text_body: string;
+  payload_json: string;
+  output_omitted: number;
+  omitted_bytes: number;
+  raw_ref_json: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface SessionRunRow {
+  run_id: string;
+  session_id: string;
+  turn_id: string;
+  instance_id: string;
+  driver_id: string;
+  model: string | null;
+  status: string;
+  failure_class: string | null;
+  usage_json: string | null;
+  started_at: number;
+  ended_at: number | null;
+}
+
+interface EffectOutboxRow {
+  effect_id: string;
+  session_id: string;
+  effect_type: string;
+  durability: string;
+  payload_json: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface HandoffRow {
+  handoff_id: string;
+  session_id: string;
+  turn_id: string | null;
+  from_instance_id: string | null;
+  to_instance_id: string;
+  mode: string;
+  delivery_channel: string;
+  delivery_status: string;
+  covered_up_to_seq: number;
+  estimated_chars: number;
+  redacted_count: number;
+  force_fresh_reason: string | null;
+  snapshot_json: string;
+  created_at: number;
+  confirmed_at: number | null;
+}
+
+interface CheckpointRow {
+  checkpoint_id: string;
+  session_id: string;
+  turn_seq: number;
+  phase: string;
+  git_ref: string;
+  tree_sha: string;
+  base_head_sha: string | null;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+  skipped_large_files_json: string;
+  created_at: number;
+}
+
+function mapTurnItem(row: TurnItemRow): TurnBlockRecord {
+  return {
+    itemId: row.item_id,
+    schemaVersion: 2,
+    sessionId: row.session_id,
+    turnId: row.turn_id,
+    seq: row.seq,
+    instanceId: row.instance_id,
+    driverId: row.driver_id,
+    blockType: row.block_type,
+    status: row.status as TurnBlockStatus,
+    title: row.title,
+    textBody: row.text_body,
+    payload: safeJsonParse<Record<string, unknown>>(row.payload_json, {}),
+    outputOmitted: row.output_omitted === 1,
+    omittedBytes: row.omitted_bytes ?? 0,
+    rawRef: safeJsonParse<TurnBlockRecord['rawRef']>(row.raw_ref_json, null),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapSessionRun(row: SessionRunRow): SessionRunRecord {
+  return {
+    runId: row.run_id,
+    sessionId: row.session_id,
+    turnId: row.turn_id,
+    instanceId: row.instance_id,
+    driverId: row.driver_id,
+    model: row.model,
+    status: row.status as SessionRunStatus,
+    failureClass: row.failure_class,
+    usage: safeJsonParse<TokenUsage | null>(row.usage_json, null),
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+  };
+}
+
+function mapOutboxRow(row: EffectOutboxRow): EffectOutboxRecord {
+  return {
+    effectId: row.effect_id,
+    sessionId: row.session_id,
+    effectType: row.effect_type,
+    durability: row.durability as EffectOutboxDurability,
+    payload: safeJsonParse<Record<string, unknown>>(row.payload_json, {}),
+    status: row.status as EffectOutboxStatus,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapHandoffRow(row: HandoffRow): SessionHandoffRecord {
+  return {
+    handoffId: row.handoff_id,
+    sessionId: row.session_id,
+    turnId: row.turn_id,
+    fromInstanceId: row.from_instance_id,
+    toInstanceId: row.to_instance_id,
+    mode: row.mode as SessionHandoffRecord['mode'],
+    deliveryChannel: row.delivery_channel as SessionHandoffRecord['deliveryChannel'],
+    deliveryStatus: row.delivery_status as HandoffDeliveryStatus,
+    coveredUpToSeq: row.covered_up_to_seq,
+    estimatedChars: row.estimated_chars,
+    redactedCount: row.redacted_count,
+    forceFreshReason: row.force_fresh_reason,
+    snapshot: safeJsonParse<Record<string, unknown>>(row.snapshot_json, {}),
+    createdAt: row.created_at,
+    confirmedAt: row.confirmed_at,
+  };
+}
+
+function mapCheckpointRow(row: CheckpointRow): SessionCheckpointRecord {
+  return {
+    checkpointId: row.checkpoint_id,
+    sessionId: row.session_id,
+    turnSeq: row.turn_seq,
+    phase: row.phase as SessionCheckpointRecord['phase'],
+    gitRef: row.git_ref,
+    treeSha: row.tree_sha,
+    baseHeadSha: row.base_head_sha,
+    filesChanged: row.files_changed,
+    insertions: row.insertions,
+    deletions: row.deletions,
+    skippedLargeFiles: safeJsonParse<string[]>(row.skipped_large_files_json, []),
+    createdAt: row.created_at,
   };
 }

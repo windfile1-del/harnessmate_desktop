@@ -14,20 +14,18 @@ import { composeSnapshot, type HandoffSnapshot } from './handoff-snapshot.js';
 import type { PluginEvents } from '../plugin-host/runtime/events.js';
 import { PluginApiError, type Disposer, type HandoffComposeEvent } from '@harnessmate/plugin-api';
 
-export interface CodexInjectMessageItem {
-  type: 'message';
-  role: 'user' | 'assistant';
-  content: Array<{ type: 'input_text' | 'output_text'; text: string }>;
-}
+import type { PortableHistoryMessage } from '../harnesses/types.js';
+
+export type CodexInjectMessageItem = PortableHistoryMessage;
 
 export interface CompiledContextPacket {
   preview: ContextPreview;
   snapshot: HandoffSnapshot;
   /** Full compiled context block (Block A + B + C + D) for ACP embeddedContext / Claude stdin / Envelope */
   deltaMarkdown: string;
-  /** Structured Responses API message items for Codex thread/inject_items */
-  codexInjectItems: CodexInjectMessageItem[];
-  /** Objective text for Codex thread/goal/set */
+  /** Vendor-neutral portable structured history items for drivers supporting native_items injection */
+  portableItems: PortableHistoryMessage[];
+  /** Objective text for drivers supporting native goal state */
   objective: string;
   /** Highest event seq covered by this compiled context */
   coveredUpToSeq: number;
@@ -269,8 +267,8 @@ export class ContextCompiler {
     sections.push('</harnessmate_context_sync>');
     const deltaMarkdown = sections.join('\n');
 
-    // Assemble Codex-native Responses API message items for `thread/inject_items`
-    const codexInjectItems: CodexInjectMessageItem[] = [];
+    // Assemble vendor-neutral portable structured message items for native_items injection
+    const portableItems: PortableHistoryMessage[] = [];
     if (syncNeeded) {
       // Inject Workspace Truth + Task Ledger (+ older digest if any) as a compact anchor pair
       const anchorParts = [
@@ -282,12 +280,12 @@ export class ContextCompiler {
         anchorParts.push('## Earlier Un-Synced Turns Digest', digestBlock);
       }
       anchorParts.push(...extraSections.map(({ text }) => text));
-      codexInjectItems.push({
+      portableItems.push({
         type: 'message',
         role: 'user',
         content: [{ type: 'input_text', text: anchorParts.join('\n\n') }],
       });
-      codexInjectItems.push({
+      portableItems.push({
         type: 'message',
         role: 'assistant',
         content: [
@@ -298,7 +296,7 @@ export class ContextCompiler {
         ],
       });
 
-      // Inject each verbatim un-synced turn as real user/assistant Responses API message items
+      // Inject each verbatim un-synced turn as real user/assistant structured message items
       for (const turn of verbatimTurns) {
         if (turn.userText || turn.attachmentNotes.length > 0) {
           const userBody = [
@@ -309,7 +307,7 @@ export class ContextCompiler {
           ]
             .filter(Boolean)
             .join('');
-          codexInjectItems.push({
+          portableItems.push({
             type: 'message',
             role: 'user',
             content: [{ type: 'input_text', text: userBody }],
@@ -318,7 +316,7 @@ export class ContextCompiler {
 
         const assistantBody = renderAssistantWithToolsForInject(turn);
         if (assistantBody) {
-          codexInjectItems.push({
+          portableItems.push({
             type: 'message',
             role: 'assistant',
             content: [{ type: 'output_text', text: assistantBody }],
@@ -355,7 +353,7 @@ export class ContextCompiler {
       preview,
       snapshot,
       deltaMarkdown,
-      codexInjectItems,
+      portableItems,
       objective: taskState.objective || session.title,
       coveredUpToSeq: targetSeq,
       syncNeeded,

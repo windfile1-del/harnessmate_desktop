@@ -75,6 +75,7 @@ export class WsGateway {
 
   private handleConnection(ws: WebSocket): void {
     const sessionUnsubs = new Map<string, () => void>();
+    const commandOutputUnsubs = new Map<string, () => void>();
     let attentionUnsub: (() => void) | null = null;
 
     this.send(ws, {
@@ -164,12 +165,44 @@ export class WsGateway {
           }
           break;
         }
+
+        case 'subscribe_command_output': {
+          const key = `${frame.sessionId}::${frame.toolCallId}`;
+          commandOutputUnsubs.get(key)?.();
+          const unsub = this.deps.sessionManager.commandOutputHub.subscribe(
+            frame.sessionId,
+            frame.toolCallId,
+            (chunk) => {
+              this.send(ws, {
+                op: 'command_output',
+                sessionId: chunk.sessionId,
+                toolCallId: chunk.toolCallId,
+                chunk: chunk.chunk,
+                stream: chunk.stream,
+                snapshot: chunk.snapshot,
+                done: chunk.done,
+                timestamp: chunk.timestamp,
+              });
+            },
+          );
+          commandOutputUnsubs.set(key, unsub);
+          break;
+        }
+
+        case 'unsubscribe_command_output': {
+          const key = `${frame.sessionId}::${frame.toolCallId}`;
+          commandOutputUnsubs.get(key)?.();
+          commandOutputUnsubs.delete(key);
+          break;
+        }
       }
     });
 
     ws.on('close', () => {
       for (const unsub of sessionUnsubs.values()) unsub();
       sessionUnsubs.clear();
+      for (const unsub of commandOutputUnsubs.values()) unsub();
+      commandOutputUnsubs.clear();
       attentionUnsub?.();
       attentionUnsub = null;
     });

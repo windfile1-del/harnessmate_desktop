@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { CustomAcpHarnessConfig } from '@harnessmate/protocol';
+import type { CustomAcpHarnessConfig, HarnessInstanceConfig } from '@harnessmate/protocol';
 
 export interface DaemonPersistedConfig {
   desktopId: string;
@@ -11,6 +11,7 @@ export interface DaemonPersistedConfig {
   lanEnabled: boolean;
   localToken: string;
   customAcpHarnesses: CustomAcpHarnessConfig[];
+  harnessInstances: HarnessInstanceConfig[];
   binaryOverrides: Record<string, string>;
   disabledPlugins: string[];
 }
@@ -57,6 +58,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
     lanEnabled: process.env.HARNESSMATE_LAN_ENABLED === '1',
     localToken: crypto.randomBytes(24).toString('hex'),
     customAcpHarnesses: [],
+    harnessInstances: [],
     binaryOverrides: {},
     disabledPlugins: [],
   };
@@ -69,6 +71,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
         ...raw,
         port: portOverride ?? raw.port ?? defaults.port,
         customAcpHarnesses: Array.isArray(raw.customAcpHarnesses) ? raw.customAcpHarnesses : [],
+        harnessInstances: Array.isArray(raw.harnessInstances) ? raw.harnessInstances : [],
         binaryOverrides:
           raw.binaryOverrides && typeof raw.binaryOverrides === 'object' ? raw.binaryOverrides : {},
         disabledPlugins: Array.isArray(raw.disabledPlugins) ? raw.disabledPlugins : [],
