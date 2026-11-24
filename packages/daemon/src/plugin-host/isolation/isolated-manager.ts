@@ -549,8 +549,8 @@ export class IsolatedPluginManager {
     return list;
   }
 
-  async runCommand(session: Session, command: string, args: string, expectedRunId?: string): Promise<PublicCommandResult> {
-    const entry = [...this.active.values()].find((item) => item.commands.has(command));
+  async runCommand(session: Session, command: string, args: string, expectedRunId?: string, pluginId?: string): Promise<PublicCommandResult> {
+    const entry = [...this.active.values()].find((item) => item.commands.has(command) && (!pluginId || item.pluginId === pluginId));
     if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未找到命令 /${command}`);
     return await entry.process.call<PublicCommandResult>(
       'host.command',

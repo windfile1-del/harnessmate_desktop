@@ -1403,6 +1403,26 @@ export class HarnessMateStore {
 
   // ── Plugin Key-Value Storage ─────────────────────────────────────────
 
+  getLatestCompletedTurnSeq(sessionId: string): number {
+    const row = this.db.prepare(
+      `SELECT seq FROM session_events
+       WHERE session_id = ? AND turn_id IS NOT NULL AND type = 'turn.completed'
+         AND COALESCE(json_extract(payload_json, '$.maintenance'), 0) != 1
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(sessionId) as { seq: number } | undefined;
+    return row?.seq ?? 0;
+  }
+
+  hasRunningSubagents(sessionId: string): boolean {
+    return !!this.db.prepare(
+      "SELECT 1 FROM subagent_runs WHERE parent_session_id = ? AND status IN ('running', 'awaiting_approval') LIMIT 1",
+    ).get(sessionId);
+  }
+
+  listSessionIds(): string[] {
+    return (this.db.prepare('SELECT id FROM sessions').all() as Array<{ id: string }>).map(({ id }) => id);
+  }
+
   getPluginStorageValue(scope: string, pluginId: string, key: string): unknown {
     const row = this.db.prepare(
       'SELECT value_json FROM plugin_kv_storage WHERE scope = ? AND plugin_id = ? AND key = ?',

@@ -1,36 +1,27 @@
 import type {
   ContextPreview,
   ContextSyncMode,
-  HarnessKind,
   PluginCatalogItem,
   PluginCategory,
   PluginRegistryStateDto,
 } from '@harnessmate/protocol';
 import { GeneratedPluginManifestSchema, PluginManifestSchema, type PluginManifest } from '@harnessmate/protocol';
 import {
-  Activity,
   ArrowRightLeft,
   Check,
-  Command,
   Copy,
-  Cpu,
   Download,
-  Eye,
   GitBranch,
   Loader2,
-  Moon,
   Plug,
   Plus,
   Puzzle,
   RefreshCw,
-  Search,
-  Smartphone,
   Sparkles,
-  Sun,
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { daemonApi } from '../api/client';
 import {
   formatCountdown,
@@ -1917,123 +1908,6 @@ function MetricMini({ label, value }: { label: string; value: string }) {
       <div className="text-[10px] text-[var(--text-muted)]">{label}</div>
       <div className="mt-0.5 truncate font-mono-code text-[11.5px] font-semibold text-[var(--text-primary)]">
         {value}
-      </div>
-    </div>
-  );
-}
-
-// ── 5. Global Command Palette (Ctrl+K) ─────────────────────────────────
-
-export function CommandPaletteModal({ onClose }: { onClose: () => void }) {
-  const { sessions, selectedSessionId, theme, toggleTheme, openModal, selectSession } = useAppStore();
-  const [query, setQuery] = useState('');
-
-  const actions = useMemo(
-    () => [
-      { id: 'new', label: '新建共享任务会话', icon: <Plus size={14} />, run: () => openModal('new_session') },
-      ...(selectedSessionId
-        ? [
-            {
-              id: 'handoff',
-              label: '当前会话切换 Harness / 分支交接',
-              icon: <ArrowRightLeft size={14} />,
-              run: () => openModal('handoff'),
-            },
-            {
-              id: 'ctx_preview',
-              label: '透视上下文同步包 (Context Bridge Preview)',
-              icon: <Eye size={14} />,
-              run: () => openModal('context_preview'),
-            },
-          ]
-        : []),
-      { id: 'plugins', label: '打开插件中心 (Plugin Studio)', icon: <Puzzle size={14} />, run: () => openModal('plugins') },
-      { id: 'mcp', label: '打开跨 CLI MCP 管理中心', icon: <Plug size={14} />, run: () => openModal('mcp') },
-      { id: 'usage', label: '打开多账号与配额用量看板', icon: <Activity size={14} />, run: () => openModal('usage') },
-      { id: 'harnesses', label: '探测与管理本机 CLI 引擎', icon: <Cpu size={14} />, run: () => openModal('harnesses') },
-      { id: 'remote', label: '移动端 HarnessMate 扫码联动', icon: <Smartphone size={14} />, run: () => openModal('remote_pairing') },
-      {
-        id: 'theme',
-        label: theme === 'dark' ? '切换为暖宣浅色主题' : '切换为夜织深色主题',
-        icon: theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />,
-        run: () => {
-          toggleTheme();
-          onClose();
-        },
-      },
-    ],
-    [theme, toggleTheme, openModal, onClose],
-  );
-
-  const q = query.trim().toLowerCase();
-  const filteredActions = actions.filter((a) => !q || a.label.toLowerCase().includes(q));
-  const filteredSessions = sessions
-    .filter((s) => !q || s.title.toLowerCase().includes(q) || s.harnessId.toLowerCase().includes(q))
-    .slice(0, 6);
-
-  return (
-    <div>
-      <div
-        className="flex items-center gap-2.5 px-4 py-3.5"
-        style={{ borderBottom: '1px solid var(--border-hairline)' }}
-      >
-        <Search size={15} className="text-[var(--accent-indigo)]" />
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="搜索命令、插件模块或快速跳转会话..."
-          autoFocus
-          className="w-full bg-transparent text-[13.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-        />
-        <span className="rounded px-1.5 py-0.5 font-mono-code text-[10px] text-[var(--text-muted)]" style={{ backgroundColor: 'var(--bg-elevated)' }}>
-          ESC
-        </span>
-      </div>
-
-      <div className="max-h-[420px] space-y-3 overflow-y-auto p-3">
-        {filteredActions.length > 0 && (
-          <div>
-            <div className="px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-              快捷指令
-            </div>
-            {filteredActions.map((a) => (
-              <button
-                key={a.id}
-                type="button"
-                onClick={a.run}
-                className="flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
-              >
-                <span className="text-[var(--accent-indigo)]">{a.icon}</span>
-                <span>{a.label}</span>
-              </button>
-            ))}
-          </div>
-        )}
-
-        {filteredSessions.length > 0 && (
-          <div>
-            <div className="px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-              最近会话
-            </div>
-            {filteredSessions.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                onClick={() => {
-                  void selectSession(s.id);
-                  onClose();
-                }}
-                className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-xl px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
-              >
-                <div className="flex min-w-0 items-center gap-2">
-                  <HarnessBadge kind={s.harnessKind as HarnessKind} compact />
-                  <span className="truncate text-[12.8px] text-[var(--text-primary)]">{s.title}</span>
-                </div>
-                <Command size={12} className="shrink-0 text-[var(--text-muted)]" />
-              </button>
-            ))}
-          </div>
-        )}
       </div>
     </div>
   );

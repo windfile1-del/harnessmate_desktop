@@ -31,6 +31,7 @@ import type {
   MergeBackRequest,
   MergeBackResult,
   MergeSubagentRequest,
+  MarkSessionViewedRequest,
   OpenTerminalRequest,
   OrchestratorBoardResponse,
   PluginCatalogItem,
@@ -44,6 +45,7 @@ import type {
   Session,
   SessionCheckpointRecord,
   SessionTaskState,
+  SessionTriageState,
   SubagentDiffStat,
   SubagentMergeBackResult,
   SubagentRunRecord,
@@ -55,11 +57,13 @@ import type {
   TurnOptionsMap,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
+  UpdateSessionTriageRequest,
   Workspace,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
 import { ApiHttpError, DaemonWsClient, daemonApi } from '../api/client';
 import { loadSavedTraitValues, persistTraitValues } from '../components/TraitsPicker';
+import { isTriageEnabled, mergeTriageState, type TriageStateBySession } from '../lib/triage';
 
 export type ActiveModal =
   | 'new_session'
@@ -72,6 +76,7 @@ export type ActiveModal =
   | 'handoff'
   | 'context_preview'
   | 'command_palette'
+  | 'keyboard_shortcuts'
   | 'worktrees'
   | 'session_explorer'
   | 'risk_rules'
@@ -97,11 +102,14 @@ interface AppState {
   inspectorFile: { sessionId: string; path: string; line?: number } | null;
   activeModal: ActiveModal;
   newSessionPresetHarnessId: string | null;
+  paletteInitialQuery: string;
+  explorerInitialQuery: string;
 
   harnesses: HarnessInfo[];
   workspaces: Workspace[];
   sessions: Session[];
   pendingApprovals: ApprovalRequest[];
+  triageBySession: TriageStateBySession;
   discoveredSessions: DiscoveredCliSession[];
   remoteStatus: RemoteAccessStatus | null;
 
@@ -171,6 +179,11 @@ interface AppState {
   openInspectorFile: (sessionId: string, path: string, line?: number) => void;
   closeInspectorFile: () => void;
   openModal: (modal: ActiveModal, presetHarnessId?: string | null) => void;
+  openCommandPalette: (query?: string) => void;
+  openSessionSearch: (query: string) => void;
+  refreshTriage: (checkSnoozes: boolean, signal: AbortSignal) => Promise<void>;
+  updateTriage: (id: string, patch: UpdateSessionTriageRequest) => Promise<void>;
+  markTriageViewed: (id: string, req: MarkSessionViewedRequest, signal?: AbortSignal) => Promise<void>;
   setSelectedWorkspaceId: (id: string | null) => void;
   setHarnessFilter: (id: string | null) => void;
   setSearchQuery: (q: string) => void;
@@ -511,6 +524,17 @@ export const useAppStore = create<AppState>((set, get) => {
     void daemonApi.listSessions().then(({ sessions }) => set({ sessions })).catch(() => {});
   };
 
+  const ingestTriage = (sessions: SessionTriageState[]) => {
+    if (!isTriageEnabled(get().plugins)) return;
+    set((state) => {
+      const triageBySession = { ...state.triageBySession };
+      for (const session of sessions) {
+        triageBySession[session.sessionId] = mergeTriageState(triageBySession[session.sessionId], session);
+      }
+      return { triageBySession };
+    });
+  };
+
   return {
     theme: initialTheme,
     connected: false,
@@ -519,12 +543,15 @@ export const useAppStore = create<AppState>((set, get) => {
     inspectorOpen: false,
     inspectorTab: 'task',
     activeModal: null,
+    paletteInitialQuery: '',
+    explorerInitialQuery: '',
     newSessionPresetHarnessId: null,
 
     harnesses: [],
     workspaces: [],
     sessions: [],
     pendingApprovals: [],
+    triageBySession: {},
     discoveredSessions: [],
     remoteStatus: null,
 
@@ -655,6 +682,12 @@ export const useAppStore = create<AppState>((set, get) => {
               handleAttention(frame.item);
             } else if (frame.op === 'plugins_changed') {
               void get().refreshPlugins().catch(() => {});
+            } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
+              ingestTriage([frame.session]);
+              if (frame.event) {
+                const session = get().sessions.find(({ id }) => id === frame.session.sessionId);
+                if (session) get().pushToast({ kind: 'info', title: '延后提醒已到期', body: session.title });
+              }
             }
           },
         });
@@ -684,7 +717,23 @@ export const useAppStore = create<AppState>((set, get) => {
     }),
     closeInspectorFile: () => set({ inspectorFile: null }),
     openModal: (modal, presetHarnessId = null) =>
-      set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId }),
+      set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId, paletteInitialQuery: '', explorerInitialQuery: '' }),
+    openCommandPalette: (query = '') =>
+      set({ activeModal: 'command_palette', paletteInitialQuery: query }),
+    openSessionSearch: (query) =>
+      set({ activeModal: 'session_explorer', explorerInitialQuery: query }),
+    refreshTriage: async (checkSnoozes, signal) => {
+      const result = await (checkSnoozes ? daemonApi.checkTriageSnoozes(signal) : daemonApi.getTriageState(signal));
+      if (!signal.aborted) ingestTriage(result.sessions);
+    },
+    updateTriage: async (id, patch) => {
+      const { session } = await daemonApi.updateSessionTriage(id, patch);
+      ingestTriage([session]);
+    },
+    markTriageViewed: async (id, req, signal) => {
+      const { session } = await daemonApi.markSessionViewed(id, req, signal);
+      if (!signal?.aborted) ingestTriage([session]);
+    },
     setSelectedWorkspaceId: (id) => set({ selectedWorkspaceId: id }),
     setHarnessFilter: (id) => set({ harnessFilter: id }),
     setSearchQuery: (q) => set({ searchQuery: q }),

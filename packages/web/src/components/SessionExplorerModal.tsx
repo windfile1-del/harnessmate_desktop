@@ -19,7 +19,7 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { daemonApi } from '../api/client';
 import { formatRelativeTime } from '../lib/harness-meta';
 import { useAppStore } from '../stores/app-store';
@@ -90,6 +90,7 @@ export function SessionExplorerView({
   sessions,
   selectedSession,
   initialTab = 'search',
+  initialQuery = '',
   initialHits = [],
   initialDiscovered = [],
   onJumpToHit,
@@ -102,6 +103,7 @@ export function SessionExplorerView({
   sessions: Session[];
   selectedSession: Session | null;
   initialTab?: ExplorerTab;
+  initialQuery?: string;
   initialHits?: SessionSearchHit[];
   initialDiscovered?: DiscoveredCliSession[];
   onJumpToHit: (hit: SessionSearchHit) => void;
@@ -114,7 +116,8 @@ export function SessionExplorerView({
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<ExplorerTab>(initialTab);
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(initialQuery);
+  const searchRequest = useRef(0);
   const [workspaceFilter, setWorkspaceFilter] = useState('');
   const [driverFilter, setDriverFilter] = useState('');
   const [searching, setSearching] = useState(false);
@@ -135,10 +138,12 @@ export function SessionExplorerView({
   const [bundleBusy, setBundleBusy] = useState(false);
 
   const runSearch = async (qStr = query) => {
+    const request = ++searchRequest.current;
     const trimmed = qStr.trim();
     if (!trimmed) {
       setHits([]);
       setTookMs(null);
+      setSearching(false);
       return;
     }
     setSearching(true);
@@ -149,15 +154,21 @@ export function SessionExplorerView({
         driverId: driverFilter || undefined,
         limit: 40,
       });
+      if (request !== searchRequest.current) return;
       setHits(res.hits);
       setFallbackUsed(res.fallbackUsed);
       setTookMs(res.tookMs);
     } catch {
-      setHits([]);
+      if (request === searchRequest.current) setHits([]);
     } finally {
-      setSearching(false);
+      if (request === searchRequest.current) setSearching(false);
     }
   };
+
+  useEffect(() => {
+    if (initialQuery.trim()) void runSearch(initialQuery);
+    return () => { searchRequest.current++; };
+  }, [initialQuery]);
 
   const refreshDiscovered = async (forceRefresh = false) => {
     setDiscoverLoading(true);
@@ -652,6 +663,7 @@ export function SessionExplorerModal({ onClose }: { onClose: () => void }) {
     workspaces,
     harnesses,
     sessions,
+    explorerInitialQuery,
     selectedSessionId,
     selectSession,
     focusTurn,
@@ -667,6 +679,7 @@ export function SessionExplorerModal({ onClose }: { onClose: () => void }) {
       workspaces={workspaces}
       harnesses={harnesses}
       sessions={sessions}
+      initialQuery={explorerInitialQuery}
       selectedSession={selectedSession}
       onJumpToHit={(hit) => {
         onClose();

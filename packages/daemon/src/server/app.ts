@@ -30,6 +30,7 @@ import {
   ImportSessionBundleRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
+  MarkSessionViewedRequestSchema,
   ManualCompressRequestSchema,
   MergeBackRequestSchema,
   MergeSubagentRequestSchema,
@@ -56,6 +57,7 @@ import {
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
   UpdateTaskStateRequestSchema,
+  UpdateSessionTriageRequestSchema,
   PluginPanelQuerySchema,
   PluginUiMessageRequestSchema,
   PreviewPluginProgramRequestSchema,
@@ -90,6 +92,7 @@ import { GitOperationError } from '../core/git-service.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
+import { TriageInboxService } from '../core/triage-inbox-service.js';
 import {
   TERMINAL_WORKSPACE_PLUGIN_ID,
   TerminalWorkspaceError,
@@ -103,7 +106,7 @@ import {
 } from '../core/context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
-import { PluginApiError } from '@harnessmate/plugin-api';
+import { PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
@@ -166,6 +169,20 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const pluginPermissions = new PluginPermissionService(store);
   const pluginSecrets = new PluginSecretStore();
   const terminalWorkspace = new TerminalWorkspaceService(store, { initialActive: false });
+  const triageInbox = new TriageInboxService(store, (session, event) => {
+    wsGateway.notifyTriage({ op: 'triage_updated', session, event });
+    if (event) {
+      void pluginManager.dispatchLifecycleEvent({
+        version: PLUGIN_EVENT_VERSION,
+        type: event.type,
+        sessionId: event.sessionId,
+        turnId: null,
+        seq: null,
+        createdAt: event.createdAt,
+        data: { snoozedUntilMs: event.snoozedUntilMs },
+      }, store.getSession(event.sessionId)?.workspaceId);
+    }
+  });
   const terminalSessionOwners = new Map<string, string>();
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
@@ -187,6 +204,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       opts.customAdapters,
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
       terminalWorkspace,
+      { service: triageInbox, bus: eventBus },
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy,
       onDevReload: () => wsGateway.notifyPluginsChanged() },
@@ -1004,6 +1022,44 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { deleted: true };
   });
 
+  // ── Session Triage ─────────────────────────────────────────────────
+
+  const activeTriage = () => pluginManager.host.get<TriageInboxService>('triage-inbox');
+  app.get('/api/v1/triage/state', async (_request, reply) => {
+    const service = activeTriage();
+    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
+    return { sessions: service.list() };
+  });
+
+  app.patch('/api/v1/triage/sessions/:id', async (request, reply) => {
+    const service = activeTriage();
+    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
+    const parsed = UpdateSessionTriageRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message });
+    const { id } = request.params as { id: string };
+    const session = service.update(id, parsed.data);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    return { session };
+  });
+
+  app.post('/api/v1/triage/sessions/:id/viewed', async (request, reply) => {
+    const service = activeTriage();
+    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
+    const parsed = MarkSessionViewedRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message });
+    const { id } = request.params as { id: string };
+    const session = service.markViewed(id, parsed.data);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    return { session };
+  });
+
+  app.post('/api/v1/triage/check-snoozes', async (_request, reply) => {
+    const service = activeTriage();
+    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
+    const expired = service.checkExpiredSnoozes();
+    return { expired, sessions: service.list() };
+  });
+
   // ── Sessions, Attachments, Files, Rules, Terminal & Handoff ──────────
 
   app.get('/api/v1/sessions', async (request) => {
@@ -1089,7 +1145,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { commands: sessionManager.getHarnessCommands(session), pluginActions: sessionManager.listPluginActions(session),
+    const pluginCommands = pluginManager.isolated?.listCommands().map(({ pluginId, pluginName, command, description, argumentHint }) =>
+      ({ pluginId, pluginName, command, description, argumentHint })) ?? [];
+    return { commands: sessionManager.getHarnessCommands(session), pluginActions: sessionManager.listPluginActions(session), pluginCommands,
       modelTools: sessionManager.getModelPluginTools(session) };
   });
 

@@ -14,6 +14,7 @@
 | `approval.requested` | emit | `events:approval` | plugin-host/runtime/map-event.ts | — |
 | `session.created` | serial | `session:read` | core/session-manager.ts | plugin-host/builtin/services.ts |
 | `session.closing` | parallel | `session:read` | core/session-manager.ts | — |
+| `triage.snooze_expired` | emit | `session:read` | core/triage-inbox-service.ts | — |
 | `session.harness_switched` | emit | `session:read` | plugin-host/runtime/map-event.ts | — |
 | `handoff.delivered` | emit | `session:read` | plugin-host/runtime/map-event.ts | — |
 | `plugin.state` | emit | — | plugin-host/runtime/lifecycle.ts | — |

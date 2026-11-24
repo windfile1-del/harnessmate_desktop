@@ -108,6 +108,7 @@ export interface SlotQueryOptions {
 }
 
 const MAX_RENDER_FAILURES = 40;
+const EMPTY_SLOT_ITEMS: readonly never[] = [];
 
 export class SlotRegistry {
   private readonly itemsBySlot = new Map<AnyPluginSlotKey, Map<string, RegisteredSlotItem>>();
@@ -153,9 +154,9 @@ export class SlotRegistry {
   ): readonly RegisteredSlotItem<K>[] {
     const canonical = normalizeAnyPluginSlotKey(slot) as K;
     const contract = ALL_PLUGIN_UI_SLOTS[canonical];
-    if (!contract) return [];
+    if (!contract) return EMPTY_SLOT_ITEMS;
     if (contract.scope === 'session' && !options.hasSession) {
-      return [];
+      return EMPTY_SLOT_ITEMS;
     }
     const cacheKey = `${canonical}|${options.hasSession ? '1' : '0'}|${options.matchKey ?? ''}`;
     const cached = this.queryCache.get(cacheKey);

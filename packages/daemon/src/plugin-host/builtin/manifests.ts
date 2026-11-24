@@ -1,4 +1,5 @@
 import type { PluginManifest } from '@harnessmate/plugin-api';
+import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 
 export const BUILTIN_PLUGINS: PluginManifest[] = [
   {
@@ -226,5 +227,16 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     provides: ['terminal-workspace'],
     permissions: ['process:pty:workspace'],
     contributes: { uiSlots: ['inspector_tab', 'composer_action'] },
+  },
+  {
+    id: TRIAGE_INBOX_PLUGIN_ID,
+    name: '会话待办与命令面板',
+    version: '1.0.0',
+    description: '分拣待审批、未读与运行会话，支持置顶、延后提醒和全局命令检索（官方可选插件）。',
+    author: 'HarnessMate Core',
+    category: 'ui',
+    provides: ['triage-inbox'],
+    permissions: ['session:read', 'storage:plugin'],
+    contributes: { uiSlots: ['sidebar_tool', 'modal'] },
   },
 ];

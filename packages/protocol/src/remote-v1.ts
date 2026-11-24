@@ -5,6 +5,9 @@ import {
   ApprovalDecisionSchema,
   AttachmentSchema,
   CanonicalEventSchema,
+  SessionTriageMetaSchema,
+  SessionTriageStateSchema,
+  TriageSnoozeExpiredSchema,
   CheckpointRevertModeSchema,
   ContextSyncModeSchema,
   CustomRiskRuleSchema,
@@ -138,6 +141,27 @@ export const SwitchHarnessRequestSchema = z.object({
   syncMode: ContextSyncModeSchema.optional(),
 });
 export type SwitchHarnessRequest = z.infer<typeof SwitchHarnessRequestSchema>;
+
+export const UpdateSessionTriageRequestSchema = SessionTriageMetaSchema
+  .pick({ pinned: true, settled: true, forceUnread: true, snoozedUntilMs: true })
+  .partial().strict()
+  .refine((patch) => Object.keys(patch).length > 0, '至少指定一个分拣字段');
+export type UpdateSessionTriageRequest = z.infer<typeof UpdateSessionTriageRequestSchema>;
+
+export const MarkSessionViewedRequestSchema = z.object({
+  throughTurnSeq: SessionTriageMetaSchema.shape.lastViewedTurnSeq.optional(),
+  observedUpdatedAt: SessionTriageMetaSchema.shape.updatedAt.optional(),
+}).strict();
+export type MarkSessionViewedRequest = z.infer<typeof MarkSessionViewedRequestSchema>;
+
+export const TriageStateResponseSchema = z.object({ sessions: z.array(SessionTriageStateSchema) });
+export type TriageStateResponse = z.infer<typeof TriageStateResponseSchema>;
+
+export const TriageCheckSnoozesResponseSchema = z.object({
+  expired: z.array(TriageSnoozeExpiredSchema),
+  sessions: z.array(SessionTriageStateSchema),
+});
+export type TriageCheckSnoozesResponse = z.infer<typeof TriageCheckSnoozesResponseSchema>;
 
 export const UpdateTaskStateRequestSchema = z.object({
   objective: z.string().max(2000).optional(),
@@ -503,6 +527,11 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
     event: z.enum(['opened', 'updated', 'exited', 'restarted', 'closed']),
   }),
   z.object({ op: z.literal('plugins_changed') }),
+  z.object({
+    op: z.literal('triage_updated'),
+    session: SessionTriageStateSchema,
+    event: TriageSnoozeExpiredSchema.optional(),
+  }),
   z.object({
     op: z.literal('pong'),
     ts: z.number(),

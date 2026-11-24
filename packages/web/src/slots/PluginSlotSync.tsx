@@ -1,5 +1,6 @@
 import {
   normalizeAnyPluginSlotKey,
+  TRIAGE_INBOX_PLUGIN_ID,
   type AnyPluginSlotKey,
   type ApprovalRequest,
   type Disposer,
@@ -27,11 +28,14 @@ import {
   TerminalWorkspaceDrawer,
 } from '../components/TerminalWorkspaceDrawer';
 import { TraitsPicker } from '../components/TraitsPicker';
+import { TriageSidebarBadge } from '../components/TriageInbox';
 import { resolveHarnessMeta, resolveHarnessOptionDescriptors } from '../lib/harness-meta';
 import { listPluginPanels } from '../lib/plugin-panels';
+import { isActivePlugin as isPluginActive, isTriageEnabled } from '../lib/triage';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry } from './hooks';
 import { SandboxedPluginFrame } from './SandboxedPluginFrame';
+import type { SlotRegistry } from './slot-registry';
 
 const V1_EVENT_LABELS = {
   'turn.completed': '完成',
@@ -188,8 +192,18 @@ function ApprovalAnnotationsDetail({ approval }: { approval: ApprovalRequest }) 
   );
 }
 
-function isPluginActive(plugin: InstalledPluginInfo): boolean {
-  return plugin.enabled && (!plugin.runtimeState || plugin.runtimeState === 'ACTIVE');
+export function registerTriageBadge(registry: SlotRegistry, plugins: InstalledPluginInfo[]): Disposer | undefined {
+  if (!isTriageEnabled(plugins)) return;
+  return registry.register({
+    slot: 'session.sidebar.badge',
+    id: 'triage-inbox',
+    pluginId: TRIAGE_INBOX_PLUGIN_ID,
+    pluginName: '会话待办与命令面板',
+    title: '会话待办状态',
+    order: 10,
+    sourceKind: 'builtin',
+    render: ({ session }) => <TriageSidebarBadge session={session} />,
+  });
 }
 
 function collectPluginIframeSlots(
@@ -213,6 +227,8 @@ export function PluginSlotSync() {
 
   useEffect(() => {
     const disposers: Disposer[] = [];
+    const triageBadge = registerTriageBadge(registry, plugins);
+    if (triageBadge) disposers.push(triageBadge);
 
     // Built-in chain adapter for approval risk annotations (P3 -> P4 UI integration)
     disposers.push(

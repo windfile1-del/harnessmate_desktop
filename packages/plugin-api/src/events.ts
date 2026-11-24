@@ -11,6 +11,7 @@ export interface PluginEventData {
   'approval.requested': { approvalId: string; toolName: string };
   'session.created': { title: string; harnessId: string };
   'session.closing': { title: string; harnessId: string };
+  'triage.snooze_expired': { snoozedUntilMs: number };
   'session.harness_switched': { previousHarnessId: string | null; targetHarnessId: string; driverId?: string; reason?: string };
   'handoff.delivered': { handoffId: string; toInstanceId: string; deliveryChannel: string; deliveryStatus: string };
   'plugin.state': { pluginId: string; state: PluginState; missingServices: readonly string[] };
@@ -101,6 +102,7 @@ export const pluginEventContracts = {
   'approval.requested': { mode: 'emit', permission: 'events:approval' },
   'session.created': { mode: 'serial', permission: 'session:read' },
   'session.closing': { mode: 'parallel', permission: 'session:read' },
+  'triage.snooze_expired': { mode: 'emit', permission: 'session:read' },
   'session.harness_switched': { mode: 'emit', permission: 'session:read' },
   'handoff.delivered': { mode: 'emit', permission: 'session:read' },
   'plugin.state': { mode: 'emit', permission: null },

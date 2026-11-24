@@ -3,6 +3,7 @@ import {
   PluginTurnEventSchema,
   isValidPluginPermission,
   type PluginAction,
+  type PluginCommand,
   type PluginProjection,
   type PluginTurnEvent,
 } from '@harnessmate/plugin-api';
@@ -24,7 +25,7 @@ export const SetPluginPermissionRequestSchema = z.object({
 export type SetPluginPermissionRequest = z.infer<typeof SetPluginPermissionRequestSchema>;
 
 export const RunPluginActionRequestSchema = z.object({
-  command: id, harnessId: z.string().min(1), args: z.string().max(12_000),
+  command: id, harnessId: z.string().min(1), args: z.string().max(12_000), pluginId: z.string().min(1).max(96).optional(),
 }).strict();
 export type RunPluginActionRequest = z.infer<typeof RunPluginActionRequestSchema>;
 
@@ -42,6 +43,7 @@ export interface PluginPermission {
 }
 
 export type SessionPluginAction = PluginAction & { pluginId: string; pluginName: string; reason?: string };
+export type SessionPluginCommand = PluginCommand & { pluginId: string; pluginName: string };
 
 export interface SessionModelPluginTools {
   count: number;

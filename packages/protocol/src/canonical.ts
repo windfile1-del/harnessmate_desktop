@@ -415,6 +415,39 @@ export const SessionSchema = z.object({
 });
 export type Session = z.infer<typeof SessionSchema>;
 
+export const TRIAGE_INBOX_PLUGIN_ID = 'hm.plugin.triage-inbox';
+const TriageIntegerSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
+export const SessionTriageMetaSchema = z.object({
+  sessionId: z.string(),
+  pinned: z.boolean(),
+  settled: z.boolean(),
+  forceUnread: z.boolean(),
+  lastViewedTurnSeq: TriageIntegerSchema,
+  snoozedUntilMs: TriageIntegerSchema.nullable(),
+  updatedAt: TriageIntegerSchema,
+});
+export type SessionTriageMeta = z.infer<typeof SessionTriageMetaSchema>;
+
+export const SessionTriageStateSchema = z.object({
+  sessionId: z.string(),
+  sessionSeq: TriageIntegerSchema,
+  status: SessionStatusSchema,
+  pendingApprovalCount: TriageIntegerSchema,
+  latestTurnSeq: TriageIntegerSchema,
+  hasRunningSubagents: z.boolean(),
+  meta: SessionTriageMetaSchema,
+});
+export type SessionTriageState = z.infer<typeof SessionTriageStateSchema>;
+
+export const TriageSnoozeExpiredSchema = z.object({
+  type: z.literal('triage.snooze_expired'),
+  sessionId: z.string(),
+  snoozedUntilMs: TriageIntegerSchema,
+  createdAt: TriageIntegerSchema,
+});
+export type TriageSnoozeExpired = z.infer<typeof TriageSnoozeExpiredSchema>;
+
 export const ApprovalAnnotationSchema = z.object({
   pluginId: z.string(),
   sourcePluginId: z.string().optional(),

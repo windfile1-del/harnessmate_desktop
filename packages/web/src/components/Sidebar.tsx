@@ -1,4 +1,5 @@
 import { useShallow } from 'zustand/react/shallow';
+import { useMemo, useState } from 'react';
 import {
   Activity,
   Command,
@@ -15,9 +16,12 @@ import {
   Trash2,
 } from 'lucide-react';
 import { formatRelativeTime, resolveHarnessMeta } from '../lib/harness-meta';
-import { Slot, useSlotItems } from '../slots';
+import { isImeComposing } from '../lib/ime';
+import { filterTriage, isTriageEnabled, isTriagePending, sortTriage, type TriageFilter } from '../lib/triage';
+import { Slot, SlotSessionProvider, useSlotItems } from '../slots';
 import { useAppStore } from '../stores/app-store';
 import { StarLoomCrest } from './BrandMark';
+import { TriageFilters } from './TriageInbox';
 
 export function Sidebar() {
   const {
@@ -28,6 +32,7 @@ export function Sidebar() {
     workspaces,
     sessions,
     plugins,
+    triageBySession,
     remoteStatus,
     selectedWorkspaceId,
     searchQuery,
@@ -46,6 +51,7 @@ export function Sidebar() {
     workspaces: state.workspaces,
     sessions: state.sessions,
     plugins: state.plugins,
+    triageBySession: state.triageBySession,
     remoteStatus: state.remoteStatus,
     selectedWorkspaceId: state.selectedWorkspaceId,
     searchQuery: state.searchQuery,
@@ -61,8 +67,11 @@ export function Sidebar() {
   const readyCount = harnesses.filter((h) => h.health === 'ready').length;
   const enabledPluginsCount = plugins.filter((p) => p.enabled).length;
   const activeDevicesCount = (remoteStatus?.pairedDevices ?? []).filter((d) => !d.revokedAt).length;
+  const triageEnabled = isTriageEnabled(plugins);
+  const [triageFilter, setTriageFilter] = useState<TriageFilter>('all');
+  const [showDeferred, setShowDeferred] = useState(false);
 
-  const filteredSessions = sessions.filter((s) => {
+  const matchingSessions = useMemo(() => sessions.filter((s) => {
     if (selectedWorkspaceId && s.workspaceId !== selectedWorkspaceId) return false;
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
@@ -76,7 +85,12 @@ export function Sidebar() {
       }
     }
     return true;
-  });
+  }), [sessions, selectedWorkspaceId, searchQuery]);
+  const triageRows = useMemo(() => triageEnabled ? sortTriage(matchingSessions, triageBySession) : [],
+    [triageEnabled, matchingSessions, triageBySession]);
+  const deferredCount = triageEnabled && triageFilter === 'all' ? filterTriage(triageRows, 'deferred').length : 0;
+  const orderedSessions = triageEnabled ? filterTriage(triageRows, triageFilter) : matchingSessions;
+  const filteredSessions = deferredCount && !showDeferred ? orderedSessions.slice(0, -deferredCount) : orderedSessions;
 
   const harnessById = new Map(harnesses.map((h) => [h.id, h]));
   const sidebarToolSlots = useSlotItems('sidebar.tools');
@@ -161,7 +175,7 @@ export function Sidebar() {
           <span>新建会话</span>
         </button>
 
-        <button
+        {triageEnabled && <button
           type="button"
           onClick={() => openModal('command_palette')}
           title="全局命令面板 (Ctrl+K)"
@@ -173,7 +187,7 @@ export function Sidebar() {
         >
           <Command size={12} />
           <span>K</span>
-        </button>
+        </button>}
       </div>
 
       {sidebarToolSlots.length > 0 && (
@@ -268,9 +282,11 @@ export function Sidebar() {
           )}
         </div>
 
+        {triageEnabled && <TriageFilters filter={triageFilter} onChange={setTriageFilter}
+          pendingCount={triageRows.filter(({ group }) => isTriagePending(group)).length} />}
         <div className="flex items-center justify-between px-1">
           <span className="text-[10.5px] font-medium uppercase tracking-widest text-[var(--text-muted)]">
-            统一任务会话 ({filteredSessions.length})
+            统一任务会话 ({orderedSessions.length})
           </span>
           <span className="text-[10px] text-[var(--text-muted)] opacity-80">
             多引擎共享
@@ -280,7 +296,7 @@ export function Sidebar() {
 
       {/* Sessions List */}
       <div className="flex-1 overflow-y-auto px-2.5 py-1">
-        {filteredSessions.length === 0 ? (
+        {orderedSessions.length === 0 ? (
           <div className="px-3 py-10 text-center">
             <p className="text-[12.5px] text-[var(--text-muted)]">暂无匹配的会话</p>
             <p className="mt-1 text-[11px] text-[var(--text-muted)] opacity-80">
@@ -312,7 +328,10 @@ export function Sidebar() {
                   role="button"
                   tabIndex={0}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') void selectSession(session.id);
+                    if (e.target === e.currentTarget && !isImeComposing(e, false) && (e.key === 'Enter' || e.key === ' ')) {
+                      e.preventDefault();
+                      void selectSession(session.id);
+                    }
                   }}
                   className="group relative flex cursor-pointer flex-col gap-1 rounded-xl px-3 py-2.5 transition-all"
                   style={{
@@ -329,7 +348,7 @@ export function Sidebar() {
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2">
-                      <span
+                      {!triageEnabled && <span
                         className={`mt-0.5 h-2 w-2 shrink-0 rounded-full ${
                           needsApproval || isRunning ? 'animate-pulse-halo' : ''
                         }`}
@@ -340,29 +359,28 @@ export function Sidebar() {
                               ? 'var(--accent-rose)'
                               : meta.accentColor,
                         }}
-                      />
+                      />}
                       <span className="truncate text-[12.6px] font-medium text-[var(--text-primary)]">
                         {session.title}
                       </span>
-                      <Slot
-                        name="session.sidebar.badge"
-                        slotProps={{ session }}
-                        compactErrors
-                        className="inline-flex shrink-0 items-center gap-1"
-                      />
                     </div>
-
-                    <button
-                      type="button"
-                      title="删除会话"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void deleteSession(session.id);
-                      }}
-                      className="opacity-0 transition-opacity group-hover:opacity-100 rounded p-0.5 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--accent-rose)]"
-                    >
-                      <Trash2 size={12.5} />
-                    </button>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <SlotSessionProvider session={session}>
+                        <Slot name="session.sidebar.badge" slotProps={{ session }} compactErrors
+                          className="inline-flex shrink-0 items-center gap-1" />
+                      </SlotSessionProvider>
+                      <button
+                        type="button"
+                        title="删除会话"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void deleteSession(session.id);
+                        }}
+                        className="opacity-0 transition-opacity group-hover:opacity-100 rounded p-0.5 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--accent-rose)]"
+                      >
+                        <Trash2 size={12.5} />
+                      </button>
+                    </div>
                   </div>
 
                   <div className="flex items-center justify-between gap-2 pl-4 text-[11px] text-[var(--text-muted)]">
@@ -419,6 +437,12 @@ export function Sidebar() {
               );
             })}
           </div>
+        )}
+        {deferredCount > 0 && (
+          <button type="button" aria-expanded={showDeferred} onClick={() => setShowDeferred(!showDeferred)}
+            className="my-1 w-full rounded-lg px-3 py-1.5 text-left text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]">
+            {showDeferred ? '收起已延后' : '展开已延后'} ({deferredCount})
+          </button>
         )}
       </div>
 

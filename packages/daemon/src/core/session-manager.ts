@@ -1432,7 +1432,8 @@ export class SessionManager {
       if (!session || !capabilities) throw new Error('会话或插件动作服务不存在');
       if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
       if (session.status === 'archived') throw new Error('会话已归档');
-      const entry = capabilities.listActions(session).find(({ action }) => action.command === req.command);
+      const entry = capabilities.listActions(session).find(({ action, plugin }) =>
+        action.command === req.command && (!req.pluginId || plugin.id === req.pluginId));
       if (entry) {
         if (!entry.granted) throw new Error('请在插件中心授权当前工作区');
         const { action, plugin } = entry;
@@ -1442,9 +1443,10 @@ export class SessionManager {
         if (action.args !== undefined && req.args.trim()) throw new Error(`请单独发送 /${action.command}，该动作使用插件配置的参数`);
         return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId });
       }
-      const isolatedCmd = this.pluginManager.isolated?.listCommands().find(({ command }) => command === req.command);
+      const isolatedCmd = this.pluginManager.isolated?.listCommands().find(({ command, pluginId }) =>
+        command === req.command && (!req.pluginId || pluginId === req.pluginId));
       if (!isolatedCmd) throw new Error('找不到已启用的插件动作');
-      const result = await this.pluginManager.isolated!.runCommand(session, req.command, req.args, isolatedCmd.runId);
+      const result = await this.pluginManager.isolated!.runCommand(session, req.command, req.args, isolatedCmd.runId, isolatedCmd.pluginId);
       if (result.kind === 'message') return { output: result.text, session };
       if (result.kind === 'compose') return { output: result.text, session };
       if (result.kind === 'native') {

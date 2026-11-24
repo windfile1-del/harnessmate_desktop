@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { dump, load, JSON_SCHEMA } from 'js-yaml';
 import { z } from 'zod';
 import { PluginApiError } from '@harnessmate/plugin-api';
+import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,95}$/);
 const entrySchema = z.object({
@@ -66,6 +67,7 @@ const OPTIONAL_BUILTIN_PLUGINS = new Set<string>([
   'hm.plugin.multi-harness-orchestrator',
   'hm.plugin.context-compression',
   'hm.plugin.terminal-workspace',
+  TRIAGE_INBOX_PLUGIN_ID,
 ]);
 const stableIds: Record<string, string> = {
   'core.task-ledger': 'ledger', 'core.context-bridge': 'handoff', 'core.git-inspector': 'git',

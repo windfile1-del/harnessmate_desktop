@@ -6,6 +6,12 @@ type AttentionListener = (item: AttentionItem) => void;
 export class DaemonEventBus {
   private readonly sessionListeners = new Map<string, Set<SessionListener>>();
   private readonly attentionListeners = new Set<AttentionListener>();
+  private readonly eventListeners = new Set<SessionListener>();
+
+  subscribeEvents(listener: SessionListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
 
   subscribeSession(sessionId: string, listener: SessionListener): () => void {
     let set = this.sessionListeners.get(sessionId);
@@ -31,14 +37,15 @@ export class DaemonEventBus {
 
   publishEvent(event: CanonicalEvent): void {
     const set = this.sessionListeners.get(event.sessionId);
-    if (!set) return;
-    for (const listener of set) {
+    const dispatch = (listener: SessionListener) => {
       try {
         listener(event);
       } catch {
         // isolate subscriber failures
       }
-    }
+    };
+    this.eventListeners.forEach(dispatch);
+    set?.forEach(dispatch);
   }
 
   publishAttention(item: AttentionItem): void {

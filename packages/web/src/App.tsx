@@ -1,9 +1,13 @@
 import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { ChatStage } from './components/ChatStage';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
+import { TriageInboxLifecycle, openTriageSession } from './components/TriageInbox';
+import { isImeComposing, trackComposition } from './lib/ime';
+import { isTriageEnabled } from './lib/triage';
+import { handleTriageShortcut } from './lib/triage-shortcuts';
 import {
   PluginSlotSync,
   Slot,
@@ -30,6 +34,8 @@ function StatusbarSlotStrip({ session }: { session: import('@harnessmate/protoco
 }
 
 export function App() {
+  const triageEnabled = useAppStore((state) => isTriageEnabled(state.plugins));
+  const composing = useRef(false);
   const {
     init,
     sessions,
@@ -65,13 +71,34 @@ export function App() {
     void init();
   }, [init]);
 
+  useEffect(() => trackComposition(window, composing), []);
+
+  useEffect(() => {
+    if (!triageEnabled) {
+      if (useAppStore.getState().activeModal === 'command_palette') openModal(null);
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      const state = useAppStore.getState();
+      handleTriageShortcut(event, composing.current, {
+        modal: state.activeModal,
+        sessions: state.sessions,
+        triage: state.triageBySession,
+        selectedSessionId: state.selectedSessionId,
+        openPalette: state.openCommandPalette,
+        closePalette: () => state.openModal(null),
+        selectSession: (session) => { void openTriageSession(session); },
+      });
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [triageEnabled, openModal]);
+
   // Keyboard-first shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        openModal(activeModal === 'command_palette' ? null : 'command_palette');
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+      if (e.defaultPrevented || isImeComposing(e, composing.current)) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
         e.preventDefault();
         openModal('new_session');
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
@@ -92,6 +119,7 @@ export function App() {
     <SlotRegistryProvider>
       <SlotSessionProvider session={selectedSession}>
         <PluginSlotSync />
+        {triageEnabled && <TriageInboxLifecycle />}
         <div className="flex h-screen w-screen flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {!sidebarCollapsed && <Sidebar />}

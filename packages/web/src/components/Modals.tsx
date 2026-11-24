@@ -16,16 +16,17 @@ import {
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { useEffect, useState, type ReactNode } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { formatRelativeTime, PERMISSION_MODE_LABELS } from '../lib/harness-meta';
 import { Slot } from '../slots';
 import { useAppStore } from '../stores/app-store';
 import { RiskRulesModal } from './ApprovalCenter';
 import { HarnessBadge } from './BrandMark';
+import { CommandPaletteModal, KeyboardShortcuts } from './CommandPalette';
 import { ModelPicker } from './ModelPicker';
 import { MergeBackReviewModal } from './OrchestratorBoard';
 import { SessionExplorerModal } from './SessionExplorerModal';
 import {
-  CommandPaletteModal,
   ContextPreviewModal,
   HandoffModal,
   McpHubModal,
@@ -35,7 +36,11 @@ import {
 import { WorktreeManagerModal } from './WorktreeManagerModal';
 
 export function ModalHost() {
-  const { activeModal, openModal } = useAppStore();
+  const { activeModal, openModal, paletteInitialQuery } = useAppStore(useShallow((state) => ({
+    activeModal: state.activeModal,
+    openModal: state.openModal,
+    paletteInitialQuery: state.paletteInitialQuery,
+  })));
   if (!activeModal) return null;
 
   const isWide =
@@ -76,7 +81,10 @@ export function ModalHost() {
         {activeModal === 'context_preview' && (
           <ContextPreviewModal onClose={() => openModal(null)} />
         )}
-        {activeModal === 'command_palette' && <CommandPaletteModal onClose={() => openModal(null)} />}
+        {activeModal === 'command_palette' && (
+          <CommandPaletteModal key={paletteInitialQuery} initialQuery={paletteInitialQuery} onClose={() => openModal(null)} />
+        )}
+        {activeModal === 'keyboard_shortcuts' && <KeyboardShortcuts onClose={() => openModal(null)} />}
         {activeModal === 'worktrees' && <WorktreeManagerModal onClose={() => openModal(null)} />}
         {activeModal === 'session_explorer' && <SessionExplorerModal onClose={() => openModal(null)} />}
         {activeModal === 'risk_rules' && <RiskRulesModal onClose={() => openModal(null)} />}

@@ -53,6 +53,7 @@ import type {
   ImportNativeSessionRequest,
   ImportSessionBundleRequest,
   ManualCompressRequest,
+  MarkSessionViewedRequest,
   McpServerEntry,
   MergeBackRequest,
   MergeBackResult,
@@ -83,9 +84,11 @@ import type {
   SubagentMergeBackResult,
   SubagentRunRecord,
   SessionPluginAction,
+  SessionPluginCommand,
   SessionSearchResponse,
   SetPluginPermissionRequest,
   SessionTaskState,
+  SessionTriageState,
   SideChatMessage,
   SideChatPromoteRequest,
   SideChatRequest,
@@ -97,12 +100,15 @@ import type {
   SwitchHarnessRequest,
   TerminalContextChip,
   ToggleMcpServerRequest,
+  TriageCheckSnoozesResponse,
+  TriageStateResponse,
   TrustSetupScriptRequest,
   TurnBlockRecord,
   TurnOptionsMap,
   UpdateCompressionConfigRequest,
   UpdatePluginRegistryConfigRequest,
   UpdateSessionRequest,
+  UpdateSessionTriageRequest,
   UpdateTaskStateRequest,
   UploadAttachmentRequest,
   Workspace,
@@ -333,6 +339,19 @@ export const daemonApi = {
       method: 'POST',
       body: JSON.stringify(req),
     }),
+
+  getTriageState: (signal?: AbortSignal) =>
+    apiFetch<TriageStateResponse>('/api/v1/triage/state', { signal }),
+  updateSessionTriage: (id: string, patch: UpdateSessionTriageRequest) =>
+    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: JSON.stringify(patch),
+    }),
+  markSessionViewed: (id: string, request: MarkSessionViewedRequest, signal?: AbortSignal) =>
+    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}/viewed`, {
+      method: 'POST', body: JSON.stringify(request), signal,
+    }),
+  checkTriageSnoozes: (signal?: AbortSignal) =>
+    apiFetch<TriageCheckSnoozesResponse>('/api/v1/triage/check-snoozes', { method: 'POST', signal }),
 
   // Plugins
   listPlugins: () => apiFetch<PluginBundleResponse>('/api/v1/plugins'),
@@ -654,9 +673,9 @@ export const daemonApi = {
     );
   },
 
-  getHarnessCommands: (id: string) =>
-    apiFetch<{ commands: HarnessCommandInfo[]; pluginActions: SessionPluginAction[]; modelTools: SessionModelPluginTools }>(
-      `/api/v1/sessions/${encodeURIComponent(id)}/commands`),
+  getHarnessCommands: (id: string, signal?: AbortSignal) =>
+    apiFetch<{ commands: HarnessCommandInfo[]; pluginActions: SessionPluginAction[]; pluginCommands?: SessionPluginCommand[]; modelTools: SessionModelPluginTools }>(
+      `/api/v1/sessions/${encodeURIComponent(id)}/commands`, { signal }),
 
   runHarnessCommand: (id: string, req: RunHarnessCommandRequest) =>
     apiFetch<HarnessCommandResult>(`/api/v1/sessions/${encodeURIComponent(id)}/commands`, {

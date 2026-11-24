@@ -40,6 +40,7 @@ for (const name of ['plugin-api', 'plugin-sdk']) {
 const daemon = 'packages/daemon/src';
 const producers = {
   'session.created': 'core/session-manager.ts', 'session.closing': 'core/session-manager.ts',
+  'triage.snooze_expired': 'core/triage-inbox-service.ts',
   'plugin.state': 'plugin-host/runtime/lifecycle.ts',
   'handoff.compose': 'core/context-compiler.ts',
   'handoff.shouldOffer': 'core/session-manager.ts',

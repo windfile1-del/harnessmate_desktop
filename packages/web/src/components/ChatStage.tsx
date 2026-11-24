@@ -1401,6 +1401,7 @@ export function ChatStage() {
 
             <textarea
               ref={textareaRef}
+              data-session-composer
               rows={1}
               value={inputText}
               onChange={(e) => handleInputChange(e.target.value)}

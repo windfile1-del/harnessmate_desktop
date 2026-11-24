@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
-import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
+import { TRIAGE_INBOX_PLUGIN_ID, type Attachment, type SessionTaskState } from '@harnessmate/protocol';
 import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
 import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointService } from '../../core/checkpoint-service.js';
@@ -39,6 +39,8 @@ import {
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
 import { TerminalWorkspaceService } from '../../core/terminal-workspace-service.js';
+import type { TriageInboxService } from '../../core/triage-inbox-service.js';
+import type { DaemonEventBus } from '../../core/event-bus.js';
 import { UsageService } from '../../core/usage-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { AcpAdapter } from '../../harnesses/acp-adapter.js';
@@ -97,7 +99,8 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   events: () => PluginEvents,
   overrides: readonly HarnessAdapter[] = [],
   collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
-  terminalWorkspace?: TerminalWorkspaceService) {
+  terminalWorkspace?: TerminalWorkspaceService,
+  triage?: { service: TriageInboxService; bus: DaemonEventBus }) {
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
   const adapterPlugin = (id: string, create: () => HarnessAdapter) => {
     const service = `harness.${id}`;
@@ -351,6 +354,13 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.effect(() => () => {
         void svc.onPluginDisabled().catch(() => {});
       });
+    },
+  });
+  if (triage) plugins.set(TRIAGE_INBOX_PLUGIN_ID, {
+    provides: ['triage-inbox'],
+    apply(ctx) {
+      ctx.provide('triage-inbox', triage.service);
+      ctx.effect(() => triage.service.start(triage.bus));
     },
   });
   return plugins;

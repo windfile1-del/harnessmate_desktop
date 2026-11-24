@@ -68,6 +68,10 @@ export class WsGateway {
     for (const ws of this.localSockets) this.send(ws, { op: 'plugins_changed' });
   }
 
+  notifyTriage(frame: Extract<WsServerFrame, { op: 'triage_updated' }>): void {
+    for (const ws of this.localSockets) this.send(ws, frame);
+  }
+
   close(): void {
     for (const client of this.wss.clients) {
       client.close(1001, 'Daemon shutting down');

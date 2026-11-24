@@ -763,6 +763,9 @@ export interface PluginEventData {
         title: string;
         harnessId: string;
     };
+    'triage.snooze_expired': {
+        snoozedUntilMs: number;
+    };
     'session.harness_switched': {
         previousHarnessId: string | null;
         targetHarnessId: string;
@@ -884,6 +887,10 @@ export declare const pluginEventContracts: {
     };
     readonly 'session.closing': {
         readonly mode: "parallel";
+        readonly permission: "session:read";
+    };
+    readonly 'triage.snooze_expired': {
+        readonly mode: "emit";
         readonly permission: "session:read";
     };
     readonly 'session.harness_switched': {

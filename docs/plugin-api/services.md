@@ -19,6 +19,7 @@
 - `orchestrator`
 - `session-search`
 - `terminal-workspace`
+- `triage-inbox`
 - `usage`
 
 ## 交接配置
