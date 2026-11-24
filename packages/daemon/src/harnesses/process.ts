@@ -100,13 +100,73 @@ function preferWindowsRunnable(filePath: string): string {
   return filePath;
 }
 
+export const DEFAULT_STRIP_ENV_KEYS = [
+  'HARNESSMATE_LOCAL_TOKEN',
+  'HARNESSMATE_DATA_DIR',
+  'HARNESSMATE_SESSION_MCP_TOKEN',
+] as const;
+
+function buildChildEnv(
+  envOverrides?: Record<string, string | undefined>,
+  unsetEnv?: readonly string[],
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  const deleteCaseInsensitive = (targetKey: string) => {
+    if (!targetKey) return;
+    delete env[targetKey];
+    if (process.platform === 'win32') {
+      const lower = targetKey.toLowerCase();
+      for (const existing of Object.keys(env)) {
+        if (existing.toLowerCase() === lower) {
+          delete env[existing];
+        }
+      }
+    }
+  };
+
+  for (const key of DEFAULT_STRIP_ENV_KEYS) {
+    deleteCaseInsensitive(key);
+  }
+  if (unsetEnv) {
+    for (const key of unsetEnv) {
+      deleteCaseInsensitive(key);
+    }
+  }
+  if (envOverrides) {
+    for (const [key, value] of Object.entries(envOverrides)) {
+      if (!key) continue;
+      if (value === undefined) {
+        deleteCaseInsensitive(key);
+      } else {
+        deleteCaseInsensitive(key);
+        env[key] = value;
+      }
+    }
+  }
+  return env;
+}
+
+export interface SpawnCliProcessOptions {
+  cwd: string;
+  env?: Record<string, string | undefined>;
+  unsetEnv?: readonly string[];
+  detached?: boolean;
+}
+
 export function spawnCliProcess(
   binaryPath: string,
   args: string[],
-  opts: { cwd: string; env?: Record<string, string | undefined> },
+  opts: SpawnCliProcessOptions,
 ): ChildProcess {
   const runnable = preferWindowsRunnable(binaryPath);
-  const env = { ...process.env, ...opts.env };
+  const env = buildChildEnv(opts.env, opts.unsetEnv);
+  const detached = opts.detached ?? process.platform !== 'win32';
 
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(runnable)) {
     // Use cmd.exe /d /s /c with properly quoted arguments to avoid broken piping
@@ -125,6 +185,7 @@ export function spawnCliProcess(
     cwd: opts.cwd,
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
+    detached,
     windowsHide: true,
   });
 }
@@ -135,18 +196,30 @@ function quoteCmdArg(arg: string): string {
   return `"${arg.replace(/"/g, '""')}"`;
 }
 
+export interface ExecCliQuickOptions {
+  cwd?: string;
+  input?: string;
+  signal?: AbortSignal;
+  env?: Record<string, string | undefined>;
+  unsetEnv?: readonly string[];
+}
+
 export async function execCliQuick(
   binaryPath: string,
   args: string[],
   timeoutMs = 8000,
-  opts: { cwd?: string; input?: string; signal?: AbortSignal } = {},
+  opts: ExecCliQuickOptions = {},
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve) => {
     if (opts.signal?.aborted) {
       resolve({ stdout: '', stderr: 'Cancelled', exitCode: -1 });
       return;
     }
-    const child = spawnCliProcess(binaryPath, args, { cwd: opts.cwd ?? process.cwd() });
+    const child = spawnCliProcess(binaryPath, args, {
+      cwd: opts.cwd ?? process.cwd(),
+      env: opts.env,
+      unsetEnv: opts.unsetEnv,
+    });
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -192,7 +265,7 @@ export async function execCliQuick(
 }
 
 export async function killProcessTree(child: ChildProcess): Promise<void> {
-  if (!child.pid || child.killed || child.exitCode !== null) return;
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
   try {
     if (process.platform === 'win32') {
       await execFileAsync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
@@ -200,17 +273,36 @@ export async function killProcessTree(child: ChildProcess): Promise<void> {
         windowsHide: true,
       });
     } else {
-      child.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 400));
-      if (child.exitCode === null) {
-        child.kill('SIGKILL');
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch {
+        child.kill('SIGTERM');
+      }
+      const deadline = Date.now() + 400;
+      while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          child.kill('SIGKILL');
+        }
       }
     }
   } catch {
     try {
-      child.kill('SIGKILL');
+      if (process.platform !== 'win32' && child.pid) {
+        process.kill(-child.pid, 'SIGKILL');
+      } else {
+        child.kill('SIGKILL');
+      }
     } catch {
-      // Already exited
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already exited
+      }
     }
   }
 }

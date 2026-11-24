@@ -1,6 +1,12 @@
 import { execCliQuick } from './process.js';
 import type { AdapterSessionConfig } from './types.js';
 
+export interface AgyCommandExecutionOptions {
+  env?: Record<string, string | undefined>;
+  unsetEnv?: readonly string[];
+  appDataDir?: string;
+}
+
 interface AgyCliResult {
   conversation_id?: string;
   status?: string;
@@ -9,9 +15,21 @@ interface AgyCliResult {
   command?: { name?: string; data?: unknown };
 }
 
-export async function inspectAgyCommand(binary: string, cwd: string, command: '/usage' | '/skills'): Promise<unknown> {
-  const result = await execCliQuick(binary, ['-p', command, '--output-format', 'json', '--print-timeout', '20s'],
-    25_000, { cwd });
+export async function inspectAgyCommand(
+  binary: string,
+  cwd: string,
+  command: '/usage' | '/skills',
+  opts?: AgyCommandExecutionOptions,
+): Promise<unknown> {
+  const args = ['-p', command, '--output-format', 'json', '--print-timeout', '20s'];
+  if (opts?.appDataDir?.trim()) {
+    args.push('--app-data-dir', opts.appDataDir.trim());
+  }
+  const result = await execCliQuick(binary, args, 25_000, {
+    cwd,
+    env: opts?.env,
+    unsetEnv: opts?.unsetEnv,
+  });
   const parsed = parseResult(result.stdout);
   if (result.exitCode !== 0 || parsed?.command?.name !== command.slice(1)) {
     throw new Error(parsed?.error || result.stderr.trim() || `AGY 未返回 ${command} 的结构化结果`);
@@ -20,7 +38,12 @@ export async function inspectAgyCommand(binary: string, cwd: string, command: '/
 }
 
 export async function runAgyCommand(
-  binary: string, config: AdapterSessionConfig, command: string, nativeSessionId: string | null, signal: AbortSignal,
+  binary: string,
+  config: AdapterSessionConfig,
+  command: string,
+  nativeSessionId: string | null,
+  signal: AbortSignal,
+  opts?: AgyCommandExecutionOptions,
 ): Promise<AgyCliResult> {
   const compact = command === '/compact';
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(binary)) {
@@ -29,6 +52,9 @@ export async function runAgyCommand(
   const inputFormat = compact ? ['-p', command, '--output-format', 'json']
     : ['--input-format', 'stream-json', '--output-format', 'stream-json'];
   const args = [...inputFormat, '--print-timeout', '15m', '--settings', '{"disableSlashCommands":false}'];
+  if (opts?.appDataDir?.trim()) {
+    args.push('--app-data-dir', opts.appDataDir.trim());
+  }
   if (nativeSessionId) args.push('--conversation', nativeSessionId);
   if (compact || config.permissionMode === 'plan') args.push('--mode', 'plan');
   else if (config.permissionMode === 'accept_edits') args.push('--mode', 'accept-edits');
@@ -38,7 +64,10 @@ export async function runAgyCommand(
     args.push('--effort', config.reasoningEffort);
   }
   const result = await execCliQuick(binary, args, 15 * 60_000 + 10_000, {
-    cwd: config.cwd, signal,
+    cwd: config.cwd,
+    signal,
+    env: opts?.env,
+    unsetEnv: opts?.unsetEnv,
     input: compact ? undefined : JSON.stringify({ event: 'user', message: { content: command } }) + '\n',
   });
   const parsed = parseResult(result.stdout);

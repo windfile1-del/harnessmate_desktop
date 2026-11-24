@@ -1,6 +1,20 @@
 import type { ChildProcess } from 'node:child_process';
 import { ResilientJsonLineParser, killProcessTree } from './process.js';
 
+export class JsonRpcResponseError extends Error {
+  readonly code?: number;
+  readonly data?: unknown;
+  readonly method: string;
+
+  constructor(message: string, code?: number, data?: unknown, method = '') {
+    super(message);
+    this.name = 'JsonRpcResponseError';
+    this.code = code;
+    this.data = data;
+    this.method = method;
+  }
+}
+
 export interface JsonRpcServerRequest {
   id: string | number;
   method: string;
@@ -12,6 +26,7 @@ export interface JsonRpcHandlers {
   onServerRequest: (req: JsonRpcServerRequest) => void;
   onDiagnostic: (stream: 'stdout' | 'stderr' | 'protocol', message: string) => void;
   onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
+  onMessageActivity?: (msg: Record<string, unknown>) => void;
 }
 
 interface PendingRequest {
@@ -26,6 +41,7 @@ export class StdioJsonRpcClient {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly parser: ResilientJsonLineParser;
   private disposed = false;
+  private _lastIncomingMessageAt = Date.now();
 
   constructor(
     private readonly child: ChildProcess,
@@ -35,6 +51,10 @@ export class StdioJsonRpcClient {
       (msg) => this.handleMessage(msg),
       (noise) => this.handlers.onDiagnostic('stdout', noise),
     );
+
+    child.stdin?.on('error', (err) => {
+      this.handlers.onDiagnostic('protocol', `CLI stdin error: ${err.message}`);
+    });
 
     child.stdout?.on('data', (chunk: Buffer) => {
       this.parser.feed(chunk);
@@ -63,6 +83,10 @@ export class StdioJsonRpcClient {
     });
   }
 
+  get lastIncomingMessageAt(): number {
+    return this._lastIncomingMessageAt;
+  }
+
   request<T = unknown>(method: string, params?: unknown, timeoutMs = 60_000): Promise<T> {
     if (this.disposed) {
       return Promise.reject(new Error(`JSON-RPC client disposed before calling ${method}`));
@@ -82,12 +106,17 @@ export class StdioJsonRpcClient {
         method,
       });
 
-      this.writeLine({
+      const ok = this.writeLine({
         jsonrpc: '2.0',
         id,
         method,
         ...(params !== undefined ? { params } : {}),
       });
+      if (!ok) {
+        clearTimeout(timer);
+        this.pending.delete(key);
+        reject(new Error(`Cannot send JSON-RPC request "${method}": CLI stdin is closed`));
+      }
     });
   }
 
@@ -130,15 +159,28 @@ export class StdioJsonRpcClient {
     await killProcessTree(this.child);
   }
 
-  private writeLine(payload: Record<string, unknown>): void {
-    if (!this.child.stdin || this.child.stdin.destroyed) {
+  private writeLine(payload: Record<string, unknown>): boolean {
+    const stdin = this.child.stdin;
+    if (!stdin || stdin.destroyed || stdin.writableEnded) {
       this.handlers.onDiagnostic('protocol', 'Cannot write to CLI stdin (stream closed)');
-      return;
+      return false;
     }
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`, 'utf8');
+    try {
+      stdin.write(`${JSON.stringify(payload)}\n`, 'utf8');
+      return true;
+    } catch (err) {
+      this.handlers.onDiagnostic(
+        'protocol',
+        `Cannot write to CLI stdin: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
   }
 
   private handleMessage(msg: Record<string, unknown>): void {
+    this._lastIncomingMessageAt = Date.now();
+    this.handlers.onMessageActivity?.(msg);
+
     const hasId = msg.id !== undefined && msg.id !== null;
     const hasMethod = typeof msg.method === 'string';
 
@@ -151,9 +193,14 @@ export class StdioJsonRpcClient {
       clearTimeout(entry.timer);
 
       if (msg.error && typeof msg.error === 'object') {
-        const errObj = msg.error as { message?: string; code?: number };
+        const errObj = msg.error as { message?: string; code?: number; data?: unknown };
         entry.reject(
-          new Error(errObj.message || `JSON-RPC error (${errObj.code ?? 'unknown'}) on ${entry.method}`),
+          new JsonRpcResponseError(
+            errObj.message || `JSON-RPC error (${errObj.code ?? 'unknown'}) on ${entry.method}`,
+            typeof errObj.code === 'number' ? errObj.code : undefined,
+            errObj.data,
+            entry.method,
+          ),
         );
       } else {
         entry.resolve(msg.result);
