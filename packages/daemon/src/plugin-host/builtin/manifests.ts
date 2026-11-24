@@ -154,6 +154,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '基于水位线增量同步与协议原生注入（Codex inject_items / AGY embeddedContext / Claude sysfile），实现单会话内多引擎无缝切换。',
     author: 'HarnessMate Core',
     category: 'workflow',
+    optional: ['compressor'],
     contributes: { uiSlots: ['composer_action', 'inspector_tab'], hooks: ['before_turn'] },
   },
   {
@@ -203,5 +204,16 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     optional: ['ledger'],
     permissions: ['session:orchestrate', 'workspace:git:write', 'tools:model'],
     contributes: { uiSlots: ['inspector_tab', 'modal'] },
+  },
+  {
+    id: 'hm.plugin.context-compression',
+    name: 'AI 上下文压缩与符号索引',
+    version: '1.0.0',
+    description: '提供纯本地零费用多语言符号轮廓索引、分块增量摘要缓存（可选外置引擎，含 8s 超时与预算熔断）及防幻觉路径校验（官方可选插件）。',
+    author: 'HarnessMate Core',
+    category: 'workflow',
+    provides: ['compressor'],
+    permissions: ['session:read', 'fs:workspace:read', 'context:compressor'],
+    contributes: { uiSlots: ['inspector_tab'] },
   },
 ];

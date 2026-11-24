@@ -6,6 +6,7 @@
 
 - `approval-center`
 - `checkpoints`
+- `compressor`
 - `failover`
 - `git`
 - `handoff`

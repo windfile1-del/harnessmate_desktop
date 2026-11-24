@@ -62,7 +62,10 @@ function writeAtomic(file: string, content: string): void {
 }
 
 const defaultBundle = 'harnessmate-core';
-const OPTIONAL_BUILTIN_PLUGINS = new Set<string>(['hm.plugin.multi-harness-orchestrator']);
+const OPTIONAL_BUILTIN_PLUGINS = new Set<string>([
+  'hm.plugin.multi-harness-orchestrator',
+  'hm.plugin.context-compression',
+]);
 const stableIds: Record<string, string> = {
   'core.task-ledger': 'ledger', 'core.context-bridge': 'handoff', 'core.git-inspector': 'git',
   'core.account-usage': 'usage', 'core.harness.codex': 'harness-codex', 'core.harness.claude': 'harness-claude',

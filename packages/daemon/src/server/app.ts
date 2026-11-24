@@ -29,6 +29,7 @@ import {
   ImportSessionBundleRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
+  ManualCompressRequestSchema,
   MergeBackRequestSchema,
   MergeSubagentRequestSchema,
   PROTOCOL_VERSION,
@@ -46,6 +47,7 @@ import {
   ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
   TrustSetupScriptRequestSchema,
+  UpdateCompressionConfigRequestSchema,
   UpdatePluginRegistryConfigRequestSchema,
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
@@ -86,6 +88,10 @@ import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
 import type { UsageService } from '../core/usage-service.js';
 import type { FailoverCoordinator } from '../core/failover-service.js';
+import {
+  CONTEXT_COMPRESSION_PLUGIN_ID,
+  ContextCompressionError,
+} from '../core/context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
@@ -1426,6 +1432,93 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const status = code === 'E_WORKTREE_BUSY' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
       return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
     }
+  });
+
+  // ── AI Context Compression & Symbol Index ─────────────────────────────
+
+  app.get('/api/v1/sessions/:id/compression', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
+    try {
+      return await sessionManager.getContextCompressionService().getSessionStatus(id);
+    } catch (err) {
+      const code = err instanceof ContextCompressionError ? err.code : 'E_COMPRESSION_STATUS_FAILED';
+      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/compression/compress', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    if (!pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID)) {
+      return reply.code(409).send({
+        error: '上下文压缩与符号索引插件当前未启用，请先在插件管理中启用。',
+        code: 'E_PLUGIN_DISABLED',
+      });
+    }
+    const parsed = ManualCompressRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid compression payload' });
+    }
+    try {
+      const svc = sessionManager.getContextCompressionService();
+      const fromSeq = parsed.data.fromSeq ?? 1;
+      const toSeq = parsed.data.toSeq ?? session.lastSeq;
+      const budgetChars = parsed.data.budgetChars ?? 6_000;
+      const result = await svc.compressRange(id, fromSeq, toSeq, budgetChars, {
+        forceRecompute: parsed.data.forceRecompute,
+      });
+      const status = await svc.getSessionStatus(id);
+      return { result, status };
+    } catch (err) {
+      const code = err instanceof ContextCompressionError ? err.code : 'E_COMPRESS_FAILED';
+      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.delete('/api/v1/sessions/:id/compression/cache', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
+    try {
+      const svc = sessionManager.getContextCompressionService();
+      const cleared = svc.clearSessionCache(id);
+      const status = await svc.getSessionStatus(id);
+      return { ...cleared, status };
+    } catch (err) {
+      const code = err instanceof ContextCompressionError ? err.code : 'E_CACHE_CLEAR_FAILED';
+      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+    }
+  });
+
+  app.get('/api/v1/compression/config', async () => {
+    const svc = sessionManager.getContextCompressionService();
+    return {
+      enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
+      config: svc.getConfig(),
+    };
+  });
+
+  app.put('/api/v1/compression/config', async (request, reply) => {
+    const parsed = UpdateCompressionConfigRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid compression config' });
+    }
+    const svc = sessionManager.getContextCompressionService();
+    const config = svc.updateConfig(parsed.data);
+    return {
+      enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
+      config,
+    };
   });
 
   app.get('/api/v1/sessions/:id/side-chat', async (request, reply) => {

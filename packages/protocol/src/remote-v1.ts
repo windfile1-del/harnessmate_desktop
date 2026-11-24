@@ -513,3 +513,27 @@ export const MergeSubagentRequestSchema = z.object({
   commitMessage: z.string().trim().min(1).max(240).optional(),
 });
 export type MergeSubagentRequest = z.infer<typeof MergeSubagentRequestSchema>;
+
+// ── Context Compression & Symbol Index REST Schemas ─────────────────────
+
+export const ManualCompressRequestSchema = z.object({
+  fromSeq: z.number().int().min(0).optional(),
+  toSeq: z.number().int().min(0).optional(),
+  budgetChars: z.number().int().min(400).max(200_000).optional(),
+  forceRecompute: z.boolean().optional(),
+  includeSymbolOutline: z.boolean().optional(),
+});
+export type ManualCompressRequest = z.infer<typeof ManualCompressRequestSchema>;
+
+export const UpdateCompressionConfigRequestSchema = z.object({
+  summarizerInstanceId: z.string().trim().min(1).max(128).nullable().optional(),
+  summarizerModel: z.string().trim().min(1).max(128).nullable().optional(),
+  dailyCallLimit: z.number().int().min(0).max(10_000).optional(),
+  sessionTokenBudgetCap: z.number().int().min(1_000).max(5_000_000).optional(),
+  timeoutMs: z.number().int().min(100).max(60_000).optional(),
+  chunkSizeTurns: z.number().int().min(2).max(50).optional(),
+  rollupTurnThreshold: z.number().int().min(5).max(500).optional(),
+  backgroundRollupEnabled: z.boolean().optional(),
+  symbolOutlineMaxChars: z.number().int().min(500).max(20_000).optional(),
+});
+export type UpdateCompressionConfigRequest = z.infer<typeof UpdateCompressionConfigRequestSchema>;

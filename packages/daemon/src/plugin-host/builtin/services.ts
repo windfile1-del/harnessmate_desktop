@@ -4,6 +4,10 @@ import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
 import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
 import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointService } from '../../core/checkpoint-service.js';
+import {
+  ContextCompressionService,
+  type ContextCompressorProvider,
+} from '../../core/context-compression-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { FailoverCoordinator } from '../../core/failover-service.js';
 import { OrchestratorService } from '../../core/orchestrator-service.js';
@@ -165,7 +169,16 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.host?.setRegistryBridge(registry);
       const ledger = ctx.get<TaskLedgerService>('ledger')!;
       const options = handoffConfigSchema.parse(settings);
-      const compiler = new ContextCompiler(store, ledger, options, (cwd) => ctx.get<GitService>('git')?.status(cwd), events(), collectIsolatedSections);
+      const compiler = new ContextCompiler(
+        store,
+        ledger,
+        options,
+        (cwd) => ctx.get<GitService>('git')?.status(cwd),
+        events(),
+        collectIsolatedSections,
+        undefined,
+        () => ctx.get<ContextCompressorProvider>('compressor'),
+      );
       const baseCompile = compiler.compile.bind(compiler);
       compiler.compile = async (compileOpts) => {
         const packet = await baseCompile(compileOpts);
@@ -307,6 +320,22 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('orchestrator', orchestrator);
       ctx.effect(() => () => {
         void orchestrator.onPluginDisabled().catch(() => {});
+      });
+    },
+  });
+  plugins.set('hm.plugin.context-compression', {
+    provides: ['compressor'],
+    apply(ctx) {
+      const compressor = new ContextCompressionService(store, registry);
+      compressor.setPluginActive(true);
+      ctx.provide('compressor', compressor);
+      ctx.on('turn.completed', ({ sessionId, data }) => {
+        if (!data.maintenance && sessionId) {
+          compressor.scheduleIdleRollup(sessionId);
+        }
+      });
+      ctx.effect(() => () => {
+        compressor.onPluginDisabled();
       });
     },
   });

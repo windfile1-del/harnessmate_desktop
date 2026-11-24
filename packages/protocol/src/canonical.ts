@@ -502,6 +502,8 @@ export const CanonicalEventTypeSchema = z.enum([
   'subagent.updated',
   'subagent.cohort_completed',
   'subagent.merged',
+  'compression.chunk_ready',
+  'compression.fallback_triggered',
   'usage.updated',
   'diagnostic.log',
 ]);
@@ -1118,3 +1120,107 @@ export const SubagentMergeBackResultSchema = z.object({
   message: z.string(),
 });
 export type SubagentMergeBackResult = z.infer<typeof SubagentMergeBackResultSchema>;
+
+// ── AI Context Compression & Symbol Index Schemas ──────────────────────
+
+export const FileSymbolKindSchema = z.enum([
+  'class',
+  'interface',
+  'type',
+  'enum',
+  'function',
+  'const',
+  'struct',
+  'trait',
+  'impl',
+  'def',
+  'mod',
+]);
+export type FileSymbolKind = z.infer<typeof FileSymbolKindSchema>;
+
+export const FileSymbolEntrySchema = z.object({
+  kind: FileSymbolKindSchema,
+  name: z.string(),
+  line: z.number().int().positive(),
+  exported: z.boolean(),
+  signature: z.string().optional(),
+});
+export type FileSymbolEntry = z.infer<typeof FileSymbolEntrySchema>;
+
+export const FileSymbolOutlineSchema = z.object({
+  path: z.string(),
+  language: z.enum(['typescript', 'javascript', 'python', 'go', 'rust', 'other']),
+  mtimeMs: z.number().nonnegative(),
+  sizeBytes: z.number().int().nonnegative(),
+  symbols: z.array(FileSymbolEntrySchema),
+  truncated: z.boolean().optional(),
+});
+export type FileSymbolOutline = z.infer<typeof FileSymbolOutlineSchema>;
+
+export const ReferencedPathCheckSchema = z.object({
+  path: z.string(),
+  existsAtCheck: z.boolean(),
+});
+export type ReferencedPathCheck = z.infer<typeof ReferencedPathCheckSchema>;
+
+export const CompressedTurnChunkSchema = z.object({
+  chunkId: z.string(),
+  sessionId: z.string(),
+  fromSeq: z.number().int().nonnegative(),
+  toSeq: z.number().int().nonnegative(),
+  fromTurn: z.number().int().positive(),
+  toTurn: z.number().int().positive(),
+  sourceItemsHash: z.string(),
+  summaryMarkdown: z.string(),
+  originalChars: z.number().int().nonnegative(),
+  compressedChars: z.number().int().nonnegative(),
+  compressionRatio: z.number().nonnegative(),
+  usedLlm: z.boolean(),
+  summarizerInstanceId: z.string().nullable(),
+  fallback: z.boolean(),
+  fallbackReason: z.string().nullable(),
+  cacheHit: z.boolean(),
+  referencedPaths: z.array(ReferencedPathCheckSchema),
+  createdAt: z.number(),
+});
+export type CompressedTurnChunk = z.infer<typeof CompressedTurnChunkSchema>;
+
+export const ContextCompressionConfigSchema = z.object({
+  summarizerInstanceId: z.string().nullable().default(null),
+  summarizerModel: z.string().nullable().default(null),
+  dailyCallLimit: z.number().int().min(0).max(10_000).default(50),
+  sessionTokenBudgetCap: z.number().int().min(1_000).max(5_000_000).default(120_000),
+  timeoutMs: z.number().int().min(100).max(60_000).default(8_000),
+  chunkSizeTurns: z.number().int().min(2).max(50).default(10),
+  rollupTurnThreshold: z.number().int().min(5).max(500).default(25),
+  backgroundRollupEnabled: z.boolean().default(true),
+  symbolOutlineMaxChars: z.number().int().min(500).max(20_000).default(4_000),
+});
+export type ContextCompressionConfig = z.infer<typeof ContextCompressionConfigSchema>;
+
+export const CompressionCacheStatsSchema = z.object({
+  chunkCount: z.number().int().nonnegative(),
+  symbolFileCount: z.number().int().nonnegative(),
+  workspaceBytesUsed: z.number().int().nonnegative(),
+  workspaceBytesCap: z.number().int().positive(),
+  dailyLlmCallsUsed: z.number().int().nonnegative(),
+  dailyLlmCallsLimit: z.number().int().nonnegative(),
+  sessionTokensUsed: z.number().int().nonnegative(),
+  sessionTokenBudgetCap: z.number().int().positive(),
+});
+export type CompressionCacheStats = z.infer<typeof CompressionCacheStatsSchema>;
+
+export const SessionCompressionStatusSchema = z.object({
+  enabled: z.boolean(),
+  sessionId: z.string(),
+  workspaceId: z.string(),
+  config: ContextCompressionConfigSchema,
+  chunks: z.array(CompressedTurnChunkSchema),
+  symbolOutlines: z.array(FileSymbolOutlineSchema),
+  symbolOutlineMarkdown: z.string(),
+  totalOriginalChars: z.number().int().nonnegative(),
+  totalCompressedChars: z.number().int().nonnegative(),
+  compressionRatio: z.number().nonnegative(),
+  cacheStats: CompressionCacheStatsSchema,
+});
+export type SessionCompressionStatus = z.infer<typeof SessionCompressionStatusSchema>;

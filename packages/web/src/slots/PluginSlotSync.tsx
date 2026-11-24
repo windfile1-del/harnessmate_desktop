@@ -12,6 +12,7 @@ import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
 import { RuntimeRequestReceiptBlock } from '../components/ApprovalCenter';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
+import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
 import { HtmlRenderCard } from '../components/HtmlRenderCard';
 import { FailoverInlineBanner } from '../components/MessageStudio';
@@ -504,6 +505,24 @@ export function PluginSlotSync() {
               />
             );
           },
+        }),
+      );
+    }
+
+    // Built-in V5 Optional AI Context Compression & Symbol Index (`inspector.tabs` key: `context-compression`)
+    const compressionPlugin = plugins.find((p) => p.id === 'hm.plugin.context-compression');
+    if (compressionPlugin && isPluginActive(compressionPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'context-compression',
+          pluginId: 'hm.plugin.context-compression',
+          pluginName: 'Context Compression',
+          title: '上下文压缩与符号索引',
+          key: 'context-compression',
+          order: 95,
+          sourceKind: 'builtin',
+          render: ({ session }) => <ContextCompressionPanel session={session} />,
         }),
       );
     }

@@ -11,6 +11,8 @@ import type {
   CanonicalEvent,
   CheckpointRevertMode,
   CheckpointRevertResult,
+  CompressedTurnChunk,
+  ContextCompressionConfig,
   ContextPreview,
   ContextSyncMode,
   CreateCustomRiskRuleRequest,
@@ -48,6 +50,7 @@ import type {
   PluginManifest,
   ImportNativeSessionRequest,
   ImportSessionBundleRequest,
+  ManualCompressRequest,
   McpServerEntry,
   MergeBackRequest,
   MergeBackResult,
@@ -71,6 +74,7 @@ import type {
   ScaffoldPluginRequest,
   Session,
   SessionCheckpointRecord,
+  SessionCompressionStatus,
   SessionModelPluginTools,
   SubagentDiffStat,
   SubagentMergeBackResult,
@@ -92,6 +96,7 @@ import type {
   TrustSetupScriptRequest,
   TurnBlockRecord,
   TurnOptionsMap,
+  UpdateCompressionConfigRequest,
   UpdatePluginRegistryConfigRequest,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
@@ -1050,6 +1055,48 @@ export const daemonApi = {
     }>(`/api/v1/subagents/${encodeURIComponent(subagentId)}/worktree`, {
       method: 'DELETE',
       body: JSON.stringify(opts ?? {}),
+    }),
+
+  // ── AI Context Compression & Symbol Index ─────────────────────────────
+
+  getSessionCompression: (sessionId: string) =>
+    apiFetch<SessionCompressionStatus>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/compression`,
+    ),
+
+  compressSessionContext: (sessionId: string, req?: ManualCompressRequest) =>
+    apiFetch<{
+      result: {
+        chunks: CompressedTurnChunk[];
+        combinedMarkdown: string;
+        totalOriginalChars: number;
+        totalCompressedChars: number;
+        compressionRatio: number;
+        usedLlm: boolean;
+        fallback: boolean;
+        fallbackReason: string | null;
+        llmCallsMade: number;
+        cacheHits: number;
+      };
+      status: SessionCompressionStatus;
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/compression/compress`, {
+      method: 'POST',
+      body: JSON.stringify(req ?? {}),
+    }),
+
+  clearSessionCompressionCache: (sessionId: string) =>
+    apiFetch<{ clearedCount: number; status: SessionCompressionStatus }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/compression/cache`,
+      { method: 'DELETE' },
+    ),
+
+  getCompressionConfig: () =>
+    apiFetch<{ enabled: boolean; config: ContextCompressionConfig }>('/api/v1/compression/config'),
+
+  updateCompressionConfig: (patch: UpdateCompressionConfigRequest) =>
+    apiFetch<{ enabled: boolean; config: ContextCompressionConfig }>('/api/v1/compression/config', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
     }),
 };
 

@@ -59,11 +59,11 @@ import type {
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
+import { ApprovalCenterService, SECRET_RECEIPT_LABEL, type ExternalApprovalAnnotator } from './approval-center-service.js';
 import {
-  ApprovalCenterService,
-  SECRET_RECEIPT_LABEL,
-  type ExternalApprovalAnnotator,
-} from './approval-center-service.js';
+  CONTEXT_COMPRESSION_PLUGIN_ID,
+  ContextCompressionService,
+} from './context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorService } from './orchestrator-service.js';
 import { CheckpointError, type CheckpointDiffResult, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
@@ -129,6 +129,7 @@ export class SessionManager {
   private fallbackExplorer?: SessionExplorerService;
   private fallbackApprovalCenter?: ApprovalCenterService;
   private fallbackOrchestrator?: OrchestratorService;
+  private fallbackCompressor?: ContextCompressionService;
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
@@ -611,6 +612,27 @@ export class SessionManager {
     return this.getOrchestratorService();
   }
 
+  getContextCompressionService(): ContextCompressionService {
+    const active = this.pluginManager.host.get<ContextCompressionService>('compressor');
+    const svc = active ?? (this.fallbackCompressor ??= new ContextCompressionService(this.store, this.registry));
+    svc.attachHooks({
+      isEnabled: () => this.pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
+      emitEvent: (sessionId, type, payload) => this.emitCanonical(sessionId, type, payload, null),
+      getTaskState: (sessionId) => {
+        const session = this.store.getSession(sessionId);
+        if (!session) return undefined;
+        return this.pluginManager.host.get<TaskLedgerService>('ledger')?.getOrCreate(session);
+      },
+    });
+    return svc;
+  }
+
+  private attachActiveCompressorHooks(): void {
+    if (!this.pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID)) return;
+    if (!this.pluginManager.host.get<ContextCompressionService>('compressor')) return;
+    this.getContextCompressionService();
+  }
+
   searchSessions(opts: SessionExplorerQueryOptions): SessionSearchResponse {
     return this.getExplorerService().query(opts);
   }
@@ -968,6 +990,7 @@ export class SessionManager {
     if (!adapter) throw new Error(`Harness not registered: ${targetId}`);
 
     const binding = this.store.getSessionBinding(sessionId, targetId);
+    this.attachActiveCompressorHooks();
     const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
     if (!compiler) return {
       sessionId, targetHarnessId: targetId, targetHarnessKind: adapter.kind, currentLastSeq: session.lastSeq,
@@ -1210,6 +1233,7 @@ export class SessionManager {
     const targetAdapter = this.registry.get(targetHarnessId);
     if (!targetAdapter) throw new Error(`Target harness not registered: ${targetHarnessId}`);
 
+    this.attachActiveCompressorHooks();
     const packet = await this.service<ContextCompiler>('handoff').compile({
       session: source,
       targetHarnessId: targetAdapter.id,
@@ -1667,6 +1691,7 @@ export class SessionManager {
 
     try {
       // Compile incremental context delta if Context Bridge plugin is active
+      this.attachActiveCompressorHooks();
       const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
       const binding = this.store.getSessionBinding(sessionId, session.harnessId);
       if (!compiler?.options.autoAttach && (session.participatingHarnesses?.length ?? 0) > 1) {
@@ -2409,6 +2434,7 @@ export class SessionManager {
           void orchCompleted.handleChildTurnCompleted(sessionId).catch(() => {});
           orchCompleted.onParentSessionIdle(sessionId);
         }
+        this.attachActiveCompressorHooks();
 
         this.eventBus.publishAttention({
           kind: 'turn_completed',

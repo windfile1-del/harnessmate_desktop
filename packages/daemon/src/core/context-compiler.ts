@@ -21,6 +21,7 @@ import {
   type HandoffRedactHook,
 } from './handoff-redactor.js';
 import type { PluginEvents } from '../plugin-host/runtime/events.js';
+import type { ContextCompressorProvider } from './context-compression-service.js';
 import { PluginApiError, type Disposer, type HandoffComposeEvent } from '@harnessmate/plugin-api';
 
 import type { PortableHistoryMessage } from '../harnesses/types.js';
@@ -104,6 +105,7 @@ export class ContextCompiler {
     private readonly events: PluginEvents,
     private readonly collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
     private readonly redactor: HandoffRedactor = new HandoffRedactor(),
+    private readonly getCompressor?: () => ContextCompressorProvider | undefined,
   ) {}
 
   registerRedactor(hook: HandoffRedactHook): Disposer {
@@ -386,13 +388,75 @@ export class ContextCompiler {
       );
     }
     if (overflowTurns.length > 0) {
-      const skeletonLines = overflowTurns.map((t, idx) => renderTurnSkeleton(t, idx + 1));
-      digestParts.push(
-        trimToTokenBudget(
-          `### Compressed Earlier Un-Synced Turns (${overflowTurns.length} turns)\n${skeletonLines.join('\n')}`,
-          Math.floor(digestBudget * 0.55),
-        ),
-      );
+      let compressedSection: string | null = null;
+      let symbolSection: string | null = null;
+      const compressor = this.getCompressor?.();
+
+      if (compressor && compressor.isEnabled()) {
+        try {
+          const fromSeq = overflowTurns[0]!.startSeq;
+          const toSeq = overflowTurns[overflowTurns.length - 1]!.endSeq;
+          const digestCharBudget = Math.max(800, Math.floor(digestBudget * 0.6) * 3);
+          const compResult = await compressor.compressRange(
+            session.id,
+            fromSeq,
+            toSeq,
+            digestCharBudget,
+          );
+          if (!compResult.fallback && compResult.combinedMarkdown.trim()) {
+            const safeSummary = await redactField(
+              trimToTokenBudget(
+                compResult.combinedMarkdown.trim(),
+                Math.floor(digestBudget * 0.55),
+              ),
+            );
+            compressedSection = `### Compressed Earlier Un-Synced Turns (${overflowTurns.length} turns, ${compResult.compressionRatio}x)\n${safeSummary}`;
+
+            const hotFiles = [...new Set([
+              ...mutatedFiles,
+              ...taskState.touchedFiles,
+              ...compResult.chunks.flatMap((c) =>
+                c.referencedPaths.filter((p) => p.existsAtCheck).map((p) => p.path),
+              ),
+            ])].slice(0, 12);
+            if (hotFiles.length > 0 && session.cwd) {
+              const outlineMaxChars = Math.min(
+                compressor.getConfig().symbolOutlineMaxChars,
+                Math.max(400, Math.floor(digestBudget * 0.25) * 3),
+              );
+              const outlineRes = await compressor.buildSymbolOutline(
+                session.cwd,
+                hotFiles,
+                outlineMaxChars,
+              );
+              if (outlineRes.markdown.trim()) {
+                symbolSection = await redactField(
+                  trimToTokenBudget(outlineRes.markdown.trim(), Math.floor(digestBudget * 0.25)),
+                );
+              }
+            }
+          }
+        } catch {
+          // Graceful deterministic fallback below
+          compressedSection = null;
+          symbolSection = null;
+        }
+      }
+
+      if (compressedSection) {
+        digestParts.push(compressedSection);
+        if (symbolSection) {
+          digestParts.push(symbolSection);
+        }
+      } else {
+        const skeletonLines = overflowTurns.map((t, idx) => renderTurnSkeleton(t, idx + 1));
+        digestParts.push(
+          trimToTokenBudget(
+            `### Compressed Earlier Un-Synced Turns (${overflowTurns.length} turns)\n${skeletonLines.join('\n')}`,
+            Math.floor(digestBudget * 0.55),
+          ),
+        );
+      }
     }
     if (mcpPullInstruction) {
       digestParts.push(mcpPullInstruction);
