@@ -1,6 +1,10 @@
 import type { HarnessCommandInfo, HarnessKind, Session } from '@harnessmate/protocol';
 import { inspectAgyCommand } from '../harnesses/agy-commands.js';
+import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
+import type { AgyLaunchContext } from '../harnesses/agy/agy-launch-context.js';
+import { formatAgyUsageSummary } from '../harnesses/agy/agy-usage.js';
 import { execCliQuick, resolveBinary } from '../harnesses/process.js';
+import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { NativeSkill } from '../harnesses/types.js';
 import type { UsageService } from './usage-service.js';
 
@@ -30,23 +34,23 @@ export class HarnessCommandTools {
   constructor(
     private readonly getUsageService: () => UsageService | undefined,
     private readonly binaryOverrides: Record<string, string>,
+    private readonly registry?: HarnessRegistry,
   ) {}
+
+  private async resolveAgyLaunchContext(harnessId?: string): Promise<AgyLaunchContext | undefined> {
+    const adapter = this.registry?.get(harnessId ?? 'agy') ?? this.registry?.get('agy');
+    if (adapter instanceof AgyAdapter) {
+      return adapter.getLaunchContext();
+    }
+    return undefined;
+  }
 
   async getUsage(session: Session): Promise<string> {
     if (session.harnessKind === 'agy') {
-      const binary = await this.getBinary('agy');
-      const data = await inspectAgyCommand(binary, session.cwd, '/usage') as {
-        description?: string;
-        groups?: Array<{ name?: string; buckets?: Array<{
-          name?: string; id?: string; window?: string; remaining_fraction?: number; reset_time?: string;
-        }> }>;
-      } | null;
-      const lines = (data?.groups ?? []).flatMap((group) => (group.buckets ?? []).map((item) =>
-        [item.name || item.id || group.name, item.window,
-          typeof item.remaining_fraction === 'number' ? `剩余 ${(100 * item.remaining_fraction).toFixed(1)}%` : undefined,
-          item.reset_time ? `${new Date(item.reset_time).toLocaleString()} 重置` : undefined,
-        ].filter(Boolean).join(' · ')));
-      return lines.join('\n') || data?.description || 'AGY 没有返回模型额度';
+      const launchContext = await this.resolveAgyLaunchContext(session.harnessId);
+      const binary = await this.getBinary('agy', launchContext?.binaryPath);
+      const data = await inspectAgyCommand(binary, session.cwd, '/usage', { launchContext });
+      return formatAgyUsageSummary(data);
     }
     const service = this.getUsageService();
     if (!service) throw new Error('额度服务已停用');
@@ -60,8 +64,12 @@ export class HarnessCommandTools {
     ].join('\n');
   }
 
-  async listAgySkills(cwd: string): Promise<NativeSkill[]> {
-    const data = await inspectAgyCommand(await this.getBinary('agy'), cwd, '/skills') as { skills?: NativeSkill[] };
+  async listAgySkills(cwd: string, harnessId?: string): Promise<NativeSkill[]> {
+    const launchContext = await this.resolveAgyLaunchContext(harnessId);
+    const binary = await this.getBinary('agy', launchContext?.binaryPath);
+    const data = (await inspectAgyCommand(binary, cwd, '/skills', {
+      launchContext,
+    })) as { skills?: NativeSkill[] };
     return data?.skills ?? [];
   }
 
@@ -82,8 +90,8 @@ export class HarnessCommandTools {
     return result.stdout.trim() || result.stderr.trim() || '插件命令完成';
   }
 
-  private async getBinary(kind: string): Promise<string> {
-    const binary = await resolveBinary(kind, this.binaryOverrides[kind]);
+  private async getBinary(kind: string, overridePath?: string): Promise<string> {
+    const binary = await resolveBinary(kind, overridePath ?? this.binaryOverrides[kind]);
     if (!binary) throw new Error(`未找到 ${kind} CLI`);
     return binary;
   }

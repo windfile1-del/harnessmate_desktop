@@ -338,7 +338,8 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     provides: ['native-commands'],
     apply(ctx) {
       ctx.provide('native-commands', {
-        list: listHarnessCommands, tools: new HarnessCommandTools(() => ctx.get<UsageService>('usage'), config.binaryOverrides),
+        list: listHarnessCommands,
+        tools: new HarnessCommandTools(() => ctx.get<UsageService>('usage'), config.binaryOverrides, registry),
       } satisfies NativeCommandsService);
     },
   });

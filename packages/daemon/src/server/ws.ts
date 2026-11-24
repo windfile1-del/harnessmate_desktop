@@ -3,6 +3,7 @@ import type { Duplex } from 'node:stream';
 import {
   PROTOCOL_VERSION,
   WsClientFrameSchema,
+  type AgyAuthState,
   type WsServerFrame,
 } from '@harnessmate/protocol';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -70,6 +71,10 @@ export class WsGateway {
 
   notifyTriage(frame: Extract<WsServerFrame, { op: 'triage_updated' }>): void {
     for (const ws of this.localSockets) this.send(ws, frame);
+  }
+
+  notifyAgyAuthState(state: AgyAuthState): void {
+    for (const ws of this.localSockets) this.send(ws, { op: 'agy_auth_state', state });
   }
 
   close(): void {

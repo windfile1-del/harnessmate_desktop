@@ -2,6 +2,10 @@ import { z } from 'zod';
 import { PluginPanelQuerySchema } from './plugin-sdk.js';
 import { PluginManifestSchema } from '@harnessmate/plugin-api';
 import {
+  AgyAccountDefaultsSchema,
+  AgyAuthMethodSchema,
+  AgyAuthStateSchema,
+  AgyIsolationModeSchema,
   ApprovalDecisionSchema,
   AttachmentSchema,
   CanonicalEventSchema,
@@ -528,6 +532,10 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
   }),
   z.object({ op: z.literal('plugins_changed') }),
   z.object({
+    op: z.literal('agy_auth_state'),
+    state: AgyAuthStateSchema,
+  }),
+  z.object({
     op: z.literal('triage_updated'),
     session: SessionTriageStateSchema,
     event: TriageSnoozeExpiredSchema.optional(),
@@ -633,3 +641,37 @@ export const ReleaseTerminalsPathRequestSchema = z.object({
   targetPath: z.string().trim().min(1),
 });
 export type ReleaseTerminalsPathRequest = z.infer<typeof ReleaseTerminalsPathRequestSchema>;
+
+// ── Phase AGY-2: Multi-Account Profile & Official Auth REST Schemas ─────
+
+export const UpsertAgyInstanceRequestSchema = z.object({
+  instanceId: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_.:-]*$/i),
+  displayName: z.string().trim().min(1).max(80),
+  description: z.string().max(300).optional(),
+  isolationMode: AgyIsolationModeSchema.optional(),
+  authMethod: AgyAuthMethodSchema.default('oauth-personal'),
+  geminiDir: z.string().optional(),
+  appDataDirName: z.string().trim().min(1).max(80).default('antigravity-cli'),
+  binaryPath: z.string().optional(),
+  gcpProject: z.string().optional(),
+  gcpLocation: z.string().optional(),
+  defaults: AgyAccountDefaultsSchema.optional(),
+  enabled: z.boolean().default(true),
+});
+export type UpsertAgyInstanceRequest = z.infer<typeof UpsertAgyInstanceRequestSchema>;
+
+export const AgyAuthRespondRequestSchema = z.object({
+  flowId: z.string().min(1),
+  codeOrUrl: z.string().trim().min(1).max(4096),
+});
+export type AgyAuthRespondRequest = z.infer<typeof AgyAuthRespondRequestSchema>;
+
+export const AgyAuthCancelRequestSchema = z.object({
+  flowId: z.string().min(1).optional(),
+});
+export type AgyAuthCancelRequest = z.infer<typeof AgyAuthCancelRequestSchema>;
+
+export const AgyAuthLogoutRequestSchema = z.object({
+  confirmSharedKeyring: z.boolean().optional(),
+});
+export type AgyAuthLogoutRequest = z.infer<typeof AgyAuthLogoutRequestSchema>;

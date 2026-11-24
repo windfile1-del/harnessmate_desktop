@@ -2335,6 +2335,15 @@ export class SessionManager {
     await entry.handle.dispose();
   }
 
+  async closeSessionsForHarness(harnessId: string): Promise<void> {
+    const matching = Array.from(this.liveHandles.values()).filter(
+      (entry) => entry.harnessId === harnessId,
+    );
+    for (const entry of matching) {
+      await this.disposeLiveHandle(entry.sessionId, entry.harnessId);
+    }
+  }
+
   private async disposeSessionHandles(sessionId: string): Promise<void> {
     this.expireSessionApprovals(sessionId);
     const matching = Array.from(this.liveHandles.values()).filter((e) => e.sessionId === sessionId);

@@ -252,6 +252,8 @@ export class FailoverCoordinator {
       }
     }
 
+    const failedAdapter = adapterById.get(failedInstanceId) ?? this.registry.get(failedInstanceId);
+    const failedDriverId = failedAdapter?.driverId ?? failedAdapter?.kind;
     const autoSwitchCount = this.getAutoSwitchCount(sessionId);
     const pingPongBlocked =
       !firstAvailable || autoSwitchCount >= policy.maxAutoSwitchesPerSession;
@@ -259,7 +261,13 @@ export class FailoverCoordinator {
     let canAutoFailover = false;
     let downgradedToManualReason: string | null = null;
 
-    if (firstAvailable && !pingPongBlocked && policy.mode !== 'manual_one_click') {
+    if (failedDriverId === 'agy' && firstAvailable?.driverId === 'agy') {
+      // Compliance guardrail: multi-account AGY quota rotation is strictly prohibited;
+      // users may only perform an explicit manual switch.
+      canAutoFailover = false;
+      downgradedToManualReason =
+        '合规护栏：多 AGY Google 账号仅支持手动一键切换，禁止自动额度轮换。';
+    } else if (firstAvailable && !pingPongBlocked && policy.mode !== 'manual_one_click') {
       if (
         policy.mode === 'auto_same_tier' &&
         failedTier === 'subscription' &&

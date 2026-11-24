@@ -1,9 +1,14 @@
+import path from 'node:path';
 import fs from 'node:fs';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import {
   AddMcpServerRequestSchema,
   AddTrustedPublisherRequestSchema,
+  AgyAuthCancelRequestSchema,
+  AgyAuthLogoutRequestSchema,
+  AgyAuthRespondRequestSchema,
+  type AgyProfileConfig,
   BuilderV2AuditRequestSchema,
   BuilderV2GenerateRequestSchema,
   BuilderV2InstallRequestSchema,
@@ -65,6 +70,7 @@ import {
   RunPluginActionRequestSchema,
   SetPluginPermissionRequestSchema,
   UploadAttachmentRequestSchema,
+  UpsertAgyInstanceRequestSchema,
   type ContextSyncMode,
   type RemoteAccessStatus,
 } from '@harnessmate/protocol';
@@ -109,6 +115,9 @@ import { createBuiltinPlugins, type FailoverService, type GitService } from '../
 import { PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
+import { AgyAuthService } from '../harnesses/agy/agy-auth-service.js';
+import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
+import { resolveAgyProfileDirectories } from '../harnesses/agy/agy-profile-manager.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
@@ -220,6 +229,26 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const outboxWorker = new EffectOutboxWorker(store);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
   const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace);
+  const agyAuthService = new AgyAuthService({
+    getAdapter: (instanceId) => {
+      const adapter = registry.get(instanceId);
+      return adapter instanceof AgyAdapter ? adapter : undefined;
+    },
+    stopInstanceSessions: (instanceId) => sessionManager.closeSessionsForHarness(instanceId),
+    onIdentityUpdated: (instanceId, identity) => {
+      const idx = config.agyProfiles.findIndex((p) => p.instanceId === instanceId);
+      if (idx >= 0) {
+        config.agyProfiles[idx] = { ...config.agyProfiles[idx]!, identity };
+        saveConfig(paths.configPath, config);
+      }
+    },
+    onUsageCacheInvalidate: (instanceId) => {
+      pluginManager.host.get<UsageService>('usage')?.invalidateCache(instanceId);
+    },
+    onStateChanged: (state) => {
+      wsGateway.notifyAgyAuthState(state);
+    },
+  });
   terminalWorkspace.subscribeStatus(({ terminal, event }) => {
     const ownerSessionId = terminalSessionOwners.get(terminal.terminalId);
     if (ownerSessionId && event === 'exited') {
@@ -383,6 +412,203 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       const result = await sessionManager.importExternalSession(parsed.data);
       return result;
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ── Phase AGY-2: Multi-Account Profiles & Official Auth Endpoints ────
+
+  app.get('/api/v1/harnesses/agy/instances', async () => {
+    const instances = registry
+      .listAdapters()
+      .filter((adapter): adapter is AgyAdapter => adapter instanceof AgyAdapter)
+      .map((adapter) => ({
+        profile: adapter.getProfile(),
+        authState: agyAuthService.getState(adapter.id),
+      }));
+    return { instances };
+  });
+
+  app.post('/api/v1/harnesses/agy/instances', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY profiles can only be modified locally from Desktop' });
+    }
+    const parsed = UpsertAgyInstanceRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid AGY profile payload' });
+    }
+    const req = parsed.data;
+    if (req.instanceId === 'codex' || req.instanceId === 'claude') {
+      return reply.code(409).send({ error: `Harness ID "${req.instanceId}" 已被内置引擎保留` });
+    }
+    const existingAdapter = registry.get(req.instanceId);
+    if (existingAdapter && existingAdapter.driverId !== 'agy' && existingAdapter.kind !== 'agy') {
+      return reply.code(409).send({ error: `Harness ID "${req.instanceId}" 已被其他引擎占用` });
+    }
+
+    const existingIdx = config.agyProfiles.findIndex((p) => p.instanceId === req.instanceId);
+    const existingProfile = existingIdx >= 0 ? config.agyProfiles[existingIdx] : undefined;
+    const isolationMode =
+      req.instanceId === 'agy' ? (req.isolationMode ?? existingProfile?.isolationMode ?? 'official_default') : 'profile_isolated';
+
+    const profile: AgyProfileConfig = {
+      instanceId: req.instanceId,
+      displayName: req.displayName,
+      description: req.description,
+      isolationMode,
+      authMethod: req.authMethod,
+      geminiDir: req.geminiDir?.trim() || existingProfile?.geminiDir,
+      appDataDirName: req.appDataDirName,
+      binaryPath: req.binaryPath?.trim() || undefined,
+      gcpProject: req.gcpProject?.trim() || undefined,
+      gcpLocation: req.gcpLocation?.trim() || undefined,
+      defaults: req.defaults ?? existingProfile?.defaults ?? {
+        linkGlobalSkills: true,
+        syncGlobalRules: true,
+        additionalDirectories: [],
+      },
+      identity: existingProfile?.identity,
+      enabled: req.enabled,
+    };
+
+    if (existingIdx >= 0) {
+      config.agyProfiles[existingIdx] = profile;
+    } else {
+      config.agyProfiles.push(profile);
+    }
+    saveConfig(paths.configPath, config);
+
+    await sessionManager.closeSessionsForHarness(profile.instanceId);
+    if (profile.enabled && registry.hasDriver('agy')) {
+      registry.registerInstance({
+        instanceId: profile.instanceId,
+        driverId: 'agy',
+        displayName: profile.displayName,
+        description: profile.description,
+        binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
+        homeDir: profile.geminiDir,
+        enabled: profile.enabled,
+      });
+    } else {
+      registry.unregister(profile.instanceId);
+    }
+    pluginManager.host.get<UsageService>('usage')?.invalidateCache(profile.instanceId);
+
+    const harnesses = await registry.probeAll(true);
+    return {
+      profile,
+      authState: agyAuthService.getState(profile.instanceId),
+      harnesses,
+    };
+  });
+
+  app.delete('/api/v1/harnesses/agy/instances/:id', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY profiles can only be deleted locally from Desktop' });
+    }
+    const { id } = request.params as { id: string };
+    const q = request.query as { purgeData?: string };
+    if (id === 'agy') {
+      return reply.code(400).send({ error: '不能删除内置主 AGY 实例，仅可删除自定义隔离账号或修改其模式。' });
+    }
+    const idx = config.agyProfiles.findIndex((p) => p.instanceId === id);
+    const existingAdapter = registry.get(id);
+    if (idx < 0 && !(existingAdapter instanceof AgyAdapter)) {
+      return reply.code(404).send({ error: 'AGY profile not found' });
+    }
+
+    await agyAuthService.cancelLogin(id).catch(() => {});
+    await sessionManager.closeSessionsForHarness(id);
+
+    if (idx >= 0) {
+      config.agyProfiles.splice(idx, 1);
+      saveConfig(paths.configPath, config);
+    }
+    registry.unregister(id);
+    pluginManager.host.get<UsageService>('usage')?.invalidateCache(id);
+
+    if (q.purgeData === '1' || q.purgeData === 'true') {
+      const dirs = resolveAgyProfileDirectories(paths.agyProfilesDir, id);
+      const profilesRootResolved = path.resolve(paths.agyProfilesDir);
+      if (path.resolve(dirs.geminiDir).startsWith(`${profilesRootResolved}${path.sep}`)) {
+        fs.rmSync(dirs.geminiDir, { recursive: true, force: true });
+      }
+      if (path.resolve(dirs.runtimeTempDir).startsWith(`${profilesRootResolved}${path.sep}`)) {
+        fs.rmSync(dirs.runtimeTempDir, { recursive: true, force: true });
+      }
+    }
+
+    const harnesses = await registry.probeAll(false);
+    return { deleted: true, instanceId: id, harnesses };
+  });
+
+  app.get('/api/v1/harnesses/agy/instances/:id/auth/state', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const adapter = registry.get(id);
+    if (!(adapter instanceof AgyAdapter)) {
+      return reply.code(404).send({ error: 'AGY instance not found' });
+    }
+    return { state: agyAuthService.getState(id) };
+  });
+
+  app.post('/api/v1/harnesses/agy/instances/:id/auth/start', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY login can only be started locally from Desktop' });
+    }
+    const { id } = request.params as { id: string };
+    try {
+      const state = await agyAuthService.startLogin(id);
+      return { state };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/v1/harnesses/agy/instances/:id/auth/respond', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY login code can only be submitted locally from Desktop' });
+    }
+    const { id } = request.params as { id: string };
+    const parsed = AgyAuthRespondRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid login response payload' });
+    }
+    try {
+      const state = await agyAuthService.respondLogin(id, parsed.data.flowId, parsed.data.codeOrUrl);
+      const harnesses = await registry.probeAll(true);
+      return { state, harnesses };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/v1/harnesses/agy/instances/:id/auth/cancel', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY login cancellation is local only' });
+    }
+    const { id } = request.params as { id: string };
+    const parsed = AgyAuthCancelRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid cancel payload' });
+    }
+    const state = await agyAuthService.cancelLogin(id, parsed.data.flowId);
+    return { state };
+  });
+
+  app.post('/api/v1/harnesses/agy/instances/:id/auth/logout', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'AGY logout can only be triggered locally from Desktop' });
+    }
+    const { id } = request.params as { id: string };
+    const parsed = AgyAuthLogoutRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid logout payload' });
+    }
+    try {
+      const state = await agyAuthService.logout(id, parsed.data);
+      const harnesses = await registry.probeAll(true);
+      return { state, harnesses };
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -2391,6 +2617,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       wsGateway.close();
       pluginAuthoring.cancel();
       pluginBuilderV2.cancel();
+      await agyAuthService.dispose();
       await terminalWorkspace.disposeAll();
       await sessionManager.shutdown();
       await app.close();

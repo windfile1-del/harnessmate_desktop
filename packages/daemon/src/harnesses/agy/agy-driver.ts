@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  AgyAccountIdentity,
   AgyProfileConfig,
   DiscoveredCliSession,
   HarnessModelInfo,
@@ -32,6 +33,7 @@ import {
   DEFAULT_AGY_APP_DATA_DIR_NAME,
 } from './agy-launch-context.js';
 import { prepareAgyProfile, resolveAgyProfileDirectories } from './agy-profile-manager.js';
+import { probeAgyUsageViaCli } from './agy-usage.js';
 
 export function classifyAgyModelGroup(modelId: string): string {
   if (modelId.startsWith('gemini-pro-orchestrator')) return 'Orchestrator (Planner + Executor)';
@@ -281,7 +283,7 @@ function buildAgyAdapterOptions(opts: AgyAdapterOptions): {
 }
 
 export class AgyAdapter extends AcpAdapter {
-  private readonly profileConfig: AgyProfileConfig;
+  private profileConfig: AgyProfileConfig;
   private readonly profilesRootDir: string;
   private readonly applyWindowsAcl?: boolean;
   private readonly userHome?: string;
@@ -301,6 +303,18 @@ export class AgyAdapter extends AcpAdapter {
 
   getProfile(): AgyProfileConfig {
     return this.profileConfig;
+  }
+
+  updateProfileIdentity(identity: AgyAccountIdentity): void {
+    this.profileConfig = {
+      ...this.profileConfig,
+      identity,
+    };
+  }
+
+  invalidateProbeCache(): void {
+    this.cachedSessionProbe = null;
+    this.authRequired = false;
   }
 
   getLaunchContextSync(binaryPathOverride?: string): AgyLaunchContext {
@@ -376,18 +390,12 @@ export class AgyAdapter extends AcpAdapter {
   }
 
   override async readUsageLimits(): Promise<AdapterUsageLimitResult> {
-    const base = await super.readUsageLimits();
-    return {
-      ...base,
-      authMethod:
-        this.profileConfig.authMethod === 'oauth-business'
-          ? 'Gemini Enterprise'
-          : this.profileConfig.authMethod === 'gemini-api-key'
-            ? 'Gemini API Key'
-            : this.profileConfig.authMethod === 'agent-platform'
-              ? 'Agent Platform'
-              : 'Google OAuth',
-    };
+    const ctx = await this.getLaunchContext();
+    return probeAgyUsageViaCli(ctx, {
+      cwd: ctx.runtimeTempDir,
+      fallbackTierName:
+        this.cachedSessionProbe?.snapshot.tierName ?? this.profileConfig.identity?.tierName ?? null,
+    });
   }
 
   override async createSession(config: AdapterSessionConfig) {
