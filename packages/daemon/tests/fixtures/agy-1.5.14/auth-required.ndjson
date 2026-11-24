@@ -1,0 +1,2 @@
+{"stage":"initialize","frame":{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentInfo":{"name":"antigravity-cli","version":"1.5.14"},"agentCapabilities":{"promptCapabilities":{"image":true}},"authMethods":[{"id":"oauth-personal","name":"Google Personal OAuth"}]}}}
+{"stage":"session/new","frame":{"jsonrpc":"2.0","error":{"code":-32000,"message":"Authentication required: run agy acp --login with official Google OAuth."}}}

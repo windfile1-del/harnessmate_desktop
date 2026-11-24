@@ -121,8 +121,9 @@ export function ensurePrivateProfileDirectory(
     if (!username) {
       return { aclApplied: false, warning: '无法确定当前 Windows 用户名以设置目录 ACL' };
     }
+    const icaclsExe = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'icacls.exe');
     execFileSync(
-      'icacls',
+      fs.existsSync(icaclsExe) ? icaclsExe : 'icacls',
       [dirPath, '/inheritance:r', '/grant:r', `${username}:(OI)(CI)F`],
       { windowsHide: true, timeout: 5000, stdio: 'ignore' },
     );
