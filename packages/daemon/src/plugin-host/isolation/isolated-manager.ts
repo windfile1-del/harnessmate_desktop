@@ -15,6 +15,7 @@ import {
   type PluginEventV4,
   type PluginHandshakeResponse,
   type PluginRuntimeSlotDescriptor,
+  type PublicAdapterUsageLimitResult,
   type PublicCommandResult,
   type PublicHarnessDriverDescriptor,
   type PublicHarnessProbeResult,
@@ -32,6 +33,7 @@ import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
+  AdapterUsageLimitResult,
   ContextSyncPayload,
   HarnessAdapter,
   NormalizedAdapterEvent,
@@ -46,6 +48,7 @@ import {
   IsolatedPluginProcess,
   type CrashPolicy,
 } from './isolated-process.js';
+import type { PluginSecretStore } from './plugin-secrets.js';
 import { IsolatedPluginRpcRouter, type PluginLogEntry } from './rpc-router.js';
 
 export interface IsolatedToolDescriptor {
@@ -72,6 +75,7 @@ interface ProxyDriverSessionEntry {
   driverId: string;
   handleId: string;
   nativeSessionId: string | null;
+  activeTurnId: string | null;
   listeners: Set<(event: NormalizedAdapterEvent) => void>;
 }
 
@@ -99,6 +103,7 @@ export interface IsolatedManagerOptions {
   store: HarnessMateStore;
   host: PluginHost;
   permissions: PluginPermissionService;
+  pluginSecrets?: PluginSecretStore;
   getPluginInfo: (pluginId: string) => InstalledPluginInfo | undefined;
   requestRestart: (pluginId: string) => Promise<void>;
   registry?: HarnessRegistry;
@@ -132,6 +137,7 @@ export class IsolatedPluginManager {
       getPluginInfo: (pluginId) => this.active.get(pluginId)?.info ?? opts.getPluginInfo(pluginId),
       isCurrentRun: (pluginId, runId) => this.active.get(pluginId)?.runId === runId,
       cliProcesses: this.cliProcesses,
+      pluginSecrets: opts.pluginSecrets,
       onCliOutput: (pluginId, runId, processId, stream, chunk) => {
         const entry = this.active.get(pluginId);
         if (!entry || entry.runId !== runId) return;
@@ -141,6 +147,21 @@ export class IsolatedPluginManager {
         const entry = this.active.get(pluginId);
         if (!entry || entry.runId !== runId) return;
         entry.process.notify('host.cli.exit', { processId, code, signal }, runId);
+      },
+      onNetStreamChunk: (pluginId, runId, streamId, chunk) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.process.notify('host.net.stream.chunk', { streamId, chunk }, runId);
+      },
+      onNetStreamEnd: (pluginId, runId, streamId) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.process.notify('host.net.stream.end', { streamId }, runId);
+      },
+      onNetStreamError: (pluginId, runId, streamId, message) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        entry.process.notify('host.net.stream.error', { streamId, message }, runId);
       },
       onDriverRegister: (pluginId, runId, driver) => {
         const entry = this.active.get(pluginId);
@@ -164,6 +185,14 @@ export class IsolatedPluginManager {
         const event = rawEvent as NormalizedAdapterEvent;
         if (event.type === 'native_session_ready' && typeof event.nativeSessionId === 'string') {
           sess.nativeSessionId = event.nativeSessionId;
+        }
+        if (event.type === 'turn.started' && typeof event.turnId === 'string') {
+          sess.activeTurnId = event.turnId;
+        } else if (
+          (event.type === 'turn.completed' || event.type === 'turn.failed' || event.type === 'turn.cancelled') &&
+          sess.activeTurnId === event.turnId
+        ) {
+          sess.activeTurnId = null;
         }
         for (const listener of [...sess.listeners]) {
           try { listener(event); } catch { /* listener isolation */ }
@@ -342,6 +371,7 @@ export class IsolatedPluginManager {
         this.active.set(info.id, placeholder);
 
         ctx.effect(() => () => {
+          this.router.abortNetStreamsForRun(info.id, proc.runId);
           this.cleanupPluginDrivers(placeholder);
           const cliTask = this.cliProcesses.killAllForRun(info.id, proc.runId)
             .finally(() => { this.pendingDisposals.delete(cliTask); });
@@ -436,7 +466,9 @@ export class IsolatedPluginManager {
   ): void {
     const current = this.active.get(pluginId);
     if (!current || current.runId !== crashedRunId) return;
-    this.cleanupPluginDrivers(current);
+    const detail = stderr ? `${code ?? signal ?? 'crash'}: ${stderr.slice(0, 200)}` : `exit ${code ?? signal ?? 'unknown'}`;
+    this.router.abortNetStreamsForRun(pluginId, crashedRunId);
+    this.cleanupPluginDrivers(current, `隔离进程异常退出 (${detail})`);
     const cliTask = this.cliProcesses.killAllForRun(pluginId, crashedRunId)
       .finally(() => { this.pendingDisposals.delete(cliTask); });
     this.pendingDisposals.add(cliTask);
@@ -445,7 +477,6 @@ export class IsolatedPluginManager {
     const tracker = this.crashTrackers.get(pluginId) ?? new CrashBackoffTracker(this.opts.crashPolicy);
     this.crashTrackers.set(pluginId, tracker);
     const outcome = tracker.recordCrash();
-    const detail = stderr ? `${code ?? signal ?? 'crash'}: ${stderr.slice(0, 200)}` : `exit ${code ?? signal ?? 'unknown'}`;
 
     if (outcome.exhausted) {
       const reason = `隔离进程 10 分钟内崩溃 ${outcome.count} 次，已停止重启 (${detail})`;
@@ -761,10 +792,29 @@ export class IsolatedPluginManager {
     }
   }
 
-  private unregisterSinglePluginDriver(entry: ActiveIsolatedPlugin, driverId: string): void {
+  private unregisterSinglePluginDriver(
+    entry: ActiveIsolatedPlugin,
+    driverId: string,
+    crashReason?: string,
+  ): void {
     for (const [handleId, sess] of [...entry.driverSessions.entries()]) {
       if (sess.driverId !== driverId) continue;
       entry.driverSessions.delete(handleId);
+      if (crashReason && sess.activeTurnId) {
+        const turnId = sess.activeTurnId;
+        sess.activeTurnId = null;
+        for (const listener of [...sess.listeners]) {
+          try {
+            listener({
+              type: 'turn.failed',
+              turnId,
+              code: 'process_exit',
+              failureClass: 'process_exit',
+              message: crashReason,
+            });
+          } catch { /* listener isolation */ }
+        }
+      }
       sess.listeners.clear();
     }
     const adapter = entry.registeredDrivers.get(driverId);
@@ -782,11 +832,26 @@ export class IsolatedPluginManager {
     registry.unregisterDriver(driverId);
   }
 
-  private cleanupPluginDrivers(entry: ActiveIsolatedPlugin): void {
+  private cleanupPluginDrivers(entry: ActiveIsolatedPlugin, crashReason?: string): void {
     for (const driverId of [...entry.registeredDrivers.keys()]) {
-      this.unregisterSinglePluginDriver(entry, driverId);
+      this.unregisterSinglePluginDriver(entry, driverId, crashReason);
     }
     for (const sess of entry.driverSessions.values()) {
+      if (crashReason && sess.activeTurnId) {
+        const turnId = sess.activeTurnId;
+        sess.activeTurnId = null;
+        for (const listener of [...sess.listeners]) {
+          try {
+            listener({
+              type: 'turn.failed',
+              turnId,
+              code: 'process_exit',
+              failureClass: 'process_exit',
+              message: crashReason,
+            });
+          } catch { /* listener isolation */ }
+        }
+      }
       sess.listeners.clear();
     }
     entry.driverSessions.clear();
@@ -850,6 +915,28 @@ export class IsolatedPluginManager {
         );
         return mapProbe(res);
       },
+      ...(desc.capabilitiesV2?.supportsUsageLimits
+        ? {
+            readUsageLimits: async (): Promise<AdapterUsageLimitResult> => {
+              const res = await entry.process.call<PublicAdapterUsageLimitResult>(
+                'host.driver.readUsageLimits',
+                { driverId: desc.driverId },
+                ISOLATED_TIMEOUTS.command,
+                capturedRunId,
+              );
+              return {
+                loggedIn: Boolean(res?.loggedIn),
+                accountLabel: res?.accountLabel ?? null,
+                planType: res?.planType ?? null,
+                authMethod: res?.authMethod ?? null,
+                billingTier: res?.billingTier,
+                gatewayUrl: res?.gatewayUrl,
+                rateLimits: Array.isArray(res?.rateLimits) ? res.rateLimits : [],
+                error: res?.error ?? null,
+              };
+            },
+          }
+        : {}),
       createSession: async (config: AdapterSessionConfig): Promise<AdapterSessionHandle> => {
         const handleId = randomUUID();
         const sanitizedConfig = {
@@ -862,7 +949,11 @@ export class IsolatedPluginManager {
           handoffContinuity: config.handoffContinuity,
           pluginMcp: config.pluginMcp,
         };
-        const created = await entry.process.call<{ nativeSessionId?: string | null; pluginMcpAvailable?: boolean }>(
+        const created = await entry.process.call<{
+          nativeSessionId?: string | null;
+          pluginMcpAvailable?: boolean;
+          supportsInjectContext?: boolean;
+        }>(
           'host.driver.createSession',
           { driverId: desc.driverId, handleId, config: sanitizedConfig },
           ISOLATED_TIMEOUTS.command,
@@ -872,6 +963,7 @@ export class IsolatedPluginManager {
           driverId: desc.driverId,
           handleId,
           nativeSessionId: created?.nativeSessionId ?? null,
+          activeTurnId: null,
           listeners: new Set(),
         };
         entry.driverSessions.set(handleId, sessionEntry);
@@ -917,27 +1009,31 @@ export class IsolatedPluginManager {
             ISOLATED_TIMEOUTS.command,
             capturedRunId,
           ),
-          injectContext: async (payload: ContextSyncPayload) => {
-            const sanitizedPayload = {
-              deltaMarkdown: payload.deltaMarkdown,
-              portableItems: payload.portableItems,
-              objective: payload.objective,
-              isWarmBinding: payload.isWarmBinding,
-            };
-            const res = await entry.process.call<{ driverUsed: ContextInjectionDriver }>(
-              'host.driver.injectContext',
-              { handleId, payload: sanitizedPayload },
-              ISOLATED_TIMEOUTS.command,
-              capturedRunId,
-            );
-            if (payload.onDispatch) {
-              payload.onDispatch(
-                res.driverUsed,
-                res.driverUsed === 'codex_inject_items' ? payload.portableItems : payload.deltaMarkdown,
-              );
-            }
-            return res.driverUsed;
-          },
+          ...(created?.supportsInjectContext
+            ? {
+                injectContext: async (payload: ContextSyncPayload) => {
+                  const sanitizedPayload = {
+                    deltaMarkdown: payload.deltaMarkdown,
+                    portableItems: payload.portableItems,
+                    objective: payload.objective,
+                    isWarmBinding: payload.isWarmBinding,
+                  };
+                  const res = await entry.process.call<{ driverUsed: ContextInjectionDriver }>(
+                    'host.driver.injectContext',
+                    { handleId, payload: sanitizedPayload },
+                    ISOLATED_TIMEOUTS.command,
+                    capturedRunId,
+                  );
+                  if (payload.onDispatch) {
+                    payload.onDispatch(
+                      res.driverUsed,
+                      res.driverUsed === 'codex_inject_items' ? payload.portableItems : payload.deltaMarkdown,
+                    );
+                  }
+                  return res.driverUsed;
+                },
+              }
+            : {}),
           interrupt: async () => {
             await entry.process.call('host.driver.interrupt', { handleId }, ISOLATED_TIMEOUTS.command, capturedRunId);
           },
@@ -983,6 +1079,7 @@ export class IsolatedPluginManager {
   async close(): Promise<void> {
     this.serviceUnsubscribe();
     this.permissionUnsubscribe();
+    this.router.abortAllNetStreams();
     for (const timer of this.restartTimers.values()) clearTimeout(timer);
     this.restartTimers.clear();
     for (const entry of this.active.values()) {

@@ -1,0 +1,44 @@
+{
+  "id": "hm.adapter.deepseek",
+  "name": "DeepSeek Harness Adapter",
+  "version": "1.0.0",
+  "description": "第三方隔离进程 DeepSeek Harness 适配器（支持 CLI 与 HTTP-SSE Reasoner/Chat 双模式）",
+  "author": "HarnessMate",
+  "category": "harness",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0.0"
+  },
+  "main": "index.mjs",
+  "permissions": [
+    "harness:driver:register",
+    "process:spawn:deepseek-code",
+    "net:api.deepseek.com",
+    "net:127.0.0.1",
+    "net:localhost",
+    "secrets:read:deepseek",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "chat.block",
+        "id": "deepseek-reasoning-budget",
+        "title": "DeepSeek 推理预算",
+        "ui": "ui/reasoning-card.html",
+        "key": "ext:deepseek.reasoning_budget",
+        "order": 100,
+        "height": 150
+      },
+      {
+        "slot": "harness.settings",
+        "id": "deepseek-settings",
+        "title": "DeepSeek 连接与模式",
+        "ui": "ui/settings.html",
+        "key": "deepseek",
+        "order": 100,
+        "height": 340
+      }
+    ]
+  }
+}

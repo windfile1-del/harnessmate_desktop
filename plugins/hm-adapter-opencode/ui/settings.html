@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>OpenCode 设置</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 8px 2px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: transparent;
+      color: var(--text-primary, #1e293b);
+      font-size: 12px;
+    }
+    .grid { display: grid; gap: 8px; }
+    label {
+      display: grid;
+      gap: 4px;
+      color: var(--text-secondary, #475569);
+      font-size: 11px;
+      font-weight: 500;
+    }
+    input, select {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hairline, rgba(148, 163, 184, 0.3));
+      background: var(--bg-surface, rgba(148, 163, 184, 0.08));
+      color: var(--text-primary, #1e293b);
+      font-size: 12px;
+    }
+    .actions { display: flex; gap: 8px; margin-top: 4px; }
+    button {
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(6, 182, 212, 0.45);
+      background: rgba(6, 182, 212, 0.14);
+      color: var(--accent-cyan, #0891b2);
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: var(--border-hairline, rgba(148, 163, 184, 0.3));
+      background: transparent;
+      color: var(--text-primary, #1e293b);
+    }
+    .status {
+      font-size: 11px;
+      color: var(--text-muted, #64748b);
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <label>
+      服务运行模式
+      <select id="modeInput">
+        <option value="managed_local">本机自动托管 (managed_local)</option>
+        <option value="external_server">连接外部 Server (external_server)</option>
+      </select>
+    </label>
+    <label>
+      本地 CLI 路径 / 命令
+      <input id="binaryInput" type="text" placeholder="opencode" />
+    </label>
+    <label>
+      外部 Server URL
+      <input id="serverUrlInput" type="text" placeholder="http://127.0.0.1:4096" />
+    </label>
+    <label>
+      密码引用 (Secret Ref，禁止明文落盘)
+      <input id="secretRefInput" type="text" placeholder="opencode:server_password" />
+    </label>
+    <label>
+      默认 Agent
+      <input id="agentInput" type="text" placeholder="build" />
+    </label>
+    <div class="actions">
+      <button id="saveBtn" type="button">保存设置</button>
+      <button id="probeBtn" type="button" class="secondary">探测 /server/info</button>
+    </div>
+    <div id="statusText" class="status"></div>
+  </div>
+  <script>
+    (function () {
+      var modeEl = document.getElementById('modeInput');
+      var binEl = document.getElementById('binaryInput');
+      var urlEl = document.getElementById('serverUrlInput');
+      var secEl = document.getElementById('secretRefInput');
+      var agentEl = document.getElementById('agentInput');
+      var statusEl = document.getElementById('statusText');
+
+      function applyState(res) {
+        if (!res || !res.config) return;
+        var cfg = res.config;
+        modeEl.value = cfg.mode || 'managed_local';
+        binEl.value = cfg.binaryPath || 'opencode';
+        urlEl.value = cfg.serverUrl || '';
+        secEl.value = cfg.serverPasswordSecretRef || 'opencode:server_password';
+        agentEl.value = cfg.defaultAgent || 'build';
+        if (res.serverStatus) {
+          statusEl.textContent = res.serverStatus.running
+            ? '运行中: ' + (res.serverStatus.baseUrl || res.serverStatus.mode)
+            : '待机 (' + res.serverStatus.mode + ')';
+        }
+      }
+
+      if (window.harnessMate) {
+        window.harnessMate.sendToPlugin({ action: 'getConfig' })
+          .then(applyState)
+          .catch(function (err) { statusEl.textContent = err.message; });
+
+        document.getElementById('saveBtn').addEventListener('click', function () {
+          statusEl.textContent = '保存并重置旧连接中…';
+          window.harnessMate.sendToPlugin({
+            action: 'saveConfig',
+            config: {
+              mode: modeEl.value,
+              binaryPath: binEl.value.trim() || 'opencode',
+              serverUrl: urlEl.value.trim() || undefined,
+              serverPasswordSecretRef: secEl.value.trim() || 'opencode:server_password',
+              defaultAgent: agentEl.value.trim() || 'build',
+            },
+          })
+            .then(function (res) {
+              applyState(res);
+              statusEl.textContent = '设置已保存';
+            })
+            .catch(function (err) { statusEl.textContent = err.message; });
+        });
+
+        document.getElementById('probeBtn').addEventListener('click', function () {
+          statusEl.textContent = '只读探测中…';
+          window.harnessMate.sendToPlugin({ action: 'testConnection' })
+            .then(function (res) {
+              statusEl.textContent = res.health === 'ready'
+                ? 'OpenCode 2.x 正常 · v' + (res.version || '2')
+                : '不可用: ' + (res.healthMessage || res.health);
+            })
+            .catch(function (err) { statusEl.textContent = err.message; });
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

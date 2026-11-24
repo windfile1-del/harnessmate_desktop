@@ -21,6 +21,15 @@ const MAX_PENDING_CALLS = 64;
 const CRASH_WINDOW_MS = 10 * 60 * 1000;
 const MAX_CRASHES_IN_WINDOW = 5;
 
+/**
+ * Tiny bootstrap stub passed via `-e` so Windows CreateProcess 32KB command-line
+ * limit (`ENAMETOOLONG`) is never exceeded regardless of `ISOLATED_RUNNER_SOURCE` size.
+ * Reads the bootstrap source frame from the first newline-delimited JSON line on stdin,
+ * pushes any subsequent bytes back onto stdin, and evaluates the runner in-memory.
+ */
+const ISOLATED_BOOTSTRAP_STUB =
+  "'use strict';{const ks=[];const onD=c=>{const i=c.indexOf(10);if(i<0){ks.push(c);return;}ks.push(c.subarray(0,i));process.stdin.off('data',onD);process.stdin.pause();const rest=c.subarray(i+1);if(rest.length)process.stdin.unshift(rest);const code=JSON.parse(Buffer.concat(ks).toString('utf8'));new Function('require',code)(require);};process.stdin.on('data',onD);}";
+
 export const ISOLATED_TIMEOUTS = {
   handshake: 5_000,
   command: 10_000,
@@ -92,7 +101,7 @@ export class IsolatedPluginProcess {
       `--allow-fs-read=${opts.packageRoot}`,
       '--max-old-space-size=128',
       '-e',
-      ISOLATED_RUNNER_SOURCE,
+      ISOLATED_BOOTSTRAP_STUB,
       '--',
       entryUrl,
     ];
@@ -104,6 +113,14 @@ export class IsolatedPluginProcess {
     });
     this.child.stdout?.setEncoding('utf8');
     this.child.stderr?.setEncoding('utf8');
+    this.child.stdin?.on('error', () => {
+      // Ignore EPIPE during teardown/early exit
+    });
+    try {
+      this.child.stdin?.write(JSON.stringify(ISOLATED_RUNNER_SOURCE) + '\n');
+    } catch {
+      // Handled by error/exit listeners
+    }
     this.child.stdout?.on('data', (chunk: string) => this.onStdoutChunk(chunk));
     this.child.stderr?.on('data', (chunk: string) => {
       this.stderrTail = (this.stderrTail + chunk).slice(-4000);

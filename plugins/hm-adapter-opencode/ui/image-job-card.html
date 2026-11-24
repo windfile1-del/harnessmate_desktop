@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>OpenCode 图像生成作业</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: transparent;
+      color: var(--text-primary, #1e293b);
+      font-size: 12px;
+    }
+    .card {
+      background: var(--bg-surface, rgba(148, 163, 184, 0.08));
+      border: 1px solid var(--border-hairline, rgba(148, 163, 184, 0.25));
+      border-radius: 12px;
+      padding: 10px 12px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .title { font-weight: 600; }
+    .meta {
+      font-size: 11px;
+      color: var(--text-muted, #64748b);
+    }
+    .preview-wrap {
+      margin-top: 8px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border-hairline, rgba(148, 163, 184, 0.2));
+      max-height: 220px;
+      display: none;
+    }
+    .preview-wrap img {
+      display: block;
+      max-width: 100%;
+      max-height: 220px;
+      object-fit: contain;
+    }
+    .error-note {
+      color: var(--accent-rose, #e11d48);
+      font-size: 11px;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <span id="titleText" class="title">OpenCode 图像生成作业</span>
+      <span id="mimeBadge" class="meta"></span>
+    </div>
+    <div id="promptText" class="meta"></div>
+    <div id="errorNote" class="error-note"></div>
+    <div id="previewWrap" class="preview-wrap">
+      <img id="previewImg" alt="OpenCode Image Job Output" />
+    </div>
+  </div>
+  <script>
+    (function () {
+      var ALLOWED_MIME = {
+        'image/png': true,
+        'image/jpeg': true,
+        'image/webp': true,
+        'image/gif': true,
+      };
+      var MAX_BYTES = 5 * 1024 * 1024;
+
+      function isSafeDataUri(uri, mimeType) {
+        if (typeof uri !== 'string') return false;
+        var m = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$/i.exec(uri.trim());
+        if (!m || m[1].toLowerCase() !== mimeType) return false;
+        return Math.floor((m[2].length * 3) / 4) <= MAX_BYTES;
+      }
+
+      function render(props) {
+        var block = (props && props.block) || {};
+        var payload = block.payload || {};
+        var titleEl = document.getElementById('titleText');
+        var mimeEl = document.getElementById('mimeBadge');
+        var promptEl = document.getElementById('promptText');
+        var errEl = document.getElementById('errorNote');
+        var wrapEl = document.getElementById('previewWrap');
+        var imgEl = document.getElementById('previewImg');
+
+        titleEl.textContent = block.title || 'OpenCode 图像生成作业';
+        errEl.textContent = '';
+        wrapEl.style.display = 'none';
+
+        if (payload.rejected) {
+          mimeEl.textContent = '已拦截';
+          errEl.textContent = payload.reason || '图片格式或体积校验未通过';
+          return;
+        }
+
+        var mime = String(payload.mimeType || '').toLowerCase();
+        var size = Number(payload.sizeBytes || 0);
+        mimeEl.textContent = mime + (size > 0 ? ' · ' + Math.round(size / 1024) + ' KB' : '');
+        promptEl.textContent = payload.prompt ? 'Prompt: ' + String(payload.prompt) : (block.fallbackSummary || '');
+
+        if (!ALLOWED_MIME[mime] || size > MAX_BYTES) {
+          errEl.textContent = '安全限制：仅允许 ≤5MB 的 png/jpg/jpeg/webp/gif 图片';
+        } else if (payload.dataUri && isSafeDataUri(payload.dataUri, mime)) {
+          imgEl.src = payload.dataUri;
+          wrapEl.style.display = 'block';
+        }
+
+        if (window.harnessMate && typeof window.harnessMate.resize === 'function') {
+          window.harnessMate.resize(wrapEl.style.display === 'block' ? 240 : 92);
+        }
+      }
+
+      if (window.harnessMate) {
+        render(window.harnessMate.props);
+        window.harnessMate.onContext(function (_session, nextProps) {
+          render(nextProps);
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

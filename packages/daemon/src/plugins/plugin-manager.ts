@@ -37,6 +37,7 @@ import { PluginComposition } from '../plugin-host/composition/profile.js';
 import { BUILTIN_PLUGINS } from '../plugin-host/builtin/manifests.js';
 import { IsolatedPluginManager } from '../plugin-host/isolation/isolated-manager.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
+import { PluginSecretStore } from '../plugin-host/isolation/plugin-secrets.js';
 import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
 import { CURATED_PLUGIN_CATALOG } from './plugin-catalog.js';
 import { PluginDevWatcher } from './plugin-dev-mode.js';
@@ -67,6 +68,7 @@ export class PluginRevisionConflictError extends PluginApiError {
 export interface PluginManagerOptions {
   store?: HarnessMateStore;
   permissions?: PluginPermissionService;
+  pluginSecrets?: PluginSecretStore;
   crashPolicy?: CrashPolicy;
   onDevReload?: () => void;
 }
@@ -84,6 +86,7 @@ export class PluginManager {
   private readonly dataDir: string;
   readonly host = new PluginHost((error) => console.error('插件生命周期错误', error));
   readonly permissions?: PluginPermissionService;
+  readonly pluginSecrets?: PluginSecretStore;
   readonly isolated?: IsolatedPluginManager;
   readonly registryService: PluginRegistryService;
   readonly devWatcher: PluginDevWatcher;
@@ -108,10 +111,12 @@ export class PluginManager {
     });
     if (options?.store) {
       this.permissions = options.permissions ?? new PluginPermissionService(options.store);
+      this.pluginSecrets = options.pluginSecrets ?? new PluginSecretStore();
       this.isolated = new IsolatedPluginManager({
         store: options.store,
         host: this.host,
         permissions: this.permissions,
+        pluginSecrets: this.pluginSecrets,
         getPluginInfo: (pluginId) => this.plugins.get(pluginId)?.info,
         requestRestart: (pluginId) => this.restartIsolatedPlugin(pluginId),
         crashPolicy: options.crashPolicy,
@@ -641,6 +646,7 @@ export class PluginManager {
       }
       if (enabled) this.isolated?.clearCrashHistory(id);
       await this.activate(new Map(this.plugins).set(id, candidate));
+      if (!enabled) await this.isolated?.awaitPendingDisposals();
       return this.listInstalled();
     });
   }

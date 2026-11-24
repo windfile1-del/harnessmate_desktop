@@ -2353,12 +2353,12 @@ export class SessionManager {
       case 'turn.failed': {
         this.deltaCoalescer.flushSession(sessionId);
         this.cancelSessionApprovals(sessionId, '轮次执行失败');
-        const failureClass = classifyTerminalFailure(ev.code, ev.message);
-        let cooldownResetsAt: number | null = null;
+        const failureClass = ev.failureClass || classifyTerminalFailure(ev.code, ev.message);
+        let cooldownResetsAt: number | null = ev.resetAt ?? null;
         if (FAILOVER_TRIGGER_CLASSES.has(failureClass)) {
           const failoverSvc = this.pluginManager.host.get<FailoverService>('failover');
-          const rec = failoverSvc?.recordFailure?.(eventHarnessId, failureClass);
-          cooldownResetsAt = rec?.resetsAt ?? null;
+          const rec = failoverSvc?.recordFailure?.(eventHarnessId, failureClass, ev.resetAt);
+          cooldownResetsAt = rec?.resetsAt ?? cooldownResetsAt;
         }
         if (meta) {
           this.store.finishSessionRun(meta.runId, {
@@ -2732,6 +2732,9 @@ export class SessionManager {
             ev.usage.cachedTokens !== undefined
               ? (prev?.cachedTokens ?? 0) + ev.usage.cachedTokens
               : prev?.cachedTokens,
+          ...(ev.usage.modelContextWindow !== undefined || prev?.modelContextWindow !== undefined
+            ? { modelContextWindow: ev.usage.modelContextWindow ?? prev?.modelContextWindow }
+            : {}),
           costUsd:
             ev.usage.costUsd !== undefined
               ? Number(((prev?.costUsd ?? 0) + ev.usage.costUsd).toFixed(6))

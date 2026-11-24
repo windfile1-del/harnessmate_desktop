@@ -30,6 +30,8 @@ import {
   type PublicDriverContextSyncPayload,
   type PublicDriverTurnInput,
   type PublicHarnessDriverDescriptor,
+  type PublicNetStreamHandle,
+  type PublicNetStreamInit,
   type PublicSlotRegistration,
   type ServiceImplementation,
   type SpawnCliSpec,
@@ -95,6 +97,19 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
     chunk?: string;
     code?: number | null;
     signal?: string | null;
+  }>>();
+  const netStreams = new Map<string, {
+    chunkListeners: Set<(chunk: string) => void>;
+    endListeners: Set<() => void>;
+    errorListeners: Set<(message: string) => void>;
+    chunkBuffer: string[];
+    ended: boolean;
+    errorMessage?: string;
+  }>();
+  const earlyNetStreamEvents = new Map<string, Array<{
+    type: 'chunk' | 'end' | 'error';
+    chunk?: string;
+    message?: string;
   }>>();
   let availableServices = new Set<string>();
   let hostFeatures = new Set<string>();
@@ -453,6 +468,74 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
       },
       net: {
         fetch: (url, init) => rpcCall('net.fetch', { url, init }),
+        openStream: async (url: string, init?: PublicNetStreamInit): Promise<PublicNetStreamHandle> => {
+          const opened = await rpcCall<{
+            streamId: string;
+            status: number;
+            ok: boolean;
+            headers?: Record<string, string>;
+          }>('net.stream.open', { url, init });
+          const streamId = opened.streamId;
+          const entry = {
+            chunkListeners: new Set<(chunk: string) => void>(),
+            endListeners: new Set<() => void>(),
+            errorListeners: new Set<(message: string) => void>(),
+            chunkBuffer: [] as string[],
+            ended: false,
+            errorMessage: undefined as string | undefined,
+          };
+          netStreams.set(streamId, entry);
+
+          const early = earlyNetStreamEvents.get(streamId);
+          if (early) {
+            earlyNetStreamEvents.delete(streamId);
+            for (const ev of early) {
+              if (ev.type === 'chunk' && ev.chunk !== undefined) entry.chunkBuffer.push(ev.chunk);
+              else if (ev.type === 'end') entry.ended = true;
+              else if (ev.type === 'error') entry.errorMessage = ev.message;
+            }
+          }
+
+          registerEffect(() => () => {
+            netStreams.delete(streamId);
+            if (!disposed && activeRunId) rpcNotify('net.stream.close', { streamId });
+          });
+
+          return {
+            streamId,
+            status: opened.status,
+            ok: opened.ok,
+            headers: opened.headers ?? {},
+            onChunk(listener) {
+              entry.chunkListeners.add(listener);
+              if (entry.chunkBuffer.length > 0) {
+                for (const c of entry.chunkBuffer.splice(0, entry.chunkBuffer.length)) listener(c);
+              }
+              return () => { entry.chunkListeners.delete(listener); };
+            },
+            onEnd(listener) {
+              entry.endListeners.add(listener);
+              if (entry.ended) void Promise.resolve().then(() => listener());
+              return () => { entry.endListeners.delete(listener); };
+            },
+            onError(listener) {
+              entry.errorListeners.add(listener);
+              if (entry.errorMessage !== undefined) {
+                const msg = entry.errorMessage;
+                void Promise.resolve().then(() => listener(msg));
+              }
+              return () => { entry.errorListeners.delete(listener); };
+            },
+            async close() {
+              netStreams.delete(streamId);
+              await rpcCall('net.stream.close', { streamId }).catch(() => {});
+            },
+          };
+        },
+      },
+      secrets: {
+        resolve: (secretRef: string) =>
+          rpcCall<{ value?: string | null }>('secrets.resolve', { secretRef }).then((res) => res?.value ?? null),
       },
       notify: {
         send: (input) => rpcCall('notify.send', input as unknown as Record<string, unknown>),
@@ -480,6 +563,9 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
       try { undo(); } catch { /* best-effort cleanup */ }
     }
     effects.clear();
+    earlyCliEvents.clear();
+    earlyNetStreamEvents.clear();
+    netStreams.clear();
     for (const req of pending.values()) req.reject(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
     pending.clear();
   };
@@ -673,6 +759,45 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           for (const waiter of entry.waiters.splice(0, entry.waiters.length)) waiter.resolve(info);
         }
         result = { ok: true };
+      } else if (method === 'host.net.stream.chunk') {
+        const streamId = String(params.streamId ?? '');
+        const chunk = typeof params.chunk === 'string' ? params.chunk : '';
+        const entry = netStreams.get(streamId);
+        if (!entry) {
+          const buf = earlyNetStreamEvents.get(streamId) ?? [];
+          buf.push({ type: 'chunk', chunk });
+          earlyNetStreamEvents.set(streamId, buf);
+        } else if (entry.chunkListeners.size === 0) {
+          entry.chunkBuffer.push(chunk);
+        } else {
+          for (const listener of [...entry.chunkListeners]) listener(chunk);
+        }
+        result = { ok: true };
+      } else if (method === 'host.net.stream.end') {
+        const streamId = String(params.streamId ?? '');
+        const entry = netStreams.get(streamId);
+        if (!entry) {
+          const buf = earlyNetStreamEvents.get(streamId) ?? [];
+          buf.push({ type: 'end' });
+          earlyNetStreamEvents.set(streamId, buf);
+        } else if (!entry.ended) {
+          entry.ended = true;
+          for (const listener of [...entry.endListeners]) listener();
+        }
+        result = { ok: true };
+      } else if (method === 'host.net.stream.error') {
+        const streamId = String(params.streamId ?? '');
+        const msg = typeof params.message === 'string' ? params.message : 'Stream error';
+        const entry = netStreams.get(streamId);
+        if (!entry) {
+          const buf = earlyNetStreamEvents.get(streamId) ?? [];
+          buf.push({ type: 'error', message: msg });
+          earlyNetStreamEvents.set(streamId, buf);
+        } else {
+          entry.errorMessage = msg;
+          for (const listener of [...entry.errorListeners]) listener(msg);
+        }
+        result = { ok: true };
       } else if (method === 'host.driver.probe' || method === 'host.driver.probePassive') {
         const driverId = String(params.driverId ?? '');
         const entry = driverHandlers.get(driverId);
@@ -682,6 +807,14 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         } else {
           result = await entry.driver.probe();
         }
+      } else if (method === 'host.driver.readUsageLimits') {
+        const driverId = String(params.driverId ?? '');
+        const entry = driverHandlers.get(driverId);
+        if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未注册驱动 ${driverId}`);
+        if (typeof entry.driver.readUsageLimits !== 'function') {
+          throw new PluginApiError('E_NOT_SUPPORTED', '驱动未实现 readUsageLimits');
+        }
+        result = await entry.driver.readUsageLimits();
       } else if (method === 'host.driver.createSession') {
         const driverId = String(params.driverId ?? '');
         const handleId = String(params.handleId ?? '');
@@ -695,6 +828,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         result = {
           nativeSessionId: handle.nativeSessionId ?? null,
           pluginMcpAvailable: handle.pluginMcpAvailable ?? false,
+          supportsInjectContext: typeof handle.injectContext === 'function',
         };
       } else if (method === 'host.driver.sendTurn') {
         const sess = driverSessions.get(String(params.handleId ?? ''));

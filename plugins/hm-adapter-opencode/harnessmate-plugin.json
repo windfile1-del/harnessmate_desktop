@@ -1,0 +1,43 @@
+{
+  "id": "hm.adapter.opencode",
+  "name": "OpenCode HTTP/SSE Adapter",
+  "version": "1.0.0",
+  "description": "第三方隔离进程 OpenCode 2.x HTTP REST + SSE 常驻服务适配器（支持托管本地 Server 与远端连接）",
+  "author": "HarnessMate",
+  "category": "harness",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0.0"
+  },
+  "main": "index.mjs",
+  "permissions": [
+    "harness:driver:register",
+    "process:spawn:opencode",
+    "net:127.0.0.1",
+    "net:localhost",
+    "secrets:read:opencode",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "harness.settings",
+        "id": "opencode-settings",
+        "title": "OpenCode 服务与模式设置",
+        "ui": "ui/settings.html",
+        "key": "opencode",
+        "order": 100,
+        "height": 380
+      },
+      {
+        "slot": "chat.block",
+        "id": "opencode-image-job",
+        "title": "OpenCode 图像生成作业",
+        "ui": "ui/image-job-card.html",
+        "key": "ext:opencode.image_job",
+        "order": 100,
+        "height": 220
+      }
+    ]
+  }
+}

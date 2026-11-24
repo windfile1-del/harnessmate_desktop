@@ -135,6 +135,23 @@ export interface PublicNetResponse {
     headers: Record<string, string>;
     body: string;
 }
+export interface PublicNetStreamInit {
+    method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+    headers?: Record<string, string>;
+    body?: string;
+    connectTimeoutMs?: number;
+    workspaceId?: string;
+}
+export interface PublicNetStreamHandle {
+    readonly streamId: string;
+    readonly status: number;
+    readonly ok: boolean;
+    readonly headers: Record<string, string>;
+    onChunk(listener: (chunk: string) => void): Disposer;
+    onEnd(listener: () => void): Disposer;
+    onError(listener: (message: string) => void): Disposer;
+    close(): Promise<void>;
+}
 export interface PluginEventQuery {
     sessionId: string;
     types?: PluginEventName[];
@@ -393,6 +410,7 @@ export interface PublicDriverTurnInput {
     model?: string | null;
     reasoningEffort?: PublicReasoningEffort | null;
     permissionMode?: PublicPermissionMode;
+    turnOptions?: Record<string, string | number | boolean>;
     contextSync?: PublicDriverContextSyncPayload | null;
     cliCommand?: string;
     nativeSkill?: {
@@ -421,6 +439,8 @@ export type PublicNormalizedAdapterEvent = {
     turnId: string;
     message: string;
     code?: string;
+    failureClass?: string;
+    resetAt?: number | null;
 } | {
     type: 'turn.cancelled';
     turnId: string;
@@ -499,6 +519,8 @@ export type PublicNormalizedAdapterEvent = {
         inputTokens: number;
         outputTokens: number;
         cachedTokens?: number;
+        reasoningTokens?: number;
+        modelContextWindow?: number;
         costUsd?: number;
     };
 } | {
@@ -507,6 +529,22 @@ export type PublicNormalizedAdapterEvent = {
     stream: 'stdout' | 'stderr' | 'protocol';
     message: string;
 };
+export interface PublicRateLimitWindow {
+    label: string;
+    usedPercent: number;
+    windowMinutes: number;
+    resetsAt?: number | null;
+}
+export interface PublicAdapterUsageLimitResult {
+    loggedIn: boolean;
+    accountLabel: string | null;
+    planType: string | null;
+    authMethod: string | null;
+    billingTier?: 'subscription' | 'api_payg' | 'local_free' | 'unknown';
+    gatewayUrl?: string | null;
+    rateLimits: PublicRateLimitWindow[];
+    error?: string | null;
+}
 export interface PluginHarnessSessionHandle {
     readonly nativeSessionId?: string | null;
     readonly pluginMcpAvailable?: boolean;
@@ -530,14 +568,17 @@ export interface PluginHarnessSessionHandle {
 export interface PluginHarnessDriverRegistration extends PublicHarnessDriverDescriptor {
     probe(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
     probePassive?(): Promise<PublicHarnessProbeResult> | PublicHarnessProbeResult;
+    readUsageLimits?(): Promise<PublicAdapterUsageLimitResult> | PublicAdapterUsageLimitResult;
     createSession(config: PublicAdapterSessionConfig): Promise<PluginHarnessSessionHandle> | PluginHarnessSessionHandle;
 }
 export interface SpawnCliSpec {
     command: string;
     args: string[];
-    cwdWorkspaceId: string;
+    cwdWorkspaceId?: string;
     cwdRelativePath?: string;
+    cwd?: string;
     extraEnv?: Record<string, string>;
+    unsetEnv?: string[];
     timeoutMs?: number;
 }
 export interface ManagedCliProcessHandle {
@@ -663,6 +704,12 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
     readonly handoff: IsolatedPluginContext['handoff'] & {
         onRedact(listener: (input: HandoffRedactEvent) => Promise<HandoffRedactResult> | HandoffRedactResult): Disposer;
         preview(sessionId: string, targetInstanceId: string): Promise<ContextHandoffPreviewV2>;
+    };
+    readonly net: IsolatedPluginContext['net'] & {
+        openStream(url: string, init?: PublicNetStreamInit): Promise<PublicNetStreamHandle>;
+    };
+    readonly secrets: {
+        resolve(secretRef: string): Promise<string | null>;
     };
 }
 export type Context = IsolatedPluginContextV5;

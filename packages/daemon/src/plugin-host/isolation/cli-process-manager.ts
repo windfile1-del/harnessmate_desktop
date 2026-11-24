@@ -1,13 +1,14 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { PluginApiError, type SpawnCliSpec } from '@harnessmate/plugin-api';
 import type { InstalledPluginInfo } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { resolveBinary } from '../../harnesses/process.js';
-import type { PluginPermissionService } from '../permissions/permissions.js';
+import { GLOBAL_WORKSPACE_SCOPE, type PluginPermissionService } from '../permissions/permissions.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -57,7 +58,10 @@ function isBlockedExtraEnvKey(key: string): boolean {
   return false;
 }
 
-export function buildSanitizedCliEnv(extraEnv?: Record<string, string>): Record<string, string> {
+export function buildSanitizedCliEnv(
+  extraEnv?: Record<string, string>,
+  unsetEnv?: readonly string[],
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of ENV_ALLOWLIST) {
     const val = process.env[key];
@@ -74,6 +78,13 @@ export function buildSanitizedCliEnv(extraEnv?: Record<string, string>): Record<
       env[key] = value;
       count += 1;
       if (count >= MAX_EXTRA_ENV_KEYS) break;
+    }
+  }
+  if (Array.isArray(unsetEnv)) {
+    for (const key of unsetEnv) {
+      if (typeof key === 'string' && key) {
+        delete env[key];
+      }
     }
   }
   return env;
@@ -151,16 +162,37 @@ export class CliProcessManager {
     if (!Array.isArray(spec.args) || spec.args.length > MAX_ARGS || spec.args.some((a) => typeof a !== 'string')) {
       throw new PluginApiError('E_INVALID_INPUT', 'CLI 参数必须为字符串数组且数量不超过 64');
     }
-    if (typeof spec.cwdWorkspaceId !== 'string' || !spec.cwdWorkspaceId) {
-      throw new PluginApiError('E_INVALID_INPUT', '缺少 cwdWorkspaceId');
-    }
 
-    const workspace = this.store.getWorkspace(spec.cwdWorkspaceId);
-    if (!workspace) {
-      throw new PluginApiError('E_INVALID_INPUT', `工作区不存在: ${spec.cwdWorkspaceId}`);
+    let cwd: string;
+    const capability = `process:spawn:${command}`;
+    if (typeof spec.cwdWorkspaceId === 'string' && spec.cwdWorkspaceId) {
+      const workspace = this.store.getWorkspace(spec.cwdWorkspaceId);
+      if (!workspace) {
+        throw new PluginApiError('E_INVALID_INPUT', `工作区不存在: ${spec.cwdWorkspaceId}`);
+      }
+      this.permissions.assertGranted(plugin, capability, workspace.id);
+      cwd = resolveSafeCwd(workspace.rootPath, spec.cwdRelativePath);
+    } else if (typeof spec.cwd === 'string' && spec.cwd.trim()) {
+      const resolvedCwd = fs.existsSync(spec.cwd) ? fs.realpathSync(spec.cwd) : path.resolve(spec.cwd);
+      const workspaces = this.store.listWorkspaces();
+      const matchedWorkspace = workspaces.find((ws) => {
+        if (!fs.existsSync(ws.rootPath)) return false;
+        const realRoot = fs.realpathSync(ws.rootPath);
+        const rel = path.relative(realRoot, resolvedCwd);
+        return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+      });
+      if (!matchedWorkspace) {
+        throw new PluginApiError('E_PERMISSION_DENIED', '禁止在未注册的工作区之外启动进程');
+      }
+      if (!this.permissions.isGranted(plugin, capability, matchedWorkspace.id)) {
+        this.permissions.assertGranted(plugin, capability, GLOBAL_WORKSPACE_SCOPE);
+      }
+      const rel = path.relative(fs.realpathSync(matchedWorkspace.rootPath), resolvedCwd);
+      cwd = resolveSafeCwd(matchedWorkspace.rootPath, rel || undefined);
+    } else {
+      this.permissions.assertGranted(plugin, capability, GLOBAL_WORKSPACE_SCOPE);
+      cwd = os.tmpdir();
     }
-
-    this.permissions.assertGranted(plugin, `process:spawn:${command}`, workspace.id);
 
     const activeCount = [...this.processes.values()].filter(
       (entry) => entry.pluginId === plugin.id && entry.runId === runId && !entry.exited,
@@ -169,7 +201,6 @@ export class CliProcessManager {
       throw new PluginApiError('E_LIMIT_EXCEEDED', `插件派生子进程数量已达上限 (${MAX_SPAWNED_CLI_PER_PLUGIN})`);
     }
 
-    const cwd = resolveSafeCwd(workspace.rootPath, spec.cwdRelativePath);
     let binaryPath = await resolveBinary(command);
     if (!binaryPath && command === 'node') {
       binaryPath = process.execPath;
@@ -178,7 +209,7 @@ export class CliProcessManager {
       throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未找到可执行程序: ${command}`);
     }
 
-    const env = buildSanitizedCliEnv(spec.extraEnv);
+    const env = buildSanitizedCliEnv(spec.extraEnv, spec.unsetEnv);
     const child =
       process.platform === 'win32' && /\.(cmd|bat)$/i.test(binaryPath)
         ? spawn(
@@ -319,7 +350,9 @@ export class CliProcessManager {
     entry.killPromise = (async () => {
       try {
         if (process.platform === 'win32') {
-          await execFileAsync('taskkill', ['/PID', String(entry.pid), '/T', '/F'], {
+          const sysRoot = process.env.SystemRoot || process.env.SYSTEMROOT;
+          const taskkillBin = sysRoot ? path.join(sysRoot, 'System32', 'taskkill.exe') : 'taskkill';
+          await execFileAsync(taskkillBin, ['/PID', String(entry.pid), '/T', '/F'], {
             timeout: 4_000,
             windowsHide: true,
           });

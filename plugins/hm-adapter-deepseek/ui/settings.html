@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>DeepSeek 设置</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 8px 2px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: transparent;
+      color: var(--text-primary, #1e293b);
+      font-size: 12px;
+    }
+    .grid {
+      display: grid;
+      gap: 8px;
+    }
+    label {
+      display: grid;
+      gap: 4px;
+      color: var(--text-secondary, #475569);
+      font-size: 11px;
+      font-weight: 500;
+    }
+    input, select {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid var(--border-hairline, rgba(148, 163, 184, 0.3));
+      background: var(--bg-surface, rgba(148, 163, 184, 0.08));
+      color: var(--text-primary, #1e293b);
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    button {
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(77, 107, 254, 0.4);
+      background: rgba(77, 107, 254, 0.14);
+      color: #4D6BFE;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: var(--border-hairline, rgba(148, 163, 184, 0.3));
+      background: transparent;
+      color: var(--text-primary, #1e293b);
+    }
+    .status {
+      font-size: 11px;
+      color: var(--text-muted, #64748b);
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <label>
+      运行模式
+      <select id="modeInput">
+        <option value="api_compatible">API Agent 模式（HTTP-SSE）</option>
+        <option value="cli">CLI 模式（stdio JSON）</option>
+      </select>
+    </label>
+    <label>
+      CLI 可执行文件名
+      <input id="cliCommandInput" type="text" placeholder="deepseek-code" />
+    </label>
+    <label>
+      API Base URL
+      <input id="apiBaseUrlInput" type="text" placeholder="https://api.deepseek.com" />
+    </label>
+    <label>
+      密钥引用（Secret Ref，非明文）
+      <input id="secretRefInput" type="text" placeholder="deepseek:api_key" />
+    </label>
+    <label>
+      默认模型
+      <select id="modelInput">
+        <option value="deepseek-reasoner">deepseek-reasoner (R1)</option>
+        <option value="deepseek-chat">deepseek-chat (V3)</option>
+      </select>
+    </label>
+    <div class="actions">
+      <button id="saveBtn" type="button">保存配置</button>
+      <button id="probeBtn" type="button" class="secondary">探测连通性</button>
+    </div>
+    <div id="statusText" class="status"></div>
+  </div>
+  <script>
+    (function () {
+      var modeEl = document.getElementById('modeInput');
+      var cliEl = document.getElementById('cliCommandInput');
+      var urlEl = document.getElementById('apiBaseUrlInput');
+      var secretEl = document.getElementById('secretRefInput');
+      var modelEl = document.getElementById('modelInput');
+      var statusEl = document.getElementById('statusText');
+
+      function applyConfig(cfg) {
+        if (!cfg) return;
+        modeEl.value = cfg.mode || 'api_compatible';
+        cliEl.value = cfg.cliCommand || 'deepseek-code';
+        urlEl.value = cfg.apiBaseUrl || 'https://api.deepseek.com';
+        secretEl.value = (cfg.apiKeyRef && cfg.apiKeyRef.secretRef) || 'deepseek:api_key';
+        modelEl.value = cfg.defaultModel || 'deepseek-reasoner';
+      }
+
+      if (window.harnessMate) {
+        window.harnessMate.sendToPlugin({ action: 'getConfig' })
+          .then(function (res) { if (res && res.config) applyConfig(res.config); })
+          .catch(function (err) { statusEl.textContent = err.message; });
+
+        document.getElementById('saveBtn').addEventListener('click', function () {
+          statusEl.textContent = '保存中…';
+          window.harnessMate.sendToPlugin({
+            action: 'saveConfig',
+            config: {
+              mode: modeEl.value,
+              cliCommand: cliEl.value.trim(),
+              apiBaseUrl: urlEl.value.trim(),
+              apiKeyRef: { secretRef: secretEl.value.trim() },
+              defaultModel: modelEl.value,
+            },
+          })
+            .then(function (res) {
+              if (res && res.config) applyConfig(res.config);
+              statusEl.textContent = '配置已保存';
+            })
+            .catch(function (err) { statusEl.textContent = err.message; });
+        });
+
+        document.getElementById('probeBtn').addEventListener('click', function () {
+          statusEl.textContent = '探测中…';
+          window.harnessMate.sendToPlugin({ action: 'testConnection' })
+            .then(function (res) {
+              statusEl.textContent = res.health === 'ready'
+                ? '连接正常 · ' + (res.accountSummary || res.version || 'ready')
+                : '状态: ' + res.health + (res.healthMessage ? ' · ' + res.healthMessage : '');
+            })
+            .catch(function (err) { statusEl.textContent = err.message; });
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

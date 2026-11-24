@@ -19,6 +19,7 @@ import {
   type PublicHarnessInstanceInfo,
   type PublicNetInit,
   type PublicNetResponse,
+  type PublicNetStreamInit,
   type PublicSession,
   type PublicSessionCapabilities,
   type PublicSessionNotice,
@@ -40,10 +41,11 @@ import type { ContextCompiler } from '../../core/context-compiler.js';
 import type { TaskLedgerService } from '../../core/task-ledger-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { handoffRedactionMap, type GitService } from '../builtin/services.js';
-import type { PluginPermissionService } from '../permissions/permissions.js';
+import { GLOBAL_WORKSPACE_SCOPE, type PluginPermissionService } from '../permissions/permissions.js';
 import type { PluginHost } from '../runtime/lifecycle.js';
 import { toPluginEvent } from '../runtime/map-event.js';
 import type { CliProcessManager } from './cli-process-manager.js';
+import { parseSecretNamespace, type PluginSecretStore } from './plugin-secrets.js';
 
 const MAX_FS_BYTES = 2 * 1024 * 1024;
 const MAX_NET_BYTES = 2 * 1024 * 1024;
@@ -66,8 +68,12 @@ export interface PluginRouterDeps {
   getPluginInfo: (pluginId: string) => InstalledPluginInfo | undefined;
   isCurrentRun: (pluginId: string, runId: string) => boolean;
   cliProcesses?: CliProcessManager;
+  pluginSecrets?: PluginSecretStore;
   onCliOutput?: (pluginId: string, runId: string, processId: string, stream: 'stdout' | 'stderr', chunk: string) => void;
   onCliExit?: (pluginId: string, runId: string, processId: string, code: number | null, signal: string | null) => void;
+  onNetStreamChunk?: (pluginId: string, runId: string, streamId: string, chunk: string) => void;
+  onNetStreamEnd?: (pluginId: string, runId: string, streamId: string) => void;
+  onNetStreamError?: (pluginId: string, runId: string, streamId: string, message: string) => void;
   onDriverRegister?: (pluginId: string, runId: string, driver: PublicHarnessDriverDescriptor) => void;
   onDriverUnregister?: (pluginId: string, runId: string, driverId: string) => void;
   onDriverSessionEvent?: (pluginId: string, runId: string, handleId: string, event: Record<string, unknown>) => void;
@@ -195,10 +201,27 @@ export class IsolatedPluginRpcRouter {
   private readonly logs = new Map<string, PluginLogEntry[]>();
   private readonly pendingSuggestions = new Map<string, Array<{ pluginId: string; suggestion: PublicComposerSuggestion; createdAt: number }>>();
   private readonly preparedTurns = new Map<string, Array<{ pluginId: string; text: string; parts?: Array<{ label: string; text: string }>; createdAt: number }>>();
+  private readonly activeNetStreams = new Map<string, { pluginId: string; runId: string; controller: AbortController }>();
   readonly notifications: Array<{ pluginId: string; title: string; body?: string; level: string; timestamp: number }> = [];
   readonly clipboardWrites: Array<{ pluginId: string; text: string; timestamp: number }> = [];
 
   constructor(private readonly deps: PluginRouterDeps) {}
+
+  abortNetStreamsForRun(pluginId: string, runId?: string): void {
+    for (const [streamId, entry] of [...this.activeNetStreams.entries()]) {
+      if (entry.pluginId === pluginId && (!runId || entry.runId === runId)) {
+        this.activeNetStreams.delete(streamId);
+        try { entry.controller.abort(); } catch {}
+      }
+    }
+  }
+
+  abortAllNetStreams(): void {
+    for (const [streamId, entry] of [...this.activeNetStreams.entries()]) {
+      this.activeNetStreams.delete(streamId);
+      try { entry.controller.abort(); } catch {}
+    }
+  }
 
   getLogs(pluginId: string): PluginLogEntry[] {
     return [...(this.logs.get(pluginId) ?? [])];
@@ -933,7 +956,7 @@ export class IsolatedPluginRpcRouter {
         }
         const init = (params.init ?? {}) as PublicNetInit;
         const controller = new AbortController();
-        const timeout = Math.min(15_000, Math.max(500, init.timeoutMs ?? 10_000));
+        const timeout = Math.min(60_000, Math.max(500, init.timeoutMs ?? 10_000));
         const timer = setTimeout(() => controller.abort(), timeout);
         try {
           const response = await fetch(parsedUrl.toString(), {
@@ -956,6 +979,124 @@ export class IsolatedPluginRpcRouter {
         } finally {
           clearTimeout(timer);
         }
+      }
+
+      case 'net.stream.open': {
+        const rawUrl = typeof params.url === 'string' ? params.url : '';
+        let parsedUrl: URL;
+        try { parsedUrl = new URL(rawUrl); } catch {
+          throw new PluginApiError('E_INVALID_INPUT', '无效的流式请求 URL');
+        }
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          throw new PluginApiError('E_INVALID_INPUT', '仅支持 http/https 协议');
+        }
+        const host = parsedUrl.hostname.toLowerCase();
+        const capability = `net:${host}`;
+        const init = (params.init ?? {}) as PublicNetStreamInit;
+        const workspaceId = typeof init.workspaceId === 'string'
+          ? init.workspaceId
+          : (typeof params.workspaceId === 'string' ? params.workspaceId : undefined);
+        const granted = workspaceId
+          ? this.deps.permissions.isGranted(plugin, capability, workspaceId)
+          : this.deps.permissions.isGranted(plugin, capability) ||
+            this.deps.store.listWorkspaces().some((ws) => this.deps.permissions.isGranted(plugin, capability, ws.id));
+        if (!granted) {
+          throw new PluginApiError('E_PERMISSION_DENIED', `插件 ${plugin.id} 未获得网络权限 ${capability}`);
+        }
+        const controller = new AbortController();
+        const connectTimeout = Math.min(60_000, Math.max(500, init.connectTimeoutMs ?? 10_000));
+        const connectTimer = setTimeout(() => controller.abort(new Error('Stream connection timeout')), connectTimeout);
+        let response: Response;
+        try {
+          response = await fetch(parsedUrl.toString(), {
+            method: init.method ?? 'GET',
+            headers: init.headers,
+            body: init.body,
+            signal: controller.signal,
+          });
+        } catch (err) {
+          clearTimeout(connectTimer);
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new PluginApiError(
+            controller.signal.aborted ? 'E_TIMEOUT' : 'E_SERVICE_UNAVAILABLE',
+            msg,
+          );
+        }
+        clearTimeout(connectTimer);
+
+        const streamId = randomUUID();
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => { headers[key] = value; });
+        this.activeNetStreams.set(streamId, {
+          pluginId: meta.pluginId,
+          runId: meta.runId,
+          controller,
+        });
+
+        const pump = async () => {
+          try {
+            if (!response.body) {
+              this.deps.onNetStreamEnd?.(meta.pluginId, meta.runId, streamId);
+              return;
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8', { fatal: false });
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (!this.activeNetStreams.has(streamId)) {
+                await reader.cancel().catch(() => {});
+                return;
+              }
+              if (value && value.byteLength > 0) {
+                const text = decoder.decode(value, { stream: true });
+                if (text) {
+                  this.deps.onNetStreamChunk?.(meta.pluginId, meta.runId, streamId, text);
+                }
+              }
+            }
+            const flushText = decoder.decode();
+            if (flushText) {
+              this.deps.onNetStreamChunk?.(meta.pluginId, meta.runId, streamId, flushText);
+            }
+            if (this.activeNetStreams.has(streamId)) {
+              this.deps.onNetStreamEnd?.(meta.pluginId, meta.runId, streamId);
+            }
+          } catch (err) {
+            if (this.activeNetStreams.has(streamId)) {
+              const msg = err instanceof Error ? err.message : String(err);
+              this.deps.onNetStreamError?.(meta.pluginId, meta.runId, streamId, msg);
+            }
+          } finally {
+            this.activeNetStreams.delete(streamId);
+          }
+        };
+        queueMicrotask(() => { void pump(); });
+
+        return {
+          streamId,
+          status: response.status,
+          ok: response.ok,
+          headers,
+        };
+      }
+
+      case 'net.stream.close': {
+        const streamId = typeof params.streamId === 'string' ? params.streamId : '';
+        const existing = this.activeNetStreams.get(streamId);
+        if (existing && existing.pluginId === meta.pluginId && existing.runId === meta.runId) {
+          this.activeNetStreams.delete(streamId);
+          try { existing.controller.abort(); } catch {}
+        }
+        return { ok: true };
+      }
+
+      case 'secrets.resolve': {
+        const secretRef = typeof params.secretRef === 'string' ? params.secretRef : '';
+        const namespace = parseSecretNamespace(secretRef);
+        this.deps.permissions.assertGranted(plugin, `secrets:read:${namespace}`, GLOBAL_WORKSPACE_SCOPE);
+        const value = this.deps.pluginSecrets?.resolve(secretRef) ?? null;
+        return { value };
       }
 
       case 'notify.send': {

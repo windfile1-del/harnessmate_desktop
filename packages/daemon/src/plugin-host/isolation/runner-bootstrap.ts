@@ -82,6 +82,8 @@ const driverHandlers = new Map();
 const driverSessions = new Map();
 const cliProcesses = new Map();
 const earlyCliEvents = new Map();
+const netStreams = new Map();
+const earlyNetStreamEvents = new Map();
 let availableServices = new Set();
 let hostFeatures = new Set();
 
@@ -465,6 +467,77 @@ function buildContext(handshake) {
     },
     net: {
       fetch: (url, init) => rpcCall('net.fetch', { url, init }),
+      async openStream(url, init) {
+        const opened = await rpcCall('net.stream.open', { url, init });
+        const streamId = opened.streamId;
+        const entry = {
+          chunkListeners: new Set(),
+          endListeners: new Set(),
+          errorListeners: new Set(),
+          chunkBuffer: [],
+          ended: false,
+          errorMessage: undefined,
+        };
+        netStreams.set(streamId, entry);
+
+        const early = earlyNetStreamEvents.get(streamId);
+        if (early) {
+          earlyNetStreamEvents.delete(streamId);
+          for (const ev of early) {
+            if (ev.type === 'chunk' && ev.chunk !== undefined) {
+              entry.chunkBuffer.push(ev.chunk);
+            } else if (ev.type === 'end') {
+              entry.ended = true;
+            } else if (ev.type === 'error') {
+              entry.errorMessage = ev.message;
+            }
+          }
+        }
+
+        registerEffect(() => () => {
+          netStreams.delete(streamId);
+          if (!disposed && activeRunId) {
+            rpcNotify('net.stream.close', { streamId });
+          }
+        });
+
+        return {
+          streamId,
+          status: opened.status,
+          ok: opened.ok,
+          headers: opened.headers || {},
+          onChunk(listener) {
+            entry.chunkListeners.add(listener);
+            if (entry.chunkBuffer.length > 0) {
+              const buffered = entry.chunkBuffer.splice(0, entry.chunkBuffer.length);
+              for (const chunk of buffered) listener(chunk);
+            }
+            return () => { entry.chunkListeners.delete(listener); };
+          },
+          onEnd(listener) {
+            entry.endListeners.add(listener);
+            if (entry.ended) {
+              queueMicrotask(() => listener());
+            }
+            return () => { entry.endListeners.delete(listener); };
+          },
+          onError(listener) {
+            entry.errorListeners.add(listener);
+            if (entry.errorMessage !== undefined) {
+              const msg = entry.errorMessage;
+              queueMicrotask(() => listener(msg));
+            }
+            return () => { entry.errorListeners.delete(listener); };
+          },
+          async close() {
+            netStreams.delete(streamId);
+            await rpcCall('net.stream.close', { streamId }).catch(() => {});
+          },
+        };
+      },
+    },
+    secrets: {
+      resolve: (secretRef) => rpcCall('secrets.resolve', { secretRef }).then((res) => (res && res.value !== undefined ? res.value : null)),
     },
     notify: {
       send: (input) => rpcCall('notify.send', input || {}),
@@ -489,6 +562,8 @@ function disposeAll() {
   }
   effects.clear();
   earlyCliEvents.clear();
+  earlyNetStreamEvents.clear();
+  netStreams.clear();
   for (const req of pending.values()) {
     req.reject(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
   }
@@ -679,6 +754,45 @@ async function handleMessage(message) {
         for (const waiter of entry.waiters.splice(0, entry.waiters.length)) waiter.resolve(info);
       }
       result = { ok: true };
+    } else if (method === 'host.net.stream.chunk') {
+      const streamId = String(params.streamId || '');
+      const chunk = typeof params.chunk === 'string' ? params.chunk : '';
+      const entry = netStreams.get(streamId);
+      if (!entry) {
+        const buf = earlyNetStreamEvents.get(streamId) || [];
+        buf.push({ type: 'chunk', chunk });
+        earlyNetStreamEvents.set(streamId, buf);
+      } else if (entry.chunkListeners.size === 0) {
+        entry.chunkBuffer.push(chunk);
+      } else {
+        for (const listener of [...entry.chunkListeners]) listener(chunk);
+      }
+      result = { ok: true };
+    } else if (method === 'host.net.stream.end') {
+      const streamId = String(params.streamId || '');
+      const entry = netStreams.get(streamId);
+      if (!entry) {
+        const buf = earlyNetStreamEvents.get(streamId) || [];
+        buf.push({ type: 'end' });
+        earlyNetStreamEvents.set(streamId, buf);
+      } else if (!entry.ended) {
+        entry.ended = true;
+        for (const listener of [...entry.endListeners]) listener();
+      }
+      result = { ok: true };
+    } else if (method === 'host.net.stream.error') {
+      const streamId = String(params.streamId || '');
+      const msg = typeof params.message === 'string' ? params.message : 'Stream error';
+      const entry = netStreams.get(streamId);
+      if (!entry) {
+        const buf = earlyNetStreamEvents.get(streamId) || [];
+        buf.push({ type: 'error', message: msg });
+        earlyNetStreamEvents.set(streamId, buf);
+      } else {
+        entry.errorMessage = msg;
+        for (const listener of [...entry.errorListeners]) listener(msg);
+      }
+      result = { ok: true };
     } else if (method === 'host.driver.probe' || method === 'host.driver.probePassive') {
       const driverId = String(params.driverId || '');
       const entry = driverHandlers.get(driverId);
@@ -688,6 +802,14 @@ async function handleMessage(message) {
       } else {
         result = await entry.driver.probe();
       }
+    } else if (method === 'host.driver.readUsageLimits') {
+      const driverId = String(params.driverId || '');
+      const entry = driverHandlers.get(driverId);
+      if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '未注册驱动 ' + driverId);
+      if (typeof entry.driver.readUsageLimits !== 'function') {
+        throw new PluginApiError('E_NOT_SUPPORTED', '驱动未实现 readUsageLimits');
+      }
+      result = await entry.driver.readUsageLimits();
     } else if (method === 'host.driver.createSession') {
       const driverId = String(params.driverId || '');
       const handleId = String(params.handleId || '');
@@ -701,6 +823,7 @@ async function handleMessage(message) {
       result = {
         nativeSessionId: handle.nativeSessionId ?? null,
         pluginMcpAvailable: handle.pluginMcpAvailable ?? false,
+        supportsInjectContext: typeof handle.injectContext === 'function',
       };
     } else if (method === 'host.driver.sendTurn') {
       const sess = driverSessions.get(String(params.handleId || ''));

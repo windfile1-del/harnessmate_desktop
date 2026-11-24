@@ -98,7 +98,7 @@ export type NormalizedAdapterEvent =
   | { type: 'model.confirmed'; actualModel: string; reroutedFrom?: string; reason?: string }
   | { type: 'turn.started'; turnId: string; continuation?: boolean }
   | { type: 'turn.completed'; turnId: string; stopReason?: string }
-  | { type: 'turn.failed'; turnId: string; message: string; code?: string }
+  | { type: 'turn.failed'; turnId: string; message: string; code?: string; failureClass?: string; resetAt?: number | null }
   | { type: 'turn.cancelled'; turnId: string }
   | { type: 'message.assistant.delta'; turnId: string; text: string; messageId?: string; parentToolUseId?: string }
   | { type: 'message.assistant.completed'; turnId: string; text: string; messageId?: string; parentToolUseId?: string }

@@ -93,6 +93,7 @@ import { runPluginProgram } from '../plugins/plugin-program.js';
 import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
 import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
+import { PluginSecretStore } from '../plugin-host/isolation/plugin-secrets.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
 
@@ -110,6 +111,7 @@ export interface DaemonInstance {
   store: HarnessMateStore;
   registry: HarnessRegistry;
   pluginManager: PluginManager;
+  pluginSecrets: PluginSecretStore;
   sessionManager: SessionManager;
   commandOutputHub: CommandOutputHub;
   outboxWorker: EffectOutboxWorker;
@@ -136,6 +138,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   }
 
   const pluginPermissions = new PluginPermissionService(store);
+  const pluginSecrets = new PluginSecretStore();
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
@@ -156,7 +159,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       opts.customAdapters,
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
     ),
-    { store, permissions: pluginPermissions, crashPolicy: opts.pluginCrashPolicy,
+    { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy,
       onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
@@ -1834,6 +1837,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     store,
     registry,
     pluginManager,
+    pluginSecrets,
     sessionManager,
     commandOutputHub,
     outboxWorker,
