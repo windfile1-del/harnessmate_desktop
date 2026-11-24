@@ -115,6 +115,19 @@ export type StandardTurnBlock =
       insertions: number;
       deletions: number;
       skippedLargeFiles: string[];
+    })
+  | (TurnBlockBase & {
+      type: 'runtime_request';
+      requestId: string;
+      kind: 'command_approval' | 'file_change_approval' | 'mcp_tool_approval' | 'user_question' | 'secret_request';
+      title: string;
+      receiptText: string;
+      requestStatus: string;
+      decision?: string | null;
+      resolvedBy?: string | null;
+      riskLevel?: string;
+      secretProvided?: boolean;
+      resolvedAt?: number;
     });
 
 export interface ExtensionTurnBlock extends TurnBlockBase {

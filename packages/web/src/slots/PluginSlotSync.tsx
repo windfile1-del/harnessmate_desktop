@@ -10,11 +10,13 @@ import {
 } from '@harnessmate/protocol';
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
+import { RuntimeRequestReceiptBlock } from '../components/ApprovalCenter';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
 import { HtmlRenderCard } from '../components/HtmlRenderCard';
 import { FailoverInlineBanner } from '../components/MessageStudio';
 import { PluginDataPanel } from '../components/PluginDataPanel';
+import { SideChatDrawer } from '../components/SideChatDrawer';
 import { TraitsPicker } from '../components/TraitsPicker';
 import { resolveHarnessMeta, resolveHarnessOptionDescriptors } from '../lib/harness-meta';
 import { listPluginPanels } from '../lib/plugin-panels';
@@ -362,6 +364,96 @@ export function PluginSlotSync() {
                 onRevert={async (mode, turnSeq) => {
                   await store.revertCheckpoint(session.id, { targetTurnSeq: turnSeq, mode });
                 }}
+              />
+            );
+          },
+        }),
+      );
+    }
+
+    // Built-in V5 Session Explorer: Side Chat (`inspector.tabs` key: `side-chat`) + Sidebar lineage badge (`session.sidebar.badge`)
+    const explorerPlugin = plugins.find((p) => p.id === 'hm.plugin.session-explorer');
+    if (!explorerPlugin || isPluginActive(explorerPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'inspector.tabs',
+          id: 'side-chat',
+          pluginId: 'hm.plugin.session-explorer',
+          pluginName: 'Session Explorer',
+          title: 'Side Chat 侧栏问答',
+          key: 'side-chat',
+          order: 120,
+          sourceKind: 'builtin',
+          render: ({ session }) => <SideChatDrawer session={session} />,
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'session.sidebar.badge',
+          id: 'session-lineage-badge',
+          pluginId: 'hm.plugin.session-explorer',
+          pluginName: 'Session Explorer',
+          title: '分支与导入徽标',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ session }) => {
+            if (session.parentSessionId) {
+              return (
+                <span
+                  title={`从父会话 ${session.parentSessionId} 分叉`}
+                  className="rounded px-1 py-0.2 font-mono-code text-[9.5px]"
+                  style={{
+                    backgroundColor: 'var(--accent-indigo-soft)',
+                    color: 'var(--accent-indigo)',
+                  }}
+                >
+                  分支
+                </span>
+              );
+            }
+            if (session.importMode === 'mirror' || session.importMode === 'attach') {
+              return (
+                <span
+                  title={`外部 CLI 导入 (${session.importSource ?? session.importMode})`}
+                  className="rounded px-1 py-0.2 font-mono-code text-[9.5px]"
+                  style={{
+                    backgroundColor: 'var(--bg-elevated)',
+                    color: 'var(--text-muted)',
+                  }}
+                >
+                  {session.importMode === 'mirror' ? '镜像' : '接管'}
+                </span>
+              );
+            }
+            return null;
+          },
+        }),
+      );
+    }
+
+    // Built-in V5 Approval Center: historical read-only receipt (`chat.block` key: `runtime_request`)
+    const approvalCenterPlugin = plugins.find((p) => p.id === 'hm.plugin.approval-center');
+    if (!approvalCenterPlugin || isPluginActive(approvalCenterPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'chat.block',
+          id: 'approval-center-receipt',
+          pluginId: 'hm.plugin.approval-center',
+          pluginName: 'Approval Center',
+          title: '审批与凭据回执卡',
+          key: 'runtime_request',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ block }) => {
+            if (block.type !== 'runtime_request') return null;
+            return (
+              <RuntimeRequestReceiptBlock
+                kind={block.kind}
+                title={block.title}
+                receiptText={block.receiptText}
+                requestStatus={block.requestStatus}
+                resolvedBy={block.resolvedBy}
               />
             );
           },

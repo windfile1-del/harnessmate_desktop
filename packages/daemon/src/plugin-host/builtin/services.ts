@@ -2,9 +2,11 @@ import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
 import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
 import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
+import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointService } from '../../core/checkpoint-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { FailoverCoordinator } from '../../core/failover-service.js';
+import { SessionExplorerService } from '../../core/session-explorer-service.js';
 import {
   createGitWorktree,
   discardFile,
@@ -252,6 +254,34 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
         () => ctx.get<UsageService>('usage'),
       );
       ctx.provide('failover', coordinator);
+    },
+  });
+  plugins.set('hm.plugin.session-explorer', {
+    provides: ['session-search'],
+    apply(ctx) {
+      const explorer = new SessionExplorerService(store, registry);
+      ctx.provide('session-search', explorer);
+      ctx.on('turn.completed', ({ sessionId, turnId }) => {
+        if (sessionId && turnId) {
+          explorer.indexSessionTurn(sessionId, turnId);
+        }
+      });
+      // Non-blocking low-priority background FTS5 backfill
+      const timer = setTimeout(() => {
+        void explorer.rebuildBacklogIndex(20).catch(() => {});
+      }, 250);
+      timer.unref?.();
+      ctx.effect(() => () => {
+        clearTimeout(timer);
+        explorer.dispose();
+      });
+    },
+  });
+  plugins.set('hm.plugin.approval-center', {
+    provides: ['approval-center'],
+    apply(ctx) {
+      const approvalCenter = new ApprovalCenterService(store);
+      ctx.provide('approval-center', approvalCenter);
     },
   });
   return plugins;

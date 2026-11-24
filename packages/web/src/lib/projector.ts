@@ -227,6 +227,33 @@ export function turnBlockRecordToBlock(record: TurnBlockRecord): TurnBlock {
     };
   }
 
+  if (record.blockType === 'runtime_request') {
+    const kind =
+      p.kind === 'file_change_approval' ||
+      p.kind === 'mcp_tool_approval' ||
+      p.kind === 'user_question' ||
+      p.kind === 'secret_request'
+        ? p.kind
+        : 'command_approval';
+    return {
+      ...base,
+      type: 'runtime_request',
+      requestId: String(p.requestId ?? record.itemId),
+      kind,
+      title: record.title || '运行时请求回执',
+      receiptText:
+        kind === 'secret_request'
+          ? '已安全提供凭据（内容已隐藏）'
+          : record.textBody || String(p.receiptText ?? '已处理'),
+      requestStatus: String(p.status ?? record.status),
+      decision: typeof p.decision === 'string' ? p.decision : null,
+      resolvedBy: typeof p.resolvedBy === 'string' ? p.resolvedBy : null,
+      riskLevel: typeof p.riskLevel === 'string' ? p.riskLevel : undefined,
+      secretProvided: Boolean(p.secretProvided),
+      resolvedAt: typeof p.resolvedAt === 'number' ? p.resolvedAt : record.updatedAt,
+    };
+  }
+
   if (record.blockType === 'checkpoint_marker') {
     const phase =
       p.phase === 'turn_pre' ||
@@ -859,13 +886,37 @@ function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
           pending.delete(approvalId);
           const decision = (p.decision as ApprovalDecision | undefined) ?? null;
           existing.decision = decision;
-          existing.status = p.status === 'expired' ? 'expired' : decision === 'deny' ? 'denied' : 'approved';
+          existing.status =
+            p.status === 'expired'
+              ? 'expired'
+              : p.status === 'cancelled'
+                ? 'cancelled'
+                : p.status === 'resolved'
+                  ? 'resolved'
+                  : decision === 'deny'
+                    ? 'denied'
+                    : 'approved';
           existing.resolvedBy =
-            existing.status === 'expired'
+            existing.status === 'expired' || existing.status === 'cancelled'
               ? null
               : ((p.resolvedBy as 'desktop' | 'mobile' | 'auto') ?? 'desktop');
           existing.comment = typeof p.comment === 'string' ? p.comment : null;
           existing.resolvedAt = typeof p.resolvedAt === 'number' ? p.resolvedAt : ev.createdAt;
+        }
+        break;
+      }
+
+      case 'runtime_request.updated': {
+        const reqObj = p.request as ApprovalRequest | undefined;
+        if (reqObj && reqObj.id) {
+          const existing = approvalMap.get(reqObj.id);
+          if (existing) {
+            Object.assign(existing, reqObj);
+            const owner = approvalOwners.get(reqObj.id);
+            if (owner) dirty.add(owner);
+            if (reqObj.status !== 'pending') pending.delete(reqObj.id);
+            else pending.add(reqObj.id);
+          }
         }
         break;
       }

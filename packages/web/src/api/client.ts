@@ -9,14 +9,18 @@ import type {
   CheckpointRevertResult,
   ContextPreview,
   ContextSyncMode,
+  CreateCustomRiskRuleRequest,
   CreateSessionRequest,
   CreateWorktreeRequest,
   CustomAcpHarnessConfig,
+  CustomRiskRule,
   DiscoveredCliSession,
   DryRunMergeRequest,
   FailoverPolicy,
   FailoverRecommendation,
   FailoverRequest,
+  ForkSessionRequest,
+  ForkSessionResult,
   GcCheckpointsRequest,
   GitActionResult,
   GitCommitRequest,
@@ -37,16 +41,21 @@ import type {
   GeneratePluginDraftRequest,
   PluginManifest,
   ImportNativeSessionRequest,
+  ImportSessionBundleRequest,
   McpServerEntry,
+  MergeBackRequest,
+  MergeBackResult,
   PluginCatalogItem,
   PluginLogEntryDto,
   PluginMcpPreset,
   PluginPermission,
   PluginRegistryStateDto,
+  PortableSessionBundleV2,
   PreviewPluginProgramRequest,
   PluginSlashCommand,
   RemoteAccessStatus,
   ReplayPluginDraftRequest,
+  ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
@@ -55,8 +64,12 @@ import type {
   SessionCheckpointRecord,
   SessionModelPluginTools,
   SessionPluginAction,
+  SessionSearchResponse,
   SetPluginPermissionRequest,
   SessionTaskState,
+  SideChatMessage,
+  SideChatPromoteRequest,
+  SideChatRequest,
   PluginPanelQuery,
   PluginPanelSnapshot,
   PluginUiMessageRequest,
@@ -153,6 +166,20 @@ export function resolveAttachmentUrl(previewUrl?: string): string | undefined {
   return `${getDaemonBaseUrl()}${previewUrl}`;
 }
 
+export class ApiHttpError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly payload?: Record<string, unknown>;
+
+  constructor(message: string, status: number, payload?: Record<string, unknown>) {
+    super(message);
+    this.name = 'ApiHttpError';
+    this.status = status;
+    this.code = typeof payload?.code === 'string' ? payload.code : undefined;
+    this.payload = payload;
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${getDaemonBaseUrl()}${path}`;
   const headers = new Headers(init?.headers);
@@ -171,11 +198,9 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!res.ok) {
-    const errMsg =
-      data && typeof data === 'object' && 'error' in data
-        ? String((data as { error: unknown }).error)
-        : `HTTP ${res.status}`;
-    throw new Error(errMsg);
+    const obj = data && typeof data === 'object' ? (data as Record<string, unknown>) : undefined;
+    const errMsg = obj && 'error' in obj ? String(obj.error) : `HTTP ${res.status}`;
+    throw new ApiHttpError(errMsg, res.status, obj);
   }
   return data as T;
 }
@@ -206,12 +231,86 @@ export const daemonApi = {
       method: 'DELETE',
     }),
 
-  discoverLocalCliSessions: (limit = 20) =>
-    apiFetch<{ sessions: DiscoveredCliSession[]; hasMore: boolean }>(`/api/v1/harnesses/discovered-sessions?limit=${limit}`),
+  discoverLocalCliSessions: (limit = 20, refresh = false) =>
+    apiFetch<{ sessions: DiscoveredCliSession[]; hasMore: boolean }>(
+      `/api/v1/harnesses/discovered-sessions?limit=${limit}${refresh ? '&refresh=1' : ''}`,
+    ),
 
   importNativeSession: (req: ImportNativeSessionRequest) =>
-    apiFetch<{ session: Session }>('/api/v1/harnesses/import-session', {
-      method: 'POST', body: JSON.stringify(req),
+    apiFetch<{ session: Session; partial?: boolean; lockWarning?: string; mode?: 'mirror' | 'attach' }>(
+      '/api/v1/harnesses/import-session',
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  searchSessions: (opts: {
+    q: string;
+    workspaceId?: string;
+    driverId?: string;
+    fromTs?: number;
+    toTs?: number;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const params = new URLSearchParams();
+    params.set('q', opts.q);
+    if (opts.workspaceId) params.set('workspaceId', opts.workspaceId);
+    if (opts.driverId) params.set('driverId', opts.driverId);
+    if (opts.fromTs !== undefined) params.set('fromTs', String(opts.fromTs));
+    if (opts.toTs !== undefined) params.set('toTs', String(opts.toTs));
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+    return apiFetch<SessionSearchResponse>(`/api/v1/search/sessions?${params.toString()}`);
+  },
+
+  rebuildSearchIndex: () =>
+    apiFetch<{ indexedCount: number }>('/api/v1/search/reindex', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  forkSession: (sessionId: string, req: ForkSessionRequest = {}) =>
+    apiFetch<ForkSessionResult>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/fork`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  mergeBackSession: (sessionId: string, req: MergeBackRequest = {}) =>
+    apiFetch<MergeBackResult>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/merge-back`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  getSideChat: (sessionId: string) =>
+    apiFetch<{ messages: SideChatMessage[] }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/side-chat`,
+    ),
+
+  sendSideChat: (sessionId: string, req: SideChatRequest) =>
+    apiFetch<{ messages: SideChatMessage[]; reply: SideChatMessage }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/side-chat`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  clearSideChat: (sessionId: string) =>
+    apiFetch<{ ok: boolean }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/side-chat`, {
+      method: 'DELETE',
+    }),
+
+  promoteSideChat: (sessionId: string, req: SideChatPromoteRequest = {}) =>
+    apiFetch<ForkSessionResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/side-chat/promote`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  exportSessionBundle: (sessionId: string, redact = true) =>
+    apiFetch<{ format: 'json_bundle'; filename: string; bundle: PortableSessionBundleV2 }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/export?format=json_bundle&redact=${redact ? '1' : '0'}`,
+    ),
+
+  importSessionBundle: (req: ImportSessionBundleRequest) =>
+    apiFetch<{ session: Session }>('/api/v1/sessions/import-bundle', {
+      method: 'POST',
+      body: JSON.stringify(req),
     }),
 
   // Plugins
@@ -646,9 +745,9 @@ export const daemonApi = {
       },
     ),
 
-  exportSessionMarkdown: (sessionId: string) =>
-    apiFetch<{ filename: string; markdown: string }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/export`,
+  exportSessionMarkdown: (sessionId: string, redact = false) =>
+    apiFetch<{ filename: string; markdown: string; redacted?: boolean; redactedCount?: number }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/export?format=markdown&redact=${redact ? '1' : '0'}`,
     ),
 
   getSessionGit: (id: string) =>
@@ -811,6 +910,29 @@ export const daemonApi = {
         method: 'POST',
         body: JSON.stringify({ decision, comment, resolvedBy: 'desktop' }),
       },
+    ),
+
+  resolveRuntimeRequest: (approvalId: string, req: ResolveApprovalRequest) =>
+    apiFetch<{ approval: ApprovalRequest }>(
+      `/api/v1/approvals/${encodeURIComponent(approvalId)}/resolve`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...req, resolvedBy: req.resolvedBy ?? 'desktop' }),
+      },
+    ),
+
+  listRiskRules: () => apiFetch<{ rules: CustomRiskRule[] }>('/api/v1/approval-center/rules'),
+
+  addRiskRule: (req: CreateCustomRiskRuleRequest) =>
+    apiFetch<{ rule: CustomRiskRule; rules: CustomRiskRule[] }>('/api/v1/approval-center/rules', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  deleteRiskRule: (ruleId: string) =>
+    apiFetch<{ deleted: boolean; rules: CustomRiskRule[] }>(
+      `/api/v1/approval-center/rules/${encodeURIComponent(ruleId)}`,
+      { method: 'DELETE' },
     ),
 
   getRemoteStatus: () => apiFetch<RemoteAccessStatus>('/api/v1/remote/status'),

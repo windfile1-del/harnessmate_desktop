@@ -33,6 +33,8 @@ import {
   FileText,
   FolderGit2,
   GitBranch,
+  GitFork,
+  GitMerge,
   Globe,
   ImagePlus,
   ListChecks,
@@ -80,6 +82,11 @@ import {
 import { useAppStore } from '../stores/app-store';
 import type { FileLink } from '../lib/file-links';
 import { Slot, SlotTurnProvider } from '../slots';
+import {
+  ComposerPendingRequestBar,
+  GlobalAttentionStrip,
+  RuntimeRequestReceiptBlock,
+} from './ApprovalCenter';
 import { HarnessBadge, StarLoomCrest } from './BrandMark';
 import { UndoRevertBanner } from './CheckpointControls';
 import { HarnessSwitcher } from './HarnessSwitcher';
@@ -151,6 +158,7 @@ function SessionUndoRevertBar({ sessionId }: { sessionId: string }) {
 export function ChatStage() {
   const {
     sessions,
+    pendingApprovals,
     harnesses,
     workspaces,
     slashCommands,
@@ -185,6 +193,9 @@ export function ChatStage() {
     interruptSession,
     updateSession,
     resolveApproval,
+    resolveRuntimeRequest,
+    forkSession,
+    mergeBackSession,
     setDraftText,
     addDraftAttachment,
     removeDraftAttachment,
@@ -193,6 +204,7 @@ export function ChatStage() {
     isPluginEnabled,
   } = useAppStore(useShallow((state) => ({
     sessions: state.sessions,
+    pendingApprovals: state.pendingApprovals,
     harnesses: state.harnesses,
     workspaces: state.workspaces,
     slashCommands: state.slashCommands,
@@ -227,6 +239,9 @@ export function ChatStage() {
     interruptSession: state.interruptSession,
     updateSession: state.updateSession,
     resolveApproval: state.resolveApproval,
+    resolveRuntimeRequest: state.resolveRuntimeRequest,
+    forkSession: state.forkSession,
+    mergeBackSession: state.mergeBackSession,
     setDraftText: state.setDraftText,
     addDraftAttachment: state.addDraftAttachment,
     removeDraftAttachment: state.removeDraftAttachment,
@@ -286,6 +301,29 @@ export function ChatStage() {
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = isPluginEnabled('core.task-ledger');
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
+  const explorerEnabled = isPluginEnabled('hm.plugin.session-explorer');
+  const approvalCenterEnabled = isPluginEnabled('hm.plugin.approval-center');
+  const sessionPendingRequests = useMemo(() => {
+    if (!session) return [];
+    const byId = new Map<string, ApprovalRequest>();
+    for (const item of timeline.pendingApprovals) byId.set(item.id, item);
+    for (const item of pendingApprovals) {
+      if (item.sessionId === session.id && item.status === 'pending') {
+        byId.set(item.id, item);
+      }
+    }
+    return [...byId.values()];
+  }, [session, timeline.pendingApprovals, pendingApprovals]);
+  const allGlobalPendingRequests = useMemo(() => {
+    const byId = new Map<string, ApprovalRequest>();
+    for (const item of pendingApprovals) {
+      if (item.status === 'pending') byId.set(item.id, item);
+    }
+    for (const item of timeline.pendingApprovals) {
+      if (item.status === 'pending') byId.set(item.id, item);
+    }
+    return [...byId.values()];
+  }, [pendingApprovals, timeline.pendingApprovals]);
   const commandCatalogKey = session ? `${session.id}:${session.harnessId}` : '';
 
   const traitScopeKey = session ? `${session.id}:${session.harnessId}` : '';
@@ -896,6 +934,35 @@ export function ChatStage() {
               </button>
             )}
 
+            {explorerEnabled && (
+              <>
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => void forkSession(session.id, {})}
+                  title="从此会话当前进度创建分叉子会话（优先原生分叉，不支持则便携降级）"
+                  className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1.5 text-[11.5px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+                  style={{ border: '1px solid var(--border-hairline)' }}
+                >
+                  <GitFork size={13} />
+                  <span className="hidden lg:inline">分叉</span>
+                </button>
+                {session.parentSessionId && (
+                  <button
+                    type="button"
+                    disabled={isRunning}
+                    onClick={() => void mergeBackSession(session.id, {})}
+                    title="提炼分叉增量结论 (fork_delta_summary) 并合并回父会话"
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1.5 text-[11.5px] text-[var(--accent-indigo)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-40"
+                    style={{ border: '1px solid var(--border-focus)' }}
+                  >
+                    <GitMerge size={13} />
+                    <span className="hidden lg:inline">合并回父会话</span>
+                  </button>
+                )}
+              </>
+            )}
+
             <button
               type="button"
               onClick={() => openModal('handoff')}
@@ -934,32 +1001,42 @@ export function ChatStage() {
           </div>
         </header>
 
-        {/* Global Background Session Approval Jump Bar */}
-        {otherAwaitingSessions.length > 0 && (
-          <div
-            className="flex shrink-0 items-center justify-between gap-2 px-4 py-1.5 text-[11.5px]"
-            style={{
-              backgroundColor: 'var(--accent-star-soft)',
-              borderBottom: '1px solid color-mix(in srgb, var(--accent-star) 35%, transparent)',
-              color: 'var(--accent-star)',
-            }}
-          >
-            <span className="inline-flex items-center gap-1.5 truncate">
-              <ShieldAlert size={13} />
-              其他后台会话正在等待权限确认：{otherAwaitingSessions.map((s) => s.title).join('、')}
-            </span>
-            <button
-              type="button"
-              onClick={() => void selectSession(otherAwaitingSessions[0]!.id)}
-              className="shrink-0 cursor-pointer rounded-md px-2 py-0.5 font-medium underline"
+        {/* Global Attention Strip (current + background + child sessions pending approvals/questions/secrets) */}
+        {approvalCenterEnabled ? (
+          <GlobalAttentionStrip
+            pendingRequests={allGlobalPendingRequests}
+            sessions={sessions}
+            selectedSessionId={selectedSessionId}
+            onJumpToSession={(targetId) => void selectSession(targetId)}
+            onOpenRiskRules={() => openModal('risk_rules')}
+          />
+        ) : (
+          otherAwaitingSessions.length > 0 && (
+            <div
+              className="flex shrink-0 items-center justify-between gap-2 px-4 py-1.5 text-[11.5px]"
+              style={{
+                backgroundColor: 'var(--accent-star-soft)',
+                borderBottom: '1px solid color-mix(in srgb, var(--accent-star) 35%, transparent)',
+                color: 'var(--accent-star)',
+              }}
             >
-              立即前往
-            </button>
-          </div>
+              <span className="inline-flex items-center gap-1.5 truncate">
+                <ShieldAlert size={13} />
+                其他后台会话正在等待权限确认：{otherAwaitingSessions.map((s) => s.title).join('、')}
+              </span>
+              <button
+                type="button"
+                onClick={() => void selectSession(otherAwaitingSessions[0]!.id)}
+                className="shrink-0 cursor-pointer rounded-md px-2 py-0.5 font-medium underline"
+              >
+                立即前往
+              </button>
+            </div>
+          )
         )}
 
-        {/* Pinned Pending Approvals Alert Bar */}
-        {timeline.pendingApprovals.length > 0 && (
+        {/* Fallback simple approval alert bar ONLY when approval-center plugin is explicitly disabled */}
+        {!approvalCenterEnabled && timeline.pendingApprovals.length > 0 && (
           <div className="shrink-0 px-4 pt-3">
             <div className="mx-auto max-w-[760px] space-y-2">
               {timeline.pendingApprovals.map((appr) => (
@@ -1072,6 +1149,14 @@ export function ChatStage() {
 
         {/* Floating Glass Composer Dock (Drag-Drop + Paste Image + @file + /slash + ModelPicker) */}
         <div className="shrink-0 px-4 pb-4 pt-1">
+          {approvalCenterEnabled && (
+            <ComposerPendingRequestBar
+              session={session}
+              pendingRequests={sessionPendingRequests}
+              onResolve={resolveRuntimeRequest}
+              onOpenRiskRules={() => openModal('risk_rules')}
+            />
+          )}
           {pluginMode && (
             <div className="mx-auto mb-2 flex max-w-[760px] items-center justify-between gap-2 px-1 text-[12px] text-[var(--text-secondary)]">
               <span>描述你想定制的功能，当前模型会收到 SDK、安装和热重载说明。</span>
@@ -1785,6 +1870,25 @@ const TurnBlock = memo(function TurnBlock({
                         html={block.html}
                         preferredHeightPx={block.preferredHeightPx}
                         allowFullscreen={block.allowFullscreen}
+                      />
+                    }
+                  />
+                );
+              }
+              if (block.type === 'runtime_request') {
+                return (
+                  <Slot
+                    key={block.blockId}
+                    name="chat.block"
+                    matchKey="runtime_request"
+                    slotProps={{ session, turn, block, onOpenFile, onFailover }}
+                    fallback={
+                      <RuntimeRequestReceiptBlock
+                        kind={block.kind}
+                        title={block.title}
+                        receiptText={block.receiptText}
+                        requestStatus={block.requestStatus}
+                        resolvedBy={block.resolvedBy}
                       />
                     }
                   />

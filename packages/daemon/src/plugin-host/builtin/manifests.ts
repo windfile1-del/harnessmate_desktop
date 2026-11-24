@@ -174,4 +174,22 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     category: 'workflow',
     contributes: { uiSlots: ['composer_action'] },
   },
+  {
+    id: 'hm.plugin.session-explorer',
+    name: '会话检索、导入与分叉中心',
+    version: '1.0.0',
+    description: '提供跨工作区 SQLite FTS5 全文检索、GiB 级安全外部 CLI 流式导入（含 .jsonl.zst）、会话 Fork / merge_back、Side Chat 与脱敏 JSON Bundle v2 导入导出。',
+    author: 'HarnessMate Core',
+    category: 'workflow',
+    contributes: { uiSlots: ['sidebar_tool', 'inspector_tab', 'modal'] },
+  },
+  {
+    id: 'hm.plugin.approval-center',
+    name: '安全审批、提问与凭据中心',
+    version: '1.0.0',
+    description: '聚合全局跨会话待审批请求、输入框锚定确认条、高危命令静态风险规则引擎、结构化提问卡与零落盘 secret_request 私密凭据通道。',
+    author: 'HarnessMate Core',
+    category: 'ui',
+    contributes: { uiSlots: ['composer_action', 'modal'] },
+  },
 ];

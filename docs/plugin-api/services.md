@@ -4,6 +4,7 @@
 
 第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。
 
+- `approval-center`
 - `checkpoints`
 - `failover`
 - `git`
@@ -14,6 +15,7 @@
 - `harness.codex`
 - `ledger`
 - `native-commands`
+- `session-search`
 - `usage`
 
 ## 交接配置

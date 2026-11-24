@@ -7,12 +7,15 @@ import {
   CanonicalEventSchema,
   CheckpointRevertModeSchema,
   ContextSyncModeSchema,
+  CustomRiskRuleSchema,
   NativeHistorySourceSchema,
   PermissionModeSchema,
+  PortableSessionBundleV2Schema,
   GeneratedPluginManifestSchema,
   ReasoningEffortSchema,
   TaskStepSchema,
   TaskVerificationSchema,
+  UserQuestionAnswerSchema,
   type Session,
 } from './canonical.js';
 
@@ -20,10 +23,55 @@ export const PROTOCOL_VERSION = 'hm-remote-v1';
 
 export const ImportNativeSessionRequestSchema = z.object({
   source: NativeHistorySourceSchema,
+  scannerId: z.string().min(1).max(64).optional(),
   nativeSessionId: z.string().min(1).max(200),
   workspaceId: z.string().optional(),
+  mode: z.enum(['mirror', 'attach']).optional(),
 });
 export type ImportNativeSessionRequest = z.infer<typeof ImportNativeSessionRequestSchema>;
+
+export const ForkSessionRequestSchema = z.object({
+  fromTurnSeq: z.number().int().nonnegative().optional(),
+  targetHarnessId: z.string().min(1).optional(),
+  targetModel: z.string().nullable().optional(),
+  title: z.string().trim().min(1).max(160).optional(),
+  createWorktree: z.boolean().optional(),
+  worktreeBranch: z.string().trim().min(1).max(120).optional(),
+});
+export type ForkSessionRequest = z.infer<typeof ForkSessionRequestSchema>;
+
+export const MergeBackRequestSchema = z.object({
+  summaryOverride: z.string().max(12_000).optional(),
+  includeTouchedFiles: z.boolean().optional(),
+  includeVerifications: z.boolean().optional(),
+});
+export type MergeBackRequest = z.infer<typeof MergeBackRequestSchema>;
+
+export const SideChatRequestSchema = z.object({
+  text: z.string().trim().min(1).max(16_000),
+  harnessId: z.string().min(1).optional(),
+  model: z.string().nullable().optional(),
+});
+export type SideChatRequest = z.infer<typeof SideChatRequestSchema>;
+
+export const SideChatPromoteRequestSchema = z.object({
+  title: z.string().trim().min(1).max(160).optional(),
+  targetHarnessId: z.string().min(1).optional(),
+  createWorktree: z.boolean().optional(),
+});
+export type SideChatPromoteRequest = z.infer<typeof SideChatPromoteRequestSchema>;
+
+export const ImportSessionBundleRequestSchema = z.object({
+  bundle: PortableSessionBundleV2Schema,
+  workspaceId: z.string().min(1).optional(),
+  titleOverride: z.string().trim().min(1).max(160).optional(),
+});
+export type ImportSessionBundleRequest = z.infer<typeof ImportSessionBundleRequestSchema>;
+
+export const CreateCustomRiskRuleRequestSchema = CustomRiskRuleSchema.omit({ id: true, builtin: true }).extend({
+  id: z.string().min(1).max(64).optional(),
+});
+export type CreateCustomRiskRuleRequest = z.infer<typeof CreateCustomRiskRuleRequestSchema>;
 
 export const HarnessCommandNameSchema = z.enum([
   'compact', 'usage', 'goal', 'plan', 'model', 'plugin', 'skills', 'skill',
@@ -206,9 +254,12 @@ export const UploadAttachmentRequestSchema = z.object({
 export type UploadAttachmentRequest = z.infer<typeof UploadAttachmentRequestSchema>;
 
 export const ResolveApprovalRequestSchema = z.object({
-  decision: ApprovalDecisionSchema,
+  decision: ApprovalDecisionSchema.optional(),
   comment: z.string().max(500).optional(),
   resolvedBy: z.enum(['desktop', 'mobile']).default('desktop'),
+  questionAnswer: UserQuestionAnswerSchema.optional(),
+  secretValue: z.string().max(16_384).optional(),
+  noLog: z.boolean().optional(),
 });
 export type ResolveApprovalRequest = z.infer<typeof ResolveApprovalRequestSchema>;
 

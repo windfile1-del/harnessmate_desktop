@@ -19,8 +19,10 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { formatRelativeTime, PERMISSION_MODE_LABELS } from '../lib/harness-meta';
 import { Slot } from '../slots';
 import { useAppStore } from '../stores/app-store';
+import { RiskRulesModal } from './ApprovalCenter';
 import { HarnessBadge } from './BrandMark';
 import { ModelPicker } from './ModelPicker';
+import { SessionExplorerModal } from './SessionExplorerModal';
 import {
   CommandPaletteModal,
   ContextPreviewModal,
@@ -40,7 +42,9 @@ export function ModalHost() {
     activeModal === 'mcp' ||
     activeModal === 'usage' ||
     activeModal === 'context_preview' ||
-    activeModal === 'worktrees';
+    activeModal === 'worktrees' ||
+    activeModal === 'session_explorer' ||
+    activeModal === 'risk_rules';
 
   return (
     <div
@@ -72,6 +76,8 @@ export function ModalHost() {
         )}
         {activeModal === 'command_palette' && <CommandPaletteModal onClose={() => openModal(null)} />}
         {activeModal === 'worktrees' && <WorktreeManagerModal onClose={() => openModal(null)} />}
+        {activeModal === 'session_explorer' && <SessionExplorerModal onClose={() => openModal(null)} />}
+        {activeModal === 'risk_rules' && <RiskRulesModal onClose={() => openModal(null)} />}
       </div>
     </div>
   );

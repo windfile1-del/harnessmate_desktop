@@ -17,9 +17,12 @@ import type {
   RateLimitWindow,
   ReasoningEffort,
   RiskLevel,
+  RuntimeRequestKind,
+  SecretRequestSpec,
   TokenUsage,
   ToolKind,
   TurnOptionsMap,
+  UserQuestionSpec,
 } from '@harnessmate/protocol';
 
 export interface PortableHistoryMessage {
@@ -131,12 +134,16 @@ export type NormalizedAdapterEvent =
       type: 'approval.requested';
       turnId: string;
       nativeRequestId: string;
+      kind?: RuntimeRequestKind;
       toolName: string;
       toolKind: ToolKind;
       summary: string;
       input: unknown;
       diffPreview?: string;
       riskLevel: RiskLevel;
+      supportedDecisions?: string[];
+      questionSpec?: UserQuestionSpec;
+      secretSpec?: SecretRequestSpec;
     }
   | {
       type: 'command.output.delta';
@@ -168,6 +175,10 @@ export interface AdapterSessionHandle {
   injectContext?(payload: ContextSyncPayload): Promise<ContextInjectionDriver>;
   interrupt(): Promise<void>;
   resolveApproval(nativeRequestId: string, decision: ApprovalDecision, comment?: string): Promise<void>;
+  /** Optional zero-log in-memory channel for secret_request delivery directly to harness stdin/memory. */
+  resolveSecret?(nativeRequestId: string, secretValue: string): Promise<void>;
+  /** Optional structured answer delivery for user_question requests. */
+  resolveQuestion?(nativeRequestId: string, answer: { selectedOptionIds?: string[]; freeText?: string }): Promise<void>;
   updateConfig?(patch: Partial<AdapterSessionConfig>): Promise<void>;
   dispose(): Promise<void>;
   onEvent(listener: (event: NormalizedAdapterEvent) => void): () => void;

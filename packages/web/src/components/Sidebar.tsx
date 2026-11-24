@@ -255,6 +255,17 @@ export function Sidebar() {
             placeholder="搜索共享任务会话..."
             className="w-full bg-transparent text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
           />
+          {isPluginEnabled('hm.plugin.session-explorer') && (
+            <button
+              type="button"
+              onClick={() => openModal('session_explorer')}
+              title="打开 Session Explorer（FTS5 全文检索 / 本机 CLI 导入 / JSON Bundle）"
+              className="shrink-0 cursor-pointer rounded-md px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+              style={{ border: '1px solid var(--border-focus)' }}
+            >
+              全文/导入
+            </button>
+          )}
         </div>
 
         <div className="flex items-center justify-between px-1">

@@ -1,6 +1,7 @@
 import type {
   AddMcpServerRequest,
   ApprovalDecision,
+  ApprovalRequest,
   Attachment,
   AttentionItem,
   CanonicalEvent,
@@ -12,6 +13,8 @@ import type {
   DiscoveredCliSession,
   FailoverPolicy,
   FailoverRequest,
+  ForkSessionRequest,
+  ForkSessionResult,
   GitStatusSummary,
   HarnessAccountUsage,
   HarnessCommandResult,
@@ -19,12 +22,16 @@ import type {
   HarnessKind,
   InstalledPluginInfo,
   ImportNativeSessionRequest,
+  ImportSessionBundleRequest,
   InstallPluginRequest,
   McpServerEntry,
+  MergeBackRequest,
+  MergeBackResult,
   PluginCatalogItem,
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
+  ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
@@ -41,7 +48,7 @@ import type {
   Workspace,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
-import { DaemonWsClient, daemonApi } from '../api/client';
+import { ApiHttpError, DaemonWsClient, daemonApi } from '../api/client';
 import { loadSavedTraitValues, persistTraitValues } from '../components/TraitsPicker';
 
 export type ActiveModal =
@@ -56,6 +63,8 @@ export type ActiveModal =
   | 'context_preview'
   | 'command_palette'
   | 'worktrees'
+  | 'session_explorer'
+  | 'risk_rules'
   | null;
 
 export type InspectorTab = 'task' | 'git' | 'files' | 'terminal' | 'diagnostics' | 'info' | 'plugins';
@@ -81,6 +90,7 @@ interface AppState {
   harnesses: HarnessInfo[];
   workspaces: Workspace[];
   sessions: Session[];
+  pendingApprovals: ApprovalRequest[];
   discoveredSessions: DiscoveredCliSession[];
   remoteStatus: RemoteAccessStatus | null;
 
@@ -200,7 +210,15 @@ interface AppState {
     },
   ) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
+  refreshPendingApprovals: () => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
+  resolveRuntimeRequest: (
+    approvalId: string,
+    req: ResolveApprovalRequest,
+  ) => Promise<{ conflict?: boolean; resolvedBy?: string | null }>;
+  forkSession: (sessionId: string, req?: ForkSessionRequest) => Promise<ForkSessionResult | null>;
+  mergeBackSession: (sessionId: string, req?: MergeBackRequest) => Promise<MergeBackResult | null>;
+  importSessionBundle: (req: ImportSessionBundleRequest) => Promise<Session>;
   refreshGitStatus: (sessionId: string) => Promise<void>;
   initSessionGit: (sessionId: string) => Promise<void>;
   refreshCheckpoints: (sessionId: string) => Promise<void>;
@@ -384,10 +402,21 @@ export const useAppStore = create<AppState>((set, get) => {
     } else if (relevant.some(({ type }) => type === 'task.state_updated')) {
       void get().refreshTaskState(currentSelected);
     }
+    if (
+      accepted.some(
+        ({ type }) =>
+          type === 'approval.requested' ||
+          type === 'approval.resolved' ||
+          type === 'runtime_request.updated',
+      )
+    ) {
+      void get().refreshPendingApprovals();
+    }
   };
 
   const handleAttention = (item: AttentionItem) => {
     if (item.kind === 'approval_needed') {
+      void get().refreshPendingApprovals();
       get().pushToast({
         kind: 'warning',
         title: `需要审批 · ${item.sessionTitle}`,
@@ -423,6 +452,7 @@ export const useAppStore = create<AppState>((set, get) => {
     harnesses: [],
     workspaces: [],
     sessions: [],
+    pendingApprovals: [],
     discoveredSessions: [],
     remoteStatus: null,
 
@@ -576,17 +606,19 @@ export const useAppStore = create<AppState>((set, get) => {
     refreshAll: async () => {
       set({ loading: true });
       try {
-        const [hRes, wRes, sRes, rRes, pRes] = await Promise.all([
+        const [hRes, wRes, sRes, rRes, pRes, aRes] = await Promise.all([
           daemonApi.listHarnesses(false),
           daemonApi.listWorkspaces(),
           daemonApi.listSessions(),
           daemonApi.getRemoteStatus(),
           daemonApi.listPlugins(),
+          daemonApi.listPendingApprovals().catch(() => ({ approvals: [] as ApprovalRequest[] })),
         ]);
         set({
           harnesses: hRes.harnesses,
           workspaces: wRes.workspaces,
           sessions: sRes.sessions,
+          pendingApprovals: aRes.approvals,
           remoteStatus: rRes,
           plugins: pRes.plugins,
           pluginCatalog: pRes.catalog,
@@ -1115,16 +1147,109 @@ export const useAppStore = create<AppState>((set, get) => {
       get().pushToast({ kind: 'info', title: '已发送中断信号' });
     },
 
-    resolveApproval: async (approvalId, decision, comment) => {
+    refreshPendingApprovals: async () => {
       try {
-        await daemonApi.resolveApproval(approvalId, decision, comment);
+        const { approvals } = await daemonApi.listPendingApprovals();
+        set({ pendingApprovals: approvals });
+      } catch {
+        // ignore
+      }
+    },
+
+    resolveApproval: async (approvalId, decision, comment) => {
+      await get().resolveRuntimeRequest(approvalId, { decision, comment, resolvedBy: 'desktop' });
+    },
+
+    resolveRuntimeRequest: async (approvalId, req) => {
+      try {
+        await daemonApi.resolveRuntimeRequest(approvalId, req);
+        set((state) => ({
+          pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
+        }));
+        void get().refreshPendingApprovals();
+        return { conflict: false };
       } catch (err) {
+        if (err instanceof ApiHttpError && err.status === 409) {
+          const resolvedBy =
+            typeof err.payload?.resolvedBy === 'string' ? err.payload.resolvedBy : null;
+          set((state) => ({
+            pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
+          }));
+          const actorLabel = resolvedBy === 'mobile' ? '移动端' : '其他客户端';
+          get().pushToast({
+            kind: 'info',
+            title: `该请求已由${actorLabel}处理`,
+            body: '已自动收起重复审批条。',
+          });
+          return { conflict: true, resolvedBy };
+        }
         get().pushToast({
           kind: 'error',
           title: '审批提交失败',
           body: err instanceof Error ? err.message : String(err),
         });
+        return { conflict: false };
       }
+    },
+
+    forkSession: async (sessionId, req) => {
+      try {
+        const res = await daemonApi.forkSession(sessionId, req ?? {});
+        set((state) => ({
+          sessions: [res.session, ...state.sessions.filter((s) => s.id !== res.session.id)],
+        }));
+        await get().selectSession(res.session.id);
+        get().pushToast({
+          kind: 'success',
+          title: res.modeUsed === 'native' ? '已创建原生分叉子会话' : '已创建便携分叉子会话',
+          body: res.notice,
+        });
+        return res;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '创建分叉失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    mergeBackSession: async (sessionId, req) => {
+      try {
+        const res = await daemonApi.mergeBackSession(sessionId, req ?? {});
+        await get().selectSession(res.parentSessionId);
+        void get().refreshTurnItems(res.parentSessionId);
+        get().pushToast({
+          kind: 'success',
+          title: '已将分叉结论合并回父会话',
+          body: `已注入 fork_delta_summary（seq #${res.eventSeq}）`,
+        });
+        return res;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '合并回父会话失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    importSessionBundle: async (req) => {
+      const { session } = await daemonApi.importSessionBundle(req);
+      const { workspaces } = await daemonApi.listWorkspaces();
+      set((state) => ({
+        workspaces,
+        sessions: [session, ...state.sessions.filter((s) => s.id !== session.id)],
+        selectedWorkspaceId: session.workspaceId,
+      }));
+      await get().selectSession(session.id);
+      get().pushToast({
+        kind: 'success',
+        title: `已还原会话 · ${session.title}`,
+      });
+      return session;
     },
 
     refreshGitStatus: async (sessionId) => {

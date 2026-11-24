@@ -43,11 +43,72 @@ export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 export const ApprovalDecisionSchema = z.enum(['allow_once', 'allow_session', 'deny']);
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
 
-export const ApprovalStatusSchema = z.enum(['pending', 'approved', 'denied', 'expired']);
+export const ApprovalStatusSchema = z.enum([
+  'pending',
+  'approved',
+  'denied',
+  'resolved',
+  'expired',
+  'cancelled',
+]);
 export type ApprovalStatus = z.infer<typeof ApprovalStatusSchema>;
 
-export const RiskLevelSchema = z.enum(['low', 'medium', 'high']);
+export const RiskLevelSchema = z.enum(['low', 'medium', 'high', 'critical']);
 export type RiskLevel = z.infer<typeof RiskLevelSchema>;
+
+export const RiskAnnotationSeveritySchema = z.enum(['info', 'low', 'medium', 'high', 'critical']);
+export type RiskAnnotationSeverity = z.infer<typeof RiskAnnotationSeveritySchema>;
+
+export const RuntimeRequestKindSchema = z.enum([
+  'command_approval',
+  'file_change_approval',
+  'mcp_tool_approval',
+  'user_question',
+  'secret_request',
+]);
+export type RuntimeRequestKind = z.infer<typeof RuntimeRequestKindSchema>;
+
+export const UserQuestionOptionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  description: z.string().optional(),
+});
+export type UserQuestionOption = z.infer<typeof UserQuestionOptionSchema>;
+
+export const UserQuestionSpecSchema = z.object({
+  question: z.string().min(1),
+  selectionMode: z.enum(['single', 'multiple', 'free_text']).default('single'),
+  allowFreeText: z.boolean().optional(),
+  options: z.array(UserQuestionOptionSchema).optional(),
+  placeholder: z.string().optional(),
+});
+export type UserQuestionSpec = z.infer<typeof UserQuestionSpecSchema>;
+
+export const UserQuestionAnswerSchema = z.object({
+  selectedOptionIds: z.array(z.string()).optional(),
+  freeText: z.string().max(4000).optional(),
+});
+export type UserQuestionAnswer = z.infer<typeof UserQuestionAnswerSchema>;
+
+export const SecretRequestSpecSchema = z.object({
+  prompt: z.string().min(1),
+  fieldLabel: z.string().optional(),
+  targetEnvKey: z.string().optional(),
+  description: z.string().optional(),
+});
+export type SecretRequestSpec = z.infer<typeof SecretRequestSpecSchema>;
+
+export const CustomRiskRuleSchema = z.object({
+  id: z.string().min(1).max(64),
+  name: z.string().min(1).max(120),
+  pattern: z.string().min(1).max(300),
+  severity: z.enum(['info', 'medium', 'high', 'critical']),
+  target: z.enum(['command', 'file_path', 'mcp', 'any']).default('any'),
+  reason: z.string().min(1).max(300),
+  enabled: z.boolean().default(true),
+  builtin: z.boolean().optional(),
+});
+export type CustomRiskRule = z.infer<typeof CustomRiskRuleSchema>;
 
 export const ToolKindSchema = z.enum([
   'shell',
@@ -151,9 +212,11 @@ export const HarnessCapabilitiesV2Schema = HarnessCapabilitiesSchema.extend({
   transport: HarnessTransportKindSchema.default('custom'),
   historyInjectionMode: HarnessHistoryInjectionModeSchema.default('inline'),
   supportsNativeRollback: z.boolean().default(false),
+  supportsNativeFork: z.boolean().optional(),
   supportsActiveSteering: z.boolean().default(false),
   supportsUsageLimits: z.boolean().default(false),
   supportsDynamicOptions: z.boolean().default(false),
+  supportedApprovalDecisions: z.array(z.string()).optional(),
   nativeCommands: z.array(z.string()).default([]),
   optionDescriptors: z.array(ProviderOptionDescriptorSchema).default([]),
 });
@@ -327,6 +390,11 @@ export const SessionSchema = z.object({
   harnessId: z.string(),
   harnessKind: HarnessKindSchema,
   nativeSessionId: z.string().nullable(),
+  parentSessionId: z.string().nullable().optional(),
+  forkedFromTurnSeq: z.number().int().nonnegative().nullable().optional(),
+  forkMode: z.enum(['native', 'portable']).nullable().optional(),
+  importMode: z.enum(['mirror', 'attach']).nullable().optional(),
+  importSource: z.string().nullable().optional(),
   participatingHarnesses: z.array(z.string()).default([]),
   contextSyncMode: ContextSyncModeSchema.default('auto'),
   bindings: z.array(SessionHarnessBindingSchema).optional(),
@@ -349,22 +417,35 @@ export type Session = z.infer<typeof SessionSchema>;
 
 export const ApprovalAnnotationSchema = z.object({
   pluginId: z.string(),
+  sourcePluginId: z.string().optional(),
   risk: RiskLevelSchema.optional(),
+  severity: RiskAnnotationSeveritySchema.optional(),
   label: z.string(),
+  title: z.string().optional(),
   detail: z.string().optional(),
+  matchedPattern: z.string().optional(),
+  degraded: z.boolean().optional(),
 });
 export type ApprovalAnnotationDto = z.infer<typeof ApprovalAnnotationSchema>;
 
 export const ApprovalRequestSchema = z.object({
   id: z.string(),
   sessionId: z.string(),
+  parentSessionId: z.string().nullable().optional(),
+  instanceId: z.string().optional(),
   nativeRequestId: z.string(),
+  kind: RuntimeRequestKindSchema.default('command_approval'),
   toolName: z.string(),
   toolKind: ToolKindSchema.default('other'),
   summary: z.string(),
   input: z.unknown(),
   diffPreview: z.string().nullable().optional(),
   riskLevel: RiskLevelSchema,
+  supportedDecisions: z.array(z.string()).optional(),
+  questionSpec: UserQuestionSpecSchema.nullable().optional(),
+  questionAnswer: UserQuestionAnswerSchema.nullable().optional(),
+  secretSpec: SecretRequestSpecSchema.nullable().optional(),
+  secretProvided: z.boolean().optional(),
   status: ApprovalStatusSchema,
   resolvedBy: z.enum(['desktop', 'mobile', 'auto']).nullable().optional(),
   decision: ApprovalDecisionSchema.nullable().optional(),
@@ -392,6 +473,10 @@ export const CanonicalEventTypeSchema = z.enum([
   'session.status',
   'session.model_confirmed',
   'session.harness_switched',
+  'session.imported',
+  'session.forked',
+  'session.merged_back',
+  'search_index.rebuilt',
   'task.state_updated',
   'handoff.snapshot',
   'handoff.snapshot_delivered',
@@ -410,6 +495,7 @@ export const CanonicalEventTypeSchema = z.enum([
   'tool.call.completed',
   'approval.requested',
   'approval.resolved',
+  'runtime_request.updated',
   'checkpoint.captured',
   'checkpoint.reverted',
   'usage.updated',
@@ -447,17 +533,23 @@ export const GitStatusSummarySchema = z.object({
 export type GitStatusSummary = z.infer<typeof GitStatusSummarySchema>;
 
 export const NativeHistorySourceSchema = z.enum([
-  'codex_cli', 'codex_desktop', 'claude_cli', 'agy_cli', 'agy_desktop',
+  'codex_cli', 'codex_desktop', 'claude_cli', 'agy_cli', 'agy_desktop', 'pi_cli', 'opencode_cli', 'custom',
 ]);
 
 export const DiscoveredCliSessionSchema = z.object({
   harnessKind: HarnessKindSchema,
   source: NativeHistorySourceSchema.optional(),
+  scannerId: z.string().optional(),
   nativeSessionId: z.string(),
   title: z.string(),
   cwd: z.string().nullable(),
   updatedAt: z.number(),
   sourcePath: z.string().optional(),
+  fileSizeBytes: z.number().nonnegative().optional(),
+  compressed: z.boolean().optional(),
+  approxTurnCount: z.number().int().nonnegative().optional(),
+  partial: z.boolean().optional(),
+  alreadyImportedSessionId: z.string().nullable().optional(),
 });
 export type DiscoveredCliSession = z.infer<typeof DiscoveredCliSessionSchema>;
 
@@ -831,3 +923,98 @@ export const GitActionResultSchema = z.object({
   prUrl: z.string().nullable().optional(),
 });
 export type GitActionResult = z.infer<typeof GitActionResultSchema>;
+
+// ── Session Explorer, FTS5 Search, Fork/MergeBack, Side Chat & Bundle v2 ─
+
+export const SessionSearchHighlightSchema = z.object({
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+});
+export type SessionSearchHighlight = z.infer<typeof SessionSearchHighlightSchema>;
+
+export const SessionSearchHitSchema = z.object({
+  sessionId: z.string(),
+  sessionTitle: z.string(),
+  workspaceId: z.string(),
+  turnId: z.string(),
+  turnSeq: z.number().int().nonnegative(),
+  itemId: z.string(),
+  blockType: z.string(),
+  snippetText: z.string(),
+  snippetHtmlSafe: z.string(),
+  highlights: z.array(SessionSearchHighlightSchema).default([]),
+  driverId: z.string(),
+  createdAt: z.number(),
+});
+export type SessionSearchHit = z.infer<typeof SessionSearchHitSchema>;
+
+export const SessionSearchResponseSchema = z.object({
+  hits: z.array(SessionSearchHitSchema),
+  fallbackUsed: z.boolean().default(false),
+  tookMs: z.number().nonnegative().default(0),
+});
+export type SessionSearchResponse = z.infer<typeof SessionSearchResponseSchema>;
+
+export const ForkSessionResultSchema = z.object({
+  session: SessionSchema,
+  modeUsed: z.enum(['native', 'portable']),
+  notice: z.string(),
+  worktreePath: z.string().nullable().optional(),
+});
+export type ForkSessionResult = z.infer<typeof ForkSessionResultSchema>;
+
+export const MergeBackResultSchema = z.object({
+  parentSessionId: z.string(),
+  childSessionId: z.string(),
+  forkDeltaSummary: z.string(),
+  itemId: z.string(),
+  eventSeq: z.number().int().nonnegative(),
+  touchedFiles: z.array(z.string()).default([]),
+});
+export type MergeBackResult = z.infer<typeof MergeBackResultSchema>;
+
+export const SideChatMessageSchema = z.object({
+  id: z.string(),
+  role: z.enum(['user', 'assistant']),
+  text: z.string(),
+  harnessId: z.string().optional(),
+  model: z.string().nullable().optional(),
+  createdAt: z.number(),
+});
+export type SideChatMessage = z.infer<typeof SideChatMessageSchema>;
+
+export const PortableSessionBundleV2Schema = z.object({
+  bundleVersion: z.literal(2),
+  exportedAt: z.number(),
+  redacted: z.boolean(),
+  redactionCategories: z.array(z.string()).default([]),
+  redactedCount: z.number().int().nonnegative().default(0),
+  session: z.object({
+    originalId: z.string(),
+    title: z.string(),
+    harnessId: z.string(),
+    harnessKind: HarnessKindSchema,
+    model: z.string().nullable().optional(),
+    actualModel: z.string().nullable().optional(),
+    reasoningEffort: ReasoningEffortSchema.nullable().optional(),
+    permissionMode: PermissionModeSchema.default('manual'),
+    cwd: z.string(),
+    participatingHarnesses: z.array(z.string()).default([]),
+    createdAt: z.number(),
+    updatedAt: z.number(),
+  }),
+  taskState: SessionTaskStateSchema.omit({ sessionId: true }).nullable().optional(),
+  items: z.array(TurnBlockRecordSchema).default([]),
+  events: z
+    .array(
+      z.object({
+        seq: z.number().int().positive(),
+        type: CanonicalEventTypeSchema,
+        turnId: z.string().nullable(),
+        createdAt: z.number(),
+        payload: z.record(z.unknown()),
+      }),
+    )
+    .default([]),
+});
+export type PortableSessionBundleV2 = z.infer<typeof PortableSessionBundleV2Schema>;

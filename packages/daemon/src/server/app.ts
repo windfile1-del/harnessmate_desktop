@@ -4,6 +4,7 @@ import fastifyStatic from '@fastify/static';
 import {
   AddMcpServerRequestSchema,
   AddTrustedPublisherRequestSchema,
+  CreateCustomRiskRuleRequestSchema,
   CreateSessionRequestSchema,
   CreateWorkspaceRequestSchema,
   CreateWorktreeRequestSchema,
@@ -11,6 +12,7 @@ import {
   DryRunMergeRequestSchema,
   FailoverPolicySchema,
   FailoverRequestSchema,
+  ForkSessionRequestSchema,
   GcCheckpointsRequestSchema,
   GeneratePluginDraftRequestSchema,
   GitCommitRequestSchema,
@@ -19,8 +21,10 @@ import {
   GitPullRequestSchema,
   GitPushRequestSchema,
   ImportNativeSessionRequestSchema,
+  ImportSessionBundleRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
+  MergeBackRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
   RemoveWorktreeRequestSchema,
@@ -29,6 +33,8 @@ import {
   RunHarnessCommandRequestSchema,
   ScaffoldPluginRequestSchema,
   SendTurnRequestSchema,
+  SideChatPromoteRequestSchema,
+  SideChatRequestSchema,
   SwitchHarnessRequestSchema,
   ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
@@ -76,7 +82,6 @@ import type { FailoverCoordinator } from '../core/failover-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
-import { scanLocalCliSessions } from '../harnesses/history-scanner.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
@@ -291,20 +296,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/harnesses/discovered-sessions', async (request, reply) => {
-    const { limit: rawLimit } = request.query as { limit?: string };
+    const { limit: rawLimit, refresh } = request.query as { limit?: string; refresh?: string };
     const limit = Number(rawLimit ?? 20);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
       return reply.code(400).send({ error: 'Invalid history list limit' });
     }
-    const found = await scanLocalCliSessions(limit + 1);
-    const counts = new Map<string, number>();
-    const sessions = found.filter((item) => {
-      const source = item.source ?? item.harnessKind;
-      const count = (counts.get(source) ?? 0) + 1;
-      counts.set(source, count);
-      return count <= limit;
-    });
-    return { sessions, hasMore: limit < 1000 && found.length > sessions.length };
+    const forceRefresh = refresh === '1' || refresh === 'true';
+    return sessionManager.discoverExternalSessions({ limit, forceRefresh });
   });
 
   app.post('/api/v1/harnesses/import-session', async (request, reply) => {
@@ -314,7 +312,53 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const parsed = ImportNativeSessionRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid history import request' });
     try {
-      return { session: await sessionManager.importNativeSession(parsed.data) };
+      const result = await sessionManager.importExternalSession(parsed.data);
+      return result;
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ── Session Explorer: Global FTS5 Search, Bundle Import ──────────────
+
+  app.get('/api/v1/search/sessions', async (request) => {
+    const q = request.query as {
+      q?: string;
+      workspaceId?: string;
+      driverId?: string;
+      fromTs?: string;
+      toTs?: string;
+      limit?: string;
+      offset?: string;
+    };
+    const fromTs = q.fromTs !== undefined && q.fromTs !== '' ? Number(q.fromTs) : undefined;
+    const toTs = q.toTs !== undefined && q.toTs !== '' ? Number(q.toTs) : undefined;
+    const limit = q.limit !== undefined && q.limit !== '' ? Number(q.limit) : 25;
+    const offset = q.offset !== undefined && q.offset !== '' ? Number(q.offset) : 0;
+    return sessionManager.searchSessions({
+      q: q.q ?? '',
+      workspaceId: q.workspaceId || undefined,
+      driverId: q.driverId || undefined,
+      fromTs: Number.isFinite(fromTs) ? fromTs : undefined,
+      toTs: Number.isFinite(toTs) ? toTs : undefined,
+      limit: Number.isFinite(limit) ? limit : 25,
+      offset: Number.isFinite(offset) ? offset : 0,
+    });
+  });
+
+  app.post('/api/v1/search/reindex', async () => {
+    const result = await sessionManager.rebuildSearchIndex();
+    return result;
+  });
+
+  app.post('/api/v1/sessions/import-bundle', async (request, reply) => {
+    const parsed = ImportSessionBundleRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid session bundle payload' });
+    }
+    try {
+      const session = await sessionManager.importSessionBundle(parsed.data);
+      return reply.code(201).send({ session });
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1135,10 +1179,81 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/sessions/:id/export', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const q = request.query as { format?: string; redact?: string };
+    const format = q.format === 'json_bundle' ? 'json_bundle' : 'markdown';
+    const redact = q.redact === '1' || q.redact === 'true';
     try {
-      return sessionManager.exportSessionMarkdown(id);
+      return sessionManager.exportSession(id, format, { redact });
     } catch (err) {
       return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/fork', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = ForkSessionRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid fork payload' });
+    }
+    try {
+      const result = await sessionManager.forkSession(id, parsed.data);
+      return reply.code(201).send(result);
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/merge-back', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = MergeBackRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid merge-back payload' });
+    }
+    try {
+      const result = sessionManager.mergeBackSession(id, parsed.data);
+      return result;
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/side-chat', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
+    return { messages: sessionManager.getSideChat(id) };
+  });
+
+  app.post('/api/v1/sessions/:id/side-chat', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = SideChatRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid side chat prompt' });
+    }
+    try {
+      return await sessionManager.sendSideChat(id, parsed.data);
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/v1/sessions/:id/side-chat', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
+    sessionManager.clearSideChat(id);
+    return { ok: true };
+  });
+
+  app.post('/api/v1/sessions/:id/side-chat/promote', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = SideChatPromoteRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid side chat promote payload' });
+    }
+    try {
+      const result = await sessionManager.promoteSideChatToFork(id, parsed.data);
+      return reply.code(201).send(result);
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -1511,10 +1626,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  // ── Approvals ────────────────────────────────────────────────────────
+  // ── Approvals, Questions, Secret Requests & Risk Rules ───────────────
 
   app.get('/api/v1/approvals', async (request) => {
-    const q = request.query as { sessionId?: string };
+    const q = request.query as { sessionId?: string; includeHistory?: string };
+    if (q.includeHistory === '1' || q.includeHistory === 'true') {
+      return { approvals: store.listApprovals({ sessionId: q.sessionId, limit: 100 }) };
+    }
     return { approvals: sessionManager.listPendingApprovals(q.sessionId) };
   });
 
@@ -1525,17 +1643,50 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid decision' });
     }
     const principal = (request as unknown as { principal?: { kind: 'local' | 'device' } }).principal;
-    const resolvedBy = principal?.kind === 'device' ? 'mobile' : parsed.data.resolvedBy;
+    const resolvedBy: 'desktop' | 'mobile' = principal?.kind === 'device' ? 'mobile' : parsed.data.resolvedBy;
     try {
-      const approval = await sessionManager.resolveApproval(
-        id,
-        parsed.data.decision,
-        resolvedBy,
-        parsed.data.comment,
-      );
-      return { approval };
+      const outcome = await sessionManager.resolveRuntimeRequest(id, parsed.data, resolvedBy);
+      if (outcome.conflict) {
+        return reply.code(409).send({
+          error: 'Already Resolved',
+          code: 'E_ALREADY_RESOLVED',
+          resolvedBy: outcome.approval.resolvedBy ?? null,
+          approval: outcome.approval,
+        });
+      }
+      return { approval: outcome.approval };
     } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
+      const msg = err instanceof Error ? err.message : String(err);
+      const status = msg.includes('not found') ? 404 : 400;
+      return reply.code(status).send({ error: msg });
+    }
+  });
+
+  app.get('/api/v1/approval-center/rules', async () => {
+    return { rules: sessionManager.getApprovalCenter().listRules() };
+  });
+
+  app.post('/api/v1/approval-center/rules', async (request, reply) => {
+    const parsed = CreateCustomRiskRuleRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid risk rule payload' });
+    }
+    try {
+      const rule = sessionManager.getApprovalCenter().addCustomRule(parsed.data);
+      return reply.code(201).send({ rule, rules: sessionManager.getApprovalCenter().listRules() });
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/v1/approval-center/rules/:ruleId', async (request, reply) => {
+    const { ruleId } = request.params as { ruleId: string };
+    try {
+      const deleted = sessionManager.getApprovalCenter().deleteCustomRule(ruleId);
+      if (!deleted) return reply.code(404).send({ error: 'Rule not found' });
+      return { deleted: true, rules: sessionManager.getApprovalCenter().listRules() };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 

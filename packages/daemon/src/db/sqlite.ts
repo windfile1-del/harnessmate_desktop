@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
+  ApprovalAnnotationDto,
   ApprovalDecision,
   ApprovalRequest,
   ApprovalStatus,
@@ -21,12 +22,15 @@ import type {
   PermissionMode,
   ReasoningEffort,
   RiskLevel,
+  RuntimeRequestKind,
+  SecretRequestSpec,
   Session,
   SessionCheckpointRecord,
   SessionHandoffRecord,
   SessionHarnessBinding,
   SessionRunRecord,
   SessionRunStatus,
+  SessionSearchHit,
   SessionStatus,
   SessionTaskState,
   TaskFailedAttempt,
@@ -36,6 +40,8 @@ import type {
   ToolKind,
   TurnBlockRecord,
   TurnBlockStatus,
+  UserQuestionAnswer,
+  UserQuestionSpec,
   Workspace,
 } from '@harnessmate/protocol';
 
@@ -54,6 +60,11 @@ interface SessionRow {
   harness_id: string;
   harness_kind: string;
   native_session_id: string | null;
+  parent_session_id?: string | null;
+  forked_from_turn_seq?: number | null;
+  fork_mode?: string | null;
+  import_mode?: string | null;
+  import_source?: string | null;
   participating_harnesses_json: string | null;
   context_sync_mode: string | null;
   cwd: string;
@@ -114,13 +125,21 @@ interface EventRow {
 interface ApprovalRow {
   id: string;
   session_id: string;
+  parent_session_id?: string | null;
+  instance_id?: string | null;
   native_request_id: string;
+  kind?: string | null;
   tool_name: string;
   tool_kind: string;
   summary: string;
   input_json: string;
   diff_preview: string | null;
   risk_level: string;
+  supported_decisions_json?: string | null;
+  question_spec_json?: string | null;
+  question_answer_json?: string | null;
+  secret_spec_json?: string | null;
+  secret_provided?: number | null;
   status: string;
   resolved_by: string | null;
   decision: string | null;
@@ -460,6 +479,21 @@ export class HarnessMateStore {
     if (!colNames.has('context_sync_mode')) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN context_sync_mode TEXT NOT NULL DEFAULT 'auto';");
     }
+    if (!colNames.has('parent_session_id')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;');
+    }
+    if (!colNames.has('forked_from_turn_seq')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN forked_from_turn_seq INTEGER;');
+    }
+    if (!colNames.has('fork_mode')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN fork_mode TEXT;');
+    }
+    if (!colNames.has('import_mode')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN import_mode TEXT;');
+    }
+    if (!colNames.has('import_source')) {
+      this.db.exec('ALTER TABLE sessions ADD COLUMN import_source TEXT;');
+    }
 
     const permCols = new Set((this.db.prepare('PRAGMA table_info(plugin_permissions)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!permCols.has('cover_future')) {
@@ -471,6 +505,30 @@ export class HarnessMateStore {
     const approvalCols = new Set((this.db.prepare('PRAGMA table_info(approvals)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!approvalCols.has('annotations_json')) {
       this.db.exec('ALTER TABLE approvals ADD COLUMN annotations_json TEXT;');
+    }
+    if (!approvalCols.has('kind')) {
+      this.db.exec("ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'command_approval';");
+    }
+    if (!approvalCols.has('parent_session_id')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN parent_session_id TEXT;');
+    }
+    if (!approvalCols.has('instance_id')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN instance_id TEXT;');
+    }
+    if (!approvalCols.has('supported_decisions_json')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN supported_decisions_json TEXT;');
+    }
+    if (!approvalCols.has('question_spec_json')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN question_spec_json TEXT;');
+    }
+    if (!approvalCols.has('question_answer_json')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN question_answer_json TEXT;');
+    }
+    if (!approvalCols.has('secret_spec_json')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN secret_spec_json TEXT;');
+    }
+    if (!approvalCols.has('secret_provided')) {
+      this.db.exec('ALTER TABLE approvals ADD COLUMN secret_provided INTEGER NOT NULL DEFAULT 0;');
     }
     const taskCols = new Set((this.db.prepare('PRAGMA table_info(session_task_state)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!taskCols.has('failed_attempts_json')) {
@@ -664,11 +722,12 @@ export class HarnessMateStore {
       .prepare(
         `INSERT INTO sessions (
           id, workspace_id, harness_id, harness_kind, native_session_id,
+          parent_session_id, forked_from_turn_seq, fork_mode, import_mode, import_source,
           participating_harnesses_json, context_sync_mode,
           cwd, worktree_branch,
           title, status, model, actual_model, model_rerouted_reason, reasoning_effort, permission_mode,
           last_seq, usage_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         session.id,
@@ -676,6 +735,11 @@ export class HarnessMateStore {
         session.harnessId,
         session.harnessKind,
         session.nativeSessionId,
+        session.parentSessionId ?? null,
+        session.forkedFromTurnSeq ?? null,
+        session.forkMode ?? null,
+        session.importMode ?? null,
+        session.importSource ?? null,
         JSON.stringify(participating),
         session.contextSyncMode ?? 'auto',
         session.cwd,
@@ -858,8 +922,33 @@ export class HarnessMateStore {
   }
 
   deleteSession(id: string): boolean {
+    try {
+      this.db.prepare('DELETE FROM session_search_fts WHERE session_id = ?').run(id);
+    } catch {
+      // ignore if FTS table is unavailable
+    }
     const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
     return Number(res.changes) > 0;
+  }
+
+  updateSessionForkMeta(
+    id: string,
+    meta: { parentSessionId?: string | null; forkedFromTurnSeq?: number | null; forkMode?: 'native' | 'portable' | null },
+  ): Session | null {
+    this.db
+      .prepare(
+        `UPDATE sessions
+         SET parent_session_id = ?, forked_from_turn_seq = ?, fork_mode = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        meta.parentSessionId ?? null,
+        meta.forkedFromTurnSeq ?? null,
+        meta.forkMode ?? null,
+        Date.now(),
+        id,
+      );
+    return this.getSession(id);
   }
 
   getUsageAggregatesByHarness(): Map<string, LocalHarnessUsageAggregate> {
@@ -1426,30 +1515,42 @@ export class HarnessMateStore {
     return this.getTaskState(state.sessionId)!;
   }
 
-  // ── Approvals ────────────────────────────────────────────────────────
+  // ── Approvals & Unified Runtime Requests ─────────────────────────────
 
   createApproval(req: ApprovalRequest): ApprovalRequest {
     this.db
       .prepare(
         `INSERT INTO approvals (
-          id, session_id, native_request_id, tool_name, tool_kind, summary, input_json,
-          diff_preview, risk_level, status, resolved_by, decision, comment, created_at, resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, session_id, parent_session_id, instance_id, native_request_id, kind,
+          tool_name, tool_kind, summary, input_json, diff_preview, risk_level,
+          supported_decisions_json, question_spec_json, question_answer_json,
+          secret_spec_json, secret_provided, status, resolved_by, decision, comment,
+          annotations_json, created_at, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         req.id,
         req.sessionId,
+        req.parentSessionId ?? null,
+        req.instanceId ?? null,
         req.nativeRequestId,
+        req.kind ?? 'command_approval',
         req.toolName,
         req.toolKind,
         req.summary,
         JSON.stringify(req.input ?? {}),
         req.diffPreview ?? null,
         req.riskLevel,
+        req.supportedDecisions ? JSON.stringify(req.supportedDecisions) : null,
+        req.questionSpec ? JSON.stringify(req.questionSpec) : null,
+        req.questionAnswer ? JSON.stringify(req.questionAnswer) : null,
+        req.secretSpec ? JSON.stringify(req.secretSpec) : null,
+        req.secretProvided ? 1 : 0,
         req.status,
         req.resolvedBy ?? null,
         req.decision ?? null,
         req.comment ?? null,
+        req.annotations ? JSON.stringify(req.annotations) : null,
         req.createdAt,
         req.resolvedAt ?? null,
       );
@@ -1476,38 +1577,114 @@ export class HarnessMateStore {
     return rows.map(mapApproval);
   }
 
+  listApprovals(filter?: { sessionId?: string; status?: ApprovalStatus; limit?: number }): ApprovalRequest[] {
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (filter?.sessionId) {
+      clauses.push('session_id = ?');
+      params.push(filter.sessionId);
+    }
+    if (filter?.status) {
+      clauses.push('status = ?');
+      params.push(filter.status);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = Math.min(500, Math.max(1, filter?.limit ?? 100));
+    params.push(limit);
+    const rows = this.db
+      .prepare(`SELECT * FROM approvals ${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params) as unknown as ApprovalRow[];
+    return rows.map(mapApproval);
+  }
+
   addApprovalAnnotation(
     approvalId: string,
-    annotation: { pluginId: string; risk?: RiskLevel; label: string; detail?: string },
+    annotation: ApprovalAnnotationDto,
   ): ApprovalRequest | null {
     const existing = this.getApproval(approvalId);
     if (!existing) return null;
     const current = existing.annotations ?? [];
-    const next = [...current.filter((item) => item.pluginId !== annotation.pluginId || item.label !== annotation.label), annotation].slice(0, 16);
+    const next = [...current.filter((item) => item.pluginId !== annotation.pluginId || item.label !== annotation.label), annotation].slice(0, 24);
     this.db.prepare('UPDATE approvals SET annotations_json = ? WHERE id = ?')
       .run(JSON.stringify(next), approvalId);
     return this.getApproval(approvalId);
   }
 
+  setApprovalAnnotationsAndRisk(
+    approvalId: string,
+    annotations: ApprovalAnnotationDto[],
+    riskLevel?: RiskLevel,
+  ): ApprovalRequest | null {
+    const existing = this.getApproval(approvalId);
+    if (!existing) return null;
+    if (riskLevel) {
+      this.db
+        .prepare('UPDATE approvals SET annotations_json = ?, risk_level = ? WHERE id = ?')
+        .run(JSON.stringify(annotations.slice(0, 24)), riskLevel, approvalId);
+    } else {
+      this.db
+        .prepare('UPDATE approvals SET annotations_json = ? WHERE id = ?')
+        .run(JSON.stringify(annotations.slice(0, 24)), approvalId);
+    }
+    return this.getApproval(approvalId);
+  }
+
   resolveApprovalIfPending(
     id: string,
-    decision: ApprovalDecision,
+    decision: ApprovalDecision | null,
     resolvedBy: 'desktop' | 'mobile' | 'auto',
     comment?: string,
+    opts?: {
+      statusOverride?: ApprovalStatus;
+      questionAnswer?: UserQuestionAnswer | null;
+      secretProvided?: boolean;
+    },
   ): { updated: boolean; approval: ApprovalRequest | null } {
     const now = Date.now();
-    const status: ApprovalStatus = decision === 'deny' ? 'denied' : 'approved';
+    const status: ApprovalStatus =
+      opts?.statusOverride ?? (decision === 'deny' ? 'denied' : 'approved');
     const res = this.db
       .prepare(
         `UPDATE approvals
-         SET status = ?, resolved_by = ?, decision = ?, comment = ?, resolved_at = ?
+         SET status = ?,
+             resolved_by = ?,
+             decision = ?,
+             comment = ?,
+             question_answer_json = COALESCE(?, question_answer_json),
+             secret_provided = CASE WHEN ? = 1 THEN 1 ELSE secret_provided END,
+             resolved_at = ?
          WHERE id = ? AND status = 'pending'`,
       )
-      .run(status, resolvedBy, decision, comment ?? null, now, id);
+      .run(
+        status,
+        resolvedBy,
+        decision ?? null,
+        comment ?? null,
+        opts?.questionAnswer ? JSON.stringify(opts.questionAnswer) : null,
+        opts?.secretProvided ? 1 : 0,
+        now,
+        id,
+      );
     return {
       updated: Number(res.changes) === 1,
       approval: this.getApproval(id),
     };
+  }
+
+  cancelPendingApprovals(sessionId?: string): ApprovalRequest[] {
+    const pending = this.listPendingApprovals(sessionId);
+    if (pending.length === 0) return [];
+    const now = Date.now();
+    if (sessionId) {
+      this.db
+        .prepare("UPDATE approvals SET status = 'cancelled', resolved_at = ? WHERE session_id = ? AND status = 'pending'")
+        .run(now, sessionId);
+    } else {
+      this.db
+        .prepare("UPDATE approvals SET status = 'cancelled', resolved_at = ? WHERE status = 'pending'")
+        .run(now);
+    }
+    return pending.map((item) => ({ ...item, status: 'cancelled' as const, resolvedAt: now }));
   }
 
   expirePendingApprovals(sessionId?: string): number {
@@ -2070,6 +2247,26 @@ export class HarnessMateStore {
       .run(entry.sessionId, entry.itemId, entry.turnId ?? '', entry.driverId, entry.title, entry.body);
   }
 
+  deleteSessionSearchIndex(sessionId: string): void {
+    this.db.prepare('DELETE FROM session_search_fts WHERE session_id = ?').run(sessionId);
+  }
+
+  listUnindexedTurnItems(limit = 20): Array<TurnBlockRecord & { sessionTitle: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT ti.*, s.title AS session_title
+         FROM session_turn_items ti
+         JOIN sessions s ON s.id = ti.session_id
+         WHERE ti.text_body != ''
+           AND ti.block_type NOT IN ('secret_request')
+           AND NOT EXISTS (SELECT 1 FROM session_search_fts f WHERE f.item_id = ti.item_id)
+         ORDER BY ti.created_at DESC
+         LIMIT ?`,
+      )
+      .all(Math.min(200, Math.max(1, limit))) as unknown as Array<TurnItemRow & { session_title: string }>;
+    return rows.map((row) => ({ ...mapTurnItem(row), sessionTitle: row.session_title }));
+  }
+
   searchSessionFts(query: string, limit = 25): Array<{
     sessionId: string;
     itemId: string;
@@ -2078,34 +2275,280 @@ export class HarnessMateStore {
     title: string;
     snippet: string;
   }> {
-    const cleaned = query.trim().replace(/["*]/g, ' ');
-    if (!cleaned) return [];
-    const safeQuery = `"${cleaned.replace(/\s+/g, '" "')}"`;
-    const rows = this.db
-      .prepare(
-        `SELECT session_id, item_id, turn_id, driver_id, title,
-                snippet(session_search_fts, 5, '[', ']', '...', 18) AS snippet
-         FROM session_search_fts
-         WHERE session_search_fts MATCH ?
-         LIMIT ?`,
-      )
-      .all(safeQuery, Math.min(100, Math.max(1, limit))) as unknown as Array<{
-      session_id: string;
-      item_id: string;
-      turn_id: string;
-      driver_id: string;
-      title: string;
-      snippet: string;
-    }>;
-    return rows.map((r) => ({
-      sessionId: r.session_id,
-      itemId: r.item_id,
-      turnId: r.turn_id,
-      driverId: r.driver_id,
-      title: r.title,
-      snippet: r.snippet,
+    const res = this.searchSessionFtsV2({ q: query, limit });
+    return res.hits.map((h) => ({
+      sessionId: h.sessionId,
+      itemId: h.itemId,
+      turnId: h.turnId,
+      driverId: h.driverId,
+      title: h.sessionTitle,
+      snippet: h.snippetText,
     }));
   }
+
+  searchSessionFtsV2(opts: {
+    q: string;
+    workspaceId?: string;
+    driverId?: string;
+    fromTs?: number;
+    toTs?: number;
+    limit?: number;
+    offset?: number;
+    forceLikeFallback?: boolean;
+  }): { hits: SessionSearchHit[]; fallbackUsed: boolean } {
+    const rawQuery = opts.q.trim();
+    if (!rawQuery) return { hits: [], fallbackUsed: false };
+
+    const limit = Math.min(100, Math.max(1, opts.limit ?? 25));
+    const offset = Math.max(0, opts.offset ?? 0);
+    const terms = extractSearchTerms(rawQuery);
+    const ftsQuery = buildSafeFts5Query(rawQuery);
+
+    const buildFilterClauses = (alias: { session: string; item: string; ftsDriverExpr: string }) => {
+      const clauses: string[] = [];
+      const params: (string | number)[] = [];
+      if (opts.workspaceId) {
+        clauses.push(`${alias.session}.workspace_id = ?`);
+        params.push(opts.workspaceId);
+      }
+      if (opts.driverId) {
+        clauses.push(`(${alias.ftsDriverExpr} = ? OR ${alias.session}.harness_kind = ? OR ${alias.session}.harness_id = ?)`);
+        params.push(opts.driverId, opts.driverId, opts.driverId);
+      }
+      if (typeof opts.fromTs === 'number' && Number.isFinite(opts.fromTs)) {
+        clauses.push(`COALESCE(${alias.item}.created_at, ${alias.session}.updated_at) >= ?`);
+        params.push(opts.fromTs);
+      }
+      if (typeof opts.toTs === 'number' && Number.isFinite(opts.toTs)) {
+        clauses.push(`COALESCE(${alias.item}.created_at, ${alias.session}.updated_at) <= ?`);
+        params.push(opts.toTs);
+      }
+      return { clauses, params };
+    };
+
+    const runLikeFallback = (): SessionSearchHit[] => {
+      const escapedPattern = `%${escapeLikePattern(rawQuery)}%`;
+      const filter = buildFilterClauses({ session: 's', item: 'ti', ftsDriverExpr: 'ti.driver_id' });
+      const whereParts = [
+        "(ti.text_body LIKE ? ESCAPE '\\' OR ti.title LIKE ? ESCAPE '\\' OR s.title LIKE ? ESCAPE '\\')",
+        ...filter.clauses,
+      ];
+      const rows = this.db
+        .prepare(
+          `SELECT ti.session_id, s.title AS session_title, s.workspace_id,
+                  COALESCE(ti.turn_id, '') AS turn_id, ti.seq AS turn_seq,
+                  ti.item_id, ti.block_type, ti.text_body AS body, ti.driver_id,
+                  ti.created_at
+           FROM session_turn_items ti
+           JOIN sessions s ON s.id = ti.session_id
+           WHERE ${whereParts.join(' AND ')}
+           ORDER BY ti.created_at DESC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(escapedPattern, escapedPattern, escapedPattern, ...filter.params, limit, offset) as unknown as Array<{
+        session_id: string;
+        session_title: string;
+        workspace_id: string;
+        turn_id: string;
+        turn_seq: number;
+        item_id: string;
+        block_type: string;
+        body: string;
+        driver_id: string;
+        created_at: number;
+      }>;
+      return rows.map((row) => {
+        const snippet = buildSafeHighlightedSnippet(row.body || row.session_title, terms);
+        return {
+          sessionId: row.session_id,
+          sessionTitle: row.session_title,
+          workspaceId: row.workspace_id,
+          turnId: row.turn_id,
+          turnSeq: row.turn_seq ?? 0,
+          itemId: row.item_id,
+          blockType: row.block_type || 'assistant_text',
+          snippetText: snippet.text,
+          snippetHtmlSafe: snippet.htmlSafe,
+          highlights: snippet.highlights,
+          driverId: row.driver_id,
+          createdAt: row.created_at,
+        };
+      });
+    };
+
+    if (opts.forceLikeFallback || !ftsQuery) {
+      return { hits: runLikeFallback(), fallbackUsed: true };
+    }
+
+    try {
+      const filter = buildFilterClauses({ session: 's', item: 'ti', ftsDriverExpr: 'f.driver_id' });
+      const whereParts = ['session_search_fts MATCH ?', ...filter.clauses];
+      const rows = this.db
+        .prepare(
+          `SELECT f.session_id,
+                  COALESCE(s.title, f.title) AS session_title,
+                  COALESCE(s.workspace_id, '') AS workspace_id,
+                  f.turn_id,
+                  COALESCE(ti.seq, 0) AS turn_seq,
+                  f.item_id,
+                  COALESCE(ti.block_type, 'assistant_text') AS block_type,
+                  f.body,
+                  f.driver_id,
+                  COALESCE(ti.created_at, s.updated_at, 0) AS created_at
+           FROM session_search_fts f
+           LEFT JOIN sessions s ON s.id = f.session_id
+           LEFT JOIN session_turn_items ti ON ti.item_id = f.item_id
+           WHERE ${whereParts.join(' AND ')}
+           ORDER BY bm25(session_search_fts) ASC, created_at DESC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(ftsQuery, ...filter.params, limit, offset) as unknown as Array<{
+        session_id: string;
+        session_title: string;
+        workspace_id: string;
+        turn_id: string;
+        turn_seq: number;
+        item_id: string;
+        block_type: string;
+        body: string;
+        driver_id: string;
+        created_at: number;
+      }>;
+
+      if (rows.length === 0 && /[\u4e00-\u9fff]/.test(rawQuery)) {
+        // SQLite default unicode61 tokenizer treats contiguous CJK runs as single tokens;
+        // fall back cleanly to parameterized LIKE so substring CJK searches always work.
+        const likeHits = runLikeFallback();
+        if (likeHits.length > 0) {
+          return { hits: likeHits, fallbackUsed: true };
+        }
+      }
+
+      const hits: SessionSearchHit[] = rows.map((row) => {
+        const snippet = buildSafeHighlightedSnippet(row.body || row.session_title, terms);
+        return {
+          sessionId: row.session_id,
+          sessionTitle: row.session_title,
+          workspaceId: row.workspace_id,
+          turnId: row.turn_id,
+          turnSeq: row.turn_seq ?? 0,
+          itemId: row.item_id,
+          blockType: row.block_type || 'assistant_text',
+          snippetText: snippet.text,
+          snippetHtmlSafe: snippet.htmlSafe,
+          highlights: snippet.highlights,
+          driverId: row.driver_id,
+          createdAt: row.created_at,
+        };
+      });
+      return { hits, fallbackUsed: false };
+    } catch {
+      return { hits: runLikeFallback(), fallbackUsed: true };
+    }
+  }
+}
+
+export function escapeFts5Query(raw: string): string {
+  return buildSafeFts5Query(raw);
+}
+
+function buildSafeFts5Query(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  // Split on whitespace & FTS5 syntax punctuation so -, ", *, NEAR, NOT, AND, OR, :, ^, () cannot break FTS5 MATCH
+  const tokens = trimmed
+    .replace(/["*^():+~]/g, ' ')
+    .split(/\s+/)
+    .map((tok) => tok.replace(/^-+/, '').trim())
+    .filter((tok) => tok.length > 0);
+  if (tokens.length === 0) return '';
+  return tokens.map((tok) => `"${tok.replace(/"/g, '""')}"`).join(' ');
+}
+
+function extractSearchTerms(raw: string): string[] {
+  const stripped = raw
+    .replace(/["*^():+~]/g, ' ')
+    .split(/\s+/)
+    .map((tok) => tok.replace(/^-+/, '').trim())
+    .filter((tok) => tok.length > 0);
+  const unique = [...new Set(stripped.length > 0 ? stripped : [raw.trim()].filter(Boolean))];
+  return unique.sort((a, b) => b.length - a.length);
+}
+
+function escapeLikePattern(raw: string): string {
+  return raw.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+export function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildSafeHighlightedSnippet(
+  body: string,
+  terms: string[],
+  windowChars = 160,
+): { text: string; htmlSafe: string; highlights: Array<{ start: number; end: number }> } {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  if (!normalized) return { text: '', htmlSafe: '', highlights: [] };
+
+  const lower = normalized.toLowerCase();
+  let firstMatch = -1;
+  for (const term of terms) {
+    const idx = lower.indexOf(term.toLowerCase());
+    if (idx >= 0 && (firstMatch < 0 || idx < firstMatch)) {
+      firstMatch = idx;
+    }
+  }
+
+  let start = 0;
+  let end = Math.min(normalized.length, windowChars);
+  if (firstMatch > 40) {
+    start = Math.max(0, firstMatch - 40);
+    end = Math.min(normalized.length, start + windowChars);
+  }
+  const prefix = start > 0 ? '...' : '';
+  const suffix = end < normalized.length ? '...' : '';
+  const snippetText = `${prefix}${normalized.slice(start, end)}${suffix}`;
+
+  // Locate non-overlapping highlight spans inside snippetText
+  const lowerSnippet = snippetText.toLowerCase();
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const term of terms) {
+    const needle = term.toLowerCase();
+    if (!needle) continue;
+    let pos = 0;
+    while (pos < lowerSnippet.length) {
+      const idx = lowerSnippet.indexOf(needle, pos);
+      if (idx < 0) break;
+      const spanEnd = idx + needle.length;
+      const overlaps = spans.some((s) => !(spanEnd <= s.start || idx >= s.end));
+      if (!overlaps) {
+        spans.push({ start: idx, end: spanEnd });
+      }
+      pos = spanEnd;
+    }
+  }
+  spans.sort((a, b) => a.start - b.start);
+
+  // Build XSS-safe HTML string with <mark> only around matched ranges
+  let cursor = 0;
+  let html = '';
+  for (const span of spans) {
+    if (span.start > cursor) {
+      html += escapeHtml(snippetText.slice(cursor, span.start));
+    }
+    html += `<mark>${escapeHtml(snippetText.slice(span.start, span.end))}</mark>`;
+    cursor = span.end;
+  }
+  if (cursor < snippetText.length) {
+    html += escapeHtml(snippetText.slice(cursor));
+  }
+  return { text: snippetText, htmlSafe: html, highlights: spans };
 }
 
 function safeJsonParse<T>(raw: string | null, fallback: T): T {
@@ -2144,6 +2587,11 @@ function mapSession(row: SessionRow, bindings?: SessionHarnessBinding[]): Sessio
     harnessId: row.harness_id,
     harnessKind: row.harness_kind as HarnessKind,
     nativeSessionId: row.native_session_id,
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
+    ...(row.forked_from_turn_seq != null ? { forkedFromTurnSeq: row.forked_from_turn_seq } : {}),
+    ...(row.fork_mode ? { forkMode: row.fork_mode as 'native' | 'portable' } : {}),
+    ...(row.import_mode ? { importMode: row.import_mode as 'mirror' | 'attach' } : {}),
+    ...(row.import_source ? { importSource: row.import_source } : {}),
     participatingHarnesses: Array.from(participatingSet),
     contextSyncMode: (row.context_sync_mode as ContextSyncMode) || 'auto',
     bindings,
@@ -2201,16 +2649,35 @@ function mapTaskState(row: TaskStateRow): SessionTaskState {
 
 function mapApproval(row: ApprovalRow): ApprovalRequest {
   const annotations = safeJsonParse<ApprovalRequest['annotations']>(row.annotations_json ?? null, undefined);
+  const supportedDecisions = safeJsonParse<string[] | undefined>(row.supported_decisions_json ?? null, undefined);
+  const questionSpec = safeJsonParse<UserQuestionSpec | null>(row.question_spec_json ?? null, null);
+  const questionAnswer = safeJsonParse<UserQuestionAnswer | null>(row.question_answer_json ?? null, null);
+  const secretSpec = safeJsonParse<SecretRequestSpec | null>(row.secret_spec_json ?? null, null);
+  const inferredKind: RuntimeRequestKind =
+    (row.kind as RuntimeRequestKind) ||
+    (row.tool_kind === 'file_edit'
+      ? 'file_change_approval'
+      : row.tool_kind === 'mcp'
+        ? 'mcp_tool_approval'
+        : 'command_approval');
   return {
     id: row.id,
     sessionId: row.session_id,
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
+    ...(row.instance_id ? { instanceId: row.instance_id } : {}),
     nativeRequestId: row.native_request_id,
+    kind: inferredKind,
     toolName: row.tool_name,
     toolKind: row.tool_kind as ToolKind,
     summary: row.summary,
     input: safeJsonParse<unknown>(row.input_json, {}),
     diffPreview: row.diff_preview,
     riskLevel: row.risk_level as RiskLevel,
+    ...(supportedDecisions?.length ? { supportedDecisions } : {}),
+    ...(questionSpec ? { questionSpec } : {}),
+    ...(questionAnswer ? { questionAnswer } : {}),
+    ...(secretSpec ? { secretSpec } : {}),
+    ...(row.secret_provided === 1 ? { secretProvided: true } : {}),
     status: row.status as ApprovalStatus,
     resolvedBy: row.resolved_by as 'desktop' | 'mobile' | 'auto' | null,
     decision: row.decision as ApprovalDecision | null,

@@ -618,32 +618,47 @@ export class IsolatedPluginManager {
   }
 
   async annotateApproval(event: ApprovalAnnotateEvent): Promise<ApprovalAnnotation[]> {
-    const results: ApprovalAnnotation[] = [];
+    const PER_PLUGIN_TIMEOUT_MS = 300;
+    const tasks: Array<Promise<ApprovalAnnotation[]>> = [];
     for (const entry of this.active.values()) {
       if (!entry.process.alive || !entry.hasApprovalAnnotate) continue;
       if (!this.opts.permissions.isGranted(entry.info, 'approvals:annotate', event.workspaceId)) continue;
-      try {
-        const res = await entry.process.call<{ annotations?: Array<{ risk?: unknown; label?: unknown; detail?: unknown }> }>(
-          'host.approval.annotate',
-          { event },
-          ISOLATED_TIMEOUTS.waterfall,
-          entry.runId,
-        );
-        for (const item of res?.annotations ?? []) {
-          if (typeof item?.label !== 'string' || !item.label.trim()) continue;
-          const risk = item.risk === 'low' || item.risk === 'medium' || item.risk === 'high' ? item.risk : undefined;
-          results.push({
-            pluginId: entry.pluginId,
-            risk,
-            label: item.label.trim().slice(0, 120),
-            detail: typeof item.detail === 'string' ? item.detail.slice(0, 500) : undefined,
-          });
-        }
-      } catch {
-        // Annotation errors never block approval flow
-      }
+      tasks.push(
+        (async () => {
+          try {
+            const res = await entry.process.call<{ annotations?: Array<{ risk?: unknown; label?: unknown; detail?: unknown }> }>(
+              'host.approval.annotate',
+              { event },
+              PER_PLUGIN_TIMEOUT_MS,
+              entry.runId,
+            );
+            const notes: ApprovalAnnotation[] = [];
+            for (const item of res?.annotations ?? []) {
+              if (typeof item?.label !== 'string' || !item.label.trim()) continue;
+              const risk = item.risk === 'low' || item.risk === 'medium' || item.risk === 'high' ? item.risk : undefined;
+              notes.push({
+                pluginId: entry.pluginId,
+                risk,
+                label: item.label.trim().slice(0, 120),
+                detail: typeof item.detail === 'string' ? item.detail.slice(0, 500) : undefined,
+              });
+            }
+            return notes;
+          } catch {
+            return [
+              {
+                pluginId: entry.pluginId,
+                risk: 'low' as const,
+                label: '部分安全规则检查未响应',
+                detail: `插件 ${entry.pluginId} 安全规则检查超时（>${PER_PLUGIN_TIMEOUT_MS}ms）或异常退出`,
+              },
+            ];
+          }
+        })(),
+      );
     }
-    return results;
+    const nested = await Promise.all(tasks);
+    return nested.flat();
   }
 
   async shouldOfferHandoff(event: HandoffShouldOfferEvent): Promise<HandoffOfferDecision | undefined> {

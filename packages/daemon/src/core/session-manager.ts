@@ -12,20 +12,32 @@ import type {
   CreateSessionRequest,
   DiscoveredCliSession,
   FailoverRequest,
+  ForkSessionRequest,
+  ForkSessionResult,
   GcCheckpointsRequest,
   HarnessKind,
   HarnessCommandInfo,
   HarnessCommandResult,
   ImportNativeSessionRequest,
+  ImportSessionBundleRequest,
+  MergeBackRequest,
+  MergeBackResult,
+  PortableSessionBundleV2,
+  ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
+  RuntimeRequestKind,
   Session,
   SessionCheckpointRecord,
   SessionPluginAction,
   SessionRunRecord,
+  SessionSearchResponse,
   SessionStatus,
   SessionTaskState,
+  SideChatMessage,
+  SideChatPromoteRequest,
+  SideChatRequest,
   SwitchHarnessRequest,
   TurnBlockRecord,
   TurnOptionsMap,
@@ -47,11 +59,17 @@ import type {
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
+import {
+  ApprovalCenterService,
+  SECRET_RECEIPT_LABEL,
+  type ExternalApprovalAnnotator,
+} from './approval-center-service.js';
 import { CheckpointError, type CheckpointDiffResult, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
 import { classifyTerminalFailure, FAILOVER_TRIGGER_CLASSES } from './failover-service.js';
+import { SessionExplorerService, type SessionExplorerQueryOptions } from './session-explorer-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
@@ -107,6 +125,8 @@ export class SessionManager {
   private readonly startingSessions = new Set<string>();
   private readonly importingSessions = new Map<string, Promise<Session>>();
   private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private fallbackExplorer?: SessionExplorerService;
+  private fallbackApprovalCenter?: ApprovalCenterService;
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
@@ -467,7 +487,7 @@ export class SessionManager {
       this.activeTurnMeta.delete(sessionId);
     }
     this.store.settleRunningTurnItems(sessionId, 'interrupted');
-    this.expireSessionApprovals(sessionId);
+    this.cancelSessionApprovals(sessionId, '会话连接中断，待处理请求已自动取消');
     const session = this.store.getSession(sessionId);
     if (session && (session.status === 'running' || session.status === 'awaiting_approval')) {
       this.emitCanonical(sessionId, 'diagnostic.log', {
@@ -478,6 +498,98 @@ export class SessionManager {
       });
       this.setSessionStatus(sessionId, 'error');
     }
+  }
+
+  getExplorerService(): SessionExplorerService {
+    const svc =
+      this.pluginManager.host.get<SessionExplorerService>('session-search') ??
+      (this.fallbackExplorer ??= new SessionExplorerService(this.store, this.registry));
+    svc.attachHooks({
+      emitCanonical: (sessionId, type, payload, turnId) =>
+        this.emitCanonical(sessionId, type, payload, turnId ?? null),
+      createSession: (req) => this.createSession(req),
+      addWorkspace: (rootPath, name) => this.addWorkspace(rootPath, name),
+      tryNativeFork: async (source, _fromTurnSeq) => {
+        const entry = this.liveHandles.get(this.handleKey(source.id, source.harnessId));
+        if (entry?.handle.runNativeCommand) {
+          const out = await entry.handle.runNativeCommand('fork', source.nativeSessionId ?? '');
+          const trimmed = out.trim();
+          if (trimmed && !/\s/.test(trimmed)) return trimmed;
+        }
+        return null;
+      },
+      getTaskLedger: () => this.pluginManager.host.get<TaskLedgerService>('ledger'),
+      onSessionImported: (importedSession, meta) => {
+        this.eventBus.publishAttention({
+          kind: 'session_updated',
+          sessionId: importedSession.id,
+          sessionTitle: importedSession.title,
+          harnessId: importedSession.harnessId,
+          summary: `Imported session (${String(meta.mode ?? 'attach')})`,
+          timestamp: Date.now(),
+        });
+      },
+    });
+    return svc;
+  }
+
+  getApprovalCenter(): ApprovalCenterService {
+    return (
+      this.pluginManager.host.get<ApprovalCenterService>('approval-center') ??
+      (this.fallbackApprovalCenter ??= new ApprovalCenterService(this.store))
+    );
+  }
+
+  searchSessions(opts: SessionExplorerQueryOptions): SessionSearchResponse {
+    return this.getExplorerService().query(opts);
+  }
+
+  async rebuildSearchIndex(): Promise<{ indexedCount: number }> {
+    return this.getExplorerService().rebuildBacklogIndex(20);
+  }
+
+  async discoverExternalSessions(opts?: { limit?: number; forceRefresh?: boolean }) {
+    return this.getExplorerService().discoverExternal(opts);
+  }
+
+  async importExternalSession(req: ImportNativeSessionRequest) {
+    return this.getExplorerService().importExternal(req);
+  }
+
+  async forkSession(sessionId: string, req: ForkSessionRequest): Promise<ForkSessionResult> {
+    return this.getExplorerService().forkSession(sessionId, req);
+  }
+
+  mergeBackSession(childSessionId: string, req: MergeBackRequest): MergeBackResult {
+    return this.getExplorerService().mergeBack(childSessionId, req);
+  }
+
+  getSideChat(sessionId: string): SideChatMessage[] {
+    return this.getExplorerService().getSideChat(sessionId);
+  }
+
+  clearSideChat(sessionId: string): void {
+    this.getExplorerService().clearSideChat(sessionId);
+  }
+
+  async sendSideChat(sessionId: string, req: SideChatRequest) {
+    return this.getExplorerService().sendSideChat(sessionId, req);
+  }
+
+  async promoteSideChatToFork(sessionId: string, req?: SideChatPromoteRequest): Promise<ForkSessionResult> {
+    return this.getExplorerService().promoteSideChatToFork(sessionId, req);
+  }
+
+  exportSession(
+    sessionId: string,
+    format: 'markdown' | 'json_bundle',
+    opts?: { redact?: boolean },
+  ) {
+    return this.getExplorerService().exportSession(sessionId, format, opts);
+  }
+
+  async importSessionBundle(req: ImportSessionBundleRequest): Promise<Session> {
+    return this.getExplorerService().importSessionBundle(req);
   }
 
   private service<Service>(name: string): Service {
@@ -1596,38 +1708,174 @@ export class SessionManager {
     }
     this.store.settleRunningTurnItems(sessionId, 'interrupted');
     this.activeTurnMeta.delete(sessionId);
-    this.expireSessionApprovals(sessionId);
+    this.cancelSessionApprovals(sessionId, '轮次已中断');
     this.setSessionStatus(sessionId, 'idle');
   }
 
-  // ── Atomic Approval Broker ───────────────────────────────────────────
+  // ── Atomic Approval, Question & Secret Broker ────────────────────────
 
-  async resolveApproval(
+  async resolveRuntimeRequest(
     approvalId: string,
-    decision: ApprovalDecision,
-    resolvedBy: 'desktop' | 'mobile' | 'auto',
-    comment?: string,
-  ): Promise<ApprovalRequest> {
+    req: ResolveApprovalRequest,
+    resolvedBy: 'desktop' | 'mobile',
+  ): Promise<{ updated: boolean; conflict: boolean; approval: ApprovalRequest }> {
+    const existing = this.store.getApproval(approvalId);
+    if (!existing) {
+      throw new Error(`Approval not found: ${approvalId}`);
+    }
+    const kind: RuntimeRequestKind = existing.kind ?? 'command_approval';
+
+    // Handle secret_request: STRICT ZERO-DISK / ZERO-LOG / ZERO-ECHO PIPELINE
+    if (kind === 'secret_request') {
+      const denied = req.decision === 'deny';
+      const secretPayload = !denied ? req.secretValue : undefined;
+      if (!denied && (!secretPayload || !secretPayload.length)) {
+        throw new Error('请提供凭据内容或选择拒绝');
+      }
+      const { updated, approval } = this.store.resolveApprovalIfPending(
+        approvalId,
+        denied ? 'deny' : 'allow_once',
+        resolvedBy,
+        undefined, // NEVER persist secret or comment containing secret to SQLite
+        {
+          statusOverride: denied ? 'denied' : 'resolved',
+          secretProvided: !denied,
+        },
+      );
+      if (!approval) throw new Error(`Approval not found: ${approvalId}`);
+      if (!updated) {
+        return { updated: false, conflict: true, approval };
+      }
+      this.clearApprovalTimer(approval.id);
+
+      // Deliver secret directly to live adapter memory/stdin; NEVER emit or log plaintext
+      for (const entry of this.liveHandles.values()) {
+        if (
+          entry.sessionId === approval.sessionId &&
+          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
+        ) {
+          entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
+          if (denied) {
+            await entry.handle.resolveApproval(approval.nativeRequestId, 'deny', '用户拒绝提供凭据');
+          } else if (entry.handle.resolveSecret) {
+            await entry.handle.resolveSecret(approval.nativeRequestId, secretPayload!);
+          } else {
+            await entry.handle.resolveApproval(approval.nativeRequestId, 'allow_once', secretPayload!);
+          }
+          break;
+        }
+      }
+
+      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
+        approvalId: approval.id,
+        kind: 'secret_request',
+        decision: approval.decision ?? (denied ? 'deny' : 'allow_once'),
+        status: approval.status,
+        resolvedBy,
+        secretProvided: !denied,
+        receiptText: denied ? '已拒绝提供凭据' : SECRET_RECEIPT_LABEL,
+      });
+      this.emitCanonical(approval.sessionId, 'runtime_request.updated', {
+        request: approval,
+        receiptText: denied ? '已拒绝提供凭据' : SECRET_RECEIPT_LABEL,
+      });
+      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
+      this.resumeSessionAfterApprovalIfClear(approval.sessionId);
+      return { updated: true, conflict: false, approval };
+    }
+
+    // Handle user_question
+    if (kind === 'user_question') {
+      const denied = req.decision === 'deny';
+      const answer = req.questionAnswer ?? (req.comment ? { freeText: req.comment } : undefined);
+      const { updated, approval } = this.store.resolveApprovalIfPending(
+        approvalId,
+        denied ? 'deny' : 'allow_once',
+        resolvedBy,
+        req.comment,
+        {
+          statusOverride: denied ? 'denied' : 'resolved',
+          questionAnswer: answer ?? null,
+        },
+      );
+      if (!approval) throw new Error(`Approval not found: ${approvalId}`);
+      if (!updated) {
+        return { updated: false, conflict: true, approval };
+      }
+      this.clearApprovalTimer(approval.id);
+
+      const formattedAnswer = answer
+        ? [
+            answer.selectedOptionIds?.length ? `selected: ${answer.selectedOptionIds.join(', ')}` : '',
+            answer.freeText?.trim() ? answer.freeText.trim() : '',
+          ]
+            .filter(Boolean)
+            .join(' | ')
+        : req.comment;
+
+      for (const entry of this.liveHandles.values()) {
+        if (
+          entry.sessionId === approval.sessionId &&
+          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
+        ) {
+          entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
+          if (!denied && entry.handle.resolveQuestion && answer) {
+            await entry.handle.resolveQuestion(approval.nativeRequestId, answer);
+          } else {
+            await entry.handle.resolveApproval(
+              approval.nativeRequestId,
+              denied ? 'deny' : 'allow_once',
+              formattedAnswer,
+            );
+          }
+          break;
+        }
+      }
+
+      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
+        approvalId: approval.id,
+        kind: 'user_question',
+        decision: approval.decision ?? (denied ? 'deny' : 'allow_once'),
+        status: approval.status,
+        resolvedBy,
+        questionAnswer: answer ?? null,
+        comment: req.comment ?? null,
+      });
+      this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
+      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
+      this.resumeSessionAfterApprovalIfClear(approval.sessionId);
+      return { updated: true, conflict: false, approval };
+    }
+
+    // Standard approval: command_approval / file_change_approval / mcp_tool_approval
+    const decision = req.decision;
+    if (!decision) {
+      throw new Error('缺少审批决策 decision');
+    }
     const { updated, approval } = this.store.resolveApprovalIfPending(
       approvalId,
       decision,
       resolvedBy,
-      comment,
+      req.comment,
     );
     if (!approval) {
       throw new Error(`Approval not found: ${approvalId}`);
     }
     if (!updated) {
-      return approval;
+      return { updated: false, conflict: true, approval };
     }
     this.clearApprovalTimer(approval.id);
 
-    this.emitCanonical(approval.sessionId, 'approval.resolved', {
+    const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
       approvalId: approval.id,
+      kind,
       decision,
+      status: approval.status,
       resolvedBy,
-      comment: comment ?? null,
+      comment: req.comment ?? null,
     });
+    this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
+    this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
 
     // Deliver approval to whichever warm handle in this session owns nativeRequestId
     for (const entry of this.liveHandles.values()) {
@@ -1636,20 +1884,91 @@ export class SessionManager {
         entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
       ) {
         entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-        await entry.handle.resolveApproval(approval.nativeRequestId, decision, comment);
+        await entry.handle.resolveApproval(approval.nativeRequestId, decision, req.comment);
         break;
       }
     }
 
-    const remaining = this.store.listPendingApprovals(approval.sessionId);
+    this.resumeSessionAfterApprovalIfClear(approval.sessionId);
+    return { updated: true, conflict: false, approval };
+  }
+
+  async resolveApproval(
+    approvalId: string,
+    decision: ApprovalDecision,
+    resolvedBy: 'desktop' | 'mobile' | 'auto',
+    comment?: string,
+  ): Promise<ApprovalRequest> {
+    // Enforce human-origin channel: map legacy 'auto' only if directly invoked internally, never from plugins
+    const actor: 'desktop' | 'mobile' = resolvedBy === 'mobile' ? 'mobile' : 'desktop';
+    const { approval } = await this.resolveRuntimeRequest(
+      approvalId,
+      { decision, comment, resolvedBy: actor },
+      actor,
+    );
+    return approval;
+  }
+
+  private recordRuntimeRequestReceipt(approval: ApprovalRequest, seq: number, createdAt: number): void {
+    const session = this.store.getSession(approval.sessionId);
+    if (!session) return;
+    const receipt = this.getApprovalCenter().buildReceiptSummary(approval);
+    this.store.upsertTurnItem({
+      itemId: `rtreq:${approval.id}`,
+      schemaVersion: 2,
+      sessionId: approval.sessionId,
+      turnId: this.activeTurnMeta.get(approval.sessionId)?.turnId ?? `rtreq_${seq}`,
+      seq,
+      instanceId: approval.instanceId ?? session.harnessId,
+      driverId: session.harnessKind,
+      blockType: 'runtime_request',
+      status: approval.status === 'cancelled' || approval.status === 'expired' ? 'cancelled' : 'completed',
+      title: receipt.title,
+      textBody: receipt.textBody,
+      payload: receipt.payload,
+      outputOmitted: false,
+      omittedBytes: 0,
+      createdAt: approval.createdAt,
+      updatedAt: createdAt,
+    });
+  }
+
+  private resumeSessionAfterApprovalIfClear(sessionId: string): void {
+    const remaining = this.store.listPendingApprovals(sessionId);
     if (remaining.length === 0) {
-      const sess = this.store.getSession(approval.sessionId);
+      const sess = this.store.getSession(sessionId);
       if (sess && sess.status === 'awaiting_approval') {
-        this.setSessionStatus(approval.sessionId, 'running');
+        this.setSessionStatus(sessionId, this.activeTurnMeta.has(sessionId) ? 'running' : 'idle');
       }
     }
+  }
 
-    return approval;
+  private cancelSessionApprovals(sessionId: string, reason = '会话中断'): void {
+    const cancelled = this.store.cancelPendingApprovals(sessionId);
+    for (const approval of cancelled) {
+      this.clearApprovalTimer(approval.id);
+      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
+        approvalId: approval.id,
+        kind: approval.kind ?? 'command_approval',
+        status: 'cancelled',
+        resolvedAt: approval.resolvedAt,
+        comment: reason,
+      });
+      this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
+      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
+      for (const entry of this.liveHandles.values()) {
+        if (
+          entry.sessionId !== approval.sessionId ||
+          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) !== approval.id
+        ) {
+          continue;
+        }
+        entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
+        void entry.handle.resolveApproval(approval.nativeRequestId, 'deny', reason).catch(() => {});
+        break;
+      }
+    }
+    this.resumeSessionAfterApprovalIfClear(sessionId);
   }
 
   private clearApprovalTimer(id: string): void {
@@ -2014,7 +2333,7 @@ export class SessionManager {
 
       case 'turn.cancelled': {
         this.deltaCoalescer.flushSession(sessionId);
-        this.expireSessionApprovals(sessionId);
+        this.cancelSessionApprovals(sessionId, '轮次已取消');
         if (meta) {
           this.store.finishSessionRun(meta.runId, { status: 'cancelled' });
         }
@@ -2033,7 +2352,7 @@ export class SessionManager {
 
       case 'turn.failed': {
         this.deltaCoalescer.flushSession(sessionId);
-        this.expireSessionApprovals(sessionId);
+        this.cancelSessionApprovals(sessionId, '轮次执行失败');
         const failureClass = classifyTerminalFailure(ev.code, ev.message);
         let cooldownResetsAt: number | null = null;
         if (FAILOVER_TRIGGER_CLASSES.has(failureClass)) {
@@ -2325,16 +2644,58 @@ export class SessionManager {
         this.deltaCoalescer.flushSession(sessionId);
         const approvalId = `appr_${crypto.randomBytes(6).toString('hex')}`;
         nativeToGlobalApprovalId.set(ev.nativeRequestId, approvalId);
-        const approval: ApprovalRequest = {
-          id: approvalId,
+        const inferredKind: RuntimeRequestKind =
+          ev.kind ??
+          (ev.toolKind === 'file_edit'
+            ? 'file_change_approval'
+            : ev.toolKind === 'mcp'
+              ? 'mcp_tool_approval'
+              : 'command_approval');
+        const adapter = this.registry.get(eventHarnessId);
+        const supportedDecisions =
+          ev.supportedDecisions ??
+          adapter?.capabilitiesV2?.supportedApprovalDecisions ??
+          ['allow_once', 'allow_session', 'deny'];
+
+        const approvalCenter = this.getApprovalCenter();
+        const localAnnotations = approvalCenter.evaluateLocalRules({
+          approvalId,
           sessionId,
-          nativeRequestId: ev.nativeRequestId,
+          workspaceId: session.workspaceId,
+          cwd: session.cwd,
+          kind: inferredKind,
           toolName: ev.toolName,
           toolKind: ev.toolKind,
           summary: ev.summary,
           input: ev.input,
           diffPreview: ev.diffPreview ?? null,
           riskLevel: ev.riskLevel,
+        });
+        const riskRank: Record<ApprovalRequest['riskLevel'], number> = { low: 0, medium: 1, high: 2, critical: 3 };
+        let effectiveRisk: ApprovalRequest['riskLevel'] = ev.riskLevel;
+        for (const note of localAnnotations) {
+          if (note.risk && riskRank[note.risk] > riskRank[effectiveRisk]) {
+            effectiveRisk = note.risk;
+          }
+        }
+
+        const approval: ApprovalRequest = {
+          id: approvalId,
+          sessionId,
+          parentSessionId: session.parentSessionId ?? null,
+          instanceId: eventHarnessId,
+          nativeRequestId: ev.nativeRequestId,
+          kind: inferredKind,
+          toolName: ev.toolName,
+          toolKind: ev.toolKind,
+          summary: ev.summary,
+          input: inferredKind === 'secret_request' ? {} : ev.input,
+          diffPreview: ev.diffPreview ?? null,
+          riskLevel: effectiveRisk,
+          supportedDecisions,
+          questionSpec: ev.questionSpec ?? null,
+          secretSpec: ev.secretSpec ?? null,
+          annotations: localAnnotations.length > 0 ? localAnnotations : undefined,
           status: 'pending',
           resolvedBy: null,
           decision: null,
@@ -2348,6 +2709,7 @@ export class SessionManager {
         this.approvalTimers.set(approvalId, expiry);
         this.setSessionStatus(sessionId, 'awaiting_approval');
         this.emitCanonical(sessionId, 'approval.requested', { approval }, ev.turnId);
+        this.emitCanonical(sessionId, 'runtime_request.updated', { request: approval }, ev.turnId);
         void this.annotatePendingApproval(session, approval);
         this.eventBus.publishAttention({
           kind: 'approval_needed',
@@ -2404,20 +2766,55 @@ export class SessionManager {
     this.emitCanonical(sessionId, 'session.status', { status });
   }
 
-  async annotatePendingApproval(session: Session, approval: ApprovalRequest) {
-    const collected = await this.pluginManager.isolated?.annotateApproval({
-      approvalId: approval.id,
-      sessionId: session.id,
-      workspaceId: session.workspaceId,
-      toolName: approval.toolName,
-      toolKind: approval.toolKind,
-      summary: approval.summary,
-      riskLevel: approval.riskLevel,
-    }) ?? [];
-    for (const note of collected) {
+  async annotatePendingApproval(
+    session: Session,
+    approval: ApprovalRequest,
+    extraAnnotators?: readonly ExternalApprovalAnnotator[],
+  ) {
+    const isolatedNotes =
+      (await this.pluginManager.isolated?.annotateApproval({
+        approvalId: approval.id,
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        toolName: approval.toolName,
+        toolKind: approval.toolKind,
+        summary: approval.summary,
+        riskLevel: approval.riskLevel === 'critical' ? 'high' : approval.riskLevel,
+      })) ?? [];
+
+    for (const note of isolatedNotes) {
       this.store.addApprovalAnnotation(approval.id, note);
     }
-    return this.store.getApproval(approval.id);
+
+    if (extraAnnotators && extraAnnotators.length > 0) {
+      const evaluation = await this.getApprovalCenter().evaluateWithPlugins(
+        {
+          approvalId: approval.id,
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          cwd: session.cwd,
+          kind: approval.kind ?? 'command_approval',
+          toolName: approval.toolName,
+          toolKind: approval.toolKind,
+          summary: approval.summary,
+          input: approval.input,
+          diffPreview: approval.diffPreview ?? null,
+          riskLevel: approval.riskLevel,
+        },
+        extraAnnotators,
+      );
+      for (const note of evaluation.annotations) {
+        if (note.pluginId !== 'hm.plugin.approval-center') {
+          this.store.addApprovalAnnotation(approval.id, note);
+        }
+      }
+    }
+
+    const updated = this.store.getApproval(approval.id);
+    if (updated && (isolatedNotes.length > 0 || (extraAnnotators?.length ?? 0) > 0)) {
+      this.emitCanonical(session.id, 'runtime_request.updated', { request: updated });
+    }
+    return updated;
   }
 
   async evaluateHandoffOffer(session: Session, harnessId: string, message?: string | null) {
