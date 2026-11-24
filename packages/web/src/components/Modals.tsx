@@ -29,6 +29,7 @@ import {
   PluginStudioModal,
   UsageDashboardModal,
 } from './StudioModals';
+import { WorktreeManagerModal } from './WorktreeManagerModal';
 
 export function ModalHost() {
   const { activeModal, openModal } = useAppStore();
@@ -38,7 +39,8 @@ export function ModalHost() {
     activeModal === 'plugins' ||
     activeModal === 'mcp' ||
     activeModal === 'usage' ||
-    activeModal === 'context_preview';
+    activeModal === 'context_preview' ||
+    activeModal === 'worktrees';
 
   return (
     <div
@@ -69,6 +71,7 @@ export function ModalHost() {
           <ContextPreviewModal onClose={() => openModal(null)} />
         )}
         {activeModal === 'command_palette' && <CommandPaletteModal onClose={() => openModal(null)} />}
+        {activeModal === 'worktrees' && <WorktreeManagerModal onClose={() => openModal(null)} />}
       </div>
     </div>
   );

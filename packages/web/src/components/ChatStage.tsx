@@ -81,6 +81,7 @@ import { useAppStore } from '../stores/app-store';
 import type { FileLink } from '../lib/file-links';
 import { Slot, SlotTurnProvider } from '../slots';
 import { HarnessBadge, StarLoomCrest } from './BrandMark';
+import { UndoRevertBanner } from './CheckpointControls';
 import { HarnessSwitcher } from './HarnessSwitcher';
 import { HtmlRenderCard } from './HtmlRenderCard';
 import { InspectorDrawer } from './InspectorDrawer';
@@ -113,6 +114,39 @@ const NO_ATTACHMENTS: Attachment[] = [];
 const NO_EVENTS: CanonicalEvent[] = [];
 const NO_TURN_ITEMS: TurnBlockRecord[] = [];
 const TIMELINE_PAGE_SIZE = 80;
+
+function SessionUndoRevertBar({ sessionId }: { sessionId: string }) {
+  const lastRevert = useAppStore((s) => s.lastRevertBySession[sessionId]);
+  const revertCheckpoint = useAppStore((s) => s.revertCheckpoint);
+  const clearLastRevert = useAppStore((s) => s.clearLastRevert);
+  const [undoing, setUndoing] = useState(false);
+
+  if (!lastRevert) return null;
+
+  return (
+    <div className="shrink-0 px-4 pt-2.5">
+      <div className="mx-auto max-w-[760px]">
+        <UndoRevertBanner
+          revertResult={lastRevert}
+          undoing={undoing}
+          onUndo={async () => {
+            setUndoing(true);
+            try {
+              await revertCheckpoint(sessionId, {
+                checkpointId: lastRevert.preRevertCheckpointId,
+                mode: 'files_only',
+              });
+              clearLastRevert(sessionId);
+            } finally {
+              setUndoing(false);
+            }
+          }}
+          onDismiss={() => clearLastRevert(sessionId)}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function ChatStage() {
   const {
@@ -941,6 +975,9 @@ export function ChatStage() {
           </div>
         )}
 
+        {/* Prominent Undo Revert Banner after a checkpoint revert */}
+        <SessionUndoRevertBar sessionId={session.id} />
+
         {/* Main Conversation Stream + Turn Minimap */}
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <div
@@ -1749,6 +1786,28 @@ const TurnBlock = memo(function TurnBlock({
                         preferredHeightPx={block.preferredHeightPx}
                         allowFullscreen={block.allowFullscreen}
                       />
+                    }
+                  />
+                );
+              }
+              if (block.type === 'checkpoint_marker') {
+                return (
+                  <Slot
+                    key={block.blockId}
+                    name="chat.block"
+                    matchKey="checkpoint_marker"
+                    slotProps={{ session, turn, block, onOpenFile, onFailover }}
+                    fallback={
+                      <div
+                        className="rounded-xl px-3 py-1.5 text-[11px] text-[var(--text-muted)]"
+                        style={{
+                          backgroundColor: 'var(--bg-surface)',
+                          border: '1px solid var(--border-hairline)',
+                        }}
+                      >
+                        检查点 · Turn #{block.turnSeq} (+{block.insertions} -{block.deletions} ·{' '}
+                        {block.filesChanged} 个文件)
+                      </div>
                     }
                   />
                 );

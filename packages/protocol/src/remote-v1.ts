@@ -5,6 +5,7 @@ import {
   ApprovalDecisionSchema,
   AttachmentSchema,
   CanonicalEventSchema,
+  CheckpointRevertModeSchema,
   ContextSyncModeSchema,
   NativeHistorySourceSchema,
   PermissionModeSchema,
@@ -105,6 +106,78 @@ export const FailoverRequestSchema = z.object({
   retryLastFailedTurn: z.boolean().default(true),
 });
 export type FailoverRequest = z.infer<typeof FailoverRequestSchema>;
+
+// ── Git Checkpoints, Diff, Worktree & Delivery Request Schemas ─────────
+
+export const RevertCheckpointRequestSchema = z.object({
+  targetTurnSeq: z.number().int().nonnegative().optional(),
+  checkpointId: z.string().min(1).optional(),
+  mode: CheckpointRevertModeSchema,
+});
+export type RevertCheckpointRequest = z.infer<typeof RevertCheckpointRequestSchema>;
+
+export const GcCheckpointsRequestSchema = z.object({
+  keepLast: z.number().int().min(0).max(500).default(20),
+  olderThanDays: z.number().min(0).max(365).optional(),
+});
+export type GcCheckpointsRequest = z.infer<typeof GcCheckpointsRequestSchema>;
+
+export const GitDiscardFileRequestSchema = z.object({
+  filePath: z.string().min(1),
+});
+export type GitDiscardFileRequest = z.infer<typeof GitDiscardFileRequestSchema>;
+
+export const CreateWorktreeRequestSchema = z.object({
+  branchName: z.string().trim().min(1).max(120),
+  baseBranch: z.string().trim().min(1).max(120).optional(),
+});
+export type CreateWorktreeRequest = z.infer<typeof CreateWorktreeRequestSchema>;
+
+export const RemoveWorktreeRequestSchema = z.object({
+  worktreePath: z.string().trim().min(1),
+  force: z.boolean().optional(),
+});
+export type RemoveWorktreeRequest = z.infer<typeof RemoveWorktreeRequestSchema>;
+
+export const DryRunMergeRequestSchema = z.object({
+  baseBranch: z.string().trim().min(1).max(120),
+  headBranch: z.string().trim().min(1).max(120),
+});
+export type DryRunMergeRequest = z.infer<typeof DryRunMergeRequestSchema>;
+
+export const TrustSetupScriptRequestSchema = z.object({
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  trusted: z.boolean(),
+});
+export type TrustSetupScriptRequest = z.infer<typeof TrustSetupScriptRequestSchema>;
+
+export const GitCommitRequestSchema = z.object({
+  message: z.string().trim().min(1).max(4000),
+  files: z.array(z.string().min(1)).optional(),
+  stageAll: z.boolean().default(true),
+});
+export type GitCommitRequest = z.infer<typeof GitCommitRequestSchema>;
+
+export const GitPushRequestSchema = z.object({
+  remote: z.string().trim().min(1).max(120).optional(),
+  branch: z.string().trim().min(1).max(120).optional(),
+  setUpstream: z.boolean().optional(),
+});
+export type GitPushRequest = z.infer<typeof GitPushRequestSchema>;
+
+export const GitPullRequestSchema = z.object({
+  remote: z.string().trim().min(1).max(120).optional(),
+  branch: z.string().trim().min(1).max(120).optional(),
+});
+export type GitPullRequest = z.infer<typeof GitPullRequestSchema>;
+
+export const GitCreatePrRequestSchema = z.object({
+  title: z.string().trim().min(1).max(240),
+  body: z.string().max(16_000).default(''),
+  base: z.string().trim().min(1).max(120).optional(),
+  draft: z.boolean().default(false),
+});
+export type GitCreatePrRequest = z.infer<typeof GitCreatePrRequestSchema>;
 
 export const TurnOptionValueSchema = z.union([z.string(), z.boolean(), z.number()]);
 export type TurnOptionValue = z.infer<typeof TurnOptionValueSchema>;

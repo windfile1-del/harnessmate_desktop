@@ -6,18 +6,22 @@ import type {
   ApprovalRequest,
   Attachment,
   CanonicalEvent,
+  CheckpointRevertResult,
   ContextPreview,
   ContextSyncMode,
   CreateSessionRequest,
   DiscoveredCliSession,
   FailoverRequest,
+  GcCheckpointsRequest,
   HarnessKind,
   HarnessCommandInfo,
   HarnessCommandResult,
   ImportNativeSessionRequest,
+  RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
   Session,
+  SessionCheckpointRecord,
   SessionPluginAction,
   SessionRunRecord,
   SessionStatus,
@@ -43,6 +47,7 @@ import type {
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
+import { CheckpointError, type CheckpointDiffResult, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
@@ -75,6 +80,8 @@ interface ActiveTurnMeta {
   harnessKind: HarnessKind;
   model: string | null;
   actualModel: string | null;
+  turnSeq?: number;
+  preTurnTreeSha?: string | null;
   advanceWatermark?: boolean;
   reloadHandle?: boolean;
   maintenance?: boolean;
@@ -211,6 +218,242 @@ export class SessionManager {
 
   getSessionRuns(sessionId: string, limit = 100): SessionRunRecord[] {
     return this.store.listSessionRuns(sessionId, limit);
+  }
+
+  // ── Session Checkpoints & Atomic Revert ──────────────────────────────
+
+  listSessionCheckpoints(sessionId: string, limit = 100): SessionCheckpointRecord[] {
+    const svc = this.pluginManager.host.get<CheckpointService>('checkpoints');
+    if (svc) return svc.list(sessionId, limit);
+    return this.store.listCheckpointRecords(sessionId, limit);
+  }
+
+  async captureManualCheckpoint(sessionId: string): Promise<SessionCheckpointRecord> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    const svc = this.service<CheckpointService>('checkpoints');
+    const latest = svc.list(sessionId, 1)[0];
+    const record = await svc.capture({
+      sessionId,
+      cwd: session.cwd,
+      turnSeq: session.lastSeq,
+      phase: 'manual',
+      compareAgainstTreeSha: latest?.treeSha ?? null,
+    });
+    if (!record) {
+      throw new CheckpointError('E_NOT_GIT_REPO', '当前工作区不是有效的 Git 仓库，无法捕获检查点');
+    }
+    this.emitCanonical(sessionId, 'checkpoint.captured', {
+      checkpoint: record,
+      phase: record.phase,
+    });
+    return record;
+  }
+
+  async diffSessionCheckpoints(
+    sessionId: string,
+    opts: { fromCheckpointId?: string; toCheckpointId?: string; fromSeq?: number; toSeq?: number },
+  ): Promise<CheckpointDiffResult> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    const svc = this.service<CheckpointService>('checkpoints');
+    return svc.diff({
+      sessionId,
+      cwd: session.cwd,
+      ...opts,
+    });
+  }
+
+  async revertSessionCheckpoint(
+    sessionId: string,
+    req: RevertCheckpointRequest,
+  ): Promise<CheckpointRevertResult> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    if (session.status === 'running' || session.status === 'awaiting_approval') {
+      throw new CheckpointError('E_SESSION_BUSY', '请先等待或中止当前运行中的轮次后再执行回滚');
+    }
+
+    const svc = this.service<CheckpointService>('checkpoints');
+    const adapter = this.registry.get(session.harnessId);
+    const supportsNativeRollback = Boolean(adapter?.capabilitiesV2?.supportsNativeRollback);
+
+    // Estimate how many turns have occurred since targetTurnSeq for native rollback
+    const allCheckpoints = svc.list(sessionId, 500);
+    const targetSeq =
+      req.targetTurnSeq ??
+      (req.checkpointId ? svc.get(req.checkpointId)?.turnSeq : undefined) ??
+      0;
+    const turnsSinceTarget = Math.max(
+      1,
+      allCheckpoints.filter((c) => c.phase === 'turn_pre' && c.turnSeq >= targetSeq).length,
+    );
+
+    const result = await svc.revert({
+      sessionId,
+      cwd: session.cwd,
+      checkpointId: req.checkpointId,
+      targetTurnSeq: req.targetTurnSeq,
+      mode: req.mode,
+      hooks: {
+        supportsNativeRollback,
+        turnsToRollback: turnsSinceTarget,
+        performNativeRollback: async (numTurns) => {
+          const key = this.handleKey(sessionId, session.harnessId);
+          const existing = this.liveHandles.get(key);
+          const entry = existing ?? (await this.ensureLiveHandle(sessionId, session.harnessId, false));
+          if (!entry.handle.runNativeCommand) {
+            throw new CheckpointError(
+              'E_NATIVE_ROLLBACK_FAILED',
+              `当前驱动 (${session.harnessId}) 未暴露原生回滚接口，已中止回滚且未修改任何工作区文件`,
+            );
+          }
+          try {
+            await entry.handle.runNativeCommand('rollback', String(numTurns));
+          } catch (err) {
+            throw new CheckpointError(
+              'E_NATIVE_ROLLBACK_FAILED',
+              `原生对话回滚失败，已中止回滚且未修改任何工作区文件：${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        },
+        resetNativeBinding: async () => {
+          await this.disposeLiveHandle(sessionId, session.harnessId);
+          this.store.updateSession(sessionId, { nativeSessionId: null });
+          const existingBinding = this.store.getSessionBinding(sessionId, session.harnessId);
+          this.store.upsertSessionBinding({
+            sessionId,
+            harnessId: session.harnessId,
+            harnessKind: session.harnessKind,
+            nativeSessionId: null,
+            lastModel: existingBinding?.lastModel ?? session.model,
+            lastActualModel: existingBinding?.lastActualModel ?? session.actualModel ?? null,
+            lastEffort: existingBinding?.lastEffort ?? session.reasoningEffort,
+            syncedUpToSeq: targetSeq,
+            driverUsed: null,
+            updatedAt: Date.now(),
+          });
+        },
+        onReverted: (revertResult, target) => {
+          const ev = this.emitCanonical(sessionId, 'checkpoint.reverted', {
+            ...revertResult,
+            checkpointId: target.checkpointId,
+            gitRef: target.gitRef,
+            treeSha: target.treeSha,
+            harnessId: session.harnessId,
+          });
+          const modeLabel =
+            revertResult.modeUsed === 'native_and_files'
+              ? '原生对话与工作区文件已同步回滚'
+              : revertResult.modeUsed === 'fork_new_branch'
+                ? '工作区文件已还原，并已重置原生会话绑定以新分支续跑'
+                : '仅还原了工作区文件（对话上下文保留原状，未伪造对话回滚）';
+          this.store.upsertTurnItem({
+            itemId: `revert:${ev.seq}`,
+            schemaVersion: 2,
+            sessionId,
+            turnId: `revert_${ev.seq}`,
+            seq: ev.seq,
+            instanceId: session.harnessId,
+            driverId: session.harnessKind,
+            blockType: 'system_notice',
+            status: 'completed',
+            title: '检查点回滚完成',
+            textBody: `${modeLabel}（还原 ${revertResult.filesRestored} 个文件，清理 ${revertResult.untrackedRemoved} 个新增文件；已自动保存撤销点 ${revertResult.preRevertCheckpointId}）。`,
+            payload: { ...revertResult },
+            outputOmitted: false,
+            omittedBytes: 0,
+            createdAt: ev.createdAt,
+            updatedAt: ev.createdAt,
+          });
+          const refreshed = this.store.getSession(sessionId);
+          if (refreshed) {
+            this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(refreshed);
+          }
+        },
+      },
+    });
+
+    return result;
+  }
+
+  async gcSessionCheckpoints(
+    sessionId: string,
+    req: GcCheckpointsRequest,
+  ): Promise<{ deletedCount: number; deletedRefs: string[] }> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
+    const svc = this.service<CheckpointService>('checkpoints');
+    return svc.gcCheckpoints({
+      sessionId,
+      cwd: session.cwd,
+      keepLast: req.keepLast,
+      olderThanDays: req.olderThanDays,
+    });
+  }
+
+  private async capturePostTurnCheckpoint(
+    session: Session,
+    meta: ActiveTurnMeta,
+    turnId: string,
+  ): Promise<void> {
+    if (meta.maintenance || meta.turnSeq === undefined) return;
+    const svc = this.pluginManager.host.get<CheckpointService>('checkpoints');
+    if (!svc) return;
+    try {
+      const record = await svc.capture({
+        sessionId: session.id,
+        cwd: session.cwd,
+        turnSeq: meta.turnSeq,
+        phase: 'turn_post',
+        skipIfUnchangedFromTreeSha: meta.preTurnTreeSha ?? null,
+        compareAgainstTreeSha: meta.preTurnTreeSha ?? null,
+      });
+      if (!record) return;
+      const ev = this.emitCanonical(
+        session.id,
+        'checkpoint.captured',
+        {
+          checkpoint: record,
+          phase: record.phase,
+          turnSeq: record.turnSeq,
+          filesChanged: record.filesChanged,
+          insertions: record.insertions,
+          deletions: record.deletions,
+        },
+        turnId,
+      );
+      this.store.upsertTurnItem({
+        itemId: `${turnId}:checkpoint:${record.checkpointId}`,
+        schemaVersion: 2,
+        sessionId: session.id,
+        turnId,
+        seq: ev.seq,
+        instanceId: meta.harnessId,
+        driverId: meta.harnessKind,
+        blockType: 'checkpoint_marker',
+        status: 'completed',
+        title: `检查点 · Turn #${record.turnSeq}`,
+        textBody: `+${record.insertions} -${record.deletions} · ${record.filesChanged} 个文件变更`,
+        payload: {
+          checkpointId: record.checkpointId,
+          turnSeq: record.turnSeq,
+          phase: record.phase,
+          gitRef: record.gitRef,
+          treeSha: record.treeSha,
+          filesChanged: record.filesChanged,
+          insertions: record.insertions,
+          deletions: record.deletions,
+          skippedLargeFiles: record.skippedLargeFiles,
+        },
+        outputOmitted: false,
+        omittedBytes: 0,
+        createdAt: ev.createdAt,
+        updatedAt: ev.createdAt,
+      });
+    } catch {
+      // Never fail or crash a completed turn due to checkpoint capture errors
+    }
   }
 
   settleOrphanedSession(sessionId: string, reason = 'Adapter process exited unexpectedly'): void {
@@ -1199,6 +1442,42 @@ export class SessionManager {
     });
     this.setSessionStatus(sessionId, 'running');
 
+    // Capture turn_pre hidden Git checkpoint (non-blocking, timeout-protected, skips non-Git)
+    if (!native?.cliCommand) {
+      const turnMeta = this.activeTurnMeta.get(sessionId);
+      if (turnMeta) {
+        turnMeta.turnSeq = userEvent.seq;
+      }
+      const checkpointSvc = this.pluginManager.host.get<CheckpointService>('checkpoints');
+      if (checkpointSvc) {
+        try {
+          const preRecord = await checkpointSvc.capture({
+            sessionId,
+            cwd: session.cwd,
+            turnSeq: userEvent.seq,
+            phase: 'turn_pre',
+          });
+          if (preRecord && turnMeta) {
+            turnMeta.preTurnTreeSha = preRecord.treeSha;
+            if (preRecord.skippedLargeFiles.length > 0) {
+              this.emitCanonical(
+                sessionId,
+                'diagnostic.log',
+                {
+                  level: 'warn',
+                  stream: 'protocol',
+                  message: `[Checkpoints] 跳过 ${preRecord.skippedLargeFiles.length} 个超大未追踪文件（>10MB 或总计 >100MB）：${preRecord.skippedLargeFiles.slice(0, 5).join(', ')}`,
+                },
+                turnId,
+              );
+            }
+          }
+        } catch {
+          // Never block turn start if checkpoint capture fails
+        }
+      }
+    }
+
     try {
       // Compile incremental context delta if Context Bridge plugin is active
       const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
@@ -1700,6 +1979,9 @@ export class SessionManager {
           ev.turnId,
         );
         this.activeTurnMeta.delete(sessionId);
+        if (meta) {
+          void this.capturePostTurnCheckpoint(session, meta, ev.turnId);
+        }
 
         // Advance this harness's exact sync watermark through its own completed turn!
         const existingBinding = this.store.getSessionBinding(sessionId, eventHarnessId);
@@ -1782,6 +2064,9 @@ export class SessionManager {
           ev.turnId,
         );
         this.activeTurnMeta.delete(sessionId);
+        if (meta) {
+          void this.capturePostTurnCheckpoint(session, meta, ev.turnId);
+        }
         this.setSessionStatus(sessionId, 'error');
         if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
 

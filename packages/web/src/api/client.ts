@@ -5,15 +5,29 @@ import type {
   ApprovalRequest,
   Attachment,
   CanonicalEvent,
+  CheckpointRevertMode,
+  CheckpointRevertResult,
   ContextPreview,
   ContextSyncMode,
   CreateSessionRequest,
+  CreateWorktreeRequest,
   CustomAcpHarnessConfig,
   DiscoveredCliSession,
+  DryRunMergeRequest,
   FailoverPolicy,
   FailoverRecommendation,
   FailoverRequest,
+  GcCheckpointsRequest,
+  GitActionResult,
+  GitCommitRequest,
+  GitCreatePrRequest,
+  GitDryRunMergeResult,
+  GitFileDiffResult,
+  GitPullRequest,
+  GitPushRequest,
   GitStatusSummary,
+  GitWorkspaceTruthDigest,
+  GitWorktreeEntry,
   HarnessAccountUsage,
   HarnessCommandInfo,
   HarnessCommandResult,
@@ -33,10 +47,12 @@ import type {
   PluginSlashCommand,
   RemoteAccessStatus,
   ReplayPluginDraftRequest,
+  RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
   ScaffoldPluginRequest,
   Session,
+  SessionCheckpointRecord,
   SessionModelPluginTools,
   SessionPluginAction,
   SetPluginPermissionRequest,
@@ -48,6 +64,7 @@ import type {
   PluginBrowserStatus,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
+  TrustSetupScriptRequest,
   TurnBlockRecord,
   TurnOptionsMap,
   UpdatePluginRegistryConfigRequest,
@@ -56,6 +73,7 @@ import type {
   UploadAttachmentRequest,
   Workspace,
   WorkspaceFileEntry,
+  WorkspaceSetupScriptInfo,
   WsClientFrame,
   WsServerFrame,
 } from '@harnessmate/protocol';
@@ -635,6 +653,151 @@ export const daemonApi = {
 
   getSessionGit: (id: string) =>
     apiFetch<{ git: GitStatusSummary }>(`/api/v1/sessions/${encodeURIComponent(id)}/git`),
+
+  getGitFileDiff: (sessionId: string, filePath: string, staged = false) =>
+    apiFetch<GitFileDiffResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/file-diff?path=${encodeURIComponent(filePath)}&staged=${staged ? '1' : '0'}`,
+    ),
+
+  getGitTruthDigest: (sessionId: string) =>
+    apiFetch<{ truth: GitWorkspaceTruthDigest }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/truth`,
+    ),
+
+  initSessionGit: (sessionId: string) =>
+    apiFetch<{ result: GitActionResult; git: GitStatusSummary }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/init`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+
+  discardGitFile: (sessionId: string, filePath: string) =>
+    apiFetch<{ result: GitActionResult; git: GitStatusSummary }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/discard`,
+      { method: 'POST', body: JSON.stringify({ filePath }) },
+    ),
+
+  gitCommit: (sessionId: string, req: GitCommitRequest) =>
+    apiFetch<{ result: GitActionResult; git: GitStatusSummary }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/commit`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  gitPush: (sessionId: string, req: GitPushRequest = {}) =>
+    apiFetch<{ result: GitActionResult; git: GitStatusSummary }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/push`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  gitPull: (sessionId: string, req: GitPullRequest = {}) =>
+    apiFetch<{ result: GitActionResult; git: GitStatusSummary }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/pull`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  gitCreatePr: (sessionId: string, req: GitCreatePrRequest) =>
+    apiFetch<{ result: GitActionResult }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/git/pr`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  listCheckpoints: (sessionId: string) =>
+    apiFetch<{ checkpoints: SessionCheckpointRecord[]; supportsNativeRollback: boolean }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
+    ),
+
+  captureCheckpoint: (sessionId: string) =>
+    apiFetch<{ checkpoint: SessionCheckpointRecord }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+
+  diffCheckpoints: (
+    sessionId: string,
+    opts: { fromCheckpointId?: string; toCheckpointId?: string; fromSeq?: number; toSeq?: number },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts.fromCheckpointId) params.set('fromCheckpointId', opts.fromCheckpointId);
+    if (opts.toCheckpointId) params.set('toCheckpointId', opts.toCheckpointId);
+    if (opts.fromSeq !== undefined) params.set('fromSeq', String(opts.fromSeq));
+    if (opts.toSeq !== undefined) params.set('toSeq', String(opts.toSeq));
+    const qs = params.toString();
+    return apiFetch<{
+      fromCheckpointId: string | null;
+      toCheckpointId: string | null;
+      fromTreeSha: string;
+      toTreeSha: string;
+      diff: string;
+      filesChanged: number;
+      insertions: number;
+      deletions: number;
+      files: Array<{
+        path: string;
+        status: 'added' | 'modified' | 'deleted' | 'renamed';
+        additions: number;
+        deletions: number;
+      }>;
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/checkpoints/diff${qs ? `?${qs}` : ''}`);
+  },
+
+  revertCheckpoint: (sessionId: string, req: RevertCheckpointRequest) =>
+    apiFetch<{
+      result: CheckpointRevertResult;
+      session: Session;
+      checkpoints: SessionCheckpointRecord[];
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/checkpoints/revert`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  gcCheckpoints: (sessionId: string, req: Partial<GcCheckpointsRequest> = {}) =>
+    apiFetch<{
+      deletedCount: number;
+      deletedRefs: string[];
+      checkpoints: SessionCheckpointRecord[];
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/checkpoints/gc`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  listWorktrees: (workspaceId: string) =>
+    apiFetch<{ worktrees: GitWorktreeEntry[]; setupScript: WorkspaceSetupScriptInfo }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees`,
+    ),
+
+  createWorktree: (workspaceId: string, req: CreateWorktreeRequest) =>
+    apiFetch<{ created: { worktreePath: string; branch: string }; worktrees: GitWorktreeEntry[] }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  removeWorktree: (workspaceId: string, worktreePath: string, force = false) =>
+    apiFetch<{ result: GitActionResult; worktrees: GitWorktreeEntry[] }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees`,
+      { method: 'DELETE', body: JSON.stringify({ worktreePath, force }) },
+    ),
+
+  dryRunMerge: (workspaceId: string, req: DryRunMergeRequest) =>
+    apiFetch<GitDryRunMergeResult>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/worktrees/dry-run-merge`,
+      { method: 'POST', body: JSON.stringify(req) },
+    ),
+
+  getSetupScript: (workspaceId: string) =>
+    apiFetch<{ setupScript: WorkspaceSetupScriptInfo }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/setup-script`,
+    ),
+
+  setSetupScriptTrust: (workspaceId: string, req: TrustSetupScriptRequest) =>
+    apiFetch<{ setupScript: WorkspaceSetupScriptInfo }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/setup-script/trust`,
+      { method: 'PUT', body: JSON.stringify(req) },
+    ),
+
+  runSetupScript: (workspaceId: string, worktreePath?: string) =>
+    apiFetch<{ result: GitActionResult }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/setup-script/run`,
+      { method: 'POST', body: JSON.stringify({ worktreePath }) },
+    ),
 
   listPendingApprovals: (sessionId?: string) =>
     apiFetch<{ approvals: ApprovalRequest[] }>(

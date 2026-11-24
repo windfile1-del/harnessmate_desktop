@@ -410,6 +410,8 @@ export const CanonicalEventTypeSchema = z.enum([
   'tool.call.completed',
   'approval.requested',
   'approval.resolved',
+  'checkpoint.captured',
+  'checkpoint.reverted',
   'usage.updated',
   'diagnostic.log',
 ]);
@@ -742,3 +744,90 @@ export const SessionCheckpointRecordSchema = z.object({
   createdAt: z.number(),
 });
 export type SessionCheckpointRecord = z.infer<typeof SessionCheckpointRecordSchema>;
+
+export const CheckpointRevertModeSchema = z.enum([
+  'native_and_files',
+  'files_only',
+  'fork_new_branch',
+]);
+export type CheckpointRevertMode = z.infer<typeof CheckpointRevertModeSchema>;
+
+export const CheckpointRevertResultSchema = z.object({
+  revertedToCheckpointId: z.string(),
+  targetTurnSeq: z.number().int().nonnegative(),
+  preRevertCheckpointId: z.string(),
+  modeUsed: CheckpointRevertModeSchema,
+  nativeRolledBack: z.boolean(),
+  newNativeBindingReset: z.boolean(),
+  filesRestored: z.number().int().nonnegative(),
+  untrackedRemoved: z.number().int().nonnegative(),
+  skippedLargeFiles: z.array(z.string()).default([]),
+});
+export type CheckpointRevertResult = z.infer<typeof CheckpointRevertResultSchema>;
+
+export const GitFileDiffResultSchema = z.object({
+  path: z.string(),
+  staged: z.boolean(),
+  diff: z.string(),
+  binary: z.boolean().default(false),
+  truncated: z.boolean().default(false),
+  totalBytes: z.number().int().nonnegative().default(0),
+});
+export type GitFileDiffResult = z.infer<typeof GitFileDiffResultSchema>;
+
+export const GitWorkspaceTruthDigestSchema = z.object({
+  isGitRepo: z.boolean(),
+  branch: z.string().nullable(),
+  headSha: z.string().nullable(),
+  dirtyFilesCount: z.number().int().nonnegative(),
+  dirtyFiles: z.array(z.string()),
+  diffStat: z.string(),
+  capturedAt: z.number(),
+  durationMs: z.number().nonnegative(),
+});
+export type GitWorkspaceTruthDigest = z.infer<typeof GitWorkspaceTruthDigestSchema>;
+
+export const GitWorktreeEntrySchema = z.object({
+  path: z.string(),
+  headSha: z.string().nullable(),
+  branch: z.string().nullable(),
+  isMain: z.boolean(),
+  isBare: z.boolean().default(false),
+  locked: z.boolean().default(false),
+  prunable: z.boolean().default(false),
+  dirtyCount: z.number().int().nonnegative().default(0),
+  linkedSessionIds: z.array(z.string()).default([]),
+});
+export type GitWorktreeEntry = z.infer<typeof GitWorktreeEntrySchema>;
+
+export const GitDryRunMergeResultSchema = z.object({
+  supported: z.boolean(),
+  gitVersion: z.string().nullable(),
+  baseBranch: z.string(),
+  headBranch: z.string(),
+  hasConflicts: z.boolean(),
+  conflictFiles: z.array(z.string()),
+  treeSha: z.string().nullable(),
+  message: z.string().optional(),
+});
+export type GitDryRunMergeResult = z.infer<typeof GitDryRunMergeResultSchema>;
+
+export const WorkspaceSetupScriptInfoSchema = z.object({
+  exists: z.boolean(),
+  scriptPath: z.string().nullable(),
+  relativePath: z.string().nullable(),
+  content: z.string().nullable(),
+  sha256: z.string().nullable(),
+  trusted: z.boolean(),
+  trustedAt: z.number().nullable().optional(),
+});
+export type WorkspaceSetupScriptInfo = z.infer<typeof WorkspaceSetupScriptInfoSchema>;
+
+export const GitActionResultSchema = z.object({
+  ok: z.boolean(),
+  stdout: z.string().default(''),
+  stderr: z.string().default(''),
+  message: z.string(),
+  prUrl: z.string().nullable().optional(),
+});
+export type GitActionResult = z.infer<typeof GitActionResultSchema>;

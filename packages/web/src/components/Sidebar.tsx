@@ -423,6 +423,15 @@ export function Sidebar() {
           onClick={() => openModal('plugins')}
         />
 
+        {isPluginEnabled('core.git-inspector') && (
+          <DockTile
+            icon={<FolderGit2 size={13.5} style={{ color: 'var(--accent-indigo)' }} />}
+            title="Worktree"
+            subtitle="分支与预检"
+            onClick={() => openModal('worktrees')}
+          />
+        )}
+
         {isPluginEnabled('core.mcp-hub') && (
           <DockTile
             icon={<Plug size={13.5} style={{ color: 'var(--accent-emerald)' }} />}

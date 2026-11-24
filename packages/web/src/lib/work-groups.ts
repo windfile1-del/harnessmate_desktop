@@ -103,6 +103,18 @@ export type StandardTurnBlock =
       level: 'info' | 'warn' | 'error';
       message: string;
       code?: string;
+    })
+  | (TurnBlockBase & {
+      type: 'checkpoint_marker';
+      checkpointId: string;
+      turnSeq: number;
+      phase: 'turn_pre' | 'turn_post' | 'pre_revert' | 'manual';
+      gitRef: string;
+      treeSha: string;
+      filesChanged: number;
+      insertions: number;
+      deletions: number;
+      skippedLargeFiles: string[];
     });
 
 export interface ExtensionTurnBlock extends TurnBlockBase {

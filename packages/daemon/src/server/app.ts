@@ -6,22 +6,33 @@ import {
   AddTrustedPublisherRequestSchema,
   CreateSessionRequestSchema,
   CreateWorkspaceRequestSchema,
+  CreateWorktreeRequestSchema,
   CustomAcpHarnessConfigSchema,
+  DryRunMergeRequestSchema,
   FailoverPolicySchema,
   FailoverRequestSchema,
+  GcCheckpointsRequestSchema,
   GeneratePluginDraftRequestSchema,
+  GitCommitRequestSchema,
+  GitCreatePrRequestSchema,
+  GitDiscardFileRequestSchema,
+  GitPullRequestSchema,
+  GitPushRequestSchema,
   ImportNativeSessionRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
   PROTOCOL_VERSION,
   PairExchangeRequestSchema,
+  RemoveWorktreeRequestSchema,
   ResolveApprovalRequestSchema,
+  RevertCheckpointRequestSchema,
   RunHarnessCommandRequestSchema,
   ScaffoldPluginRequestSchema,
   SendTurnRequestSchema,
   SwitchHarnessRequestSchema,
   ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
+  TrustSetupScriptRequestSchema,
   UpdatePluginRegistryConfigRequestSchema,
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
@@ -53,8 +64,10 @@ import {
   searchWorkspaceFiles,
 } from '../core/attachment-service.js';
 import { CommandOutputHub } from '../core/command-output-hub.js';
+import { CheckpointError } from '../core/checkpoint-service.js';
 import { EffectOutboxWorker } from '../core/effect-outbox.js';
 import { DaemonEventBus } from '../core/event-bus.js';
+import { GitOperationError } from '../core/git-service.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
@@ -1137,6 +1150,365 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
     const git = await service.status(session.cwd);
     return { git };
+  });
+
+  app.get('/api/v1/sessions/:id/git/file-diff', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const q = request.query as { path?: string; staged?: string };
+    if (!q.path) return reply.code(400).send({ error: 'Missing path parameter' });
+    try {
+      const result = await service.fileDiff(session.cwd, q.path, q.staged === '1' || q.staged === 'true');
+      return result;
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_GIT_DIFF_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/git/truth', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const digest = await service.workspaceTruthDigest(session.cwd);
+    return { digest };
+  });
+
+  app.post('/api/v1/sessions/:id/git/init', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    try {
+      const result = await service.init(session.cwd);
+      const git = await service.status(session.cwd);
+      return { result, git };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_GIT_INIT_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/git/discard', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = GitDiscardFileRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid filePath' });
+    try {
+      const result = await service.discardFile(session.cwd, parsed.data.filePath);
+      const git = await service.status(session.cwd);
+      return { result, git };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_DISCARD_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/git/commit', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = GitCommitRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid commit payload' });
+    try {
+      const result = await service.commit(session.cwd, parsed.data);
+      const git = await service.status(session.cwd);
+      return { result, git };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_GIT_COMMIT_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/git/push', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = GitPushRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid push payload' });
+    try {
+      const result = await service.push(session.cwd, parsed.data);
+      const git = await service.status(session.cwd);
+      return { result, git };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_GIT_PUSH_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/git/pull', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = GitPullRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid pull payload' });
+    try {
+      const result = await service.pull(session.cwd, parsed.data);
+      const git = await service.status(session.cwd);
+      return { result, git };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_GIT_PULL_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/git/pr', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = GitCreatePrRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid PR payload' });
+    try {
+      const result = await service.createPr(session.cwd, parsed.data);
+      return { result };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_PR_CREATE_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  // ── Session Checkpoints & Atomic Revert ──────────────────────────────
+
+  app.get('/api/v1/sessions/:id/checkpoints', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const checkpoints = sessionManager.listSessionCheckpoints(id);
+    const adapter = registry.get(session.harnessId);
+    const supportsNativeRollback = Boolean(adapter?.capabilitiesV2?.supportsNativeRollback);
+    return { checkpoints, supportsNativeRollback };
+  });
+
+  app.post('/api/v1/sessions/:id/checkpoints', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    try {
+      const checkpoint = await sessionManager.captureManualCheckpoint(id);
+      return reply.code(201).send({ checkpoint });
+    } catch (err) {
+      const code = err instanceof CheckpointError ? err.code : 'E_CHECKPOINT_CAPTURE_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/checkpoints/diff', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const q = request.query as {
+      fromCheckpointId?: string;
+      toCheckpointId?: string;
+      fromSeq?: string;
+      toSeq?: string;
+    };
+    try {
+      const diff = await sessionManager.diffSessionCheckpoints(id, {
+        fromCheckpointId: q.fromCheckpointId || undefined,
+        toCheckpointId: q.toCheckpointId || undefined,
+        fromSeq: q.fromSeq !== undefined ? Number(q.fromSeq) : undefined,
+        toSeq: q.toSeq !== undefined ? Number(q.toSeq) : undefined,
+      });
+      return diff;
+    } catch (err) {
+      const code = err instanceof CheckpointError ? err.code : 'E_CHECKPOINT_DIFF_FAILED';
+      const status = code === 'E_CHECKPOINT_MISSING' || code === 'E_CHECKPOINT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/checkpoints/revert', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const parsed = RevertCheckpointRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid revert payload' });
+    }
+    try {
+      const result = await sessionManager.revertSessionCheckpoint(id, parsed.data);
+      return {
+        result,
+        session: sessionManager.getSession(id),
+        checkpoints: sessionManager.listSessionCheckpoints(id),
+      };
+    } catch (err) {
+      const code = err instanceof CheckpointError ? err.code : 'E_REVERT_FAILED';
+      const status = code === 'E_CHECKPOINT_MISSING' || code === 'E_CHECKPOINT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/checkpoints/gc', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const parsed = GcCheckpointsRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid GC payload' });
+    try {
+      const result = await sessionManager.gcSessionCheckpoints(id, parsed.data);
+      return { ...result, checkpoints: sessionManager.listSessionCheckpoints(id) };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ── Workspace Worktrees, Dry-Run Merge & .harnessmate/setup Trust ────
+
+  app.get('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
+    const worktrees = await service.listWorktrees(
+      workspace.rootPath,
+      sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
+    );
+    const setupScript = service.inspectSetupScript(workspace.rootPath, store);
+    return { worktrees, setupScript };
+  });
+
+  app.post('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = CreateWorktreeRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid worktree payload' });
+    try {
+      const created = await service.createWorktree(workspace.rootPath, parsed.data.branchName, {
+        baseBranch: parsed.data.baseBranch,
+      });
+      const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
+      const worktrees = await service.listWorktrees(
+        workspace.rootPath,
+        sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
+      );
+      return reply.code(201).send({ created, worktrees });
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_WORKTREE_CREATE_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.delete('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const q = request.query as { worktreePath?: string; force?: string };
+    const rawBody = request.body && typeof request.body === 'object' ? request.body : {
+      worktreePath: q.worktreePath,
+      force: q.force === '1' || q.force === 'true',
+    };
+    const parsed = RemoveWorktreeRequestSchema.safeParse(rawBody);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid worktreePath' });
+    try {
+      const result = await service.removeWorktree(workspace.rootPath, parsed.data.worktreePath, {
+        force: parsed.data.force,
+      });
+      const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
+      const worktrees = await service.listWorktrees(
+        workspace.rootPath,
+        sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
+      );
+      return { result, worktrees };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_WORKTREE_REMOVE_FAILED';
+      const status = code === 'E_WORKTREE_BUSY' ? 409 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/workspaces/:id/worktrees/dry-run-merge', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = DryRunMergeRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid merge pre-check payload' });
+    try {
+      const result = await service.dryRunMerge(
+        workspace.rootPath,
+        parsed.data.baseBranch,
+        parsed.data.headBranch,
+      );
+      return result;
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_MERGE_PRECHECK_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.get('/api/v1/workspaces/:id/setup-script', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    return { setupScript: service.inspectSetupScript(workspace.rootPath, store) };
+  });
+
+  app.put('/api/v1/workspaces/:id/setup-script/trust', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const parsed = TrustSetupScriptRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid setup script trust payload' });
+    try {
+      const setupScript = service.setSetupScriptTrust(
+        workspace.rootPath,
+        store,
+        parsed.data.sha256,
+        parsed.data.trusted,
+      );
+      return { setupScript };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_SETUP_TRUST_FAILED';
+      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
+  });
+
+  app.post('/api/v1/workspaces/:id/setup-script/run', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const workspace = store.getWorkspace(id);
+    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
+    const service = pluginManager.host.get<GitService>('git');
+    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    const body = (request.body ?? {}) as { worktreePath?: string };
+    const targetDir = body.worktreePath?.trim() || workspace.rootPath;
+    try {
+      const result = await service.executeTrustedSetupScript(workspace.rootPath, targetDir, store);
+      return { result };
+    } catch (err) {
+      const code = err instanceof GitOperationError ? err.code : 'E_SETUP_EXEC_FAILED';
+      const status = code === 'E_SETUP_SCRIPT_UNTRUSTED' ? 403 : 400;
+      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
+    }
   });
 
   // ── Approvals ────────────────────────────────────────────────────────

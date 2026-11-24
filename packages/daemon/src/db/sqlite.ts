@@ -2033,6 +2033,27 @@ export class HarnessMateStore {
     return rows.map(mapCheckpointRow);
   }
 
+  getCheckpointRecord(checkpointId: string): SessionCheckpointRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM session_checkpoints WHERE checkpoint_id = ?')
+      .get(checkpointId) as unknown as CheckpointRow | undefined;
+    return row ? mapCheckpointRow(row) : null;
+  }
+
+  deleteCheckpointRecords(sessionId: string, checkpointIds?: string[]): number {
+    if (checkpointIds && checkpointIds.length > 0) {
+      const placeholders = checkpointIds.map(() => '?').join(', ');
+      const res = this.db
+        .prepare(`DELETE FROM session_checkpoints WHERE session_id = ? AND checkpoint_id IN (${placeholders})`)
+        .run(sessionId, ...checkpointIds);
+      return Number(res.changes);
+    }
+    const res = this.db
+      .prepare('DELETE FROM session_checkpoints WHERE session_id = ?')
+      .run(sessionId);
+    return Number(res.changes);
+  }
+
   indexSearchItem(entry: {
     sessionId: string;
     itemId: string;

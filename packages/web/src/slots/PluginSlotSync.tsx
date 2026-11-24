@@ -10,11 +10,13 @@ import {
 } from '@harnessmate/protocol';
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
+import { CheckpointTurnBadge } from '../components/CheckpointControls';
+import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
 import { HtmlRenderCard } from '../components/HtmlRenderCard';
 import { FailoverInlineBanner } from '../components/MessageStudio';
 import { PluginDataPanel } from '../components/PluginDataPanel';
 import { TraitsPicker } from '../components/TraitsPicker';
-import { resolveHarnessOptionDescriptors } from '../lib/harness-meta';
+import { resolveHarnessMeta, resolveHarnessOptionDescriptors } from '../lib/harness-meta';
 import { listPluginPanels } from '../lib/plugin-panels';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry } from './hooks';
@@ -300,6 +302,72 @@ export function PluginSlotSync() {
         },
       }),
     );
+
+    // Built-in V5 Git Checkpoints & Diff Inspector (`inspector.diff` + `chat.block` checkpoint_marker)
+    const gitInspectorPlugin = plugins.find((p) => p.id === 'core.git-inspector');
+    if (!gitInspectorPlugin || isPluginActive(gitInspectorPlugin)) {
+      disposers.push(
+        registry.register({
+          slot: 'inspector.diff',
+          id: 'git-diff-inspector',
+          pluginId: 'core.git-inspector',
+          pluginName: 'Git Checkpoints & Diff',
+          title: 'Git 差异与检查点对比',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ session, git, onRefresh }) => (
+            <DiffInspectorPanel session={session} git={git} onRefresh={onRefresh} />
+          ),
+        }),
+      );
+
+      disposers.push(
+        registry.register({
+          slot: 'chat.block',
+          id: 'git-checkpoint-marker',
+          pluginId: 'core.git-inspector',
+          pluginName: 'Git Checkpoints & Diff',
+          title: '轮次检查点徽章',
+          key: 'checkpoint_marker',
+          order: 100,
+          sourceKind: 'builtin',
+          render: ({ session, block }) => {
+            if (block.type !== 'checkpoint_marker') return null;
+            const store = useAppStore.getState();
+            const harness = store.harnesses.find((h) => h.id === session.harnessId) ?? null;
+            const meta = resolveHarnessMeta(
+              { harnessId: session.harnessId, harnessKind: session.harnessKind },
+              store.harnesses,
+            );
+            const supportsNativeRollback =
+              store.supportsNativeRollbackBySession[session.id] ??
+              Boolean(harness?.capabilitiesV2?.supportsNativeRollback);
+            return (
+              <CheckpointTurnBadge
+                session={session}
+                block={block}
+                harnessLabel={meta.shortLabel || session.harnessId}
+                supportsNativeRollback={supportsNativeRollback}
+                onViewDiff={(checkpointId) => {
+                  const checkpoints = store.checkpointsBySession[session.id] ?? [];
+                  const pre = checkpoints.find(
+                    (c) => c.phase === 'turn_pre' && c.turnSeq === block.turnSeq,
+                  );
+                  store.focusCheckpointDiff(
+                    session.id,
+                    pre?.checkpointId ?? checkpointId,
+                    pre ? checkpointId : undefined,
+                  );
+                }}
+                onRevert={async (mode, turnSeq) => {
+                  await store.revertCheckpoint(session.id, { targetTurnSeq: turnSeq, mode });
+                }}
+              />
+            );
+          },
+        }),
+      );
+    }
 
     // 1. V2 dataPanels -> inspector.tabs, sidebar.tools, composer.actions
     const dataPanels = listPluginPanels(plugins);

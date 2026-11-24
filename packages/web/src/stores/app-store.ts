@@ -4,6 +4,7 @@ import type {
   Attachment,
   AttentionItem,
   CanonicalEvent,
+  CheckpointRevertResult,
   ContextPreview,
   ContextSyncMode,
   CreateSessionRequest,
@@ -24,9 +25,11 @@ import type {
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
+  RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
   Session,
+  SessionCheckpointRecord,
   SessionTaskState,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
@@ -52,6 +55,7 @@ export type ActiveModal =
   | 'handoff'
   | 'context_preview'
   | 'command_palette'
+  | 'worktrees'
   | null;
 
 export type InspectorTab = 'task' | 'git' | 'files' | 'terminal' | 'diagnostics' | 'info' | 'plugins';
@@ -111,6 +115,14 @@ interface AppState {
   liveCommandOutputByKey: Record<string, { text: string; done: boolean; updatedAt: number }>;
   traitsByScope: Record<string, Record<string, TurnOptionValue>>;
   gitBySession: Record<string, GitStatusSummary | null>;
+  checkpointsBySession: Record<string, SessionCheckpointRecord[]>;
+  supportsNativeRollbackBySession: Record<string, boolean>;
+  lastRevertBySession: Record<string, CheckpointRevertResult | null>;
+  focusedCheckpointDiff: {
+    sessionId: string;
+    fromCheckpointId: string;
+    toCheckpointId?: string;
+  } | null;
   taskStateBySession: Record<string, SessionTaskState | null>;
   contextPreviewBySession: Record<string, ContextPreview | null>;
   draftTextBySession: Record<string, string>;
@@ -190,6 +202,18 @@ interface AppState {
   interruptSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
   refreshGitStatus: (sessionId: string) => Promise<void>;
+  initSessionGit: (sessionId: string) => Promise<void>;
+  refreshCheckpoints: (sessionId: string) => Promise<void>;
+  revertCheckpoint: (
+    sessionId: string,
+    req: RevertCheckpointRequest,
+  ) => Promise<CheckpointRevertResult | null>;
+  clearLastRevert: (sessionId: string) => void;
+  focusCheckpointDiff: (
+    sessionId: string,
+    fromCheckpointId: string,
+    toCheckpointId?: string,
+  ) => void;
 
   registerCustomHarness: (cfg: CustomAcpHarnessConfig) => Promise<void>;
   deleteCustomHarness: (id: string) => Promise<void>;
@@ -344,12 +368,19 @@ export const useAppStore = create<AppState>((set, get) => {
     if (turnEnded) {
       void get().refreshContextPreview(currentSelected);
       void get().refreshTurnItems(currentSelected);
+      void get().refreshCheckpoints(currentSelected);
       void daemonApi.getSession(currentSelected).then(({ session, taskState }) =>
         set((state) => ({
           sessions: state.sessions.map((s) => s.id === session.id && s.lastSeq <= session.lastSeq ? session : s),
           ...(taskState ? { taskStateBySession: { ...state.taskStateBySession, [session.id]: taskState } } : {}),
         })),
       ).catch(() => {});
+    } else if (relevant.some(({ type }) => type === 'checkpoint.captured' || type === 'checkpoint.reverted')) {
+      void get().refreshCheckpoints(currentSelected);
+      void get().refreshTurnItems(currentSelected);
+      if (get().inspectorOpen) {
+        void get().refreshGitStatus(currentSelected);
+      }
     } else if (relevant.some(({ type }) => type === 'task.state_updated')) {
       void get().refreshTaskState(currentSelected);
     }
@@ -424,6 +455,10 @@ export const useAppStore = create<AppState>((set, get) => {
     liveCommandOutputByKey: {},
     traitsByScope: {},
     gitBySession: {},
+    checkpointsBySession: {},
+    supportsNativeRollbackBySession: {},
+    lastRevertBySession: {},
+    focusedCheckpointDiff: null,
     taskStateBySession: {},
     contextPreviewBySession: {},
     draftTextBySession: {},
@@ -854,6 +889,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
         void get().refreshContextPreview(sessionId);
         void get().refreshTurnItems(sessionId);
+        void get().refreshCheckpoints(sessionId);
         void get().refreshFailoverPolicy();
         if (get().inspectorOpen) {
           void get().refreshGitStatus(sessionId);
@@ -1101,6 +1137,84 @@ export const useAppStore = create<AppState>((set, get) => {
         // ignore
       }
     },
+
+    initSessionGit: async (sessionId) => {
+      try {
+        const res = await daemonApi.initSessionGit(sessionId);
+        set((state) => ({
+          gitBySession: { ...state.gitBySession, [sessionId]: res.git },
+        }));
+        get().pushToast({ kind: 'success', title: res.result.message });
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '初始化 Git 仓库失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+
+    refreshCheckpoints: async (sessionId) => {
+      try {
+        const res = await daemonApi.listCheckpoints(sessionId);
+        set((state) => ({
+          checkpointsBySession: {
+            ...state.checkpointsBySession,
+            [sessionId]: res.checkpoints,
+          },
+          supportsNativeRollbackBySession: {
+            ...state.supportsNativeRollbackBySession,
+            [sessionId]: res.supportsNativeRollback,
+          },
+        }));
+      } catch {
+        // ignore if checkpoints service disabled
+      }
+    },
+
+    revertCheckpoint: async (sessionId, req) => {
+      try {
+        const res = await daemonApi.revertCheckpoint(sessionId, req);
+        set((state) => ({
+          sessions: state.sessions.map((s) => (s.id === sessionId ? res.session : s)),
+          checkpointsBySession: {
+            ...state.checkpointsBySession,
+            [sessionId]: res.checkpoints,
+          },
+          lastRevertBySession: {
+            ...state.lastRevertBySession,
+            [sessionId]: res.result,
+          },
+        }));
+        void get().refreshGitStatus(sessionId);
+        void get().refreshTurnItems(sessionId);
+        get().pushToast({
+          kind: 'success',
+          title: `已回滚至 Turn #${res.result.targetTurnSeq}`,
+          body: `还原 ${res.result.filesRestored} 个文件，清理 ${res.result.untrackedRemoved} 个新增文件。可随时点击顶部横幅“撤销回滚”。`,
+        });
+        return res.result;
+      } catch (err) {
+        get().pushToast({
+          kind: 'error',
+          title: '回滚检查点失败',
+          body: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      }
+    },
+
+    clearLastRevert: (sessionId) =>
+      set((state) => ({
+        lastRevertBySession: { ...state.lastRevertBySession, [sessionId]: null },
+      })),
+
+    focusCheckpointDiff: (sessionId, fromCheckpointId, toCheckpointId) =>
+      set({
+        inspectorOpen: true,
+        inspectorTab: 'git',
+        focusedCheckpointDiff: { sessionId, fromCheckpointId, toCheckpointId },
+      }),
 
     registerCustomHarness: async (cfg) => {
       const { harnesses } = await daemonApi.registerCustomHarness(cfg);

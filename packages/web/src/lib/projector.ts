@@ -103,6 +103,7 @@ const KNOWN_STANDARD_RECORD_TYPES = new Set([
   'html_render',
   'handoff_card',
   'system_notice',
+  'checkpoint_marker',
 ]);
 
 /**
@@ -226,6 +227,31 @@ export function turnBlockRecordToBlock(record: TurnBlockRecord): TurnBlock {
     };
   }
 
+  if (record.blockType === 'checkpoint_marker') {
+    const phase =
+      p.phase === 'turn_pre' ||
+      p.phase === 'turn_post' ||
+      p.phase === 'pre_revert' ||
+      p.phase === 'manual'
+        ? p.phase
+        : 'turn_post';
+    return {
+      ...base,
+      type: 'checkpoint_marker',
+      checkpointId: String(p.checkpointId ?? record.itemId),
+      turnSeq: typeof p.turnSeq === 'number' ? p.turnSeq : record.seq,
+      phase,
+      gitRef: String(p.gitRef ?? ''),
+      treeSha: String(p.treeSha ?? ''),
+      filesChanged: typeof p.filesChanged === 'number' ? p.filesChanged : 0,
+      insertions: typeof p.insertions === 'number' ? p.insertions : 0,
+      deletions: typeof p.deletions === 'number' ? p.deletions : 0,
+      skippedLargeFiles: Array.isArray(p.skippedLargeFiles)
+        ? p.skippedLargeFiles.map(String)
+        : [],
+    };
+  }
+
   if (record.blockType.startsWith('ext:')) {
     return {
       ...base,
@@ -324,10 +350,11 @@ export function mergeTurnBlockRecords(
         continue;
       }
 
-      // Insert ext:*, html_render, unknown blocks, or missing records in chronological order
+      // Insert ext:*, html_render, checkpoint_marker, unknown blocks, or missing records in chronological order
       if (
         rec.blockType.startsWith('ext:') ||
         rec.blockType === 'html_render' ||
+        rec.blockType === 'checkpoint_marker' ||
         rec.blockType === 'system_notice' ||
         !KNOWN_STANDARD_RECORD_TYPES.has(rec.blockType) ||
         blocks.length === 0

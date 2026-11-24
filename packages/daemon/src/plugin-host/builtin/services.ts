@@ -2,9 +2,29 @@ import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
 import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
 import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
+import { CheckpointService } from '../../core/checkpoint-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { FailoverCoordinator } from '../../core/failover-service.js';
-import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from '../../core/git-service.js';
+import {
+  createGitWorktree,
+  discardFile,
+  dryRunMerge,
+  executeTrustedSetupScript,
+  getFileDiff,
+  getGitStatusSummary,
+  getGitVersion,
+  gitCommit,
+  gitCreatePr,
+  gitPull,
+  gitPush,
+  initGitRepo,
+  inspectGitRepo,
+  inspectSetupScript,
+  listGitWorktrees,
+  removeGitWorktree,
+  setSetupScriptTrust,
+  workspaceTruthDigest,
+} from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
 import { UsageService } from '../../core/usage-service.js';
@@ -19,7 +39,27 @@ import type { PluginEvents } from '../runtime/events.js';
 
 export const handoffRedactionMap = new WeakMap<object, { categories: string[]; redactedCount: number }>();
 
-export const gitService = { status: getGitStatusSummary, inspect: inspectGitRepo, worktree: createGitWorktree };
+export const gitService = {
+  status: getGitStatusSummary,
+  inspect: inspectGitRepo,
+  init: initGitRepo,
+  version: getGitVersion,
+  fileDiff: getFileDiff,
+  discardFile,
+  workspaceTruthDigest,
+  worktree: createGitWorktree,
+  createWorktree: createGitWorktree,
+  listWorktrees: listGitWorktrees,
+  removeWorktree: removeGitWorktree,
+  dryRunMerge,
+  inspectSetupScript,
+  setSetupScriptTrust,
+  executeTrustedSetupScript,
+  commit: gitCommit,
+  push: gitPush,
+  pull: gitPull,
+  createPr: gitCreatePr,
+};
 export type GitService = typeof gitService;
 export type NativeCommandsService = { list: typeof listHarnessCommands; tools: HarnessCommandTools };
 export interface FailoverService {
@@ -81,8 +121,11 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     },
   });
   plugins.set('core.git-inspector', {
-    provides: ['git'],
-    apply: (ctx) => { ctx.provide('git', gitService); },
+    provides: ['git', 'checkpoints'],
+    apply: (ctx) => {
+      ctx.provide('git', gitService);
+      ctx.provide('checkpoints', new CheckpointService(store));
+    },
   });
   plugins.set('core.task-ledger', {
     provides: ['ledger'],

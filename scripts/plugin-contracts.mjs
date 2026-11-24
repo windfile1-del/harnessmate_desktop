@@ -49,7 +49,9 @@ output.set('events.md', heading('公共事件') +
 
 const serviceNames = [
   ...[...builtin.matchAll(/adapterPlugin\('([^']+)'/g)].map(([, id]) => `harness.${id}`),
-  ...[...builtin.matchAll(/provides: \['([^']+)'\]/g)].map(([, name]) => name),
+  ...[...builtin.matchAll(/provides:\s*\[([^\]]+)\]/g)].flatMap(([, list]) =>
+    [...list.matchAll(/'([^']+)'/g)].map(([, name]) => name),
+  ),
 ].sort();
 const handoffConfig = builtin.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
