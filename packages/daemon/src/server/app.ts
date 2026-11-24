@@ -7,6 +7,7 @@ import {
   CreateSessionRequestSchema,
   CreateWorkspaceRequestSchema,
   CustomAcpHarnessConfigSchema,
+  FailoverPolicySchema,
   FailoverRequestSchema,
   GeneratePluginDraftRequestSchema,
   ImportNativeSessionRequestSchema,
@@ -58,7 +59,8 @@ import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
 import type { UsageService } from '../core/usage-service.js';
-import { createBuiltinPlugins, type GitService } from '../plugin-host/builtin/services.js';
+import type { FailoverCoordinator } from '../core/failover-service.js';
+import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { scanLocalCliSessions } from '../harnesses/history-scanner.js';
@@ -749,11 +751,50 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   // ── Multi-Account & Quota Usage (/api/v1/usage/*) ────────────────────
 
-  app.get('/api/v1/usage/accounts', async (_request, reply) => {
+  app.get('/api/v1/usage/accounts', async (request, reply) => {
     const usage = pluginManager.host.get<UsageService>('usage');
     if (!usage) return reply.code(409).send({ error: '额度服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const accounts = await usage.collectAccountUsage();
+    const q = request.query as { refresh?: string };
+    const forceRefresh = q.refresh === '1' || q.refresh === 'true';
+    const accounts = await usage.collectAccountUsage({ forceRefresh });
     return { accounts, collectedAt: Date.now() };
+  });
+
+  app.get('/api/v1/usage/failover-policy', async (_request, reply) => {
+    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
+    if (!failover || typeof failover.getPolicy !== 'function') {
+      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    return { policy: failover.getPolicy() };
+  });
+
+  app.put('/api/v1/usage/failover-policy', async (request, reply) => {
+    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
+    if (!failover || typeof failover.setPolicy !== 'function') {
+      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    const parsed = FailoverPolicySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid failover policy' });
+    }
+    return { policy: failover.setPolicy(parsed.data) };
+  });
+
+  app.get('/api/v1/sessions/:id/failover-recommendation', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
+    if (!failover || typeof failover.recommendFailover !== 'function') {
+      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    const q = request.query as { failedInstanceId?: string; failureClass?: string };
+    const recommendation = failover.recommendFailover(
+      id,
+      q.failedInstanceId || session.harnessId,
+      q.failureClass || 'usage_limit',
+    );
+    return { recommendation };
   });
 
   // ── Workspaces ───────────────────────────────────────────────────────
@@ -895,6 +936,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const result = await sessionManager.sendTurn(id, parsed.data.text, parsed.data.attachments, {
         harnessId: parsed.data.harnessId,
         model: parsed.data.model,
+        turnOptions: parsed.data.turnOptions,
         omitHandoff: parsed.data.omitHandoff,
         literalText: parsed.data.literalText,
         mode: parsed.data.mode,
@@ -1232,12 +1274,29 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const q = request.query as { afterSeq?: string; turnId?: string; limit?: string };
-    const items = sessionManager.getSessionTurnItems(id, {
+    const rawItems = sessionManager.getSessionTurnItems(id, {
       afterSeq: q.afterSeq !== undefined ? Number(q.afterSeq) : undefined,
       turnId: q.turnId || undefined,
       limit: q.limit !== undefined ? Number(q.limit) : undefined,
     });
+    const items = rawItems.map((item) =>
+      item.outputOmitted && item.textBody.length > 16_384
+        ? { ...item, textBody: item.textBody.slice(0, 16_384) }
+        : item,
+    );
     return { items };
+  });
+
+  app.get('/api/v1/sessions/:id/items/:itemId', async (request, reply) => {
+    const { id, itemId } = request.params as { id: string; itemId: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const q = request.query as { textOffset?: string; maxChars?: string };
+    const textOffset = Math.max(0, Number(q.textOffset ?? 0) || 0);
+    const maxChars = Math.min(262_144, Math.max(256, Number(q.maxChars ?? 65_536) || 65_536));
+    const slice = sessionManager.getSessionTurnItemSlice(id, itemId, { textOffset, maxChars });
+    if (!slice) return reply.code(404).send({ error: 'Turn item not found' });
+    return slice;
   });
 
   app.get('/api/v1/sessions/:id/runs', async (request, reply) => {

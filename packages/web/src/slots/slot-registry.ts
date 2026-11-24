@@ -1,16 +1,22 @@
 import type { ReactNode } from 'react';
 import {
-  PLUGIN_UI_SLOTS,
-  normalizePluginSlotKey,
+  ALL_PLUGIN_UI_SLOTS,
+  normalizeAnyPluginSlotKey,
+  type AnyPluginSlotKey,
   type ApprovalRequest,
   type Disposer,
-  type PluginSlotKey,
+  type GitStatusSummary,
+  type HarnessInfo,
   type PluginSlotRenderFailure,
   type Session,
+  type TurnOptionValue,
 } from '@harnessmate/protocol';
+import type { FileLink } from '../lib/file-links';
 import type { ProjectedToolCall, ProjectedTurn } from '../lib/projector';
+import type { TurnBlock } from '../lib/work-groups';
 
 export interface SlotPropsMap {
+  // V4 slots (100% backward compatible)
   'session.header.title': {
     session: Session;
     onRename: () => void;
@@ -47,11 +53,38 @@ export interface SlotPropsMap {
     turn: ProjectedTurn;
     children: ReactNode;
   };
+  // V5 slots
+  'chat.block': {
+    session: Session;
+    turn?: ProjectedTurn;
+    block: TurnBlock;
+    onOpenFile?: (file: FileLink) => void;
+    onFailover?: (targetHarnessId: string) => void;
+  };
+  'composer.traits': {
+    session: Session;
+    harness: HarnessInfo | null;
+    disabled: boolean;
+    values: Record<string, TurnOptionValue>;
+    onChange: (key: string, value: TurnOptionValue | null) => void;
+  };
+  'harness.settings': {
+    harness: HarnessInfo;
+    onRefresh: () => void;
+  };
+  'inspector.diff': {
+    session: Session;
+    git: GitStatusSummary | null;
+    onRefresh: () => void;
+  };
+  'session.sidebar.badge': {
+    session: Session;
+  };
 }
 
 export type SlotSourceKind = 'builtin' | 'v1-panel' | 'v2-data-panel' | 'iframe';
 
-export interface SlotItemRegistration<K extends PluginSlotKey = PluginSlotKey> {
+export interface SlotItemRegistration<K extends AnyPluginSlotKey = AnyPluginSlotKey> {
   slot: K;
   id: string;
   pluginId: string;
@@ -63,7 +96,8 @@ export interface SlotItemRegistration<K extends PluginSlotKey = PluginSlotKey> {
   render: (props: SlotPropsMap[K]) => ReactNode;
 }
 
-export interface RegisteredSlotItem<K extends PluginSlotKey = PluginSlotKey> extends SlotItemRegistration<K> {
+export interface RegisteredSlotItem<K extends AnyPluginSlotKey = AnyPluginSlotKey>
+  extends SlotItemRegistration<K> {
   readonly registrationKey: string;
   readonly seq: number;
 }
@@ -76,7 +110,7 @@ export interface SlotQueryOptions {
 const MAX_RENDER_FAILURES = 40;
 
 export class SlotRegistry {
-  private readonly itemsBySlot = new Map<PluginSlotKey, Map<string, RegisteredSlotItem>>();
+  private readonly itemsBySlot = new Map<AnyPluginSlotKey, Map<string, RegisteredSlotItem>>();
   private readonly listeners = new Set<() => void>();
   private failures: PluginSlotRenderFailure[] = [];
   private seqCounter = 0;
@@ -85,8 +119,8 @@ export class SlotRegistry {
   private cachedFailures: readonly PluginSlotRenderFailure[] = [];
   private readonly queryCache = new Map<string, { version: number; items: readonly RegisteredSlotItem[] }>();
 
-  register<K extends PluginSlotKey>(registration: SlotItemRegistration<K>): Disposer {
-    const slot = normalizePluginSlotKey(registration.slot) as K;
+  register<K extends AnyPluginSlotKey>(registration: SlotItemRegistration<K>): Disposer {
+    const slot = normalizeAnyPluginSlotKey(registration.slot) as K;
     const registrationKey = `${registration.pluginId}:${registration.id}`;
     const bucket = this.itemsBySlot.get(slot) ?? new Map<string, RegisteredSlotItem>();
     this.itemsBySlot.set(slot, bucket);
@@ -113,9 +147,13 @@ export class SlotRegistry {
     };
   }
 
-  getItems<K extends PluginSlotKey>(slot: K, options: SlotQueryOptions): readonly RegisteredSlotItem<K>[] {
-    const canonical = normalizePluginSlotKey(slot) as K;
-    const contract = PLUGIN_UI_SLOTS[canonical];
+  getItems<K extends AnyPluginSlotKey>(
+    slot: K,
+    options: SlotQueryOptions,
+  ): readonly RegisteredSlotItem<K>[] {
+    const canonical = normalizeAnyPluginSlotKey(slot) as K;
+    const contract = ALL_PLUGIN_UI_SLOTS[canonical];
+    if (!contract) return [];
     if (contract.scope === 'session' && !options.hasSession) {
       return [];
     }

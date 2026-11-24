@@ -27,6 +27,7 @@ import {
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
+  AdapterUsageLimitResult,
   HarnessAdapter,
   NativeSkill,
   NormalizedAdapterEvent,
@@ -509,6 +510,58 @@ export class ClaudeStreamJsonAdapter implements HarnessAdapter {
 
   async probe(): Promise<HarnessInfo> {
     return this.probePassive();
+  }
+
+  /**
+   * Standard V2 usage & auth probe delegated from `UsageService`.
+   * Respects this instance's isolated `configDir`, `apiBaseUrl`, and `binaryOverride`.
+   */
+  async readUsageLimits(): Promise<AdapterUsageLimitResult> {
+    const localSettings = readClaudeLocalSettings(this.configDir, this.modelGroupRules);
+    const gatewayUrl = this.apiBaseUrl ?? localSettings.gatewayUrl;
+    const base: AdapterUsageLimitResult = {
+      loggedIn: false,
+      accountLabel: null,
+      planType: null,
+      authMethod: null,
+      billingTier: gatewayUrl || this.authToken ? 'api_payg' : 'subscription',
+      gatewayUrl,
+      rateLimits: [],
+      dailyBuckets: [],
+    };
+    const bin = await resolveBinary('claude', this.binaryOverride);
+    if (!bin) {
+      base.error = 'claude CLI not found';
+      return base;
+    }
+    try {
+      const res = await execCliQuick(bin, ['auth', 'status'], 6000, {
+        env: this.buildIsolatedEnv(),
+        unsetEnv: this.buildUnsetEnv(),
+        input: '',
+      });
+      const parsed = JSON.parse(res.stdout.trim()) as {
+        loggedIn?: boolean;
+        authMethod?: string;
+        apiProvider?: string;
+        email?: string;
+      };
+      base.loggedIn = Boolean(parsed.loggedIn);
+      base.authMethod = parsed.authMethod ?? null;
+      base.planType = gatewayUrl ? 'Custom Gateway' : parsed.apiProvider ?? null;
+      base.billingTier =
+        gatewayUrl || parsed.authMethod === 'api_key' ? 'api_payg' : 'subscription';
+      base.accountLabel =
+        parsed.email ??
+        (gatewayUrl
+          ? `Gateway · ${gatewayUrl}`
+          : parsed.loggedIn
+            ? 'Anthropic Account'
+            : null);
+    } catch (err) {
+      base.error = err instanceof Error ? err.message : String(err);
+    }
+    return base;
   }
 
   async createSession(config: ClaudeSessionExtendedConfig): Promise<AdapterSessionHandle> {

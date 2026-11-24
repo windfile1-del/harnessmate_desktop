@@ -24,6 +24,7 @@ import { DEFAULT_STRIP_ENV_KEYS, execCliQuick, resolveBinary, spawnCliProcess } 
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
+  AdapterUsageLimitResult,
   HarnessAdapter,
   NormalizedAdapterEvent,
   TurnInput,
@@ -558,6 +559,34 @@ export class AcpAdapter implements HarnessAdapter {
     // Phase 0/1A invariant: default probe() is strictly passive (never calls `session/new`).
     // Explicit deep catalog refresh uses `probeAcpSessionMetadata()` on demand.
     return this.probePassive();
+  }
+
+  /**
+   * Standard V2 usage & account probe delegated from `UsageService`.
+   */
+  async readUsageLimits(): Promise<AdapterUsageLimitResult> {
+    const base: AdapterUsageLimitResult = {
+      loggedIn: false,
+      accountLabel: null,
+      planType: null,
+      authMethod: this.kind === 'agy' ? 'Google OAuth' : 'ACP Auth',
+      billingTier: 'subscription',
+      rateLimits: [],
+      dailyBuckets: [],
+    };
+    try {
+      const snap = await this.probeAcpSessionMetadata();
+      base.loggedIn = snap.models.length > 0 || Boolean(snap.tierName);
+      base.planType = snap.tierName;
+      base.accountLabel = snap.tierName
+        ? `${this.displayName} (${snap.tierName})`
+        : base.loggedIn
+          ? this.displayName
+          : null;
+    } catch (err) {
+      base.error = err instanceof Error ? err.message : String(err);
+    }
+    return base;
   }
 
   async probeAcpSessionMetadata(

@@ -3,6 +3,7 @@ import type { DaemonPersistedConfig } from '../../config.js';
 import type { Attachment, SessionTaskState } from '@harnessmate/protocol';
 import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
 import { ContextCompiler } from '../../core/context-compiler.js';
+import { FailoverCoordinator } from '../../core/failover-service.js';
 import { createGitWorktree, getGitStatusSummary, inspectGitRepo } from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
@@ -23,6 +24,12 @@ export type GitService = typeof gitService;
 export type NativeCommandsService = { list: typeof listHarnessCommands; tools: HarnessCommandTools };
 export interface FailoverService {
   retryInput(sessionId: string): { text: string; attachments?: Attachment[] } | undefined;
+  getPolicy?: FailoverCoordinator['getPolicy'];
+  setPolicy?: FailoverCoordinator['setPolicy'];
+  recordFailure?: FailoverCoordinator['recordFailure'];
+  recommendFailover?: FailoverCoordinator['recommendFailover'];
+  recordAutoSwitch?: FailoverCoordinator['recordAutoSwitch'];
+  checkQuotaResets?: FailoverCoordinator['checkQuotaResets'];
 }
 export const handoffConfigSchema = z.object({
   budgetTokens: z.number().int().min(2_000).max(48_000).default(12_000),
@@ -180,7 +187,9 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   });
   plugins.set('core.account-usage', {
     provides: ['usage'],
-    apply: (ctx) => { ctx.provide('usage', new UsageService(store, registry, config.binaryOverrides)); },
+    apply: (ctx) => {
+      ctx.provide('usage', new UsageService(store, registry));
+    },
   });
   plugins.set('core.harness-commands', {
     provides: ['native-commands'],
@@ -194,23 +203,12 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     inject: ['handoff'],
     provides: ['failover'],
     apply(ctx) {
-      ctx.provide('failover', {
-        retryInput(sessionId) {
-          let current: { text: string; attachments?: Attachment[] } | undefined;
-          let retry: typeof current;
-          let lastUserTurnId: string | null = null;
-          for (const event of store.iterateEvents(sessionId)) {
-            if (event.type === 'message.user') {
-              lastUserTurnId = event.turnId;
-              const { text, attachments } = event.payload;
-              current = typeof text === 'string' && text.trim()
-                ? { text, attachments: Array.isArray(attachments) ? attachments as Attachment[] : undefined } : undefined;
-            } else if (event.type === 'turn.completed') retry = undefined;
-            else if (event.type === 'turn.failed' && event.turnId === lastUserTurnId) retry = current;
-          }
-          return retry;
-        },
-      } satisfies FailoverService);
+      const coordinator = new FailoverCoordinator(
+        store,
+        registry,
+        () => ctx.get<UsageService>('usage'),
+      );
+      ctx.provide('failover', coordinator);
     },
   });
   return plugins;

@@ -200,7 +200,7 @@ export interface PluginSlotRenderFailure {
   id: string;
   pluginId: string;
   pluginName: string;
-  slot: PluginSlotKey;
+  slot: AnyPluginSlotKey;
   slotItemId: string;
   message: string;
   timestamp: number;
@@ -214,7 +214,7 @@ export type PluginSlotBridgeHostMessage =
       pluginId: string;
       runId: string;
       slotId: string;
-      slot: PluginSlotKey;
+      slot: AnyPluginSlotKey;
       theme: 'dark' | 'light';
       cssVars: Record<string, string>;
       session: PublicSession | null;

@@ -1,5 +1,5 @@
-import type { HarnessKind } from '@harnessmate/protocol';
-import { HARNESS_META } from '../lib/harness-meta';
+import type { HarnessKind, HarnessPresentationMeta } from '@harnessmate/protocol';
+import { getHarnessMeta } from '../lib/harness-meta';
 
 export function StarLoomCrest({ size = 26 }: { size?: number }) {
   return (
@@ -59,13 +59,15 @@ export function StarLoomCrest({ size = 26 }: { size?: number }) {
 export function HarnessBadge({
   kind,
   label,
+  presentation,
   compact = false,
 }: {
   kind: HarnessKind;
   label?: string;
+  presentation?: HarnessPresentationMeta | null;
   compact?: boolean;
 }) {
-  const meta = HARNESS_META[kind] ?? HARNESS_META.acp;
+  const meta = getHarnessMeta(kind, presentation);
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-full font-medium tracking-tight ${

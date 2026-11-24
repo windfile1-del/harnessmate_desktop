@@ -1,7 +1,7 @@
 import type { HarnessInfo, Session } from '@harnessmate/protocol';
 import { Check, ChevronDown, Layers, Sparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { HARNESS_META } from '../lib/harness-meta';
+import { resolveHarnessMeta } from '../lib/harness-meta';
 
 interface HarnessSwitcherProps {
   session: Session;
@@ -22,7 +22,10 @@ export function HarnessSwitcher({
   const rootRef = useRef<HTMLDivElement>(null);
 
   const activeHarness = harnesses.find((h) => h.id === session.harnessId);
-  const activeMeta = HARNESS_META[session.harnessKind] ?? HARNESS_META.acp;
+  const activeMeta = resolveHarnessMeta(
+    { harness: activeHarness, harnessId: session.harnessId, harnessKind: session.harnessKind },
+    harnesses,
+  );
   const bindingMap = new Map((session.bindings ?? []).map((b) => [b.harnessId, b]));
 
   useEffect(() => {
@@ -95,7 +98,7 @@ export function HarnessSwitcher({
           <div className="max-h-[280px] space-y-1 overflow-y-auto py-0.5">
             {harnesses.map((h) => {
               const isActive = h.id === session.harnessId;
-              const meta = HARNESS_META[h.kind] ?? HARNESS_META.acp;
+              const meta = resolveHarnessMeta({ harness: h }, harnesses);
               const binding = bindingMap.get(h.id);
               const syncedSeq = binding?.syncedUpToSeq ?? 0;
               const isWarm = Boolean(binding && syncedSeq > 0);

@@ -106,11 +106,17 @@ export const FailoverRequestSchema = z.object({
 });
 export type FailoverRequest = z.infer<typeof FailoverRequestSchema>;
 
+export const TurnOptionValueSchema = z.union([z.string(), z.boolean(), z.number()]);
+export type TurnOptionValue = z.infer<typeof TurnOptionValueSchema>;
+export const TurnOptionsMapSchema = z.record(z.string().min(1), TurnOptionValueSchema);
+export type TurnOptionsMap = z.infer<typeof TurnOptionsMapSchema>;
+
 export const SendTurnRequestSchema = z.object({
   text: z.string().min(1),
   attachments: z.array(AttachmentSchema).optional(),
   harnessId: z.string().min(1).optional(),
   model: z.string().nullable().optional(),
+  turnOptions: TurnOptionsMapSchema.optional(),
   omitHandoff: z.boolean().optional(),
   literalText: z.boolean().optional(),
   mode: z.literal('plugin_development').optional(),

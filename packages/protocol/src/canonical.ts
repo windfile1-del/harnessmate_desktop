@@ -215,6 +215,9 @@ export const TokenUsageSchema = z.object({
   outputTokens: z.number().nonnegative().default(0),
   cachedTokens: z.number().nonnegative().optional(),
   costUsd: z.number().nonnegative().optional(),
+  contextTokens: z.number().nonnegative().optional(),
+  modelContextWindow: z.number().positive().optional(),
+  cacheReadTokens: z.number().nonnegative().optional(),
 });
 export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 
@@ -536,10 +539,21 @@ export const DailyTokenBucketSchema = z.object({
 });
 export type DailyTokenBucket = z.infer<typeof DailyTokenBucketSchema>;
 
+export const InstanceBillingTierSchema = z.enum([
+  'subscription',
+  'api_payg',
+  'local_free',
+  'unknown',
+]);
+export type InstanceBillingTier = z.infer<typeof InstanceBillingTierSchema>;
+
 export const HarnessAccountUsageSchema = z.object({
   harnessId: z.string(),
   harnessKind: HarnessKindSchema,
+  instanceId: z.string().optional(),
+  driverId: HarnessDriverIdSchema.optional(),
   displayName: z.string(),
+  billingTier: InstanceBillingTierSchema.optional(),
   loggedIn: z.boolean(),
   accountLabel: z.string().nullable(),
   planType: z.string().nullable(),
@@ -556,9 +570,51 @@ export const HarnessAccountUsageSchema = z.object({
   localOutputTokens: z.number().nonnegative().default(0),
   localCachedTokens: z.number().nonnegative().default(0),
   localCostUsd: z.number().nonnegative().default(0),
+  fetchedAt: z.number().optional(),
+  cached: z.boolean().optional(),
   error: z.string().nullable().optional(),
 });
 export type HarnessAccountUsage = z.infer<typeof HarnessAccountUsageSchema>;
+
+export const FailoverModeSchema = z.enum(['manual_one_click', 'auto_same_tier', 'auto_any']);
+export type FailoverMode = z.infer<typeof FailoverModeSchema>;
+
+export const FailoverPolicySchema = z.object({
+  mode: FailoverModeSchema.default('manual_one_click'),
+  priorityChain: z.array(z.string().min(1)).default([]),
+  maxAutoSwitchesPerSession: z.number().int().min(0).max(10).default(2),
+  autoRetryInterruptedPrompt: z.boolean().default(true),
+  notifyOnQuotaReset: z.boolean().default(true),
+});
+export type FailoverPolicy = z.infer<typeof FailoverPolicySchema>;
+
+export const FailoverRecommendationSchema = z.object({
+  failedInstanceId: z.string(),
+  failureClass: z.string(),
+  recommendedInstanceId: z.string().nullable(),
+  recommendedDisplayName: z.string().nullable().optional(),
+  recommendedBillingTier: InstanceBillingTierSchema.optional(),
+  canAutoFailover: z.boolean(),
+  downgradedToManualReason: z.string().nullable().optional(),
+  pingPongBlocked: z.boolean().default(false),
+  autoSwitchCount: z.number().int().nonnegative().default(0),
+  maxAutoSwitchesPerSession: z.number().int().nonnegative().default(2),
+  failedResetsAt: z.number().nullable().optional(),
+  earliestResetAt: z.number().nullable().optional(),
+  candidates: z.array(
+    z.object({
+      instanceId: z.string(),
+      driverId: HarnessDriverIdSchema,
+      displayName: z.string(),
+      billingTier: InstanceBillingTierSchema,
+      available: z.boolean(),
+      inCooldown: z.boolean(),
+      resetsAt: z.number().nullable().optional(),
+      reason: z.string().optional(),
+    }),
+  ).default([]),
+});
+export type FailoverRecommendation = z.infer<typeof FailoverRecommendationSchema>;
 
 // ── V2 Materialized TurnBlock, Runs, Outbox, Handoff & Checkpoint Schemas ─
 

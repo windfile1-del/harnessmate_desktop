@@ -4,6 +4,7 @@ import path from 'node:path';
 import type {
   ApprovalDecision,
   Attachment,
+  DailyTokenBucket,
   HarnessCapabilities,
   HarnessCapabilitiesV2,
   HarnessInfo,
@@ -11,6 +12,7 @@ import type {
   HarnessPresentationMeta,
   PermissionMode,
   ProviderOptionDescriptor,
+  RateLimitWindow,
   ReasoningEffort,
   RiskLevel,
   ToolKind,
@@ -21,6 +23,7 @@ import { DEFAULT_STRIP_ENV_KEYS, execCliQuick, resolveBinary, spawnCliProcess } 
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
+  AdapterUsageLimitResult,
   HarnessAdapter,
   NativeSkill,
   NormalizedAdapterEvent,
@@ -324,6 +327,97 @@ export class CodexAppServerAdapter implements HarnessAdapter {
 
   async probe(): Promise<HarnessInfo> {
     return this.probePassive();
+  }
+
+  /**
+   * Standard V2 usage & rate-limit probe delegated from `UsageService`.
+   * Uses this instance's isolated `CODEX_HOME` and env whitelist.
+   */
+  async readUsageLimits(): Promise<AdapterUsageLimitResult> {
+    const base: AdapterUsageLimitResult = {
+      loggedIn: false,
+      accountLabel: null,
+      planType: null,
+      authMethod: null,
+      billingTier: 'unknown',
+      rateLimits: [],
+      dailyBuckets: [],
+    };
+    try {
+      const snap = await this.probeAppServerMetadata(undefined, true);
+      if (snap.account) {
+        base.loggedIn = true;
+        base.accountLabel = snap.account.email ?? snap.account.type ?? 'Signed In';
+        base.planType = snap.account.planType ?? null;
+        base.authMethod = snap.account.type ?? null;
+        base.billingTier = snap.account.type === 'apiKey' ? 'api_payg' : 'subscription';
+      }
+      const rlRoot = snap.rateLimits as {
+        rateLimits?: {
+          primary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
+          secondary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
+        };
+        rateLimitResetCredits?: { availableCount?: number };
+      } | null;
+
+      const windows: RateLimitWindow[] = [];
+      const formatWindow = (mins: number) =>
+        mins >= 1440
+          ? `${Math.round(mins / 1440)} 天周期限额`
+          : mins >= 60
+            ? `${Math.round(mins / 60)} 小时周期限额`
+            : `${mins} 分钟限额`;
+      const clampPct = (v: number) => (Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 0);
+
+      if (rlRoot?.rateLimits?.primary) {
+        const p = rlRoot.rateLimits.primary;
+        windows.push({
+          label: formatWindow(p.windowDurationMins ?? 300),
+          usedPercent: clampPct(p.usedPercent ?? 0),
+          windowMinutes: p.windowDurationMins ?? 300,
+          resetsAt: p.resetsAt ? p.resetsAt * 1000 : null,
+        });
+      }
+      if (rlRoot?.rateLimits?.secondary) {
+        const s = rlRoot.rateLimits.secondary;
+        windows.push({
+          label: formatWindow(s.windowDurationMins ?? 10080),
+          usedPercent: clampPct(s.usedPercent ?? 0),
+          windowMinutes: s.windowDurationMins ?? 10080,
+          resetsAt: s.resetsAt ? s.resetsAt * 1000 : null,
+        });
+      }
+      base.rateLimits = windows;
+      base.resetCreditsAvailable = rlRoot?.rateLimitResetCredits?.availableCount;
+
+      const usageRoot = snap.usage as {
+        summary?: {
+          lifetimeTokens?: number;
+          peakDailyTokens?: number;
+          currentStreakDays?: number;
+        };
+        dailyUsageBuckets?: Array<{ startDate?: string; tokens?: number }>;
+      } | null;
+
+      if (usageRoot?.summary) {
+        base.lifetimeTokens = usageRoot.summary.lifetimeTokens;
+        base.peakDailyTokens = usageRoot.summary.peakDailyTokens;
+        base.currentStreakDays = usageRoot.summary.currentStreakDays;
+      }
+      if (Array.isArray(usageRoot?.dailyUsageBuckets)) {
+        const recent: DailyTokenBucket[] = usageRoot.dailyUsageBuckets
+          .slice(-14)
+          .filter((b) => Boolean(b.startDate))
+          .map((b) => ({
+            date: String(b.startDate),
+            tokens: Number(b.tokens ?? 0),
+          }));
+        base.dailyBuckets = recent;
+      }
+    } catch (err) {
+      base.error = err instanceof Error ? err.message : String(err);
+    }
+    return base;
   }
 
   /**

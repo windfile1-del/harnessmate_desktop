@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   Attachment,
   ContextInjectionDriver,
+  DailyTokenBucket,
   DiscoveredCliSession,
   HarnessCapabilities,
   HarnessCapabilitiesV2,
@@ -11,11 +12,14 @@ import type {
   HarnessKind,
   HarnessModelInfo,
   HarnessPresentationMeta,
+  InstanceBillingTier,
   PermissionMode,
+  RateLimitWindow,
   ReasoningEffort,
   RiskLevel,
   TokenUsage,
   ToolKind,
+  TurnOptionsMap,
 } from '@harnessmate/protocol';
 
 export interface PortableHistoryMessage {
@@ -73,6 +77,7 @@ export interface TurnInput {
   model?: string | null;
   reasoningEffort?: ReasoningEffort | null;
   permissionMode?: PermissionMode;
+  turnOptions?: TurnOptionsMap;
   contextSync?: ContextSyncPayload | null;
   cliCommand?: string;
   nativeSkill?: { name: string; path: string };
@@ -168,6 +173,22 @@ export interface AdapterSessionHandle {
   onEvent(listener: (event: NormalizedAdapterEvent) => void): () => void;
 }
 
+export interface AdapterUsageLimitResult {
+  loggedIn: boolean;
+  accountLabel: string | null;
+  planType: string | null;
+  authMethod: string | null;
+  billingTier?: InstanceBillingTier;
+  gatewayUrl?: string | null;
+  rateLimits: RateLimitWindow[];
+  resetCreditsAvailable?: number;
+  lifetimeTokens?: number;
+  peakDailyTokens?: number;
+  currentStreakDays?: number;
+  dailyBuckets?: DailyTokenBucket[];
+  error?: string | null;
+}
+
 export interface HarnessAdapter {
   readonly id: string;
   readonly kind: HarnessKind;
@@ -185,5 +206,7 @@ export interface HarnessAdapter {
   /** Passive health check: must NOT spawn stateful sessions or create side effects. */
   probePassive?(): Promise<HarnessInfo>;
   probe(): Promise<HarnessInfo>;
+  /** Optional standard driver hook for reading account auth & rate-limit windows on demand. */
+  readUsageLimits?(): Promise<AdapterUsageLimitResult>;
   createSession(config: AdapterSessionConfig): Promise<AdapterSessionHandle>;
 }

@@ -10,6 +10,8 @@ import type {
   CreateSessionRequest,
   CustomAcpHarnessConfig,
   DiscoveredCliSession,
+  FailoverPolicy,
+  FailoverRecommendation,
   FailoverRequest,
   GitStatusSummary,
   HarnessAccountUsage,
@@ -46,6 +48,8 @@ import type {
   PluginBrowserStatus,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
+  TurnBlockRecord,
+  TurnOptionsMap,
   UpdatePluginRegistryConfigRequest,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
@@ -377,8 +381,29 @@ export const daemonApi = {
     ),
 
   // Accounts & Usage
-  getAccountUsage: () =>
-    apiFetch<{ accounts: HarnessAccountUsage[]; collectedAt: number }>('/api/v1/usage/accounts'),
+  getAccountUsage: (refresh = false) =>
+    apiFetch<{ accounts: HarnessAccountUsage[]; collectedAt: number }>(
+      `/api/v1/usage/accounts${refresh ? '?refresh=1' : ''}`,
+    ),
+
+  getFailoverPolicy: () =>
+    apiFetch<{ policy: FailoverPolicy }>('/api/v1/usage/failover-policy'),
+
+  updateFailoverPolicy: (policy: FailoverPolicy) =>
+    apiFetch<{ policy: FailoverPolicy }>('/api/v1/usage/failover-policy', {
+      method: 'PUT',
+      body: JSON.stringify(policy),
+    }),
+
+  getFailoverRecommendation: (sessionId: string, failedInstanceId?: string, failureClass?: string) => {
+    const params = new URLSearchParams();
+    if (failedInstanceId) params.set('failedInstanceId', failedInstanceId);
+    if (failureClass) params.set('failureClass', failureClass);
+    const qs = params.toString();
+    return apiFetch<{ recommendation: FailoverRecommendation }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/failover-recommendation${qs ? `?${qs}` : ''}`,
+    );
+  },
 
   // Workspaces
   listWorkspaces: () => apiFetch<{ workspaces: Workspace[] }>('/api/v1/workspaces'),
@@ -431,6 +456,41 @@ export const daemonApi = {
       `/api/v1/sessions/${encodeURIComponent(id)}/events?afterSeq=${afterSeq}`,
     ),
 
+  getSessionTurnItems: (
+    id: string,
+    opts?: { afterSeq?: number; turnId?: string; limit?: number },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.afterSeq !== undefined) params.set('afterSeq', String(opts.afterSeq));
+    if (opts?.turnId) params.set('turnId', opts.turnId);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return apiFetch<{ items: TurnBlockRecord[] }>(
+      `/api/v1/sessions/${encodeURIComponent(id)}/items${qs ? `?${qs}` : ''}`,
+    );
+  },
+
+  getSessionTurnItem: (
+    sessionId: string,
+    itemId: string,
+    opts?: { textOffset?: number; maxChars?: number },
+  ) => {
+    const params = new URLSearchParams();
+    if (opts?.textOffset !== undefined) params.set('textOffset', String(opts.textOffset));
+    if (opts?.maxChars !== undefined) params.set('maxChars', String(opts.maxChars));
+    const qs = params.toString();
+    return apiFetch<{
+      item: TurnBlockRecord;
+      text: string;
+      totalChars: number;
+      textOffset: number;
+      nextTextOffset: number | null;
+      hasMore: boolean;
+    }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}${qs ? `?${qs}` : ''}`,
+    );
+  },
+
   getHarnessCommands: (id: string) =>
     apiFetch<{ commands: HarnessCommandInfo[]; pluginActions: SessionPluginAction[]; modelTools: SessionModelPluginTools }>(
       `/api/v1/sessions/${encodeURIComponent(id)}/commands`),
@@ -444,7 +504,14 @@ export const daemonApi = {
     id: string,
     text: string,
     attachments?: Attachment[],
-    opts?: { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' },
+    opts?: {
+      harnessId?: string;
+      model?: string | null;
+      turnOptions?: TurnOptionsMap;
+      omitHandoff?: boolean;
+      literalText?: boolean;
+      mode?: 'plugin_development';
+    },
   ) =>
     apiFetch<{ turnId: string }>(`/api/v1/sessions/${encodeURIComponent(id)}/turns`, {
       method: 'POST',
@@ -453,6 +520,9 @@ export const daemonApi = {
         attachments,
         ...(opts?.harnessId ? { harnessId: opts.harnessId } : {}),
         ...(opts?.model !== undefined ? { model: opts.model } : {}),
+        ...(opts?.turnOptions && Object.keys(opts.turnOptions).length > 0
+          ? { turnOptions: opts.turnOptions }
+          : {}),
         omitHandoff: opts?.omitHandoff,
         literalText: opts?.literalText,
         mode: opts?.mode,
@@ -605,6 +675,7 @@ export class DaemonWsClient {
   private reconnectTimer: number | null = null;
   private closed = false;
   private activeSubscription: { sessionId: string; afterSeq: number } | null = null;
+  private commandOutputSubscriptions = new Map<string, { sessionId: string; toolCallId: string }>();
 
   constructor(
     private readonly handlers: {
@@ -624,6 +695,18 @@ export class DaemonWsClient {
     }
     this.activeSubscription = { sessionId, afterSeq };
     this.send({ op: 'subscribe', sessionId, afterSeq });
+  }
+
+  subscribeCommandOutput(sessionId: string, toolCallId: string): void {
+    const key = `${sessionId}::${toolCallId}`;
+    this.commandOutputSubscriptions.set(key, { sessionId, toolCallId });
+    this.send({ op: 'subscribe_command_output', sessionId, toolCallId });
+  }
+
+  unsubscribeCommandOutput(sessionId: string, toolCallId: string): void {
+    const key = `${sessionId}::${toolCallId}`;
+    this.commandOutputSubscriptions.delete(key);
+    this.send({ op: 'unsubscribe_command_output', sessionId, toolCallId });
   }
 
   updateCursor(sessionId: string, seq: number): void {
@@ -656,6 +739,13 @@ export class DaemonWsClient {
             op: 'subscribe',
             sessionId: this.activeSubscription.sessionId,
             afterSeq: this.activeSubscription.afterSeq,
+          });
+        }
+        for (const sub of this.commandOutputSubscriptions.values()) {
+          this.send({
+            op: 'subscribe_command_output',
+            sessionId: sub.sessionId,
+            toolCallId: sub.toolCallId,
           });
         }
       };

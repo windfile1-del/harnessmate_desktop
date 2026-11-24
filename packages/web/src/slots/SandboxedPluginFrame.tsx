@@ -1,7 +1,7 @@
 import type {
+  AnyPluginSlotKey,
   PluginSlotBridgeHostMessage,
   PluginSlotBridgeIframeMessage,
-  PluginSlotKey,
   Session,
 } from '@harnessmate/protocol';
 import { Loader2, ShieldAlert } from 'lucide-react';
@@ -19,7 +19,7 @@ export interface SandboxedPluginFrameProps {
   pluginId: string;
   pluginName: string;
   revision: string;
-  slot: PluginSlotKey;
+  slot: AnyPluginSlotKey;
   slotId: string;
   title: string;
   ui: string;

@@ -1,4 +1,4 @@
-import { PLUGIN_UI_SLOTS, type PluginSlotKey } from '@harnessmate/protocol';
+import { ALL_PLUGIN_UI_SLOTS, type AnyPluginSlotKey } from '@harnessmate/protocol';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
 import { Component, Fragment, type ErrorInfo, type ReactNode } from 'react';
 import { useSession, useSlotItems, useSlotRegistry } from './hooks';
@@ -87,7 +87,7 @@ export class SlotErrorBoundary extends Component<SlotErrorBoundaryProps, SlotErr
   }
 }
 
-function SlotItemRender<K extends PluginSlotKey>({
+function SlotItemRender<K extends AnyPluginSlotKey>({
   item,
   props,
 }: {
@@ -97,7 +97,7 @@ function SlotItemRender<K extends PluginSlotKey>({
   return <>{item.render(props)}</>;
 }
 
-export interface SlotProps<K extends PluginSlotKey> {
+export interface SlotProps<K extends AnyPluginSlotKey> {
   name: K;
   slotProps: SlotPropsMap[K];
   matchKey?: string;
@@ -107,7 +107,7 @@ export interface SlotProps<K extends PluginSlotKey> {
   children?: ReactNode;
 }
 
-export function Slot<K extends PluginSlotKey>({
+export function Slot<K extends AnyPluginSlotKey>({
   name,
   slotProps,
   matchKey,
@@ -118,11 +118,11 @@ export function Slot<K extends PluginSlotKey>({
 }: SlotProps<K>) {
   const registry = useSlotRegistry();
   const session = useSession();
-  const contract = PLUGIN_UI_SLOTS[name];
+  const contract = ALL_PLUGIN_UI_SLOTS[name];
   const items = useSlotItems(name, matchKey);
 
-  if (contract.scope === 'session' && !session) {
-    return <>{contract.cardinality === 'hoc' ? children : fallback}</>;
+  if (!contract || (contract.scope === 'session' && !session)) {
+    return <>{contract?.cardinality === 'hoc' ? children : fallback}</>;
   }
 
   if (contract.cardinality === 'single') {

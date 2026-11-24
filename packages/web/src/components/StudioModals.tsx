@@ -32,7 +32,12 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { daemonApi } from '../api/client';
-import { formatTokenCount, HARNESS_META } from '../lib/harness-meta';
+import {
+  formatCountdown,
+  formatTokenCount,
+  getHarnessMeta,
+  resolveHarnessMeta,
+} from '../lib/harness-meta';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry, useSlotRenderFailures } from '../slots';
 import { HarnessBadge } from './BrandMark';
@@ -1104,7 +1109,7 @@ export function McpHubModal({ onClose }: { onClose: () => void }) {
                       }}
                     >
                       {checked && <Check size={12} />}
-                      <span>{HARNESS_META[h].shortLabel}</span>
+                      <span>{getHarnessMeta(h).shortLabel}</span>
                     </button>
                   );
                 })}
@@ -1132,44 +1137,107 @@ export function McpHubModal({ onClose }: { onClose: () => void }) {
 // ── 3. Multi-Account & Quota / Usage Dashboard ─────────────────────────
 
 export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
-  const { accountUsage, usageLoading, refreshAccountUsage } = useAppStore();
+  const {
+    harnesses,
+    accountUsage,
+    usageLoading,
+    failoverPolicy,
+    refreshAccountUsage,
+    refreshFailoverPolicy,
+    updateFailoverPolicy,
+  } = useAppStore();
+
+  const [policyDraft, setPolicyDraft] = useState({
+    mode: failoverPolicy?.mode ?? ('manual_one_click' as const),
+    priorityChain: failoverPolicy?.priorityChain ?? harnesses.map((h) => h.id),
+    maxAutoSwitchesPerSession: failoverPolicy?.maxAutoSwitchesPerSession ?? 2,
+    autoRetryInterruptedPrompt: failoverPolicy?.autoRetryInterruptedPrompt ?? true,
+    notifyOnQuotaReset: failoverPolicy?.notifyOnQuotaReset ?? true,
+  });
+  const [savingPolicy, setSavingPolicy] = useState(false);
 
   useEffect(() => {
-    void refreshAccountUsage();
-  }, [refreshAccountUsage]);
+    void refreshAccountUsage(false);
+    void refreshFailoverPolicy();
+  }, [refreshAccountUsage, refreshFailoverPolicy]);
+
+  useEffect(() => {
+    if (failoverPolicy) {
+      const knownIds = harnesses.map((h) => h.id);
+      const mergedChain = [
+        ...failoverPolicy.priorityChain.filter((id) => knownIds.includes(id)),
+        ...knownIds.filter((id) => !failoverPolicy.priorityChain.includes(id)),
+      ];
+      setPolicyDraft({
+        ...failoverPolicy,
+        priorityChain: mergedChain,
+      });
+    } else if (harnesses.length > 0) {
+      setPolicyDraft((prev) => ({
+        ...prev,
+        priorityChain: prev.priorityChain.length > 0 ? prev.priorityChain : harnesses.map((h) => h.id),
+      }));
+    }
+  }, [failoverPolicy, harnesses]);
+
+  const movePriority = (index: number, dir: -1 | 1) => {
+    const nextIdx = index + dir;
+    if (nextIdx < 0 || nextIdx >= policyDraft.priorityChain.length) return;
+    const copy = [...policyDraft.priorityChain];
+    const [moved] = copy.splice(index, 1);
+    copy.splice(nextIdx, 0, moved!);
+    setPolicyDraft((prev) => ({ ...prev, priorityChain: copy }));
+  };
+
+  const handleSavePolicy = async () => {
+    setSavingPolicy(true);
+    try {
+      await updateFailoverPolicy(policyDraft);
+    } finally {
+      setSavingPolicy(false);
+    }
+  };
 
   return (
     <div>
       <StudioHeader
-        title="多账号与实时用量看板"
-        subtitle="聚合各 CLI 的订阅身份、5h/7d 速率限额、历史每日 Token 趋势与桌面会话消耗"
+        title="多实例用量与 Failover 接力看板"
+        subtitle="按已注册 Harness 实例聚合实时配额窗口、Prompt Cache 命中、本地 Token 账本与接力优先级链"
         onClose={onClose}
       />
 
-      <div className="max-h-[520px] space-y-3.5 overflow-y-auto p-5">
-        <div className="flex justify-end">
+      <div className="max-h-[540px] space-y-3.5 overflow-y-auto p-5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] text-[var(--text-muted)]">
+            已注册 {accountUsage.length || harnesses.length} 个实例 · 默认 60s TTL 缓存防探活限流
+          </span>
           <button
             type="button"
-            onClick={() => void refreshAccountUsage()}
+            onClick={() => void refreshAccountUsage(true)}
             className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl px-3 py-1.5 text-[12px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-hairline)' }}
           >
             <RefreshCw size={12.5} className={usageLoading ? 'animate-spin' : ''} />
-            刷新实时配额
+            强制刷新配额
           </button>
         </div>
 
         {usageLoading && accountUsage.length === 0 ? (
           <div className="py-12 text-center text-[12.5px] text-[var(--text-muted)]">
             <Loader2 size={18} className="mx-auto mb-2 animate-spin text-[var(--accent-indigo)]" />
-            正在采集 Codex / AGY / Claude 账号与限额信息...
+            正在采集全部已注册实例的账号与配额信息...
           </div>
         ) : (
           accountUsage.map((acc) => {
+            const matchedHarness = harnesses.find((h) => h.id === (acc.instanceId ?? acc.harnessId));
             const maxDaily = Math.max(1, ...acc.dailyBuckets.map((b) => b.tokens));
+            const cacheHitPct =
+              acc.localInputTokens > 0 && acc.localCachedTokens > 0
+                ? Math.min(100, Math.round((acc.localCachedTokens / acc.localInputTokens) * 100))
+                : null;
             return (
               <div
-                key={acc.harnessId}
+                key={acc.instanceId ?? acc.harnessId}
                 className="space-y-3 rounded-2xl p-4"
                 style={{
                   backgroundColor: 'var(--bg-elevated)',
@@ -1178,12 +1246,32 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2.5">
-                    <HarnessBadge kind={acc.harnessKind} label={acc.displayName} />
+                    <HarnessBadge
+                      kind={acc.driverId ?? acc.harnessKind}
+                      label={acc.displayName}
+                      presentation={matchedHarness?.presentation}
+                    />
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      {acc.accountLabel ?? (acc.loggedIn ? '已登录' : '未登录')}
+                      {acc.accountLabel ?? (acc.loggedIn ? '已登录' : '本地统计')}
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5">
+                    {acc.billingTier && acc.billingTier !== 'unknown' && (
+                      <span
+                        className="rounded-full px-2 py-0.5 font-mono-code text-[10px]"
+                        style={{
+                          backgroundColor: 'var(--bg-surface)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border-hairline)',
+                        }}
+                      >
+                        {acc.billingTier === 'subscription'
+                          ? '订阅包月'
+                          : acc.billingTier === 'api_payg'
+                            ? 'API 按量'
+                            : '本地免费'}
+                      </span>
+                    )}
                     {acc.planType && (
                       <span
                         className="rounded-full px-2 py-0.5 text-[10.5px] font-medium uppercase"
@@ -1239,7 +1327,14 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
                           </div>
                           {rl.resetsAt && (
                             <div className="mt-1 text-[10px] text-[var(--text-muted)]">
-                              重置时间：{new Date(rl.resetsAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                              重置：{formatCountdown(rl.resetsAt)} (
+                              {new Date(rl.resetsAt).toLocaleString('zh-CN', {
+                                month: 'numeric',
+                                day: 'numeric',
+                                hour: '2-digit',
+                                minute: '2-digit',
+                              })}
+                              )
                             </div>
                           )}
                         </div>
@@ -1248,19 +1343,21 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
                   </div>
                 )}
 
-                {/* Lifetime & Daily Sparkline (Codex) */}
+                {/* Lifetime & Daily Sparkline */}
                 {(acc.lifetimeTokens !== undefined || acc.dailyBuckets.length > 0) && (
                   <div
                     className="space-y-2 rounded-xl p-3"
                     style={{ backgroundColor: 'var(--bg-surface)' }}
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                      <span className="text-[var(--text-muted)]">
-                        累计历史 Token：
-                        <strong className="font-mono-code text-[var(--text-primary)]">
-                          {formatTokenCount(acc.lifetimeTokens ?? 0)}
-                        </strong>
-                      </span>
+                      {acc.lifetimeTokens !== undefined && (
+                        <span className="text-[var(--text-muted)]">
+                          累计历史 Token：
+                          <strong className="font-mono-code text-[var(--text-primary)]">
+                            {formatTokenCount(acc.lifetimeTokens)}
+                          </strong>
+                        </span>
+                      )}
                       {acc.currentStreakDays !== undefined && (
                         <span className="text-[var(--text-muted)]">
                           连续活跃 <strong className="text-[var(--accent-star)]">{acc.currentStreakDays}</strong> 天
@@ -1301,9 +1398,14 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
                   <span className="font-mono-code">
                     ↑{formatTokenCount(acc.localInputTokens)} / ↓{formatTokenCount(acc.localOutputTokens)}
                   </span>
+                  {cacheHitPct !== null && (
+                    <span className="font-mono-code text-[var(--accent-emerald)]">
+                      Prompt Cache {cacheHitPct}%
+                    </span>
+                  )}
                   {acc.localCostUsd > 0 && (
                     <span className="font-mono-code text-[var(--accent-star)]">
-                      本机统计成本 ${acc.localCostUsd.toFixed(4)}
+                      本机估算 ${acc.localCostUsd.toFixed(4)}
                     </span>
                   )}
                 </div>
@@ -1315,6 +1417,122 @@ export function UsageDashboardModal({ onClose }: { onClose: () => void }) {
             );
           })
         )}
+
+        {/* Failover Priority Chain & Guardrail Configurator */}
+        <div
+          className="space-y-3 rounded-2xl p-4"
+          style={{
+            backgroundColor: 'var(--bg-elevated)',
+            border: '1px solid var(--border-hairline)',
+          }}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-[12.5px] font-semibold text-[var(--text-primary)]">
+                Failover 限额接力策略与优先级链
+              </div>
+              <div className="text-[11px] text-[var(--text-muted)]">
+                当实例遇到 usage_limit / rate_limited / provider_unavailable 时按链推荐备选实例
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={savingPolicy}
+              onClick={() => void handleSavePolicy()}
+              className="cursor-pointer rounded-xl px-3 py-1.5 text-[11.5px] font-medium text-white disabled:opacity-45"
+              style={{ backgroundColor: 'var(--accent-indigo)' }}
+            >
+              {savingPolicy ? '保存中...' : '保存策略'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+            <label className="space-y-1 text-[11px] text-[var(--text-secondary)]">
+              <span>接力模式</span>
+              <select
+                value={policyDraft.mode}
+                onChange={(e) =>
+                  setPolicyDraft((prev) => ({
+                    ...prev,
+                    mode: e.target.value as typeof prev.mode,
+                  }))
+                }
+                className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[12px] text-[var(--text-primary)]"
+              >
+                <option value="manual_one_click">一键确认接力（推荐）</option>
+                <option value="auto_same_tier">同档位自动接力（防包月切付费 API）</option>
+                <option value="auto_any">任意可用实例自动接力</option>
+              </select>
+            </label>
+            <label className="space-y-1 text-[11px] text-[var(--text-secondary)]">
+              <span>单会话最大自动切换次数（防乒乓循环）</span>
+              <input
+                type="number"
+                min={0}
+                max={10}
+                value={policyDraft.maxAutoSwitchesPerSession}
+                onChange={(e) =>
+                  setPolicyDraft((prev) => ({
+                    ...prev,
+                    maxAutoSwitchesPerSession: Math.max(0, Math.min(10, Number(e.target.value) || 0)),
+                  }))
+                }
+                className="font-mono-code w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[12px] text-[var(--text-primary)]"
+              />
+            </label>
+          </div>
+
+          {policyDraft.priorityChain.length > 0 && (
+            <div className="space-y-1">
+              <div className="text-[11px] text-[var(--text-muted)]">备选实例接力顺序：</div>
+              {policyDraft.priorityChain.map((id, idx) => {
+                const h = harnesses.find((item) => item.id === id);
+                const meta = resolveHarnessMeta({ harness: h, harnessId: id }, harnesses);
+                return (
+                  <div
+                    key={id}
+                    className="flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[11.5px]"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      border: '1px solid var(--border-hairline)',
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono-code text-[10.5px] text-[var(--text-muted)]">
+                        #{idx + 1}
+                      </span>
+                      <span
+                        className="h-2 w-2 rounded-full"
+                        style={{ backgroundColor: meta.accentColor }}
+                      />
+                      <span className="font-medium text-[var(--text-primary)]">
+                        {h?.displayName ?? id}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={idx === 0}
+                        onClick={() => movePriority(idx, -1)}
+                        className="cursor-pointer rounded px-1.5 py-0.5 text-[10.5px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-30"
+                      >
+                        上移
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === policyDraft.priorityChain.length - 1}
+                        onClick={() => movePriority(idx, 1)}
+                        className="cursor-pointer rounded px-1.5 py-0.5 text-[10.5px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-30"
+                      >
+                        下移
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1330,7 +1548,7 @@ export function HandoffModal({ onClose }: { onClose: () => void }) {
   const [targetHarnessId, setTargetHarnessId] = useState(
     harnesses.find((h) => h.id !== source?.harnessId && h.health === 'ready')?.id ??
       harnesses[0]?.id ??
-      'codex',
+      '',
   );
   const [targetModel, setTargetModel] = useState<string | null>(null);
   const [syncMode, setSyncMode] = useState<ContextSyncMode>('auto');
@@ -1453,7 +1671,7 @@ export function HandoffModal({ onClose }: { onClose: () => void }) {
                     border: `1px solid ${active ? 'var(--border-focus)' : 'var(--border-hairline)'}`,
                   }}
                 >
-                  <HarnessBadge kind={h.kind} label={h.displayName} compact />
+                  <HarnessBadge kind={h.kind} label={h.displayName} presentation={h.presentation} compact />
                   <span className="text-[10.5px] text-[var(--text-muted)]">
                     {h.models.length} 个模型
                   </span>
@@ -1560,7 +1778,7 @@ export function HandoffModal({ onClose }: { onClose: () => void }) {
 export function ContextPreviewModal({ onClose }: { onClose: () => void }) {
   const { sessions, harnesses, selectedSessionId, pushToast } = useAppStore();
   const session = sessions.find((s) => s.id === selectedSessionId);
-  const [targetHarnessId, setTargetHarnessId] = useState(session?.harnessId ?? 'codex');
+  const [targetHarnessId, setTargetHarnessId] = useState(session?.harnessId ?? harnesses[0]?.id ?? '');
   const [syncMode, setSyncMode] = useState<ContextSyncMode>(session?.contextSyncMode ?? 'auto');
   const [preview, setPreview] = useState<ContextPreview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1599,7 +1817,7 @@ export function ContextPreviewModal({ onClose }: { onClose: () => void }) {
           <div className="flex flex-wrap items-center gap-1.5">
             {harnesses.map((h) => {
               const active = targetHarnessId === h.id;
-              const meta = HARNESS_META[h.kind] ?? HARNESS_META.acp;
+              const meta = resolveHarnessMeta({ harness: h }, harnesses);
               return (
                 <button
                   key={h.id}

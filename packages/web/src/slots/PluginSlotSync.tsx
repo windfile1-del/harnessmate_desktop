@@ -1,16 +1,20 @@
 import {
-  normalizePluginSlotKey,
+  normalizeAnyPluginSlotKey,
+  type AnyPluginSlotKey,
   type ApprovalRequest,
   type Disposer,
   type InstalledPluginInfo,
   type PluginPanel,
   type PluginSlotContribution,
-  type PluginSlotKey,
   type Session,
 } from '@harnessmate/protocol';
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
+import { HtmlRenderCard } from '../components/HtmlRenderCard';
+import { FailoverInlineBanner } from '../components/MessageStudio';
 import { PluginDataPanel } from '../components/PluginDataPanel';
+import { TraitsPicker } from '../components/TraitsPicker';
+import { resolveHarnessOptionDescriptors } from '../lib/harness-meta';
 import { listPluginPanels } from '../lib/plugin-panels';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry } from './hooks';
@@ -175,10 +179,12 @@ function isPluginActive(plugin: InstalledPluginInfo): boolean {
   return plugin.enabled && (!plugin.runtimeState || plugin.runtimeState === 'ACTIVE');
 }
 
-function collectPluginIframeSlots(plugin: InstalledPluginInfo): Array<PluginSlotContribution & { slot: PluginSlotKey }> {
-  const merged = new Map<string, PluginSlotContribution & { slot: PluginSlotKey }>();
+function collectPluginIframeSlots(
+  plugin: InstalledPluginInfo,
+): Array<PluginSlotContribution & { slot: AnyPluginSlotKey }> {
+  const merged = new Map<string, PluginSlotContribution & { slot: AnyPluginSlotKey }>();
   for (const entry of [...(plugin.contributes.slots ?? []), ...(plugin.runtimeSlots ?? [])]) {
-    const slot = normalizePluginSlotKey(entry.slot);
+    const slot = normalizeAnyPluginSlotKey(entry.slot);
     merged.set(`${slot}:${entry.id}`, { ...entry, slot });
   }
   return [...merged.values()];
@@ -186,7 +192,7 @@ function collectPluginIframeSlots(plugin: InstalledPluginInfo): Array<PluginSlot
 
 /**
  * Effect-driven synchronizer that projects installed/active plugins (V1 panels, V2 dataPanels,
- * V4 manifest/runtime iframe slots, and built-in adapters) into the typed UI SlotRegistry.
+ * V4/V5 manifest/runtime iframe slots, and built-in adapters) into the typed UI SlotRegistry.
  */
 export function PluginSlotSync() {
   const plugins = useAppStore((state) => state.plugins);
@@ -206,6 +212,92 @@ export function PluginSlotSync() {
         sourceKind: 'builtin',
         render: ({ approval }) =>
           approval.annotations?.length ? <ApprovalAnnotationsDetail approval={approval} /> : null,
+      }),
+    );
+
+    // Built-in V5 Message Studio: dynamic schema-driven TraitsPicker (composer.traits)
+    disposers.push(
+      registry.register({
+        slot: 'composer.traits',
+        id: 'message-studio-traits',
+        pluginId: 'hm.plugin.message-studio',
+        pluginName: 'Message Studio',
+        title: '动态参数选择器',
+        order: 100,
+        sourceKind: 'builtin',
+        render: ({ session, harness, disabled, values, onChange }) => {
+          const descriptors = resolveHarnessOptionDescriptors(harness, session.model);
+          return (
+            <TraitsPicker
+              descriptors={descriptors}
+              values={values}
+              disabled={disabled}
+              onChange={onChange}
+            />
+          );
+        },
+      }),
+    );
+
+    // Built-in V5 Message Studio: sandboxed html_render card (chat.block)
+    disposers.push(
+      registry.register({
+        slot: 'chat.block',
+        id: 'message-studio-html-render',
+        pluginId: 'hm.plugin.message-studio',
+        pluginName: 'Message Studio',
+        title: 'HTML 沙箱预览',
+        key: 'html_render',
+        order: 100,
+        sourceKind: 'builtin',
+        render: ({ block }) => {
+          if (block.type !== 'html_render') return null;
+          return (
+            <HtmlRenderCard
+              renderId={block.renderId}
+              title={block.title}
+              html={block.html}
+              preferredHeightPx={block.preferredHeightPx}
+              allowFullscreen={block.allowFullscreen}
+            />
+          );
+        },
+      }),
+    );
+
+    // Built-in V5 Usage & Failover: inline failover banner (chat.block)
+    disposers.push(
+      registry.register({
+        slot: 'chat.block',
+        id: 'usage-failover-banner',
+        pluginId: 'hm.plugin.usage-failover',
+        pluginName: 'Usage & Failover',
+        title: '限额接力横幅',
+        key: 'ext:failover.banner',
+        order: 100,
+        sourceKind: 'builtin',
+        render: ({ block, onFailover }) => {
+          if (block.type !== 'ext:failover.banner' || !('payload' in block)) return null;
+          const store = useAppStore.getState();
+          const p = block.payload as {
+            failedInstanceId?: string;
+            failureClass?: string;
+            errorMessage?: string;
+            resetsAt?: number | null;
+          };
+          return (
+            <FailoverInlineBanner
+              failedInstanceId={p.failedInstanceId ?? block.harnessInstanceId}
+              failureClass={p.failureClass ?? 'usage_limit'}
+              errorMessage={p.errorMessage ?? block.fallbackSummary ?? '达到速率限额'}
+              resetsAt={p.resetsAt ?? null}
+              harnesses={store.harnesses}
+              accountUsage={store.accountUsage}
+              failoverPolicy={store.failoverPolicy}
+              onFailover={(targetId) => onFailover?.(targetId)}
+            />
+          );
+        },
       }),
     );
 
@@ -325,6 +417,8 @@ export function PluginSlotSync() {
         const isCompactSlot =
           slotDef.slot === 'statusbar.items' ||
           slotDef.slot === 'composer.actions' ||
+          slotDef.slot === 'composer.traits' ||
+          slotDef.slot === 'session.sidebar.badge' ||
           slotDef.slot === 'session.header.title';
         disposers.push(
           registry.register({

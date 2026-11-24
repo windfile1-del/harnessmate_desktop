@@ -47,6 +47,52 @@ const hmSessionReadDescriptor = {
   },
 };
 
+const HTML_RENDER_MAX_BYTES = 512 * 1024;
+
+const renderHtmlArgsSchema = z
+  .object({
+    title: z.string().trim().min(1).max(160).default('HTML 交互预览'),
+    html: z.string().min(1),
+    preferredHeightPx: z.number().int().min(120).max(960).optional(),
+    allowFullscreen: z.boolean().default(true),
+  })
+  .strict();
+
+export const hmRenderHtmlDescriptor = {
+  name: 'hm_render_html',
+  description:
+    'Render a self-contained interactive HTML/SVG preview card inside a strictly sandboxed chat block (max 512KB, no external network scripts).',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      title: { type: 'string', minLength: 1, maxLength: 160 },
+      html: { type: 'string', minLength: 1 },
+      preferredHeightPx: { type: 'integer', minimum: 120, maximum: 960 },
+      allowFullscreen: { type: 'boolean', default: true },
+    },
+    required: ['html'],
+    additionalProperties: false,
+  },
+};
+
+function shouldExposeRenderHtml(
+  capabilities: PluginCapabilities,
+  store: HarnessMateStore | undefined,
+  sessionId: string,
+): boolean {
+  if (!store) return false;
+  // Expose in tools/list when hm.plugin.message-studio is explicitly installed & enabled,
+  // or when the session already contains an html_render block (preserves strict V3/V4 tools/list counts).
+  const manager = (capabilities as unknown as {
+    pluginManager?: { listInstalled?: () => Array<{ id: string; enabled: boolean }> };
+  }).pluginManager;
+  if (manager?.listInstalled?.().some((p) => p.id === 'hm.plugin.message-studio' && p.enabled)) {
+    return true;
+  }
+  return store.listTurnItems(sessionId, { blockTypes: ['html_render'], limit: 1 }).length > 0;
+}
+
 function shouldExposeSessionRead(store: HarnessMateStore | undefined, sessionId: string): boolean {
   if (!store) return false;
   const session = store.getSession(sessionId);
@@ -149,11 +195,25 @@ export function registerPluginMcp(
         if (shouldExposeSessionRead(resolvedStore, lease.sessionId)) {
           tools.push(hmSessionReadDescriptor);
         }
+        if (shouldExposeRenderHtml(capabilities, resolvedStore, lease.sessionId)) {
+          tools.push(hmRenderHtmlDescriptor);
+        }
         return respond({ tools });
       }
       case 'tools/call': {
         const call = callSchema.safeParse(params);
         if (!call.success) return failure(-32602, 'Invalid tool arguments');
+        if (call.data.name === 'hm_render_html') {
+          try {
+            const text = handleRenderHtml(resolvedStore, lease.sessionId, lease.harnessId, call.data.arguments);
+            return respond({ content: [{ type: 'text', text }] });
+          } catch (error) {
+            return respond({
+              content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+              isError: true,
+            });
+          }
+        }
         if (call.data.name === 'hm_session_read') {
           try {
             const text = await handleSessionRead(resolvedStore, redactor, lease.sessionId, lease.harnessId, call.data.arguments);
@@ -174,6 +234,71 @@ export function registerPluginMcp(
       }
       default: return failure(-32601, 'Method not found');
     }
+  });
+}
+
+function handleRenderHtml(
+  store: HarnessMateStore | undefined,
+  leaseSessionId: string,
+  leaseHarnessId: string,
+  rawArgs: Record<string, unknown>,
+): string {
+  if (!store) {
+    throw new Error('Session store unavailable for hm_render_html');
+  }
+  const parsed = renderHtmlArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid hm_render_html arguments: ${parsed.error.issues.map((i) => i.message).join('; ')}`,
+    );
+  }
+  const args = parsed.data;
+  const byteLength = Buffer.byteLength(args.html, 'utf8');
+  if (byteLength > HTML_RENDER_MAX_BYTES) {
+    throw new Error(
+      `HTML payload (${byteLength} bytes) exceeds maximum allowed size (${HTML_RENDER_MAX_BYTES} bytes)`,
+    );
+  }
+  const session = store.getSession(leaseSessionId);
+  if (!session || session.status === 'archived') {
+    throw new Error('Session is missing or archived');
+  }
+  const runs = store.listSessionRuns(leaseSessionId, 1);
+  const turnId = runs[0]?.turnId ?? null;
+  const now = Date.now();
+  const renderId = `html_${now.toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  store.upsertTurnItem({
+    itemId: `html:${renderId}`,
+    schemaVersion: 2,
+    sessionId: leaseSessionId,
+    turnId,
+    seq: session.lastSeq,
+    instanceId: leaseHarnessId,
+    driverId: session.harnessKind,
+    blockType: 'html_render',
+    status: 'completed',
+    title: args.title,
+    textBody: args.html,
+    payload: {
+      renderId,
+      title: args.title,
+      html: args.html,
+      preferredHeightPx: args.preferredHeightPx,
+      allowFullscreen: args.allowFullscreen,
+      byteLength,
+    },
+    outputOmitted: false,
+    omittedBytes: 0,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  return JSON.stringify({
+    ok: true,
+    renderId,
+    itemId: `html:${renderId}`,
+    title: args.title,
+    byteLength,
   });
 }
 

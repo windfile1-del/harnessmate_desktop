@@ -1,4 +1,4 @@
-import type { PluginSlotKey, PublicSession, Session } from '@harnessmate/protocol';
+import type { AnyPluginSlotKey, PublicSession, Session } from '@harnessmate/protocol';
 
 export const THEME_CSS_VAR_NAMES = [
   '--bg-canvas',
@@ -94,7 +94,7 @@ export function buildIframeSrcDoc(params: {
   pluginId: string;
   runId: string;
   slotId: string;
-  slot: PluginSlotKey;
+  slot: AnyPluginSlotKey;
   session: PublicSession | null;
   props: Record<string, unknown>;
   browserAvailable?: boolean;

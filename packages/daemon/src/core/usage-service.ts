@@ -1,239 +1,296 @@
 import type {
   DailyTokenBucket,
   HarnessAccountUsage,
-  RateLimitWindow,
+  InstanceBillingTier,
 } from '@harnessmate/protocol';
-import type { HarnessMateStore } from '../db/sqlite.js';
-import { AcpAdapter } from '../harnesses/acp-adapter.js';
-import { readClaudeLocalSettings } from '../harnesses/claude-adapter.js';
-import { CodexAppServerAdapter } from '../harnesses/codex-adapter.js';
-import { execCliQuick, resolveBinary } from '../harnesses/process.js';
+import type { HarnessMateStore, LocalInstanceUsageAggregate } from '../db/sqlite.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
+import type { AdapterUsageLimitResult, HarnessAdapter } from '../harnesses/types.js';
 
+export interface UsageServiceOptions {
+  /** Cache TTL for remote `readUsageLimits()` queries (defaults to 60s). */
+  ttlMs?: number;
+  /** Clock override for deterministic unit tests. */
+  now?: () => number;
+}
+
+export interface SessionContextMeterSnapshot {
+  sessionId: string;
+  usedTokens: number;
+  maxTokens: number;
+  usagePercent: number;
+  cachedInputTokens: number;
+  cacheHitRate: number | null;
+  level: 'normal' | 'warning' | 'critical';
+  isEstimated: boolean;
+}
+
+interface CachedRemoteUsage {
+  result: AdapterUsageLimitResult;
+  fetchedAt: number;
+}
+
+const DEFAULT_USAGE_TTL_MS = 60_000;
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+
+/**
+ * Multi-instance, driver-agnostic Usage Aggregation Service.
+ *
+ * Iterates over all registered instances in `HarnessRegistry`, invokes each
+ * driver's optional standard `readUsageLimits()` capability (zero hardcoded
+ * vendor names or `instanceof` checks), merges local SQLite `session_runs`
+ * statistics, and caches remote probes with a 60s TTL.
+ */
 export class UsageService {
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+  private readonly remoteCache = new Map<string, CachedRemoteUsage>();
+  private readonly inflight = new Map<string, Promise<CachedRemoteUsage | null>>();
+
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
-    private readonly binaryOverrides: Record<string, string> = {},
-  ) {}
-
-  async collectAccountUsage(): Promise<HarnessAccountUsage[]> {
-    const localAggs = this.store.getUsageAggregatesByHarness();
-
-    const [codex, agy, claude] = await Promise.all([
-      this.probeCodexUsage(localAggs.get('codex')),
-      this.probeAgyUsage(localAggs.get('agy')),
-      this.probeClaudeUsage(localAggs.get('claude')),
-    ]);
-
-    return [codex, agy, claude];
+    opts?: UsageServiceOptions | Record<string, string>,
+  ) {
+    const structured =
+      opts && ('ttlMs' in opts || 'now' in opts) ? (opts as UsageServiceOptions) : undefined;
+    this.ttlMs = structured?.ttlMs ?? DEFAULT_USAGE_TTL_MS;
+    this.now = structured?.now ?? (() => Date.now());
   }
 
-  collectCodexUsage(): Promise<HarnessAccountUsage> {
-    return this.probeCodexUsage(this.store.getUsageAggregatesByHarness().get('codex'));
+  /**
+   * Collects usage & quota snapshots across ALL registered Harness instances.
+   * Respects the 60s TTL cache unless `forceRefresh` is explicitly requested.
+   */
+  async collectAccountUsage(opts?: { forceRefresh?: boolean }): Promise<HarnessAccountUsage[]> {
+    const forceRefresh = opts?.forceRefresh === true;
+    const localAggs = this.store.getUsageAggregatesByInstance();
+    const adapters = this.registry.listAdapters();
+
+    return Promise.all(
+      adapters.map((adapter) =>
+        this.collectForAdapter(adapter, localAggs.get(adapter.id), forceRefresh),
+      ),
+    );
   }
 
-  private async probeCodexUsage(
-    local?: ReturnType<HarnessMateStore['getUsageAggregatesByHarness']> extends Map<string, infer V>
-      ? V
-      : never,
+  /**
+   * Collects usage & quota for a single registered instance by `instanceId`.
+   */
+  async collectInstanceUsage(
+    instanceId: string,
+    opts?: { forceRefresh?: boolean },
   ): Promise<HarnessAccountUsage> {
+    const forceRefresh = opts?.forceRefresh === true;
+    const local = this.store.getUsageAggregatesByInstance().get(instanceId);
+    const adapter = this.registry.get(instanceId);
+    if (!adapter) {
+      return this.buildOfflineFallback(instanceId, local);
+    }
+    return this.collectForAdapter(adapter, local, forceRefresh);
+  }
+
+  /**
+   * Backward-compatible alias for `/usage` callers expecting Codex instance usage.
+   */
+  collectCodexUsage(opts?: { forceRefresh?: boolean }): Promise<HarnessAccountUsage> {
+    return this.collectInstanceUsage('codex', opts);
+  }
+
+  /**
+   * Clears cached remote usage for one instance (e.g. after a `usage_limit` error) or all instances.
+   */
+  invalidateCache(instanceId?: string): void {
+    if (instanceId) {
+      this.remoteCache.delete(instanceId);
+    } else {
+      this.remoteCache.clear();
+    }
+  }
+
+  /**
+   * Returns cached billing tier for an instance without triggering a remote probe.
+   */
+  getKnownBillingTier(instanceId: string): InstanceBillingTier {
+    const cached = this.remoteCache.get(instanceId)?.result;
+    if (cached?.billingTier) return cached.billingTier;
+    const instance = this.registry.getInstanceConfig(instanceId);
+    if (instance?.sanitizedEnv) {
+      for (const k of Object.keys(instance.sanitizedEnv)) {
+        if (/API_KEY|AUTH_TOKEN/i.test(k)) return 'api_payg';
+      }
+    }
+    return 'unknown';
+  }
+
+  /**
+   * Computes session-level context window occupancy & Prompt Cache hit rate.
+   */
+  getSessionContextMeter(sessionId: string): SessionContextMeterSnapshot | null {
+    const session = this.store.getSession(sessionId);
+    if (!session?.usage) return null;
+    const usage = session.usage;
+    const usedTokens = usage.contextTokens ?? (usage.inputTokens + usage.outputTokens);
+    const isEstimated = !usage.modelContextWindow;
+    const maxTokens = usage.modelContextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const usagePercent = Math.min(100, Math.round((usedTokens / Math.max(1, maxTokens)) * 100));
+    const cachedInputTokens = usage.cacheReadTokens ?? usage.cachedTokens ?? 0;
+    const denom = Math.max(usage.inputTokens, cachedInputTokens);
+    const cacheHitRate =
+      cachedInputTokens > 0 && denom > 0
+        ? Math.min(100, Math.round((cachedInputTokens / denom) * 100))
+        : null;
+    const level: SessionContextMeterSnapshot['level'] =
+      usagePercent >= 85 ? 'critical' : usagePercent >= 70 ? 'warning' : 'normal';
+    return {
+      sessionId,
+      usedTokens,
+      maxTokens,
+      usagePercent,
+      cachedInputTokens,
+      cacheHitRate,
+      level,
+      isEstimated,
+    };
+  }
+
+  private async collectForAdapter(
+    adapter: HarnessAdapter,
+    local: LocalInstanceUsageAggregate | undefined,
+    forceRefresh: boolean,
+  ): Promise<HarnessAccountUsage> {
+    const nowTs = this.now();
+    const driverId = adapter.driverId ?? adapter.kind;
+    const instanceCfg = this.registry.getInstanceConfig(adapter.id);
+    const displayName = instanceCfg?.displayName ?? adapter.displayName;
+    const localBuckets: DailyTokenBucket[] = local?.dailyBuckets ?? [];
+
     const base: HarnessAccountUsage = {
-      harnessId: 'codex',
-      harnessKind: 'codex',
-      displayName: 'Codex CLI',
+      harnessId: adapter.id,
+      harnessKind: adapter.kind,
+      instanceId: adapter.id,
+      driverId,
+      displayName,
+      billingTier: 'unknown',
       loggedIn: false,
       accountLabel: null,
       planType: null,
       authMethod: null,
       rateLimits: [],
-      dailyBuckets: [],
+      dailyBuckets: localBuckets,
       localSessionCount: local?.sessionCount ?? 0,
       localInputTokens: local?.inputTokens ?? 0,
       localOutputTokens: local?.outputTokens ?? 0,
       localCachedTokens: local?.cachedTokens ?? 0,
       localCostUsd: local?.costUsd ?? 0,
+      fetchedAt: nowTs,
+      cached: false,
     };
 
-    const adapter = this.registry.get('codex');
-    if (!(adapter instanceof CodexAppServerAdapter)) return base;
-
-    try {
-      const snap = await adapter.probeAppServerMetadata(undefined, true);
-      if (snap.account) {
-        base.loggedIn = true;
-        base.accountLabel = snap.account.email ?? snap.account.type ?? 'Signed In';
-        base.planType = snap.account.planType ?? null;
-        base.authMethod = snap.account.type ?? null;
-      }
-
-      const rlRoot = snap.rateLimits as {
-        rateLimits?: {
-          primary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
-          secondary?: { usedPercent?: number; windowDurationMins?: number; resetsAt?: number };
-        };
-        rateLimitResetCredits?: { availableCount?: number };
-      } | null;
-
-      const windows: RateLimitWindow[] = [];
-      if (rlRoot?.rateLimits?.primary) {
-        const p = rlRoot.rateLimits.primary;
-        windows.push({
-          label: formatWindowLabel(p.windowDurationMins ?? 300),
-          usedPercent: clampPct(p.usedPercent ?? 0),
-          windowMinutes: p.windowDurationMins ?? 300,
-          resetsAt: p.resetsAt ? p.resetsAt * 1000 : null,
-        });
-      }
-      if (rlRoot?.rateLimits?.secondary) {
-        const s = rlRoot.rateLimits.secondary;
-        windows.push({
-          label: formatWindowLabel(s.windowDurationMins ?? 10080),
-          usedPercent: clampPct(s.usedPercent ?? 0),
-          windowMinutes: s.windowDurationMins ?? 10080,
-          resetsAt: s.resetsAt ? s.resetsAt * 1000 : null,
-        });
-      }
-      base.rateLimits = windows;
-      base.resetCreditsAvailable = rlRoot?.rateLimitResetCredits?.availableCount;
-
-      const usageRoot = snap.usage as {
-        summary?: {
-          lifetimeTokens?: number;
-          peakDailyTokens?: number;
-          currentStreakDays?: number;
-        };
-        dailyUsageBuckets?: Array<{ startDate?: string; tokens?: number }>;
-      } | null;
-
-      if (usageRoot?.summary) {
-        base.lifetimeTokens = usageRoot.summary.lifetimeTokens;
-        base.peakDailyTokens = usageRoot.summary.peakDailyTokens;
-        base.currentStreakDays = usageRoot.summary.currentStreakDays;
-      }
-      if (Array.isArray(usageRoot?.dailyUsageBuckets)) {
-        const recent: DailyTokenBucket[] = usageRoot.dailyUsageBuckets
-          .slice(-14)
-          .filter((b) => Boolean(b.startDate))
-          .map((b) => ({
-            date: String(b.startDate),
-            tokens: Number(b.tokens ?? 0),
-          }));
-        base.dailyBuckets = recent;
-      }
-    } catch (err) {
-      base.error = err instanceof Error ? err.message : String(err);
-    }
-
-    return base;
-  }
-
-  private async probeAgyUsage(
-    local?: ReturnType<HarnessMateStore['getUsageAggregatesByHarness']> extends Map<string, infer V>
-      ? V
-      : never,
-  ): Promise<HarnessAccountUsage> {
-    const base: HarnessAccountUsage = {
-      harnessId: 'agy',
-      harnessKind: 'agy',
-      displayName: 'Antigravity CLI',
-      loggedIn: false,
-      accountLabel: null,
-      planType: null,
-      authMethod: 'Google OAuth',
-      rateLimits: [],
-      dailyBuckets: [],
-      localSessionCount: local?.sessionCount ?? 0,
-      localInputTokens: local?.inputTokens ?? 0,
-      localOutputTokens: local?.outputTokens ?? 0,
-      localCachedTokens: local?.cachedTokens ?? 0,
-      localCostUsd: local?.costUsd ?? 0,
-    };
-
-    const adapter = this.registry.get('agy');
-    if (!(adapter instanceof AcpAdapter)) return base;
-
-    try {
-      const snap = await adapter.probeAcpSessionMetadata();
-      base.loggedIn = snap.models.length > 0 || Boolean(snap.tierName);
-      base.planType = snap.tierName;
-      base.accountLabel = snap.tierName ? `Google Account (${snap.tierName})` : 'Google Account';
-    } catch (err) {
-      base.error = err instanceof Error ? err.message : String(err);
-    }
-
-    return base;
-  }
-
-  private async probeClaudeUsage(
-    local?: ReturnType<HarnessMateStore['getUsageAggregatesByHarness']> extends Map<string, infer V>
-      ? V
-      : never,
-  ): Promise<HarnessAccountUsage> {
-    const localSettings = readClaudeLocalSettings();
-    const base: HarnessAccountUsage = {
-      harnessId: 'claude',
-      harnessKind: 'claude',
-      displayName: 'Claude Code',
-      loggedIn: false,
-      accountLabel: null,
-      planType: null,
-      authMethod: null,
-      gatewayUrl: localSettings.gatewayUrl,
-      rateLimits: [],
-      dailyBuckets: [],
-      localSessionCount: local?.sessionCount ?? 0,
-      localInputTokens: local?.inputTokens ?? 0,
-      localOutputTokens: local?.outputTokens ?? 0,
-      localCachedTokens: local?.cachedTokens ?? 0,
-      localCostUsd: local?.costUsd ?? 0,
-    };
-
-    const bin = await resolveBinary('claude', this.binaryOverrides.claude);
-    if (!bin) {
-      base.error = 'claude CLI not found';
+    if (typeof adapter.readUsageLimits !== 'function') {
+      // Graceful degradation for custom/third-party drivers without remote usage hook
+      base.billingTier = this.getKnownBillingTier(adapter.id);
       return base;
     }
 
-    try {
-      const res = await execCliQuick(bin, ['auth', 'status'], 6000);
-      const parsed = JSON.parse(res.stdout.trim()) as {
-        loggedIn?: boolean;
-        authMethod?: string;
-        apiProvider?: string;
-        email?: string;
-      };
-      base.loggedIn = Boolean(parsed.loggedIn);
-      base.authMethod = parsed.authMethod ?? null;
-      base.planType = localSettings.gatewayUrl ? 'Custom Gateway (Magpie)' : parsed.apiProvider ?? null;
-      base.accountLabel =
-        parsed.email ??
-        (localSettings.gatewayUrl
-          ? `Gateway · ${localSettings.gatewayUrl}`
-          : parsed.loggedIn
-            ? 'Anthropic Account'
-            : null);
-    } catch (err) {
-      base.error = err instanceof Error ? err.message : String(err);
+    const existingCache = this.remoteCache.get(adapter.id);
+    if (!forceRefresh && existingCache && nowTs - existingCache.fetchedAt < this.ttlMs) {
+      return this.mergeRemoteResult(base, existingCache.result, existingCache.fetchedAt, true);
     }
 
-    return base;
+    const remote = await this.fetchWithDeduplication(adapter);
+    if (!remote) return base;
+    return this.mergeRemoteResult(base, remote.result, remote.fetchedAt, false);
   }
-}
 
-function formatWindowLabel(mins: number): string {
-  if (mins >= 1440) {
-    const days = Math.round(mins / 1440);
-    return `${days} 天周期限额`;
-  }
-  if (mins >= 60) {
-    const hrs = Math.round(mins / 60);
-    return `${hrs} 小时周期限额`;
-  }
-  return `${mins} 分钟限额`;
-}
+  private async fetchWithDeduplication(adapter: HarnessAdapter): Promise<CachedRemoteUsage | null> {
+    const existing = this.inflight.get(adapter.id);
+    if (existing) return existing;
 
-function clampPct(v: number): number {
-  if (!Number.isFinite(v)) return 0;
-  return Math.max(0, Math.min(100, Math.round(v)));
+    const promise = (async (): Promise<CachedRemoteUsage | null> => {
+      const fetchedAt = this.now();
+      try {
+        const result = await adapter.readUsageLimits!();
+        const entry: CachedRemoteUsage = { result, fetchedAt };
+        this.remoteCache.set(adapter.id, entry);
+        return entry;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const fallbackResult: AdapterUsageLimitResult = {
+          loggedIn: false,
+          accountLabel: null,
+          planType: null,
+          authMethod: null,
+          billingTier: 'unknown',
+          rateLimits: [],
+          error: errMsg,
+        };
+        const entry: CachedRemoteUsage = { result: fallbackResult, fetchedAt };
+        this.remoteCache.set(adapter.id, entry);
+        return entry;
+      } finally {
+        this.inflight.delete(adapter.id);
+      }
+    })();
+
+    this.inflight.set(adapter.id, promise);
+    return promise;
+  }
+
+  private mergeRemoteResult(
+    base: HarnessAccountUsage,
+    remote: AdapterUsageLimitResult,
+    fetchedAt: number,
+    cached: boolean,
+  ): HarnessAccountUsage {
+    return {
+      ...base,
+      loggedIn: remote.loggedIn,
+      accountLabel: remote.accountLabel,
+      planType: remote.planType,
+      authMethod: remote.authMethod,
+      billingTier: remote.billingTier ?? base.billingTier,
+      gatewayUrl: remote.gatewayUrl ?? base.gatewayUrl,
+      rateLimits: remote.rateLimits ?? [],
+      resetCreditsAvailable: remote.resetCreditsAvailable,
+      lifetimeTokens: remote.lifetimeTokens,
+      peakDailyTokens: remote.peakDailyTokens,
+      currentStreakDays: remote.currentStreakDays,
+      dailyBuckets:
+        remote.dailyBuckets && remote.dailyBuckets.length > 0
+          ? remote.dailyBuckets
+          : base.dailyBuckets,
+      fetchedAt,
+      cached,
+      error: remote.error ?? null,
+    };
+  }
+
+  private buildOfflineFallback(
+    instanceId: string,
+    local: LocalInstanceUsageAggregate | undefined,
+  ): HarnessAccountUsage {
+    return {
+      harnessId: instanceId,
+      harnessKind: instanceId,
+      instanceId,
+      driverId: instanceId,
+      displayName: instanceId,
+      billingTier: 'unknown',
+      loggedIn: false,
+      accountLabel: null,
+      planType: null,
+      authMethod: null,
+      rateLimits: [],
+      dailyBuckets: local?.dailyBuckets ?? [],
+      localSessionCount: local?.sessionCount ?? 0,
+      localInputTokens: local?.inputTokens ?? 0,
+      localOutputTokens: local?.outputTokens ?? 0,
+      localCachedTokens: local?.cachedTokens ?? 0,
+      localCostUsd: local?.costUsd ?? 0,
+      fetchedAt: this.now(),
+      cached: false,
+      error: `Harness instance not registered: ${instanceId}`,
+    };
+  }
 }

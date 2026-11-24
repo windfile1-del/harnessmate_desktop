@@ -50,11 +50,11 @@ export class HarnessCommandTools {
     }
     const service = this.getUsageService();
     if (!service) throw new Error('额度服务已停用');
-    const usage = await service.collectCodexUsage();
+    const usage = await service.collectInstanceUsage(session.harnessId);
     const windows = usage.rateLimits.map((item) =>
       `${item.label} · 剩余 ${(100 - item.usedPercent).toFixed(1)}%` +
       (item.resetsAt ? ` · ${new Date(item.resetsAt).toLocaleString()} 重置` : ''));
-    return [...windows, ...(windows.length ? [] : ['Codex 未返回订阅额度']),
+    return [...windows, ...(windows.length ? [] : [`${usage.displayName} 未返回订阅额度`]),
       `HarnessMate 已记录 ${usage.localInputTokens} 输入 / ${usage.localOutputTokens} 输出 tokens`,
       ...(usage.error ? [usage.error] : []),
     ].join('\n');

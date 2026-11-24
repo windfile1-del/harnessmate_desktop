@@ -3,15 +3,20 @@ import type {
   ApprovalRequest,
   Attachment,
   CanonicalEvent,
+  FailoverPolicy,
+  HarnessAccountUsage,
   HarnessCommandInfo,
+  HarnessInfo,
   PermissionMode,
   ReasoningEffort,
   Session,
   SessionModelPluginTools,
   SessionPluginAction,
+  TurnBlockRecord,
+  TurnOptionValue,
   WorkspaceFileEntry,
 } from '@harnessmate/protocol';
-import { HarnessCommandNameSchema } from '@harnessmate/protocol';
+import { HarnessCommandNameSchema, ReasoningEffortSchema } from '@harnessmate/protocol';
 import {
   AlertTriangle,
   ArrowRightLeft,
@@ -52,34 +57,61 @@ import { daemonApi, resolveAttachmentUrl } from '../api/client';
 import { formatPluginSummary, listPluginPanels } from '../lib/plugin-panels';
 import {
   formatTokenCount,
-  HARNESS_META,
   PERMISSION_MODE_LABELS,
+  resolveContextWindowMeter,
+  resolveHarnessMeta,
+  resolveHarnessOptionDescriptors,
 } from '../lib/harness-meta';
 import {
   createSessionEventProjector,
+  mergeTurnBlockRecords,
   type ProjectedSwitchEvent,
   type ProjectedToolCall,
   type ProjectedTurn,
 } from '../lib/projector';
+import {
+  buildTimelineMinimapItems,
+  groupTurnBlocks,
+  isExtensionOrUnknownBlock,
+  readTimelinePosition,
+  rememberTimelinePosition,
+  type TimelineMinimapEntry,
+} from '../lib/work-groups';
 import { useAppStore } from '../stores/app-store';
 import type { FileLink } from '../lib/file-links';
 import { Slot, SlotTurnProvider } from '../slots';
 import { HarnessBadge, StarLoomCrest } from './BrandMark';
 import { HarnessSwitcher } from './HarnessSwitcher';
+import { HtmlRenderCard } from './HtmlRenderCard';
 import { InspectorDrawer } from './InspectorDrawer';
 import { MarkdownView } from './MarkdownView';
+import {
+  FailoverInlineBanner,
+  GenericExtBlockCard,
+  TimelineMinimap,
+  WorkGroupRow,
+} from './MessageStudio';
 import { ModelPicker } from './ModelPicker';
+import {
+  loadSavedTraitValues,
+  sanitizeTraitValues,
+  TraitsPicker,
+} from './TraitsPicker';
 
 const DRIVER_LABELS: Record<string, string> = {
-  codex_inject_items: 'Codex 原生历史注入 (thread/inject_items)',
-  acp_embedded_context: 'AGY ACP 原生资源块 (embeddedContext)',
-  claude_sysfile_delta: 'Claude 系统约束 + 增量同步通道',
+  native_items: '原生结构化历史注入 (native_items)',
+  embedded_context: '原生嵌入式资源上下文 (embedded_context)',
+  sysfile_delta: '系统约束 + 增量同步通道 (sysfile_delta)',
+  inline: '结构化上下文信封 (inline)',
+  codex_inject_items: '原生历史注入 (native_items)',
+  acp_embedded_context: 'ACP 原生资源块 (embeddedContext)',
+  claude_sysfile_delta: '系统约束 + 增量同步通道',
   prompt_envelope: '结构化上下文信封',
   native_warm: '原生热记忆（零重传）',
 };
 const NO_ATTACHMENTS: Attachment[] = [];
 const NO_EVENTS: CanonicalEvent[] = [];
-const NO_ALTERNATIVES: [] = [];
+const NO_TURN_ITEMS: TurnBlockRecord[] = [];
 const TIMELINE_PAGE_SIZE = 80;
 
 export function ChatStage() {
@@ -94,6 +126,11 @@ export function ChatStage() {
     focusTurn,
     selectedSessionId,
     events,
+    turnItems,
+    accountUsage,
+    failoverPolicy,
+    traitsByScope,
+    setTraitValue,
     selectedTaskState,
     selectedContextPreview,
     selectedDraft,
@@ -131,6 +168,11 @@ export function ChatStage() {
     focusTurn: state.focusTurn,
     selectedSessionId: state.selectedSessionId,
     events: state.selectedSessionId ? state.eventsBySession[state.selectedSessionId] : undefined,
+    turnItems: state.selectedSessionId ? state.turnItemsBySession[state.selectedSessionId] : undefined,
+    accountUsage: state.accountUsage,
+    failoverPolicy: state.failoverPolicy,
+    traitsByScope: state.traitsByScope,
+    setTraitValue: state.setTraitValue,
     selectedTaskState: state.selectedSessionId ? state.taskStateBySession[state.selectedSessionId] : undefined,
     selectedContextPreview: state.selectedSessionId ? state.contextPreviewBySession[state.selectedSessionId] : undefined,
     selectedDraft: state.selectedSessionId ? state.draftTextBySession[state.selectedSessionId] : undefined,
@@ -181,19 +223,76 @@ export function ChatStage() {
   );
 
   const visibleEvents = events ?? NO_EVENTS;
+  const visibleTurnItems = turnItems ?? NO_TURN_ITEMS;
   const taskState = selectedTaskState ?? null;
   const contextPreview = selectedContextPreview ?? null;
   const project = useMemo(() => createSessionEventProjector(), [selectedSessionId]);
-  const timeline = project(visibleEvents, session ? { id: session.harnessId, kind: session.harnessKind } : undefined);
-  const readyAlternativeHarnesses = useMemo(
-    () => harnesses.filter((h) => h.id !== session?.harnessId && h.health === 'ready'),
-    [harnesses, session?.harnessId],
+  const baseTimeline = project(
+    visibleEvents,
+    session ? { id: session.harnessId, kind: session.harnessKind } : undefined,
+  );
+  const timeline = useMemo(
+    () =>
+      visibleTurnItems.length > 0
+        ? mergeTurnBlockRecords(baseTimeline, visibleTurnItems)
+        : baseTimeline,
+    [baseTimeline, visibleTurnItems],
+  );
+  const minimapEntries = useMemo(
+    () =>
+      session
+        ? buildTimelineMinimapItems(timeline.items, {
+            id: session.harnessId,
+            kind: session.harnessKind,
+          })
+        : [],
+    [timeline.items, session],
   );
   const autoFailoverEnabled = isPluginEnabled('core.auto-failover');
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = isPluginEnabled('core.task-ledger');
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
   const commandCatalogKey = session ? `${session.id}:${session.harnessId}` : '';
+
+  const traitScopeKey = session ? `${session.id}:${session.harnessId}` : '';
+  const instanceTraitScopeKey = session ? `instance:${session.harnessId}` : '';
+  const activeOptionDescriptors = useMemo(
+    () => resolveHarnessOptionDescriptors(harness, session?.model),
+    [harness, session?.model],
+  );
+  const effectiveTraitValues = useMemo(() => {
+    if (!session) return {};
+    const fromInstance = traitsByScope[instanceTraitScopeKey] ?? loadSavedTraitValues(instanceTraitScopeKey);
+    const fromSession = traitsByScope[traitScopeKey] ?? loadSavedTraitValues(traitScopeKey);
+    const merged: Record<string, TurnOptionValue | undefined> = {
+      ...fromInstance,
+      ...fromSession,
+    };
+    if (session.reasoningEffort) {
+      if (activeOptionDescriptors.some((d) => d.key === 'reasoningEffort')) {
+        merged.reasoningEffort = session.reasoningEffort;
+      } else if (activeOptionDescriptors.some((d) => d.key === 'effort')) {
+        merged.effort = session.reasoningEffort;
+      }
+    }
+    return sanitizeTraitValues(activeOptionDescriptors, merged);
+  }, [session, traitsByScope, instanceTraitScopeKey, traitScopeKey, activeOptionDescriptors]);
+
+  const handleTraitChange = useCallback(
+    (key: string, value: TurnOptionValue | null) => {
+      if (!session) return;
+      setTraitValue(traitScopeKey, key, value);
+      setTraitValue(instanceTraitScopeKey, key, value);
+      if (key === 'reasoningEffort' || key === 'effort') {
+        const parsedEffort =
+          typeof value === 'string' ? ReasoningEffortSchema.safeParse(value) : null;
+        void updateSession(session.id, {
+          reasoningEffort: parsedEffort?.success ? parsedEffort.data : null,
+        });
+      }
+    },
+    [session, traitScopeKey, instanceTraitScopeKey, setTraitValue, updateSession],
+  );
 
   const inputText = selectedDraft ?? '';
   const attachments = selectedAttachments ?? NO_ATTACHMENTS;
@@ -238,11 +337,21 @@ export function ChatStage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (previousSessionId.current !== selectedSessionId) {
-      followBottom.current = true;
-      previousSessionId.current = selectedSessionId;
-    }
     const el = scrollRef.current;
+    if (previousSessionId.current !== selectedSessionId) {
+      previousSessionId.current = selectedSessionId;
+      const saved = selectedSessionId ? readTimelinePosition(selectedSessionId) : null;
+      if (saved && el) {
+        followBottom.current = saved.followBottom;
+        if (saved.followBottom) {
+          el.scrollTop = el.scrollHeight;
+        } else {
+          el.scrollTop = saved.scrollTop;
+        }
+        return;
+      }
+      followBottom.current = true;
+    }
     if (el && followBottom.current) el.scrollTop = el.scrollHeight;
   }, [visibleEvents.length, selectedSessionId]);
 
@@ -349,14 +458,16 @@ export function ChatStage() {
   const commandArgs = commandMatch?.[2]?.trim() ?? '';
   const nativeCommandName = HarnessCommandNameSchema.safeParse(
     typedCommand === 'quota' ? 'usage' : typedCommand === 'plugins' ? 'plugin' : typedCommand);
-  const isGoalControl = nativeCommandsEnabled && session.harnessKind === 'codex'
-    && typedCommand === 'goal' && ['', 'status', 'pause', 'clear'].includes(commandArgs);
-
-  const selectedModelMeta = harness?.models.find((m) => m.id === session.model) ?? null;
-  const availableEfforts: ReasoningEffort[] =
-    selectedModelMeta?.supportedEfforts && selectedModelMeta.supportedEfforts.length > 0
-      ? selectedModelMeta.supportedEfforts
-      : harness?.capabilities.reasoningEfforts ?? [];
+  const supportsGoalControl = Boolean(
+    harness?.capabilitiesV2?.nativeCommands?.includes('goal') ||
+      nativeCommands.some((c) => c.command === 'goal'),
+  );
+  const isGoalControl =
+    nativeCommandsEnabled &&
+    supportsGoalControl &&
+    typedCommand === 'goal' &&
+    ['', 'status', 'pause', 'clear'].includes(commandArgs);
+  const contextMeter = resolveContextWindowMeter(session.usage);
 
   const handleUploadFiles = async (fileList: FileList | File[]) => {
     const filesArr = Array.from(fileList);
@@ -517,8 +628,13 @@ export function ChatStage() {
       clearDraft(session.id);
       setFilePickerOpen(false);
       const approved = suggestionChoice === 'apply' && activeSuggestion;
-      await sendTurn(session.id, approved ? approved.text : outgoingText, turnAttachments,
-        { omitHandoff: handoffOmitted, literalText: Boolean(approved), mode: pluginMode ? 'plugin_development' : undefined });
+      await sendTurn(session.id, approved ? approved.text : outgoingText, turnAttachments, {
+        omitHandoff: handoffOmitted,
+        literalText: Boolean(approved),
+        mode: pluginMode ? 'plugin_development' : undefined,
+        turnOptions:
+          Object.keys(effectiveTraitValues).length > 0 ? effectiveTraitValues : undefined,
+      });
       setOmitHandoffFor(undefined);
     } finally {
       setSending(false);
@@ -673,22 +789,56 @@ export function ChatStage() {
           </div>
 
           <div className="app-no-drag flex shrink-0 items-center gap-1.5">
-            {session.usage && (
-              <div
-                className="hidden items-center gap-1.5 rounded-full px-2.5 py-1 font-mono-code text-[10.5px] text-[var(--text-muted)] xl:flex"
+            {contextMeter && (
+              <button
+                type="button"
+                onClick={() => openModal('usage')}
+                title={
+                  `上下文窗口占用 ${contextMeter.usagePercent}% (${formatTokenCount(contextMeter.usedTokens)} / ${formatTokenCount(contextMeter.maxTokens)})${contextMeter.isEstimated ? ' · 估算' : ''}` +
+                  (contextMeter.cacheHitRate !== null ? ` · Prompt Cache 命中 ${contextMeter.cacheHitRate}%` : '') +
+                  (contextMeter.level === 'critical'
+                    ? ' · 建议立即 /compact 或开启新会话'
+                    : contextMeter.level === 'warning'
+                      ? ' · 上下文接近高位'
+                      : '')
+                }
+                className="hidden cursor-pointer items-center gap-1.5 rounded-full px-2.5 py-1 font-mono-code text-[10.5px] transition-colors hover:bg-[var(--bg-hover)] xl:flex"
                 style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  border: '1px solid var(--border-hairline)',
+                  backgroundColor:
+                    contextMeter.level === 'critical'
+                      ? 'var(--accent-rose-soft)'
+                      : contextMeter.level === 'warning'
+                        ? 'var(--accent-star-soft)'
+                        : 'var(--bg-surface)',
+                  color:
+                    contextMeter.level === 'critical'
+                      ? 'var(--accent-rose)'
+                      : contextMeter.level === 'warning'
+                        ? 'var(--accent-star)'
+                        : 'var(--text-muted)',
+                  border: `1px solid ${
+                    contextMeter.level === 'critical'
+                      ? 'color-mix(in srgb, var(--accent-rose) 35%, transparent)'
+                      : contextMeter.level === 'warning'
+                        ? 'color-mix(in srgb, var(--accent-star) 35%, transparent)'
+                        : 'var(--border-hairline)'
+                  }`,
                 }}
               >
-                <span>↑{formatTokenCount(session.usage.inputTokens)}</span>
-                <span>↓{formatTokenCount(session.usage.outputTokens)}</span>
-                {session.usage.costUsd !== undefined && session.usage.costUsd > 0 && (
+                <span>
+                  {formatTokenCount(contextMeter.usedTokens)}/{formatTokenCount(contextMeter.maxTokens)} · {contextMeter.usagePercent}%
+                </span>
+                {contextMeter.cacheHitRate !== null && (
+                  <span style={{ color: 'var(--accent-emerald)' }}>
+                    Cache {contextMeter.cacheHitRate}%
+                  </span>
+                )}
+                {session.usage?.costUsd !== undefined && session.usage.costUsd > 0 && (
                   <span className="text-[var(--accent-star)]">
                     ${session.usage.costUsd.toFixed(3)}
                   </span>
                 )}
-              </div>
+              </button>
             )}
 
             {taskLedgerEnabled && (
@@ -791,60 +941,80 @@ export function ChatStage() {
           </div>
         )}
 
-        {/* Main Conversation Stream */}
-        <div
-          ref={scrollRef}
-          style={{ overflowAnchor: 'none' }}
-          onScroll={(event) => {
-            const el = event.currentTarget;
-            followBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 72;
-          }}
-          className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6"
-        >
-          <div className="mx-auto max-w-[760px] space-y-7">
-            {firstVisible > 0 && (
-              <button type="button" className="mx-auto block cursor-pointer rounded-lg px-3 py-1.5 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
-                onClick={() => {
-                  previousHistoryHeight.current = scrollRef.current?.scrollHeight ?? null;
-                  followBottom.current = false;
-                  setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
-                }}>
-                加载更早的消息（{firstVisible}）
-              </button>
-            )}
-            {timeline.items.length === 0 ? (
-              <SessionReadyPlaceholder
-                session={session}
-                onQuickPrompt={(t) => setDraftText(session.id, t)}
-              />
-            ) : (
-              timeline.items.slice(firstVisible).map((item) =>
-                item.kind === 'switch' ? (
-                  <HarnessSwitchDivider
-                    key={`sw_${item.seq}`}
-                    event={item}
-                    onInspect={() => openModal('context_preview')}
-                  />
-                ) : (
-                  <TurnBlock
-                    key={item.turnId}
-                    session={session}
-                    turn={item}
-                    fallbackHarnessKind={session.harnessKind}
-                    fallbackHarnessId={session.harnessId}
-                    alternativeHarnesses={
-                      autoFailoverEnabled && !isRunning && item.status === 'failed' ? readyAlternativeHarnesses : NO_ALTERNATIVES
-                    }
-                    onFailover={onFailover}
-                    onPreviewImage={setLightboxImg}
-                    onResolveApproval={resolveApproval}
-                    onOpenFile={openFile}
-                  />
-                ),
-              )
-            )}
-            <div className="h-4" />
+        {/* Main Conversation Stream + Turn Minimap */}
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <div
+            ref={scrollRef}
+            style={{ overflowAnchor: 'none' }}
+            onScroll={(event) => {
+              const el = event.currentTarget;
+              const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 72;
+              followBottom.current = atBottom;
+              rememberTimelinePosition(session.id, el.scrollTop, atBottom);
+            }}
+            className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6"
+          >
+            <div className="mx-auto max-w-[760px] space-y-7">
+              {firstVisible > 0 && (
+                <button
+                  type="button"
+                  className="mx-auto block cursor-pointer rounded-lg px-3 py-1.5 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+                  onClick={() => {
+                    previousHistoryHeight.current = scrollRef.current?.scrollHeight ?? null;
+                    followBottom.current = false;
+                    setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
+                  }}
+                >
+                  加载更早的消息（{firstVisible}）
+                </button>
+              )}
+              {timeline.items.length === 0 ? (
+                <SessionReadyPlaceholder
+                  session={session}
+                  onQuickPrompt={(t) => setDraftText(session.id, t)}
+                />
+              ) : (
+                timeline.items.slice(firstVisible).map((item) =>
+                  item.kind === 'switch' ? (
+                    <HarnessSwitchDivider
+                      key={`sw_${item.seq}`}
+                      event={item}
+                      harnesses={harnesses}
+                      onInspect={() => openModal('context_preview')}
+                    />
+                  ) : (
+                    <TurnBlock
+                      key={item.turnId}
+                      session={session}
+                      turn={item}
+                      harnesses={harnesses}
+                      accountUsage={accountUsage}
+                      failoverPolicy={failoverPolicy}
+                      fallbackHarnessKind={session.harnessKind}
+                      fallbackHarnessId={session.harnessId}
+                      allowFailover={autoFailoverEnabled && !isRunning && item.status === 'failed'}
+                      onFailover={onFailover}
+                      onPreviewImage={setLightboxImg}
+                      onResolveApproval={resolveApproval}
+                      onOpenFile={openFile}
+                    />
+                  ),
+                )
+              )}
+              <div className="h-4" />
+            </div>
           </div>
+
+          <TimelineMinimap
+            entries={minimapEntries}
+            harnesses={harnesses}
+            activeTurnId={focusedTurn?.turnId ?? null}
+            onJump={(entry: TimelineMinimapEntry) => {
+              if (entry.kind === 'turn') {
+                focusTurn({ sessionId: session.id, turnId: entry.id });
+              }
+            }}
+          />
         </div>
 
         {commandOutputs[session.id]?.output && (
@@ -1232,30 +1402,26 @@ export function ChatStage() {
                   />
                 )}
 
-                {/* Per-Model Dynamic Reasoning Effort Selector */}
-                {availableEfforts.length > 0 && (
-                  <select
-                    value={session.reasoningEffort ?? ''}
-                    disabled={isRunning}
-                    onChange={(e) =>
-                      void updateSession(session.id, {
-                        reasoningEffort: (e.target.value || null) as ReasoningEffort | null,
-                      })
-                    }
-                    className="cursor-pointer rounded-lg px-2 py-1 text-[11.5px] text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)] focus:outline-none disabled:opacity-50"
-                    style={{
-                      backgroundColor: 'var(--bg-elevated)',
-                      border: '1px solid var(--border-hairline)',
-                    }}
-                  >
-                    <option value="">推理: 默认</option>
-                    {availableEfforts.map((eff) => (
-                      <option key={eff} value={eff}>
-                        推理: {eff}
-                      </option>
-                    ))}
-                  </select>
-                )}
+                {/* V5 Schema-Driven Dynamic TraitsPicker (composer.traits slot) */}
+                <Slot
+                  name="composer.traits"
+                  slotProps={{
+                    session,
+                    harness,
+                    disabled: isRunning,
+                    values: effectiveTraitValues,
+                    onChange: handleTraitChange,
+                  }}
+                  compactErrors
+                  fallback={
+                    <TraitsPicker
+                      descriptors={activeOptionDescriptors}
+                      values={effectiveTraitValues}
+                      disabled={isRunning}
+                      onChange={handleTraitChange}
+                    />
+                  }
+                />
 
                 {/* Permission Mode Selector */}
                 <select
@@ -1344,13 +1510,21 @@ function readFileAsBase64(file: File): Promise<string> {
 
 function HarnessSwitchDivider({
   event,
+  harnesses,
   onInspect,
 }: {
   event: ProjectedSwitchEvent;
+  harnesses: readonly HarnessInfo[];
   onInspect: () => void;
 }) {
-  const fromMeta = HARNESS_META[event.fromHarnessKind] ?? HARNESS_META.acp;
-  const toMeta = HARNESS_META[event.toHarnessKind] ?? HARNESS_META.acp;
+  const fromMeta = resolveHarnessMeta(
+    { harnessId: event.fromHarnessId, harnessKind: event.fromHarnessKind },
+    harnesses,
+  );
+  const toMeta = resolveHarnessMeta(
+    { harnessId: event.toHarnessId, harnessKind: event.toHarnessKind },
+    harnesses,
+  );
 
   return (
     <div className="animate-fade-up flex items-center gap-3 py-1">
@@ -1400,9 +1574,12 @@ function HarnessSwitchDivider({
 const TurnBlock = memo(function TurnBlock({
   session,
   turn,
+  harnesses,
+  accountUsage,
+  failoverPolicy,
   fallbackHarnessKind,
   fallbackHarnessId,
-  alternativeHarnesses,
+  allowFailover,
   onFailover,
   onPreviewImage,
   onResolveApproval,
@@ -1410,9 +1587,12 @@ const TurnBlock = memo(function TurnBlock({
 }: {
   session: Session;
   turn: ProjectedTurn;
+  harnesses: readonly HarnessInfo[];
+  accountUsage: readonly HarnessAccountUsage[];
+  failoverPolicy: FailoverPolicy | null;
   fallbackHarnessKind: Session['harnessKind'];
   fallbackHarnessId: string;
-  alternativeHarnesses: Array<{ id: string; kind: Session['harnessKind']; displayName: string }>;
+  allowFailover: boolean;
   onFailover: (targetHarnessId: string) => void;
   onPreviewImage: (src: string) => void;
   onResolveApproval: (id: string, decision: 'allow_once' | 'allow_session' | 'deny') => void;
@@ -1420,8 +1600,15 @@ const TurnBlock = memo(function TurnBlock({
 }) {
   const effectiveKind = turn.harnessKind ?? fallbackHarnessKind;
   const effectiveId = turn.harnessId ?? fallbackHarnessId;
-  const meta = HARNESS_META[effectiveKind] ?? HARNESS_META.acp;
+  const meta = resolveHarnessMeta(
+    { harnessId: effectiveId, harnessKind: effectiveKind },
+    harnesses,
+  );
   const turnModelLabel = turn.actualModel || turn.model;
+  const groupedSegments = useMemo(
+    () => (turn.blocks.length > 0 ? groupTurnBlocks(turn.blocks, turn.status === 'running') : []),
+    [turn.blocks, turn.status],
+  );
 
   return (
     <SlotTurnProvider turn={turn}>
@@ -1522,19 +1709,127 @@ const TurnBlock = memo(function TurnBlock({
           )}
         </div>
 
-        {turn.thinking && (
-          <ThinkingAccordion
-            text={turn.thinking}
-            running={turn.status === 'running' && !turn.thinkingDone}
-          />
-        )}
-
-        {turn.tools.length > 0 && (
-          <div className="space-y-2">
-            {turn.tools.map((tool) => (
-              <ToolCallCard key={tool.toolCallId} session={session} tool={tool} />
-            ))}
+        {groupedSegments.length > 0 ? (
+          <div className="space-y-2.5">
+            {groupedSegments.map((segment) => {
+              if (segment.kind === 'work_group') {
+                return <WorkGroupRow key={segment.groupId} session={session} group={segment} />;
+              }
+              const block = segment.block;
+              if (block.type === 'assistant_text') {
+                return (
+                  <div key={block.blockId} className="pl-0.5">
+                    <Slot
+                      name="chat.message.wrapper"
+                      slotProps={{ session, turn, children: null }}
+                    >
+                      {block.streaming || turn.status === 'running' ? (
+                        <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">
+                          {block.text}
+                        </div>
+                      ) : (
+                        <MarkdownView content={block.text} onOpenFile={onOpenFile} />
+                      )}
+                    </Slot>
+                  </div>
+                );
+              }
+              if (block.type === 'html_render') {
+                return (
+                  <Slot
+                    key={block.blockId}
+                    name="chat.block"
+                    matchKey="html_render"
+                    slotProps={{ session, turn, block, onOpenFile, onFailover }}
+                    fallback={
+                      <HtmlRenderCard
+                        renderId={block.renderId}
+                        title={block.title}
+                        html={block.html}
+                        preferredHeightPx={block.preferredHeightPx}
+                        allowFullscreen={block.allowFullscreen}
+                      />
+                    }
+                  />
+                );
+              }
+              if (block.type === 'system_notice') {
+                return (
+                  <div
+                    key={block.blockId}
+                    className="rounded-xl px-3 py-2 text-[12px]"
+                    style={{
+                      backgroundColor:
+                        block.level === 'error'
+                          ? 'var(--accent-rose-soft)'
+                          : block.level === 'warn'
+                            ? 'var(--accent-star-soft)'
+                            : 'var(--bg-surface)',
+                      border: '1px solid var(--border-hairline)',
+                      color:
+                        block.level === 'error'
+                          ? 'var(--accent-rose)'
+                          : block.level === 'warn'
+                            ? 'var(--accent-star)'
+                            : 'var(--text-secondary)',
+                    }}
+                  >
+                    {block.message}
+                  </div>
+                );
+              }
+              if (isExtensionOrUnknownBlock(block)) {
+                const matchKey = block.type === 'unknown_block' ? block.originalType : block.type;
+                return (
+                  <Slot
+                    key={block.blockId}
+                    name="chat.block"
+                    matchKey={matchKey}
+                    slotProps={{ session, turn, block, onOpenFile, onFailover }}
+                    fallback={<GenericExtBlockCard block={block} />}
+                  />
+                );
+              }
+              return (
+                <Slot
+                  key={block.blockId}
+                  name="chat.block"
+                  matchKey={block.type}
+                  slotProps={{ session, turn, block, onOpenFile, onFailover }}
+                />
+              );
+            })}
           </div>
+        ) : (
+          <>
+            {turn.thinking && (
+              <ThinkingAccordion
+                text={turn.thinking}
+                running={turn.status === 'running' && !turn.thinkingDone}
+              />
+            )}
+
+            {turn.tools.length > 0 && (
+              <div className="space-y-2">
+                {turn.tools.map((tool) => (
+                  <ToolCallCard key={tool.toolCallId} session={session} tool={tool} />
+                ))}
+              </div>
+            )}
+
+            {turn.assistantText && (
+              <div className="pl-0.5">
+                <Slot
+                  name="chat.message.wrapper"
+                  slotProps={{ session, turn, children: null }}
+                >
+                  {turn.status === 'running' ? (
+                    <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">{turn.assistantText}</div>
+                  ) : <MarkdownView content={turn.assistantText} onOpenFile={onOpenFile} />}
+                </Slot>
+              </div>
+            )}
+          </>
         )}
 
         {turn.approvals
@@ -1548,19 +1843,6 @@ const TurnBlock = memo(function TurnBlock({
             />
           ))}
 
-        {turn.assistantText && (
-          <div className="pl-0.5">
-            <Slot
-              name="chat.message.wrapper"
-              slotProps={{ session, turn, children: null }}
-            >
-              {turn.status === 'running' ? (
-                <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">{turn.assistantText}</div>
-              ) : <MarkdownView content={turn.assistantText} onOpenFile={onOpenFile} />}
-            </Slot>
-          </div>
-        )}
-
         <Slot
           name="chat.node"
           matchKey={`turn.${turn.status}`}
@@ -1572,52 +1854,16 @@ const TurnBlock = memo(function TurnBlock({
         />
 
         {turn.status === 'failed' && turn.errorMessage && (
-          <div
-            className="space-y-2.5 rounded-xl px-3.5 py-3 text-[13px]"
-            style={{
-              backgroundColor: 'var(--accent-rose-soft)',
-              border: '1px solid color-mix(in srgb, var(--accent-rose) 35%, transparent)',
-              color: 'var(--accent-rose)',
-            }}
-          >
-            <div className="flex items-start gap-2.5">
-              <AlertTriangle size={15} className="mt-0.5 shrink-0" />
-              <div className="min-w-0 break-words">{turn.errorMessage}</div>
-            </div>
-
-            {alternativeHarnesses.length > 0 && (
-              <div
-                className="flex flex-wrap items-center gap-1.5 pt-2"
-                style={{ borderTop: '1px solid color-mix(in srgb, var(--accent-rose) 22%, transparent)' }}
-              >
-                <span className="inline-flex items-center gap-1 text-[11px] text-[var(--text-secondary)]">
-                  <RefreshCw size={11} />
-                  带着完整上下文一键换引擎续跑：
-                </span>
-                {alternativeHarnesses.slice(0, 3).map((alt) => {
-                  const altMeta = HARNESS_META[alt.kind] ?? HARNESS_META.acp;
-                  return (
-                    <button
-                      key={alt.id}
-                      type="button"
-                      onClick={() => onFailover(alt.id)}
-                      className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        border: '1px solid var(--border-strong)',
-                      }}
-                    >
-                      <span
-                        className="h-1.5 w-1.5 rounded-full"
-                        style={{ backgroundColor: altMeta.accentColor }}
-                      />
-                      <span>切换 {altMeta.shortLabel} 续跑</span>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+          <FailoverInlineBanner
+            failedInstanceId={effectiveId}
+            failureClass={turn.failureClass}
+            errorMessage={turn.errorMessage}
+            resetsAt={turn.resetsAt}
+            harnesses={allowFailover ? harnesses : []}
+            accountUsage={accountUsage}
+            failoverPolicy={failoverPolicy}
+            onFailover={onFailover}
+          />
         )}
       </div>
     </div>
@@ -1969,7 +2215,7 @@ function AtelierWelcome({
             模块化微内核，编织全部 Agent Harness
           </h1>
           <p className="mx-auto mt-2.5 max-w-[540px] text-[13.8px] leading-relaxed text-[var(--text-secondary)]">
-            实时同步本机 Codex、Antigravity、Claude Code 与任意 ACP CLI 的真实模型、账号限额与 MCP；
+            实时同步全部已注册 CLI 与插件 Harness 的真实模型、动态参数、多账号限额与 MCP；
             所有能力均以插件方式按需装卸，并原生联动移动端 HarnessMate。
           </p>
         </div>
@@ -1977,7 +2223,7 @@ function AtelierWelcome({
         {/* Live Probed Harness Launch Cards */}
         <div className="mt-9 grid grid-cols-1 gap-3.5 sm:grid-cols-3">
           {harnesses.slice(0, 6).map((h) => {
-            const meta = HARNESS_META[h.kind] ?? HARNESS_META.acp;
+            const meta = resolveHarnessMeta({ harness: h }, harnesses);
             const ready = h.health === 'ready';
             return (
               <button
@@ -1993,7 +2239,7 @@ function AtelierWelcome({
               >
                 <div>
                   <div className="flex items-center justify-between gap-2">
-                    <HarnessBadge kind={h.kind} label={h.displayName} />
+                    <HarnessBadge kind={h.kind} label={h.displayName} presentation={h.presentation} />
                     <span
                       className="font-mono-code text-[11px] font-medium"
                       style={{

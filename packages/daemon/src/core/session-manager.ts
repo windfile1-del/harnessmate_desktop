@@ -24,6 +24,7 @@ import type {
   SessionTaskState,
   SwitchHarnessRequest,
   TurnBlockRecord,
+  TurnOptionsMap,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
   Workspace,
@@ -45,6 +46,7 @@ import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js'
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
+import { classifyTerminalFailure, FAILOVER_TRIGGER_CLASSES } from './failover-service.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
@@ -80,7 +82,15 @@ interface ActiveTurnMeta {
 
 const MAX_WARM_HANDLES = 6;
 const MAX_STORED_TOOL_OUTPUT_CHARS = 16_384;
-type TurnOptions = { harnessId?: string; model?: string | null; omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' };
+const MAX_TURN_ITEM_TEXT_CHARS = 512_000;
+type TurnOptions = {
+  harnessId?: string;
+  model?: string | null;
+  turnOptions?: TurnOptionsMap;
+  omitHandoff?: boolean;
+  literalText?: boolean;
+  mode?: 'plugin_development';
+};
 
 export class SessionManager {
   readonly commandOutputHub: CommandOutputHub;
@@ -155,6 +165,48 @@ export class SessionManager {
     opts?: { afterSeq?: number; turnId?: string; blockTypes?: string[]; limit?: number },
   ): TurnBlockRecord[] {
     return this.store.listTurnItems(sessionId, opts);
+  }
+
+  getSessionTurnItemSlice(
+    sessionId: string,
+    itemId: string,
+    opts: { textOffset: number; maxChars: number },
+  ): {
+    item: TurnBlockRecord;
+    text: string;
+    totalChars: number;
+    textOffset: number;
+    nextTextOffset: number | null;
+    hasMore: boolean;
+  } | null {
+    const item = this.store.getTurnItem(itemId);
+    if (!item || item.sessionId !== sessionId) return null;
+    let fullText = item.textBody;
+    const toolCallId =
+      typeof item.payload?.toolCallId === 'string'
+        ? item.payload.toolCallId
+        : item.itemId.startsWith('tool:')
+          ? item.itemId.slice(5)
+          : undefined;
+    if (toolCallId) {
+      const liveSnap = this.commandOutputHub.getSnapshot(sessionId, toolCallId);
+      if (liveSnap && liveSnap.text.length > fullText.length) {
+        fullText = liveSnap.text;
+      }
+    }
+    const totalChars = fullText.length;
+    const start = Math.min(Math.max(0, opts.textOffset), totalChars);
+    const end = Math.min(start + Math.max(1, opts.maxChars), totalChars);
+    const text = fullText.slice(start, end);
+    const hasMore = end < totalChars;
+    return {
+      item: { ...item, textBody: text },
+      text,
+      totalChars,
+      textOffset: start,
+      nextTextOffset: hasMore ? end : null,
+      hasMore,
+    };
   }
 
   getSessionRuns(sessionId: string, limit = 100): SessionRunRecord[] {
@@ -1192,6 +1244,7 @@ export class SessionManager {
         model: session.model,
         reasoningEffort: session.reasoningEffort,
         permissionMode: session.permissionMode,
+        ...(turnOpts?.turnOptions ? { turnOptions: turnOpts.turnOptions } : {}),
         ...native,
       }, compiled, (type, payload) => { this.emitCanonical(sessionId, type, payload, turnId); });
 
@@ -1699,10 +1752,17 @@ export class SessionManager {
       case 'turn.failed': {
         this.deltaCoalescer.flushSession(sessionId);
         this.expireSessionApprovals(sessionId);
+        const failureClass = classifyTerminalFailure(ev.code, ev.message);
+        let cooldownResetsAt: number | null = null;
+        if (FAILOVER_TRIGGER_CLASSES.has(failureClass)) {
+          const failoverSvc = this.pluginManager.host.get<FailoverService>('failover');
+          const rec = failoverSvc?.recordFailure?.(eventHarnessId, failureClass);
+          cooldownResetsAt = rec?.resetsAt ?? null;
+        }
         if (meta) {
           this.store.finishSessionRun(meta.runId, {
             status: 'failed',
-            failureClass: ev.code ?? (/rate.?limit|quota|429/i.test(ev.message) ? 'usage_limit' : 'provider_error'),
+            failureClass,
           });
         }
         this.store.settleRunningTurnItems(sessionId, 'interrupted');
@@ -1712,6 +1772,8 @@ export class SessionManager {
           {
             message: ev.message,
             code: ev.code ?? null,
+            failureClass,
+            ...(cooldownResetsAt ? { resetsAt: cooldownResetsAt } : {}),
             harnessId: eventHarnessId,
             harnessKind: eventHarnessKind,
             model: activeTurnModel,
@@ -1899,10 +1961,14 @@ export class SessionManager {
         const hubSnap = this.commandOutputHub.getSnapshot(sessionId, ev.toolCallId);
         const rawOutput = ev.output ?? hubSnap?.text ?? null;
         const outputBytes = rawOutput ? Buffer.byteLength(rawOutput, 'utf8') : 0;
+        const existingItem = this.store.getTurnItem(`tool:${ev.toolCallId}`);
         const outputOmitted = Boolean(rawOutput && rawOutput.length > MAX_STORED_TOOL_OUTPUT_CHARS);
         const storedOutput = outputOmitted && rawOutput
           ? rawOutput.slice(0, MAX_STORED_TOOL_OUTPUT_CHARS)
           : rawOutput;
+        const turnItemBody = rawOutput
+          ? rawOutput.slice(0, MAX_TURN_ITEM_TEXT_CHARS)
+          : existingItem?.textBody ?? '';
 
         const toolDoneEv = this.emitCanonical(
           sessionId,
@@ -1919,7 +1985,6 @@ export class SessionManager {
           },
           ev.turnId,
         );
-        const existingItem = this.store.getTurnItem(`tool:${ev.toolCallId}`);
         this.store.upsertTurnItem({
           itemId: `tool:${ev.toolCallId}`,
           schemaVersion: 2,
@@ -1931,7 +1996,7 @@ export class SessionManager {
           blockType: existingItem?.blockType ?? 'tool_call',
           status: ev.status === 'success' ? 'completed' : ev.status === 'cancelled' ? 'cancelled' : 'failed',
           title: ev.toolName,
-          textBody: storedOutput ?? existingItem?.textBody ?? '',
+          textBody: turnItemBody,
           payload: {
             ...(existingItem?.payload ?? {}),
             toolCallId: ev.toolCallId,

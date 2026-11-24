@@ -29,13 +29,13 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { SlotErrorBoundary, useSlotItems, useSlotRegistry } from '../slots';
+import { Slot, SlotErrorBoundary, useSlotItems, useSlotRegistry } from '../slots';
 import {
   daemonApi,
   type ProjectInstructionInfo,
   type TerminalExecResult,
 } from '../api/client';
-import { formatTokenCount, HARNESS_META } from '../lib/harness-meta';
+import { formatTokenCount, resolveHarnessMeta } from '../lib/harness-meta';
 import type { DiagnosticEntry } from '../lib/projector';
 import { useAppStore } from '../stores/app-store';
 
@@ -47,6 +47,7 @@ export function InspectorDrawer({
   diagnostics: DiagnosticEntry[];
 }) {
   const {
+    harnesses,
     inspectorTab,
     inspectorFile,
     openInspectorFile,
@@ -66,6 +67,7 @@ export function InspectorDrawer({
     pushToast,
     isPluginEnabled,
   } = useAppStore(useShallow((state) => ({
+    harnesses: state.harnesses,
     inspectorTab: state.inspectorTab,
     inspectorFile: state.inspectorFile,
     openInspectorFile: state.openInspectorFile,
@@ -601,7 +603,10 @@ export function InspectorDrawer({
                 </span>
                 <div className="space-y-1">
                   {session.bindings!.map((b) => {
-                    const meta = HARNESS_META[b.harnessKind] ?? HARNESS_META.acp;
+                    const meta = resolveHarnessMeta(
+                      { harnessId: b.harnessId, harnessKind: b.harnessKind },
+                      harnesses,
+                    );
                     const upToDate = b.syncedUpToSeq >= session.lastSeq;
                     return (
                       <div
@@ -729,104 +734,114 @@ export function InspectorDrawer({
         )}
 
         {inspectorTab === 'git' && (
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-[12px] text-[var(--text-secondary)]">
-                <GitBranch size={13.5} className="text-[var(--accent-indigo)]" />
-                <span className="font-mono-code font-medium text-[var(--text-primary)]">
-                  {git?.isGitRepo ? git.branch || 'HEAD' : '非 Git 仓库'}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => void refreshGitStatus(session.id)}
-                className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-              >
-                <RefreshCw size={12} />
-                <span>刷新</span>
-              </button>
-            </div>
-
-            {!git || !git.isGitRepo ? (
-              <EmptyBox text="当前目录未检测到 Git 版本库，无法展示差异。" />
-            ) : git.changes.length === 0 ? (
-              <EmptyBox text="工作区干净，暂无未提交改动。" />
-            ) : (
-              <>
-                <div
-                  className="overflow-hidden rounded-xl"
-                  style={{
-                    backgroundColor: 'var(--bg-surface)',
-                    border: '1px solid var(--border-hairline)',
-                  }}
-                >
-                  {git.changes.map((c) => (
-                    <div
-                      key={`${c.staged ? 's' : 'u'}-${c.path}`}
-                      className="flex items-center justify-between gap-2 px-3 py-1.5 text-[11.5px]"
-                      style={{ borderBottom: '1px solid var(--border-hairline)' }}
-                    >
-                      <span className="font-mono-code truncate text-[var(--text-primary)]">
-                        {c.path}
-                      </span>
-                      <span
-                        className="shrink-0 rounded px-1.5 py-0.5 font-mono-code text-[10px] uppercase"
-                        style={{
-                          color:
-                            c.status === 'added' || c.status === 'untracked'
-                              ? 'var(--accent-emerald)'
-                              : c.status === 'deleted'
-                                ? 'var(--accent-rose)'
-                                : 'var(--accent-star)',
-                          backgroundColor: 'var(--bg-elevated)',
-                        }}
-                      >
-                        {c.status[0]}
-                      </span>
-                    </div>
-                  ))}
+          <Slot
+            name="inspector.diff"
+            slotProps={{
+              session,
+              git,
+              onRefresh: () => void refreshGitStatus(session.id),
+            }}
+            fallback={
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-[12px] text-[var(--text-secondary)]">
+                    <GitBranch size={13.5} className="text-[var(--accent-indigo)]" />
+                    <span className="font-mono-code font-medium text-[var(--text-primary)]">
+                      {git?.isGitRepo ? git.branch || 'HEAD' : '非 Git 仓库'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void refreshGitStatus(session.id)}
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  >
+                    <RefreshCw size={12} />
+                    <span>刷新</span>
+                  </button>
                 </div>
 
-                {git.diff && (
-                  <div
-                    className="overflow-x-auto rounded-xl p-2.5 font-mono-code text-[11px] leading-relaxed"
-                    style={{
-                      backgroundColor: 'var(--code-bg)',
-                      border: '1px solid var(--border-hairline)',
-                    }}
-                  >
-                    {git.diff.split('\n').map((line, i) => {
-                      const isAdd = line.startsWith('+') && !line.startsWith('+++');
-                      const isDel = line.startsWith('-') && !line.startsWith('---');
-                      const isHunk = line.startsWith('@@');
-                      return (
+                {!git || !git.isGitRepo ? (
+                  <EmptyBox text="当前目录未检测到 Git 版本库，无法展示差异。" />
+                ) : git.changes.length === 0 ? (
+                  <EmptyBox text="工作区干净，暂无未提交改动。" />
+                ) : (
+                  <>
+                    <div
+                      className="overflow-hidden rounded-xl"
+                      style={{
+                        backgroundColor: 'var(--bg-surface)',
+                        border: '1px solid var(--border-hairline)',
+                      }}
+                    >
+                      {git.changes.map((c) => (
                         <div
-                          key={i}
-                          className="whitespace-pre px-1.5"
-                          style={{
-                            backgroundColor: isAdd
-                              ? 'var(--diff-add-bg)'
-                              : isDel
-                                ? 'var(--diff-del-bg)'
-                                : 'transparent',
-                            color: isAdd
-                              ? 'var(--accent-emerald)'
-                              : isDel
-                                ? 'var(--accent-rose)'
-                                : isHunk
-                                  ? 'var(--accent-indigo)'
-                                  : 'var(--text-secondary)',
-                          }}
+                          key={`${c.staged ? 's' : 'u'}-${c.path}`}
+                          className="flex items-center justify-between gap-2 px-3 py-1.5 text-[11.5px]"
+                          style={{ borderBottom: '1px solid var(--border-hairline)' }}
                         >
-                          {line || ' '}
+                          <span className="font-mono-code truncate text-[var(--text-primary)]">
+                            {c.path}
+                          </span>
+                          <span
+                            className="shrink-0 rounded px-1.5 py-0.5 font-mono-code text-[10px] uppercase"
+                            style={{
+                              color:
+                                c.status === 'added' || c.status === 'untracked'
+                                  ? 'var(--accent-emerald)'
+                                  : c.status === 'deleted'
+                                    ? 'var(--accent-rose)'
+                                    : 'var(--accent-star)',
+                              backgroundColor: 'var(--bg-elevated)',
+                            }}
+                          >
+                            {c.status[0]}
+                          </span>
                         </div>
-                      );
-                    })}
-                  </div>
+                      ))}
+                    </div>
+
+                    {git.diff && (
+                      <div
+                        className="overflow-x-auto rounded-xl p-2.5 font-mono-code text-[11px] leading-relaxed"
+                        style={{
+                          backgroundColor: 'var(--code-bg)',
+                          border: '1px solid var(--border-hairline)',
+                        }}
+                      >
+                        {git.diff.split('\n').map((line, i) => {
+                          const isAdd = line.startsWith('+') && !line.startsWith('+++');
+                          const isDel = line.startsWith('-') && !line.startsWith('---');
+                          const isHunk = line.startsWith('@@');
+                          return (
+                            <div
+                              key={i}
+                              className="whitespace-pre px-1.5"
+                              style={{
+                                backgroundColor: isAdd
+                                  ? 'var(--diff-add-bg)'
+                                  : isDel
+                                    ? 'var(--diff-del-bg)'
+                                    : 'transparent',
+                                color: isAdd
+                                  ? 'var(--accent-emerald)'
+                                  : isDel
+                                    ? 'var(--accent-rose)'
+                                    : isHunk
+                                      ? 'var(--accent-indigo)'
+                                      : 'var(--text-secondary)',
+                              }}
+                            >
+                              {line || ' '}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
                 )}
-              </>
-            )}
-          </div>
+              </div>
+            }
+          />
         )}
 
         {inspectorTab === 'files' && (

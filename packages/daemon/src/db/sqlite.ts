@@ -7,6 +7,7 @@ import type {
   CanonicalEventType,
   ContextInjectionDriver,
   ContextSyncMode,
+  DailyTokenBucket,
   DiscoveredCliSession,
   EffectOutboxDurability,
   EffectOutboxRecord,
@@ -154,6 +155,11 @@ export interface LocalHarnessUsageAggregate {
   outputTokens: number;
   cachedTokens: number;
   costUsd: number;
+}
+
+export interface LocalInstanceUsageAggregate extends LocalHarnessUsageAggregate {
+  instanceId: string;
+  dailyBuckets: DailyTokenBucket[];
 }
 
 export class HarnessMateStore {
@@ -885,6 +891,118 @@ export class HarnessMateStore {
       }
     }
     return map;
+  }
+
+  /**
+   * Multi-instance usage aggregation backed primarily by `session_runs` (per `instance_id`),
+   * with 14-day daily token buckets and seamless merge of historical `sessions` rows that
+   * predate `session_runs`.
+   */
+  getUsageAggregatesByInstance(): Map<string, LocalInstanceUsageAggregate> {
+    const runRows = this.db
+      .prepare('SELECT session_id, instance_id, usage_json, started_at FROM session_runs')
+      .all() as unknown as Array<{
+      session_id: string;
+      instance_id: string;
+      usage_json: string | null;
+      started_at: number;
+    }>;
+
+    const map = new Map<
+      string,
+      LocalInstanceUsageAggregate & { _sessions: Set<string>; _daily: Map<string, number> }
+    >();
+    const sessionsCoveredByRuns = new Set<string>();
+
+    const ensure = (instanceId: string) => {
+      let agg = map.get(instanceId);
+      if (!agg) {
+        agg = {
+          instanceId,
+          harnessId: instanceId,
+          sessionCount: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedTokens: 0,
+          costUsd: 0,
+          dailyBuckets: [],
+          _sessions: new Set<string>(),
+          _daily: new Map<string, number>(),
+        };
+        map.set(instanceId, agg);
+      }
+      return agg;
+    };
+
+    const cutoffMs = Date.now() - 14 * 86_400_000;
+    for (const row of runRows) {
+      const agg = ensure(row.instance_id);
+      agg._sessions.add(row.session_id);
+      sessionsCoveredByRuns.add(`${row.instance_id}::${row.session_id}`);
+      const usage = safeJsonParse<TokenUsage | null>(row.usage_json, null);
+      if (usage) {
+        agg.inputTokens += usage.inputTokens || 0;
+        agg.outputTokens += usage.outputTokens || 0;
+        agg.cachedTokens += usage.cachedTokens || usage.cacheReadTokens || 0;
+        agg.costUsd += usage.costUsd || 0;
+        if (row.started_at >= cutoffMs) {
+          const day = new Date(row.started_at).toISOString().slice(0, 10);
+          agg._daily.set(
+            day,
+            (agg._daily.get(day) ?? 0) + (usage.inputTokens || 0) + (usage.outputTokens || 0),
+          );
+        }
+      }
+    }
+
+    // Merge sessions without corresponding session_runs rows (legacy / imported sessions)
+    const sessionRows = this.db
+      .prepare('SELECT id, harness_id, usage_json, updated_at FROM sessions')
+      .all() as unknown as Array<{
+      id: string;
+      harness_id: string;
+      usage_json: string | null;
+      updated_at: number;
+    }>;
+
+    for (const row of sessionRows) {
+      const agg = ensure(row.harness_id);
+      agg._sessions.add(row.id);
+      if (sessionsCoveredByRuns.has(`${row.harness_id}::${row.id}`)) continue;
+      const usage = safeJsonParse<TokenUsage | null>(row.usage_json, null);
+      if (usage) {
+        agg.inputTokens += usage.inputTokens || 0;
+        agg.outputTokens += usage.outputTokens || 0;
+        agg.cachedTokens += usage.cachedTokens || usage.cacheReadTokens || 0;
+        agg.costUsd += usage.costUsd || 0;
+        if (row.updated_at >= cutoffMs) {
+          const day = new Date(row.updated_at).toISOString().slice(0, 10);
+          agg._daily.set(
+            day,
+            (agg._daily.get(day) ?? 0) + (usage.inputTokens || 0) + (usage.outputTokens || 0),
+          );
+        }
+      }
+    }
+
+    const result = new Map<string, LocalInstanceUsageAggregate>();
+    for (const [instanceId, agg] of map.entries()) {
+      const dailyBuckets: DailyTokenBucket[] = [...agg._daily.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .slice(-14)
+        .map(([date, tokens]) => ({ date, tokens }));
+      result.set(instanceId, {
+        instanceId,
+        harnessId: instanceId,
+        sessionCount: agg._sessions.size,
+        inputTokens: agg.inputTokens,
+        outputTokens: agg.outputTokens,
+        cachedTokens: agg.cachedTokens,
+        costUsd: agg.costUsd,
+        dailyBuckets,
+      });
+    }
+    return result;
   }
 
   // ── Canonical Events ─────────────────────────────────────────────────

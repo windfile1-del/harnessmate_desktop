@@ -14,7 +14,7 @@ import {
   Sun,
   Trash2,
 } from 'lucide-react';
-import { formatRelativeTime, HARNESS_META } from '../lib/harness-meta';
+import { formatRelativeTime, resolveHarnessMeta } from '../lib/harness-meta';
 import { Slot, useSlotItems } from '../slots';
 import { useAppStore } from '../stores/app-store';
 import { StarLoomCrest } from './BrandMark';
@@ -280,7 +280,11 @@ export function Sidebar() {
           <div className="space-y-1">
             {filteredSessions.map((session) => {
               const selected = session.id === selectedSessionId;
-              const meta = HARNESS_META[session.harnessKind] ?? HARNESS_META.acp;
+              const sessionHarness = harnessById.get(session.harnessId);
+              const meta = resolveHarnessMeta(
+                { harness: sessionHarness, harnessId: session.harnessId, harnessKind: session.harnessKind },
+                harnesses,
+              );
               const ws = workspaceMap.get(session.workspaceId);
               const needsApproval =
                 session.status === 'awaiting_approval' || session.pendingApprovalCount > 0;
@@ -329,6 +333,12 @@ export function Sidebar() {
                       <span className="truncate text-[12.6px] font-medium text-[var(--text-primary)]">
                         {session.title}
                       </span>
+                      <Slot
+                        name="session.sidebar.badge"
+                        slotProps={{ session }}
+                        compactErrors
+                        className="inline-flex shrink-0 items-center gap-1"
+                      />
                     </div>
 
                     <button
@@ -354,7 +364,10 @@ export function Sidebar() {
                         {participants.map((pid) => {
                           const pInfo = harnessById.get(pid);
                           const pKind = pInfo?.kind ?? (pid === session.harnessId ? session.harnessKind : 'acp');
-                          const pMeta = HARNESS_META[pKind] ?? HARNESS_META.acp;
+                          const pMeta = resolveHarnessMeta(
+                            { harness: pInfo, harnessId: pid, harnessKind: pKind },
+                            harnesses,
+                          );
                           const isCurrent = pid === session.harnessId;
                           return (
                             <span

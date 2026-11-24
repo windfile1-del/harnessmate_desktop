@@ -9,6 +9,7 @@ import type {
   CreateSessionRequest,
   CustomAcpHarnessConfig,
   DiscoveredCliSession,
+  FailoverPolicy,
   FailoverRequest,
   GitStatusSummary,
   HarnessAccountUsage,
@@ -29,12 +30,16 @@ import type {
   SessionTaskState,
   SwitchHarnessRequest,
   ToggleMcpServerRequest,
+  TurnBlockRecord,
+  TurnOptionValue,
+  TurnOptionsMap,
   UpdateSessionRequest,
   UpdateTaskStateRequest,
   Workspace,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
 import { DaemonWsClient, daemonApi } from '../api/client';
+import { loadSavedTraitValues, persistTraitValues } from '../components/TraitsPicker';
 
 export type ActiveModal =
   | 'new_session'
@@ -94,6 +99,7 @@ interface AppState {
   accountUsage: HarnessAccountUsage[];
   usageLoading: boolean;
   usageCollectedAt: number | null;
+  failoverPolicy: FailoverPolicy | null;
 
   selectedWorkspaceId: string | null;
   harnessFilter: string | null;
@@ -101,6 +107,9 @@ interface AppState {
   selectedSessionId: string | null;
 
   eventsBySession: Record<string, CanonicalEvent[]>;
+  turnItemsBySession: Record<string, TurnBlockRecord[]>;
+  liveCommandOutputByKey: Record<string, { text: string; done: boolean; updatedAt: number }>;
+  traitsByScope: Record<string, Record<string, TurnOptionValue>>;
   gitBySession: Record<string, GitStatusSummary | null>;
   taskStateBySession: Record<string, SessionTaskState | null>;
   contextPreviewBySession: Record<string, ContextPreview | null>;
@@ -142,7 +151,12 @@ interface AppState {
   toggleMcpServer: (req: ToggleMcpServerRequest) => Promise<void>;
   removeMcpServer: (harnessId: 'codex' | 'agy' | 'claude', name: string) => Promise<void>;
 
-  refreshAccountUsage: () => Promise<void>;
+  refreshAccountUsage: (forceRefresh?: boolean) => Promise<void>;
+  refreshFailoverPolicy: () => Promise<void>;
+  updateFailoverPolicy: (policy: FailoverPolicy) => Promise<void>;
+  refreshTurnItems: (sessionId: string) => Promise<void>;
+  subscribeCommandOutput: (sessionId: string, toolCallId: string) => () => void;
+  setTraitValue: (scopeKey: string, key: string, value: TurnOptionValue | null) => void;
   refreshRemoteStatus: () => Promise<void>;
   loadDiscoveredSessions: (limit?: number) => Promise<boolean>;
 
@@ -162,8 +176,17 @@ interface AppState {
   updateTaskState: (sessionId: string, patch: UpdateTaskStateRequest) => Promise<void>;
   summarizeTaskState: (sessionId: string) => Promise<void>;
   handoffSession: (sourceId: string, targetHarnessId: string, targetModel?: string | null) => Promise<void>;
-  sendTurn: (sessionId: string, text: string, attachments?: Attachment[],
-    options?: { omitHandoff?: boolean; literalText?: boolean; mode?: 'plugin_development' }) => Promise<void>;
+  sendTurn: (
+    sessionId: string,
+    text: string,
+    attachments?: Attachment[],
+    options?: {
+      omitHandoff?: boolean;
+      literalText?: boolean;
+      mode?: 'plugin_development';
+      turnOptions?: TurnOptionsMap;
+    },
+  ) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
   resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
   refreshGitStatus: (sessionId: string) => Promise<void>;
@@ -180,6 +203,7 @@ interface AppState {
 }
 
 let wsClient: DaemonWsClient | null = null;
+const commandOutputRefCounts = new Map<string, number>();
 
 function contiguousCursor(events: CanonicalEvent[]): number {
   let seq = 0;
@@ -319,6 +343,7 @@ export const useAppStore = create<AppState>((set, get) => {
     }
     if (turnEnded) {
       void get().refreshContextPreview(currentSelected);
+      void get().refreshTurnItems(currentSelected);
       void daemonApi.getSession(currentSelected).then(({ session, taskState }) =>
         set((state) => ({
           sessions: state.sessions.map((s) => s.id === session.id && s.lastSeq <= session.lastSeq ? session : s),
@@ -387,6 +412,7 @@ export const useAppStore = create<AppState>((set, get) => {
     accountUsage: [],
     usageLoading: false,
     usageCollectedAt: null,
+    failoverPolicy: null,
 
     selectedWorkspaceId: null,
     harnessFilter: null,
@@ -394,6 +420,9 @@ export const useAppStore = create<AppState>((set, get) => {
     selectedSessionId: null,
 
     eventsBySession: {},
+    turnItemsBySession: {},
+    liveCommandOutputByKey: {},
+    traitsByScope: {},
     gitBySession: {},
     taskStateBySession: {},
     contextPreviewBySession: {},
@@ -417,6 +446,24 @@ export const useAppStore = create<AppState>((set, get) => {
                 eventQueue = [];
                 ingestEvents(batch);
               }, 25);
+            } else if (frame.op === 'command_output') {
+              const key = `${frame.sessionId}::${frame.toolCallId}`;
+              set((state) => {
+                const prev = state.liveCommandOutputByKey[key];
+                const nextText = frame.snapshot
+                  ? frame.chunk
+                  : `${prev?.text ?? ''}${frame.chunk}`.slice(-256_000);
+                return {
+                  liveCommandOutputByKey: {
+                    ...state.liveCommandOutputByKey,
+                    [key]: {
+                      text: nextText,
+                      done: Boolean(frame.done || prev?.done),
+                      updatedAt: frame.timestamp,
+                    },
+                  },
+                };
+              });
             } else if (frame.op === 'attention') {
               handleAttention(frame.item);
             } else if (frame.op === 'plugins_changed') {
@@ -655,10 +702,10 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
-    refreshAccountUsage: async () => {
+    refreshAccountUsage: async (forceRefresh = false) => {
       set({ usageLoading: true });
       try {
-        const res = await daemonApi.getAccountUsage();
+        const res = await daemonApi.getAccountUsage(forceRefresh);
         set({ accountUsage: res.accounts, usageCollectedAt: res.collectedAt, usageLoading: false });
       } catch (err) {
         set({ usageLoading: false });
@@ -668,6 +715,69 @@ export const useAppStore = create<AppState>((set, get) => {
           body: err instanceof Error ? err.message : String(err),
         });
       }
+    },
+
+    refreshFailoverPolicy: async () => {
+      try {
+        const { policy } = await daemonApi.getFailoverPolicy();
+        set({ failoverPolicy: policy });
+      } catch {
+        // ignore if failover plugin disabled
+      }
+    },
+
+    updateFailoverPolicy: async (policy) => {
+      const res = await daemonApi.updateFailoverPolicy(policy);
+      set({ failoverPolicy: res.policy });
+      get().pushToast({ kind: 'success', title: '已保存 Failover 接力策略' });
+    },
+
+    refreshTurnItems: async (sessionId) => {
+      try {
+        const { items } = await daemonApi.getSessionTurnItems(sessionId, { limit: 1000 });
+        set((state) => ({
+          turnItemsBySession: { ...state.turnItemsBySession, [sessionId]: items },
+        }));
+      } catch {
+        // ignore if endpoint unavailable
+      }
+    },
+
+    subscribeCommandOutput: (sessionId, toolCallId) => {
+      const key = `${sessionId}::${toolCallId}`;
+      const prev = commandOutputRefCounts.get(key) ?? 0;
+      commandOutputRefCounts.set(key, prev + 1);
+      if (prev === 0) {
+        wsClient?.subscribeCommandOutput(sessionId, toolCallId);
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const count = (commandOutputRefCounts.get(key) ?? 1) - 1;
+        if (count <= 0) {
+          commandOutputRefCounts.delete(key);
+          wsClient?.unsubscribeCommandOutput(sessionId, toolCallId);
+        } else {
+          commandOutputRefCounts.set(key, count);
+        }
+      };
+    },
+
+    setTraitValue: (scopeKey, key, value) => {
+      set((state) => {
+        const existing = state.traitsByScope[scopeKey] ?? loadSavedTraitValues(scopeKey);
+        const next = { ...existing };
+        if (value === null || value === undefined || value === '') {
+          delete next[key];
+        } else {
+          next[key] = value;
+        }
+        persistTraitValues(scopeKey, next);
+        return {
+          traitsByScope: { ...state.traitsByScope, [scopeKey]: next },
+        };
+      });
     },
 
     refreshRemoteStatus: async () => {
@@ -743,6 +853,8 @@ export const useAppStore = create<AppState>((set, get) => {
         wsClient?.subscribeSession(sessionId, contiguousCursor(latestList));
 
         void get().refreshContextPreview(sessionId);
+        void get().refreshTurnItems(sessionId);
+        void get().refreshFailoverPolicy();
         if (get().inspectorOpen) {
           void get().refreshGitStatus(sessionId);
         }

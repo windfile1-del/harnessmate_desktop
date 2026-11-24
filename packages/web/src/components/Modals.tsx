@@ -17,6 +17,7 @@ import {
 import { QRCodeSVG } from 'qrcode.react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { formatRelativeTime, PERMISSION_MODE_LABELS } from '../lib/harness-meta';
+import { Slot } from '../slots';
 import { useAppStore } from '../stores/app-store';
 import { HarnessBadge } from './BrandMark';
 import { ModelPicker } from './ModelPicker';
@@ -124,7 +125,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
   );
   const [newPath, setNewPath] = useState('');
   const [harnessId, setHarnessId] = useState(
-    newSessionPresetHarnessId ?? harnesses.find((h) => h.health === 'ready')?.id ?? harnesses[0]?.id ?? 'codex',
+    newSessionPresetHarnessId ?? harnesses.find((h) => h.health === 'ready')?.id ?? harnesses[0]?.id ?? '',
   );
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<ReasoningEffort | ''>('');
@@ -222,7 +223,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     <div>
       <ModalHeader
         title="新建共享任务会话"
-        subtitle="所有 CLI 引擎共享同一会话与任务账本，进入对话后可随时无缝切换 Codex / AGY / Claude"
+        subtitle="所有已注册 CLI 引擎共享同一会话与任务账本，进入对话后可随时无缝切换"
         onClose={onClose}
       />
 
@@ -325,7 +326,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
                       opacity: ready ? 1 : 0.65,
                     }}
                   >
-                    <HarnessBadge kind={h.kind} label={h.displayName} compact />
+                    <HarnessBadge kind={h.kind} label={h.displayName} presentation={h.presentation} compact />
                     <span className="font-mono-code text-[10.5px] text-[var(--text-muted)]">
                       {ready ? `v${h.version ?? 'ready'} · ${h.models.length} 模型` : '未安装'}
                     </span>
@@ -763,7 +764,7 @@ function HarnessCenterModal({ onClose }: { onClose: () => void }) {
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <HarnessBadge kind={h.kind} label={h.displayName} />
+                    <HarnessBadge kind={h.kind} label={h.displayName} presentation={h.presentation} />
                     <span
                       className="text-[11.5px] font-medium"
                       style={{
@@ -786,10 +787,24 @@ function HarnessCenterModal({ onClose }: { onClose: () => void }) {
 
                 <div className="mt-2 space-y-1 text-[11.5px] text-[var(--text-secondary)]">
                   <div>协议：{h.protocolLabel}</div>
+                  {h.driverId && (
+                    <div className="font-mono-code text-[10.5px] text-[var(--text-muted)]">
+                      驱动：{h.driverId} · 实例：{h.instanceId ?? h.id}
+                      {h.capabilitiesV2?.transport ? ` · ${h.capabilitiesV2.transport}` : ''}
+                    </div>
+                  )}
                   {h.accountSummary && <div>账号 / 网关：{h.accountSummary}</div>}
                   <div className="font-mono-code truncate text-[11px] text-[var(--text-muted)]">
                     路径：{h.binaryPath ?? h.healthMessage ?? '未找到'}
                   </div>
+                </div>
+                <div className="mt-2.5">
+                  <Slot
+                    name="harness.settings"
+                    matchKey={h.driverId ?? h.kind}
+                    slotProps={{ harness: h, onRefresh: () => void handleRefresh() }}
+                    compactErrors
+                  />
                 </div>
               </div>
             );
