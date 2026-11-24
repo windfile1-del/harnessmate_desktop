@@ -27,7 +27,7 @@ import {
 } from '../history-scanner.js';
 import { execCliQuick, resolveBinary } from '../process.js';
 import type { HarnessDriverFactory } from '../registry.js';
-import type { AdapterSessionConfig, AdapterUsageLimitResult } from '../types.js';
+import type { AdapterSessionConfig, AdapterUsageLimitResult, NormalizedAdapterEvent } from '../types.js';
 import { AgyModelEffortCache, resolveAgyTurnConfig } from './agy-config-scope.js';
 import {
   AGY_STRIP_ENV_KEYS,
@@ -36,6 +36,18 @@ import {
   DEFAULT_AGY_APP_DATA_DIR_NAME,
 } from './agy-launch-context.js';
 import { prepareAgyProfile, resolveAgyProfileDirectories } from './agy-profile-manager.js';
+import {
+  parseAgyBackgroundOrSubagentUpdate,
+  parseAgyInteractionPermission,
+  parseAgySessionInfoUpdate,
+  parseAgyUpdateStepsToolCall,
+  parseAgyUsageUpdate,
+  supportsAgyActiveSteering,
+} from './agy-protocol.js';
+import {
+  detectSilentAgyTurnError,
+  readAgyConversationMaxStepIdx,
+} from './agy-turn-outcome.js';
 import { probeAgyUsageViaCli } from './agy-usage.js';
 
 export function classifyAgyModelGroup(modelId: string): string {
@@ -193,6 +205,81 @@ export class AntigravityAcpFlavorPolicy implements AcpFlavorPolicy {
       }
     }
     return undefined;
+  }
+
+  onSessionUpdate(
+    update: Record<string, unknown>,
+    ctx: {
+      turnId: string;
+      emit: (ev: NormalizedAdapterEvent) => void;
+      markBackgroundWork?: (active: boolean) => void;
+    },
+  ): boolean {
+    const usageEv = parseAgyUsageUpdate(update, ctx.turnId);
+    if (usageEv) {
+      ctx.emit(usageEv);
+      return true;
+    }
+    const infoEv = parseAgySessionInfoUpdate(update);
+    if (infoEv) {
+      ctx.emit(infoEv);
+      return true;
+    }
+    const planEv = parseAgyUpdateStepsToolCall(update, ctx.turnId);
+    if (planEv) {
+      ctx.emit(planEv);
+      return true;
+    }
+    const extra = parseAgyBackgroundOrSubagentUpdate(update, ctx.turnId);
+    if (extra) {
+      if (extra.keepsBackgroundAlive !== undefined) {
+        ctx.markBackgroundWork?.(extra.keepsBackgroundAlive);
+      }
+      ctx.emit(extra.event);
+    }
+    return false;
+  }
+
+  onPermissionRequest(
+    reqId: string | number,
+    params: Record<string, unknown>,
+    options: AcpPermissionOption[],
+    ctx: {
+      turnId: string;
+      nativeRequestId: string;
+      emit: (ev: NormalizedAdapterEvent) => void;
+      registerPending: (nativeRequestId: string, rpcId: string | number, options: AcpPermissionOption[]) => void;
+    },
+  ): boolean {
+    const parsed = parseAgyInteractionPermission(params, options);
+    if (!parsed) return false;
+    ctx.registerPending(ctx.nativeRequestId, reqId, options);
+    ctx.emit({
+      type: 'approval.requested',
+      turnId: ctx.turnId,
+      nativeRequestId: ctx.nativeRequestId,
+      kind: 'user_question',
+      toolName: 'interaction',
+      toolKind: 'other',
+      summary: parsed.summary,
+      input: (params.toolCall as Record<string, unknown> | undefined)?.rawInput ?? params,
+      riskLevel: 'low',
+      questionSpec: parsed.questionSpec,
+    });
+    return true;
+  }
+
+  beforeTurnPrompt(nativeSessionId: string): number | null {
+    const launchCtx = this.getLaunchContextFn?.();
+    if (!launchCtx) return null;
+    return readAgyConversationMaxStepIdx(launchCtx.appDataPath, nativeSessionId);
+  }
+
+  afterTurnPrompt(nativeSessionId: string, beforeToken: unknown) {
+    const launchCtx = this.getLaunchContextFn?.();
+    if (!launchCtx) return null;
+    const baseline = typeof beforeToken === 'number' ? beforeToken : null;
+    return detectSilentAgyTurnError(launchCtx.appDataPath, nativeSessionId, baseline);
   }
 
   canRunNativeCliCommand(): boolean {
@@ -365,6 +452,13 @@ export class AgyAdapter extends AcpAdapter {
 
   getAdvertisedCommands(): AgyAdvertisedCommand[] {
     return this.liveDetailedCommands;
+  }
+
+  override get capabilitiesV2() {
+    return {
+      ...super.capabilitiesV2,
+      supportsActiveSteering: supportsAgyActiveSteering(this.lastObservedVersion),
+    };
   }
 
   getObservedEffortsForModel(modelId: string): ReasoningEffort[] | undefined {

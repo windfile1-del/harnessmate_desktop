@@ -1606,8 +1606,53 @@ export class SessionManager {
   ): Promise<{ turnId: string }> {
     let session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
-    if (session.status === 'running' || session.status === 'awaiting_approval') {
-      throw new Error('Session already has an active turn in progress.');
+    if (session.status === 'awaiting_approval') {
+      throw new Error('Session already has a pending approval blocking the turn.');
+    }
+    if (session.status === 'running') {
+      const adapter = this.registry.get(session.harnessId);
+      const liveEntry = this.liveHandles.get(this.handleKey(sessionId, session.harnessId));
+      const canSteer = Boolean(
+        !native &&
+          adapter?.capabilitiesV2?.supportsActiveSteering &&
+          liveEntry?.handle.steerTurn &&
+          this.activeTurnMeta.has(sessionId),
+      );
+      if (!canSteer || !liveEntry?.handle.steerTurn) {
+        throw new Error('Session already has an active turn in progress.');
+      }
+      const turnId = this.activeTurnMeta.get(sessionId)!.turnId;
+      this.emitCanonical(
+        sessionId,
+        'message.user',
+        {
+          text,
+          steering: true,
+          harnessId: session.harnessId,
+          harnessKind: session.harnessKind,
+          model: session.model,
+          actualModel: session.actualModel ?? null,
+          attachments: (attachments ?? []).map((a) => ({
+            id: a.id,
+            kind: a.kind,
+            name: a.name,
+            relativePath: a.relativePath,
+            mimeType: a.mimeType,
+            sizeBytes: a.sizeBytes,
+            previewUrl: a.previewUrl,
+          })),
+        },
+        turnId,
+      );
+      await liveEntry.handle.steerTurn({
+        turnId,
+        text,
+        attachments,
+        model: session.model,
+        reasoningEffort: session.reasoningEffort,
+        permissionMode: session.permissionMode,
+      });
+      return { turnId };
     }
 
     // Optional per-turn seamless harness/model override (e.g. from Mobile or API)
@@ -2336,6 +2381,7 @@ export class SessionManager {
     const candidates = Array.from(this.liveHandles.values())
       .filter((e) => {
         if (e.sessionId === protectedSessionId) return false;
+        if (e.handle.hasActiveBackgroundWork?.()) return false;
         const s = this.store.getSession(e.sessionId);
         return !s || (s.status !== 'running' && s.status !== 'awaiting_approval');
       })
@@ -2652,7 +2698,22 @@ export class SessionManager {
           void this.capturePostTurnCheckpoint(session, meta, ev.turnId);
         }
         this.setSessionStatus(sessionId, 'error');
-        if (meta?.reloadHandle) void this.disposeLiveHandle(sessionId, eventHarnessId);
+        if (ev.code === 'invalid_thinking_signature') {
+          if (session.harnessId === eventHarnessId) {
+            this.store.updateSession(sessionId, { nativeSessionId: null });
+          }
+          const badBinding = this.store.getSessionBinding(sessionId, eventHarnessId);
+          if (badBinding) {
+            this.store.upsertSessionBinding({
+              ...badBinding,
+              nativeSessionId: null,
+              updatedAt: Date.now(),
+            });
+          }
+          void this.disposeLiveHandle(sessionId, eventHarnessId);
+        } else if (meta?.reloadHandle) {
+          void this.disposeLiveHandle(sessionId, eventHarnessId);
+        }
 
         const orchFailed = this.getActiveOrchestrator();
         if (orchFailed) {
@@ -3003,6 +3064,9 @@ export class SessionManager {
             ev.usage.cachedTokens !== undefined
               ? (prev?.cachedTokens ?? 0) + ev.usage.cachedTokens
               : prev?.cachedTokens,
+          ...(ev.usage.contextTokens !== undefined || prev?.contextTokens !== undefined
+            ? { contextTokens: ev.usage.contextTokens ?? prev?.contextTokens }
+            : {}),
           ...(ev.usage.modelContextWindow !== undefined || prev?.modelContextWindow !== undefined
             ? { modelContextWindow: ev.usage.modelContextWindow ?? prev?.modelContextWindow }
             : {}),

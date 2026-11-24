@@ -116,6 +116,7 @@ import { PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import { AgyAuthService } from '../harnesses/agy/agy-auth-service.js';
+import { listAgySubagentRecords, readAgySubagentDetail } from '../harnesses/agy/agy-child-work.js';
 import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
 import { resolveAgyProfileDirectories } from '../harnesses/agy/agy-profile-manager.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
@@ -139,6 +140,7 @@ export interface CreateDaemonOptions {
   port?: number;
   hostOverride?: string;
   customAdapters?: HarnessAdapter[];
+  binaryOverrides?: Record<string, string>;
   webDistDir?: string | null;
   pluginCrashPolicy?: CrashPolicy;
 }
@@ -166,6 +168,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     paths.webDistDir = opts.webDistDir;
   }
   const config = loadOrCreateConfig(paths.configPath, opts.port);
+  if (opts.binaryOverrides) {
+    config.binaryOverrides = { ...config.binaryOverrides, ...opts.binaryOverrides };
+  }
   const store = new HarnessMateStore(paths.dbPath);
   const eventBus = new DaemonEventBus();
   const registry = new HarnessRegistry();
@@ -2588,6 +2593,40 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     return { runs: sessionManager.getSessionRuns(id) };
+  });
+
+  app.get('/api/v1/sessions/:id/agy/subagents', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const adapter = registry.get(session.harnessId);
+    if (!(adapter instanceof AgyAdapter)) {
+      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    }
+    if (!session.nativeSessionId) {
+      return { subagents: [] };
+    }
+    const ctx = adapter.getLaunchContextSync();
+    return { subagents: listAgySubagentRecords(ctx.appDataPath, session.nativeSessionId) };
+  });
+
+  app.get('/api/v1/sessions/:id/agy/subagents/:subagentId', async (request, reply) => {
+    const { id, subagentId } = request.params as { id: string; subagentId: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const adapter = registry.get(session.harnessId);
+    if (!(adapter instanceof AgyAdapter)) {
+      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    }
+    if (!session.nativeSessionId) {
+      return reply.code(404).send({ error: 'Native session not initialized' });
+    }
+    const ctx = adapter.getLaunchContextSync();
+    const detail = readAgySubagentDetail(ctx.appDataPath, session.nativeSessionId, subagentId);
+    if (!detail) {
+      return reply.code(404).send({ error: 'Subagent trace not found' });
+    }
+    return { subagent: detail };
   });
 
   return {
