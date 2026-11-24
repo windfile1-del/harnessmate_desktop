@@ -1,12 +1,17 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import type {
   ApprovalDecision,
   DiscoveredCliSession,
   HarnessCapabilities,
+  HarnessCapabilitiesV2,
+  HarnessDriverId,
   HarnessInfo,
   HarnessKind,
   HarnessModelInfo,
+  HarnessPresentationMeta,
   PermissionMode,
+  ProviderOptionDescriptor,
   ReasoningEffort,
   RiskLevel,
   ToolKind,
@@ -14,8 +19,8 @@ import type {
 import { buildPromptWithFileAttachments } from './codex-adapter.js';
 import { runAgyCommand } from './agy-commands.js';
 import { agyDataDirectory, readAgyIndexedHistory, type HistoryMessage } from './history-scanner.js';
-import { StdioJsonRpcClient, type JsonRpcServerRequest } from './jsonrpc.js';
-import { execCliQuick, resolveBinary, spawnCliProcess } from './process.js';
+import { JsonRpcResponseError, StdioJsonRpcClient, type JsonRpcServerRequest } from './jsonrpc.js';
+import { DEFAULT_STRIP_ENV_KEYS, execCliQuick, resolveBinary, spawnCliProcess } from './process.js';
 import type {
   AdapterSessionConfig,
   AdapterSessionHandle,
@@ -25,6 +30,8 @@ import type {
 } from './types.js';
 import { pluginMcpServerName } from './types.js';
 import { pluginMcpStdioConfig } from './plugin-mcp-stdio.js';
+
+export type AcpFlavor = 'strict_acp' | 'antigravity';
 
 export interface AcpAdapterOptions {
   id: string;
@@ -36,6 +43,16 @@ export interface AcpAdapterOptions {
   env?: Record<string, string>;
   binaryOverride?: string;
   isCustom?: boolean;
+  flavor?: AcpFlavor;
+  driverId?: HarnessDriverId;
+  continuationKey?: string;
+  registryAgentId?: string;
+  appDataDir?: string;
+  authMethodId?: string;
+  authenticateEagerly?: boolean;
+  sessionLoadReplayIdleMs?: number;
+  envWhitelist?: Record<string, string>;
+  presentation?: Partial<HarnessPresentationMeta>;
 }
 
 interface AcpPermissionOption {
@@ -44,7 +61,7 @@ interface AcpPermissionOption {
   kind?: string;
 }
 
-interface AcpConfigOption {
+export interface AcpConfigOption {
   id: string;
   name?: string;
   category?: string;
@@ -64,11 +81,7 @@ interface AcpSessionNewResult {
     availableModes?: Array<{ id: string; name?: string }>;
   };
   configOptions?: AcpConfigOption[];
-  _meta?: {
-    antigravity?: {
-      tier?: { name?: string; id?: string };
-    };
-  };
+  _meta?: Record<string, unknown>;
 }
 
 export interface AcpLiveProbeSnapshot {
@@ -76,46 +89,378 @@ export interface AcpLiveProbeSnapshot {
   defaultModelId: string | null;
   tierName: string | null;
   serverVersion: string | null;
+  configOptions?: AcpConfigOption[];
 }
 
 const VALID_ACP_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
+const DEFAULT_SESSION_LOAD_REPLAY_IDLE_MS = 2000;
+const RESERVED_ENV_SET = new Set<string>(DEFAULT_STRIP_ENV_KEYS);
+
+export function isAcpAuthRequiredError(err: unknown): boolean {
+  if (err instanceof JsonRpcResponseError && err.code === -32000) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /auth.?required|unauthenticated|authentication required|not authenticated|login required/i.test(
+    msg,
+  );
+}
+
+export function mapAcpConfigOptionsToDescriptors(
+  configOptions: readonly AcpConfigOption[],
+): ProviderOptionDescriptor[] {
+  const descriptors: ProviderOptionDescriptor[] = [];
+  for (const opt of configOptions) {
+    const key = opt.id?.trim();
+    if (!key) continue;
+    const label = opt.name?.trim() || key;
+    if (opt.type === 'boolean') {
+      descriptors.push({
+        key,
+        label,
+        kind: 'boolean',
+        defaultValue: opt.currentValue === 'true',
+      });
+      continue;
+    }
+    const choices = Array.isArray(opt.options)
+      ? opt.options
+          .filter((o) => o && typeof o.value === 'string')
+          .map((o) => ({
+            value: o.value,
+            label: o.name?.trim() || o.value,
+            ...(o.description ? { description: o.description } : {}),
+          }))
+      : [];
+    if (choices.length > 0 || opt.type === 'select' || !opt.type) {
+      descriptors.push({
+        key,
+        label,
+        kind: 'select',
+        ...(opt.currentValue !== undefined ? { defaultValue: opt.currentValue } : {}),
+        options: choices,
+      });
+    }
+  }
+  return descriptors;
+}
+
+// ── Flavor Policy Separation (strict_acp vs antigravity) ──────────────────
+
+interface AcpFlavorPolicy {
+  readonly flavor: AcpFlavor;
+  readonly permissionModes: PermissionMode[];
+  readonly presentation: HarnessPresentationMeta;
+  readonly defaultNativeCommands: string[];
+  buildLaunchArgs(
+    baseArgs: readonly string[],
+    source?: DiscoveredCliSession['source'],
+    appDataDir?: string,
+  ): string[];
+  probeCliModels(
+    binaryPath: string,
+    env?: Record<string, string | undefined>,
+    unsetEnv?: readonly string[],
+  ): Promise<HarnessModelInfo[]>;
+  readIndexedHistory(session: DiscoveredCliSession): HistoryMessage[];
+  classifyModelGroup(modelId: string): string;
+  extractTierName(sessRes: AcpSessionNewResult): string | null;
+  resolveModeId(
+    requested: string,
+    advertised: Array<{ id: string; name?: string }> | undefined,
+    permissionMode: PermissionMode,
+  ): string;
+  shouldThrowOnModeError(permissionMode: PermissionMode, appliedModeId?: string): boolean;
+  canRunNativeCliCommand(): boolean;
+  executeNativeCliCommand(
+    binaryPath: string,
+    config: AdapterSessionConfig,
+    command: string,
+    nativeSessionId: string | null,
+    signal: AbortSignal,
+    envOpts?: { env?: Record<string, string | undefined>; unsetEnv?: readonly string[]; appDataDir?: string },
+  ): Promise<{ conversation_id?: string; response?: string }>;
+  evaluatePermissionPolicy(
+    params: Record<string, unknown>,
+    options: AcpPermissionOption[],
+    permissionMode: PermissionMode,
+    currentTurnId: string | null,
+    nativeSessionId: string | null,
+  ): { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } | null;
+}
+
+class StrictAcpFlavorPolicy implements AcpFlavorPolicy {
+  readonly flavor = 'strict_acp' as const;
+  readonly permissionModes: PermissionMode[] = ['plan', 'accept_edits', 'auto'];
+  readonly presentation: HarnessPresentationMeta = {
+    shortLabel: 'ACP',
+    accentColor: 'var(--accent-star)',
+    softBg: 'var(--accent-star-soft)',
+    tagline: 'Custom ACP Agent',
+  };
+  readonly defaultNativeCommands: string[] = [];
+
+  buildLaunchArgs(baseArgs: readonly string[]): string[] {
+    return [...baseArgs];
+  }
+
+  async probeCliModels(): Promise<HarnessModelInfo[]> {
+    return [];
+  }
+
+  readIndexedHistory(): HistoryMessage[] {
+    return [];
+  }
+
+  classifyModelGroup(modelId: string): string {
+    if (modelId.includes('/')) return modelId.split('/')[0]!;
+    return 'ACP Models';
+  }
+
+  extractTierName(): string | null {
+    return null;
+  }
+
+  resolveModeId(requested: string): string {
+    return requested;
+  }
+
+  shouldThrowOnModeError(): boolean {
+    return false;
+  }
+
+  canRunNativeCliCommand(): boolean {
+    return false;
+  }
+
+  async executeNativeCliCommand(): Promise<{ conversation_id?: string; response?: string }> {
+    throw new Error('Strict ACP flavor does not support vendor CLI subcommands');
+  }
+
+  evaluatePermissionPolicy(): null {
+    // Strict ACP forwards all permission requests honestly without client-side spoofing
+    return null;
+  }
+}
+
+class AntigravityAcpFlavorPolicy implements AcpFlavorPolicy {
+  readonly flavor = 'antigravity' as const;
+  readonly permissionModes: PermissionMode[] = ['plan', 'manual', 'accept_edits', 'auto'];
+  readonly presentation: HarnessPresentationMeta = {
+    shortLabel: 'AGY',
+    accentColor: 'var(--accent-indigo)',
+    softBg: 'var(--accent-indigo-soft)',
+    tagline: 'Antigravity · Native ACP',
+  };
+  readonly defaultNativeCommands: string[] = ['compact', 'usage', 'skills', 'goal'];
+
+  buildLaunchArgs(
+    baseArgs: readonly string[],
+    source?: DiscoveredCliSession['source'],
+    appDataDir?: string,
+  ): string[] {
+    const args = [...baseArgs];
+    const resolvedDir = appDataDir?.trim() || (source ? agyDataDirectory(source) : undefined);
+    if (resolvedDir) {
+      args.push('--app-data-dir', resolvedDir);
+    }
+    return args;
+  }
+
+  async probeCliModels(
+    binaryPath: string,
+    env?: Record<string, string | undefined>,
+    unsetEnv?: readonly string[],
+  ): Promise<HarnessModelInfo[]> {
+    return probeAgyModelsCli(binaryPath, env, unsetEnv);
+  }
+
+  readIndexedHistory(session: DiscoveredCliSession): HistoryMessage[] {
+    return readAgyIndexedHistory(session);
+  }
+
+  classifyModelGroup(modelId: string): string {
+    return classifyAgyModelGroup(modelId);
+  }
+
+  extractTierName(sessRes: AcpSessionNewResult): string | null {
+    const meta = sessRes?._meta as { antigravity?: { tier?: { name?: string } } } | undefined;
+    return meta?.antigravity?.tier?.name ?? null;
+  }
+
+  resolveModeId(
+    requested: string,
+    advertised: Array<{ id: string; name?: string }> | undefined,
+    permissionMode: PermissionMode,
+  ): string {
+    return (
+      advertised?.find(({ id }) => id === requested)?.id ??
+      (permissionMode !== 'plan'
+        ? advertised?.find(({ id }) => id === 'accept-edits')?.id ?? requested
+        : requested)
+    );
+  }
+
+  shouldThrowOnModeError(permissionMode: PermissionMode, appliedModeId?: string): boolean {
+    return permissionMode === 'plan' || appliedModeId === 'plan' || appliedModeId === 'auto';
+  }
+
+  canRunNativeCliCommand(): boolean {
+    return true;
+  }
+
+  executeNativeCliCommand(
+    binaryPath: string,
+    config: AdapterSessionConfig,
+    command: string,
+    nativeSessionId: string | null,
+    signal: AbortSignal,
+    envOpts?: { env?: Record<string, string | undefined>; unsetEnv?: readonly string[]; appDataDir?: string },
+  ): Promise<{ conversation_id?: string; response?: string }> {
+    return runAgyCommand(binaryPath, config, command, nativeSessionId, signal, envOpts);
+  }
+
+  evaluatePermissionPolicy(
+    params: Record<string, unknown>,
+    options: AcpPermissionOption[],
+    permissionMode: PermissionMode,
+    currentTurnId: string | null,
+    nativeSessionId: string | null,
+  ): { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } | null {
+    if (!currentTurnId || (typeof params.sessionId === 'string' && params.sessionId !== nativeSessionId)) {
+      return { outcome: { outcome: 'cancelled' } };
+    }
+    const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;
+    const kind = String(toolCall.kind ?? '').toLowerCase();
+    const readOnly = kind === 'read' || kind === 'search';
+    const edit = ['edit', 'write', 'create'].includes(kind);
+    const allow =
+      permissionMode === 'auto' ||
+      (permissionMode === 'accept_edits' && (readOnly || edit)) ||
+      (permissionMode === 'plan' && readOnly);
+    const reject =
+      permissionMode === 'plan' &&
+      (edit || ['delete', 'move', 'execute', 'shell', 'terminal'].includes(kind));
+    if (allow || reject) {
+      const chosen = pickAcpOption(options, reject ? 'deny' : 'allow_once', true);
+      if (chosen || reject) {
+        return {
+          outcome: chosen
+            ? { outcome: 'selected', optionId: chosen.optionId }
+            : { outcome: 'cancelled' },
+        };
+      }
+    }
+    return null;
+  }
+}
+
+function createAcpFlavorPolicy(flavor: AcpFlavor): AcpFlavorPolicy {
+  return flavor === 'antigravity' ? new AntigravityAcpFlavorPolicy() : new StrictAcpFlavorPolicy();
+}
 
 export class AcpAdapter implements HarnessAdapter {
   readonly pluginMcpTransport = 'acp' as const;
   readonly id: string;
   readonly kind: HarnessKind;
+  readonly driverId: HarnessDriverId;
+  readonly continuationKey: string;
   readonly displayName: string;
   readonly description: string;
   readonly protocolLabel = 'Agent Client Protocol (ACP JSON-RPC 2.0)';
   readonly isCustom?: boolean;
-  readonly capabilities: HarnessCapabilities = {
-    streaming: true,
-    interactiveApproval: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
-    permissionModes: ['plan', 'accept_edits', 'auto'],
-    sessionResume: true,
-    sessionFork: false,
-    imageInput: true,
-    subagents: true,
-  };
+  readonly flavor: AcpFlavor;
+  readonly presentation: HarnessPresentationMeta;
+  readonly capabilities: HarnessCapabilities;
 
   private readonly command: string;
   private readonly args: string[];
   private readonly env?: Record<string, string>;
+  private readonly envWhitelist?: Record<string, string>;
   private readonly binaryOverride?: string;
+  private readonly appDataDir?: string;
+  private readonly authMethodId?: string;
+  private readonly authenticateEagerly: boolean;
+  private readonly sessionLoadReplayIdleMs: number;
+  private readonly flavorPolicy: AcpFlavorPolicy;
   private cachedSessionProbe: { snapshot: AcpLiveProbeSnapshot; fetchedAt: number } | null = null;
+  private liveConfigOptions: AcpConfigOption[] = [];
+  private liveNativeCommands: string[] | null = null;
+  private lastSupportsEmbeddedContext: boolean | null = null;
+  private authRequired = false;
 
   constructor(opts: AcpAdapterOptions) {
     this.id = opts.id;
     this.kind = opts.kind;
-    if (opts.kind === 'agy') this.capabilities.permissionModes = ['plan', 'manual', 'accept_edits', 'auto'];
+    this.flavor = opts.flavor ?? (opts.kind === 'agy' ? 'antigravity' : 'strict_acp');
+    this.flavorPolicy = createAcpFlavorPolicy(this.flavor);
+    this.driverId = opts.driverId ?? (this.flavor === 'antigravity' ? 'agy' : 'acp');
+    this.appDataDir = opts.appDataDir?.trim() || undefined;
+    this.continuationKey =
+      opts.continuationKey ??
+      (this.flavor === 'antigravity' && this.appDataDir
+        ? `agy:home:${path.resolve(this.appDataDir)}`
+        : `${this.driverId}:instance:${this.id}`);
     this.displayName = opts.displayName;
     this.description = opts.description;
     this.command = opts.command;
     this.args = opts.args ?? ['acp', '--stdio'];
     this.env = opts.env;
+    this.envWhitelist = opts.envWhitelist;
     this.binaryOverride = opts.binaryOverride;
     this.isCustom = opts.isCustom;
+    this.authMethodId = opts.authMethodId;
+    this.authenticateEagerly = opts.authenticateEagerly ?? false;
+    this.sessionLoadReplayIdleMs =
+      opts.sessionLoadReplayIdleMs ?? DEFAULT_SESSION_LOAD_REPLAY_IDLE_MS;
+
+    this.presentation = {
+      ...this.flavorPolicy.presentation,
+      ...(opts.presentation ?? {}),
+    };
+    this.capabilities = {
+      streaming: true,
+      interactiveApproval: true,
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+      permissionModes: [...this.flavorPolicy.permissionModes],
+      sessionResume: true,
+      sessionFork: false,
+      imageInput: true,
+      subagents: true,
+    };
+  }
+
+  get optionDescriptors(): ProviderOptionDescriptor[] {
+    return mapAcpConfigOptionsToDescriptors(this.liveConfigOptions);
+  }
+
+  get capabilitiesV2(): HarnessCapabilitiesV2 {
+    return {
+      ...this.capabilities,
+      transport: 'acp_stdio',
+      historyInjectionMode:
+        this.lastSupportsEmbeddedContext === false ? 'inline' : 'embedded_context',
+      supportsNativeRollback: false,
+      supportsActiveSteering: false,
+      supportsUsageLimits: false,
+      supportsDynamicOptions: true,
+      nativeCommands: this.liveNativeCommands ?? [...this.flavorPolicy.defaultNativeCommands],
+      optionDescriptors: this.optionDescriptors,
+    };
+  }
+
+  private buildSpawnEnv(): Record<string, string | undefined> | undefined {
+    const merged: Record<string, string | undefined> = {};
+    let hasEntries = false;
+    for (const src of [this.env, this.envWhitelist]) {
+      if (!src) continue;
+      for (const [k, v] of Object.entries(src)) {
+        if (!k || RESERVED_ENV_SET.has(k)) continue;
+        merged[k] = v;
+        hasEntries = true;
+      }
+    }
+    return hasEntries ? merged : undefined;
   }
 
   /**
@@ -124,12 +469,15 @@ export class AcpAdapter implements HarnessAdapter {
    */
   async probePassive(): Promise<HarnessInfo> {
     const binaryPath = await resolveBinary(this.command, this.binaryOverride);
+    const descriptors = this.optionDescriptors;
+    const capsV2 = this.capabilitiesV2;
     if (!binaryPath) {
       return {
         id: this.id,
         kind: this.kind,
-        driverId: this.kind,
+        driverId: this.driverId,
         instanceId: this.id,
+        continuationKey: this.continuationKey,
         displayName: this.displayName,
         description: this.description,
         protocolLabel: this.protocolLabel,
@@ -138,6 +486,9 @@ export class AcpAdapter implements HarnessAdapter {
         health: 'unavailable',
         healthMessage: `${this.command} not found in PATH`,
         capabilities: this.capabilities,
+        capabilitiesV2: capsV2,
+        presentation: this.presentation,
+        optionDescriptors: descriptors,
         models: [],
         defaultModelId: null,
         accountSummary: null,
@@ -145,7 +496,8 @@ export class AcpAdapter implements HarnessAdapter {
       };
     }
 
-    const verRes = await execCliQuick(binaryPath, ['--version'], 6000);
+    const env = this.buildSpawnEnv();
+    const verRes = await execCliQuick(binaryPath, ['--version'], 10_000, { env, input: '' });
     const verText = `${verRes.stdout}\n${verRes.stderr}`.trim();
     let version = verText.match(/(\d+\.\d+\.\d+[\w.-]*)/)?.[1] ?? (verText.split(/\r?\n/)[0] || null);
 
@@ -160,24 +512,41 @@ export class AcpAdapter implements HarnessAdapter {
       if (!version && this.cachedSessionProbe.snapshot.serverVersion) {
         version = this.cachedSessionProbe.snapshot.serverVersion;
       }
-    } else if (this.kind === 'agy') {
-      models = await probeAgyModelsCli(binaryPath);
+    } else {
+      models = await this.flavorPolicy.probeCliModels(binaryPath, env);
       defaultModelId = models[0]?.id ?? null;
     }
+
+    const health =
+      verRes.exitCode !== 0
+        ? 'degraded'
+        : this.authRequired
+          ? 'unauthenticated'
+          : 'ready';
+    const healthMessage =
+      health === 'unauthenticated'
+        ? 'ACP agent requires authentication'
+        : verRes.exitCode !== 0
+          ? verText.slice(0, 200)
+          : undefined;
 
     return {
       id: this.id,
       kind: this.kind,
-      driverId: this.kind,
+      driverId: this.driverId,
       instanceId: this.id,
+      continuationKey: this.continuationKey,
       displayName: this.displayName,
       description: this.description,
       protocolLabel: this.protocolLabel,
       binaryPath,
       version,
-      health: verRes.exitCode === 0 ? 'ready' : 'degraded',
-      healthMessage: verRes.exitCode === 0 ? undefined : verText.slice(0, 200),
+      health,
+      healthMessage,
       capabilities: this.capabilities,
+      capabilitiesV2: capsV2,
+      presentation: this.presentation,
+      optionDescriptors: descriptors,
       models,
       defaultModelId,
       accountSummary,
@@ -186,7 +555,7 @@ export class AcpAdapter implements HarnessAdapter {
   }
 
   async probe(): Promise<HarnessInfo> {
-    // Phase 0 invariant: default probe() is strictly passive (never calls `session/new`).
+    // Phase 0/1A invariant: default probe() is strictly passive (never calls `session/new`).
     // Explicit deep catalog refresh uses `probeAcpSessionMetadata()` on demand.
     return this.probePassive();
   }
@@ -208,7 +577,11 @@ export class AcpAdapter implements HarnessAdapter {
       throw new Error(`ACP binary "${this.command}" not found`);
     }
 
-    const child = spawnCliProcess(binaryPath, this.args, { cwd: process.cwd(), env: this.env });
+    const launchArgs = this.flavorPolicy.buildLaunchArgs(this.args, undefined, this.appDataDir);
+    const child = spawnCliProcess(binaryPath, launchArgs, {
+      cwd: process.cwd(),
+      env: this.buildSpawnEnv(),
+    });
     const rpc = new StdioJsonRpcClient(child, {
       onNotification: () => {},
       onServerRequest: (req) => rpc.respondError(req.id, -32601, 'Not supported during probe'),
@@ -225,7 +598,24 @@ export class AcpAdapter implements HarnessAdapter {
           clientInfo: { name: 'harnessmate-probe', version: '0.1.0' },
         },
         12_000,
-      )) as { agentInfo?: { version?: string } };
+      )) as {
+        agentInfo?: { version?: string };
+        agentCapabilities?: { promptCapabilities?: { embeddedContext?: boolean } };
+        authMethods?: Array<{ id?: string }>;
+      };
+
+      if (initRes?.agentCapabilities?.promptCapabilities?.embeddedContext !== undefined) {
+        this.lastSupportsEmbeddedContext = Boolean(
+          initRes.agentCapabilities.promptCapabilities.embeddedContext,
+        );
+      }
+
+      if (this.authenticateEagerly) {
+        const methodId = this.authMethodId ?? initRes?.authMethods?.[0]?.id;
+        if (methodId) {
+          await rpc.request('authenticate', { methodId }, 12_000);
+        }
+      }
 
       const sessRes = (await rpc.request(
         'session/new',
@@ -233,15 +623,27 @@ export class AcpAdapter implements HarnessAdapter {
         20_000,
       )) as AcpSessionNewResult;
 
-      const parsed = parseAcpModelCatalog(sessRes);
+      this.authRequired = false;
+      const parsed = parseAcpModelCatalog(sessRes, (id) =>
+        this.flavorPolicy.classifyModelGroup(id),
+      );
+      if (Array.isArray(sessRes?.configOptions)) {
+        this.liveConfigOptions = sessRes.configOptions;
+      }
       const snapshot: AcpLiveProbeSnapshot = {
         models: parsed.models,
         defaultModelId: parsed.defaultModelId,
-        tierName: sessRes?._meta?.antigravity?.tier?.name ?? null,
+        tierName: this.flavorPolicy.extractTierName(sessRes),
         serverVersion: initRes?.agentInfo?.version ?? null,
+        ...(Array.isArray(sessRes?.configOptions) ? { configOptions: sessRes.configOptions } : {}),
       };
       this.cachedSessionProbe = { snapshot, fetchedAt: Date.now() };
       return snapshot;
+    } catch (err) {
+      if (isAcpAuthRequiredError(err)) {
+        this.authRequired = true;
+      }
+      throw err;
     } finally {
       await rpc.dispose();
     }
@@ -253,11 +655,37 @@ export class AcpAdapter implements HarnessAdapter {
       throw new Error(`ACP CLI binary "${this.command}" not found.`);
     }
 
-    const launchArgs = [...this.args];
-    const dataDirectory = agyDataDirectory(config.nativeHistorySource);
-    if (this.kind === 'agy' && dataDirectory) launchArgs.push('--app-data-dir', dataDirectory);
-    const child = spawnCliProcess(binaryPath, launchArgs, { cwd: config.cwd, env: this.env });
-    const handle = new AcpSessionHandle(child, config, this.kind === 'agy' ? binaryPath : undefined);
+    const launchArgs = this.flavorPolicy.buildLaunchArgs(
+      this.args,
+      config.nativeHistorySource,
+      this.appDataDir,
+    );
+    const spawnEnv = this.buildSpawnEnv();
+    const child = spawnCliProcess(binaryPath, launchArgs, { cwd: config.cwd, env: spawnEnv });
+    const handle = new AcpSessionHandle(child, config, {
+      flavorPolicy: this.flavorPolicy,
+      cliBinary: this.flavorPolicy.canRunNativeCliCommand() ? binaryPath : undefined,
+      appDataDir: this.appDataDir,
+      spawnEnv,
+      authMethodId: this.authMethodId,
+      authenticateEagerly: this.authenticateEagerly,
+      sessionLoadReplayIdleMs: this.sessionLoadReplayIdleMs,
+      onAuthRequired: () => {
+        this.authRequired = true;
+      },
+      onAuthenticated: () => {
+        this.authRequired = false;
+      },
+      onConfigOptionsUpdated: (opts) => {
+        this.liveConfigOptions = opts;
+      },
+      onAvailableCommandsUpdated: (cmds) => {
+        this.liveNativeCommands = cmds;
+      },
+      onEmbeddedContextSupportChanged: (supported) => {
+        this.lastSupportsEmbeddedContext = supported;
+      },
+    });
     try {
       await handle.initialize();
       return handle;
@@ -270,23 +698,24 @@ export class AcpAdapter implements HarnessAdapter {
   async readHistory(session: DiscoveredCliSession, cwd: string): Promise<HistoryMessage[]> {
     const binary = await resolveBinary(this.command, this.binaryOverride);
     if (!binary) {
-      const indexed = readAgyIndexedHistory(session);
+      const indexed = this.flavorPolicy.readIndexedHistory(session);
       if (indexed.length) return indexed;
       throw new Error(`ACP CLI binary "${this.command}" not found.`);
     }
-    const args = [...this.args];
-    const dataDirectory = agyDataDirectory(session.source);
-    if (dataDirectory) args.push('--app-data-dir', dataDirectory);
+    const args = this.flavorPolicy.buildLaunchArgs(this.args, session.source, this.appDataDir);
     const messages: HistoryMessage[] = [];
     let separated = false;
-    const rpc = new StdioJsonRpcClient(spawnCliProcess(binary, args, { cwd, env: this.env }), {
+    let replayTracker: { notifyUpdate: () => void } | undefined;
+
+    const rpc = new StdioJsonRpcClient(spawnCliProcess(binary, args, { cwd, env: this.buildSpawnEnv() }), {
       onNotification(method, params) {
         if (method !== 'session/update') return;
         const { sessionId, update } = params as {
           sessionId?: string;
           update?: { sessionUpdate?: string; content?: { type?: string; text?: string } };
         };
-        if (sessionId !== session.nativeSessionId || !update) return;
+        if ((sessionId && sessionId !== session.nativeSessionId) || !update) return;
+        replayTracker?.notifyUpdate();
         if (update.sessionUpdate === 'tool_call') {
           separated = true;
           return;
@@ -307,14 +736,21 @@ export class AcpAdapter implements HarnessAdapter {
     });
     try {
       await rpc.request('initialize', { protocolVersion: 1, clientCapabilities: {} }, 15_000);
-      await rpc.request('session/load', { sessionId: session.nativeSessionId, cwd, mcpServers: [] }, 45_000);
+      await requestSessionLoadWithIdleGap(
+        rpc,
+        { sessionId: session.nativeSessionId, cwd, mcpServers: [] },
+        this.sessionLoadReplayIdleMs,
+        (tracker) => {
+          replayTracker = tracker;
+        },
+      );
       if (messages.some((message) => message.role === 'user') && messages.some((message) => message.role === 'assistant')) {
         return messages;
       }
-      const indexed = readAgyIndexedHistory(session);
+      const indexed = this.flavorPolicy.readIndexedHistory(session);
       return indexed.length > messages.length ? indexed : messages;
     } catch (err) {
-      const indexed = readAgyIndexedHistory(session);
+      const indexed = this.flavorPolicy.readIndexedHistory(session);
       if (indexed.length) return indexed;
       throw err;
     } finally {
@@ -323,7 +759,10 @@ export class AcpAdapter implements HarnessAdapter {
   }
 }
 
-function parseAcpModelCatalog(sessRes: AcpSessionNewResult): {
+export function parseAcpModelCatalog(
+  sessRes: AcpSessionNewResult,
+  classifyGroup: (modelId: string) => string = classifyAgyModelGroup,
+): {
   models: HarnessModelInfo[];
   defaultModelId: string | null;
 } {
@@ -347,7 +786,7 @@ function parseAcpModelCatalog(sessRes: AcpSessionNewResult): {
       return {
         id: opt.value,
         displayName: opt.name ?? opt.value,
-        group: classifyAgyModelGroup(opt.value),
+        group: classifyGroup(opt.value),
         isDefault: opt.value === defaultModelId,
         supportedEfforts: efforts.length > 0 ? efforts : undefined,
         inputModalities: ['text', 'image'],
@@ -361,7 +800,7 @@ function parseAcpModelCatalog(sessRes: AcpSessionNewResult): {
   const models: HarnessModelInfo[] = availableVariants.map((m) => ({
     id: m.modelId,
     displayName: m.name ?? m.modelId,
-    group: classifyAgyModelGroup(m.modelId),
+    group: classifyGroup(m.modelId),
     isDefault: m.modelId === defaultModelId,
     inputModalities: ['text', 'image'],
   }));
@@ -374,8 +813,12 @@ function classifyAgyModelGroup(modelId: string): string {
   return 'Other Models';
 }
 
-async function probeAgyModelsCli(binaryPath: string): Promise<HarnessModelInfo[]> {
-  const res = await execCliQuick(binaryPath, ['models'], 8000);
+async function probeAgyModelsCli(
+  binaryPath: string,
+  env?: Record<string, string | undefined>,
+  unsetEnv?: readonly string[],
+): Promise<HarnessModelInfo[]> {
+  const res = await execCliQuick(binaryPath, ['models'], 8000, { env, unsetEnv, input: '' });
   const models: HarnessModelInfo[] = [];
   for (const rawLine of res.stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -393,12 +836,84 @@ async function probeAgyModelsCli(binaryPath: string): Promise<HarnessModelInfo[]
   return models;
 }
 
+async function requestSessionLoadWithIdleGap(
+  rpc: StdioJsonRpcClient,
+  params: Record<string, unknown>,
+  idleGapMs: number,
+  attachTracker: (tracker: { notifyUpdate: () => void } | undefined) => void,
+  onIdleResolved?: () => void,
+): Promise<AcpSessionNewResult> {
+  const sessionId = String(params.sessionId ?? '');
+  return new Promise<AcpSessionNewResult>((resolve, reject) => {
+    let settled = false;
+    let sawReplayUpdate = false;
+    let idleTimer: NodeJS.Timeout | undefined;
+
+    const cleanup = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+      attachTracker(undefined);
+    };
+
+    const scheduleIdleCheck = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (settled || !sawReplayUpdate) return;
+        settled = true;
+        cleanup();
+        onIdleResolved?.();
+        resolve({ sessionId });
+      }, Math.max(50, idleGapMs));
+    };
+
+    attachTracker({
+      notifyUpdate: () => {
+        if (settled) return;
+        sawReplayUpdate = true;
+        scheduleIdleCheck();
+      },
+    });
+
+    rpc
+      .request<AcpSessionNewResult>('session/load', params, 45_000)
+      .then((res) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(res);
+      })
+      .catch((err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      });
+  });
+}
+
 interface PendingAcpApproval {
   rpcId: string | number;
   options: AcpPermissionOption[];
 }
 
-class AcpSessionHandle implements AdapterSessionHandle {
+interface AcpSessionRuntimeOptions {
+  flavorPolicy: AcpFlavorPolicy;
+  cliBinary?: string;
+  appDataDir?: string;
+  spawnEnv?: Record<string, string | undefined>;
+  authMethodId?: string;
+  authenticateEagerly: boolean;
+  sessionLoadReplayIdleMs: number;
+  onAuthRequired?: () => void;
+  onAuthenticated?: () => void;
+  onConfigOptionsUpdated?: (configOptions: AcpConfigOption[]) => void;
+  onAvailableCommandsUpdated?: (commands: string[]) => void;
+  onEmbeddedContextSupportChanged?: (supported: boolean) => void;
+}
+
+export class AcpSessionHandle implements AdapterSessionHandle {
   pluginMcpAvailable = false;
   private readonly listeners = new Set<(event: NormalizedAdapterEvent) => void>();
   private readonly earlyBuffer: NormalizedAdapterEvent[] = [];
@@ -415,6 +930,8 @@ class AcpSessionHandle implements AdapterSessionHandle {
   private nativeCommandAbort?: AbortController;
   private nativeCommandTask?: Promise<void>;
   private hasAcpTurn = false;
+  private sessionLoadTracker?: { notifyUpdate: () => void };
+  private advertisedCommands: string[] = [];
 
   // Authoritative server-side model/config state tracked from session/new + set_config_option
   private configOptions: AcpConfigOption[] = [];
@@ -426,7 +943,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
   constructor(
     child: ReturnType<typeof spawnCliProcess>,
     private readonly config: AdapterSessionConfig,
-    private readonly agyBinary?: string,
+    private readonly runtimeOpts: AcpSessionRuntimeOptions,
   ) {
     this.rpc = new StdioJsonRpcClient(child, {
       onNotification: (method, params) => this.handleNotification(method, params),
@@ -450,24 +967,58 @@ class AcpSessionHandle implements AdapterSessionHandle {
     return this._nativeSessionId;
   }
 
+  getConfigOptions(): AcpConfigOption[] {
+    return this.configOptions;
+  }
+
+  getAvailableCommands(): string[] {
+    return this.advertisedCommands;
+  }
+
   async initialize(): Promise<void> {
-    const initRes = (await this.rpc.request('initialize', {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
-      },
-      clientInfo: { name: 'harnessmate-desktop', version: '0.3.0' },
-    })) as {
+    let initRes: {
       agentCapabilities?: {
         mcpCapabilities?: { http?: boolean };
         promptCapabilities?: { embeddedContext?: boolean };
+        sessionCapabilities?: { resume?: unknown };
       };
+      authMethods?: Array<{ id?: string; name?: string }>;
     };
+    try {
+      initRes = (await this.rpc.request('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+        clientInfo: { name: 'harnessmate-desktop', version: '0.3.0' },
+      })) as typeof initRes;
+    } catch (err) {
+      if (isAcpAuthRequiredError(err)) {
+        this.runtimeOpts.onAuthRequired?.();
+      }
+      throw err;
+    }
 
     this.supportsEmbeddedContext = Boolean(
       initRes?.agentCapabilities?.promptCapabilities?.embeddedContext,
     );
+    this.runtimeOpts.onEmbeddedContextSupportChanged?.(this.supportsEmbeddedContext);
+
+    if (this.runtimeOpts.authenticateEagerly) {
+      const methodId = this.runtimeOpts.authMethodId ?? initRes?.authMethods?.[0]?.id;
+      if (methodId) {
+        try {
+          await this.rpc.request('authenticate', { methodId }, 15_000);
+          this.runtimeOpts.onAuthenticated?.();
+        } catch (err) {
+          if (isAcpAuthRequiredError(err)) {
+            this.runtimeOpts.onAuthRequired?.();
+          }
+          throw err;
+        }
+      }
+    }
 
     const mcp = this.config.pluginMcp;
     const server = mcp && (initRes?.agentCapabilities?.mcpCapabilities?.http ? {
@@ -476,41 +1027,77 @@ class AcpSessionHandle implements AdapterSessionHandle {
     } : pluginMcpStdioConfig(mcp));
     this.pluginMcpAvailable = Boolean(server);
     const requestSession = async (method: string, params: Record<string, unknown>) => {
+      const callMethod = async (callParams: Record<string, unknown>) => {
+        if (method === 'session/load') {
+          return requestSessionLoadWithIdleGap(
+            this.rpc,
+            callParams,
+            this.runtimeOpts.sessionLoadReplayIdleMs,
+            (tracker) => {
+              this.sessionLoadTracker = tracker;
+            },
+            () => {
+              this.emit({
+                type: 'diagnostic.log',
+                level: 'info',
+                stream: 'protocol',
+                message: `ACP session/load resolved via replay idle gap (${this.runtimeOpts.sessionLoadReplayIdleMs}ms)`,
+              });
+            },
+          );
+        }
+        return this.rpc.request<AcpSessionNewResult>(method, callParams, 25_000);
+      };
+
       if (server && this.pluginMcpAvailable) {
         try {
-          return await this.rpc.request<AcpSessionNewResult>(method, { ...params, mcpServers: [server] }, 25_000);
-        } catch {
+          return await callMethod({ ...params, mcpServers: [server] });
+        } catch (err) {
+          if (isAcpAuthRequiredError(err)) {
+            this.runtimeOpts.onAuthRequired?.();
+            throw err;
+          }
           this.pluginMcpAvailable = false;
           this.emit({ type: 'diagnostic.log', level: 'warn', stream: 'protocol', message: 'ACP 无法挂载会话插件工具，使用原会话能力重试' });
         }
       }
-      return this.rpc.request<AcpSessionNewResult>(method, params, 25_000);
+      return callMethod(params);
     };
 
     const createFreshAcpSession = () =>
       requestSession('session/new', { cwd: this.config.cwd, mcpServers: [] });
 
     let sessRes: AcpSessionNewResult | undefined;
-    if (this.config.nativeSessionId) {
-      try {
-        const params = {
+    try {
+      if (this.config.nativeSessionId) {
+        try {
+          const params = {
             sessionId: this.config.nativeSessionId,
             cwd: this.config.cwd,
             mcpServers: [],
-        };
-        const supportsResume = (initRes.agentCapabilities as {
-          sessionCapabilities?: { resume?: unknown };
-        } | undefined)?.sessionCapabilities?.resume;
-        sessRes = await requestSession(supportsResume ? 'session/resume' : 'session/load', params);
-        this._nativeSessionId = this.config.nativeSessionId;
-      } catch (err) {
-        if (this.config.requireNativeResume) throw err;
+          };
+          const supportsResume = initRes.agentCapabilities?.sessionCapabilities?.resume;
+          sessRes = await requestSession(supportsResume ? 'session/resume' : 'session/load', params);
+          this._nativeSessionId = this.config.nativeSessionId;
+        } catch (err) {
+          if (isAcpAuthRequiredError(err)) {
+            this.runtimeOpts.onAuthRequired?.();
+            throw err;
+          }
+          if (this.config.requireNativeResume) throw err;
+          sessRes = await createFreshAcpSession();
+          this._nativeSessionId = sessRes?.sessionId ?? null;
+        }
+      } else {
         sessRes = await createFreshAcpSession();
         this._nativeSessionId = sessRes?.sessionId ?? null;
       }
-    } else {
-      sessRes = await createFreshAcpSession();
-      this._nativeSessionId = sessRes?.sessionId ?? null;
+      this.runtimeOpts.onAuthenticated?.();
+    } catch (err) {
+      if (isAcpAuthRequiredError(err)) {
+        this.runtimeOpts.onAuthRequired?.();
+      }
+      throw err;
     }
 
     this.ingestSessionMetadata(sessRes);
@@ -526,8 +1113,54 @@ class AcpSessionHandle implements AdapterSessionHandle {
     }
   }
 
-  async updateConfig(patch: Partial<AdapterSessionConfig>): Promise<void> {
+  async updateConfig(
+    patch: Partial<AdapterSessionConfig> & { configOptions?: Record<string, string> },
+  ): Promise<void> {
     await this.applyRuntimeConfig(patch);
+  }
+
+  async setConfigOption(configId: string, value: string): Promise<boolean> {
+    if (!this._nativeSessionId) return false;
+    const opt = this.configOptions.find((c) => c.id === configId || c.category === configId);
+    if (!opt) {
+      this.emit({
+        type: 'diagnostic.log',
+        level: 'warn',
+        stream: 'protocol',
+        message: `ACP config option "${configId}" is not advertised; skipping stale/unknown key`,
+      });
+      return false;
+    }
+    const allowed = new Set((opt.options ?? []).map((o) => o.value));
+    if (allowed.size > 0 && !allowed.has(value)) {
+      this.emit({
+        type: 'diagnostic.log',
+        level: 'warn',
+        stream: 'protocol',
+        message: `ACP config option "${configId}" value "${value}" is not in advertised choices; skipping`,
+      });
+      return false;
+    }
+    try {
+      const res = (await this.rpc.request(
+        'session/set_config_option',
+        { sessionId: this._nativeSessionId, configId: opt.id, value },
+        6000,
+      )) as { configOptions?: AcpConfigOption[] };
+      if (Array.isArray(res?.configOptions)) {
+        this.configOptions = res.configOptions;
+        this.runtimeOpts.onConfigOptionsUpdated?.(this.configOptions);
+      }
+      return true;
+    } catch (err) {
+      this.emit({
+        type: 'diagnostic.log',
+        level: 'warn',
+        stream: 'protocol',
+        message: `ACP set_config_option "${configId}=${value}" failed and was skipped: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return false;
+    }
   }
 
   private ingestSessionMetadata(res: AcpSessionNewResult | undefined): void {
@@ -536,6 +1169,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
     this.appliedModeId = res.modes?.currentModeId;
     if (Array.isArray(res.configOptions)) {
       this.configOptions = res.configOptions;
+      this.runtimeOpts.onConfigOptionsUpdated?.(this.configOptions);
     }
     if (Array.isArray(res.models?.availableModels)) {
       this.availableVariantIds = new Set(res.models.availableModels.map((m) => m.modelId));
@@ -551,10 +1185,18 @@ class AcpSessionHandle implements AdapterSessionHandle {
   /**
    * Explicitly switches model, thought_level, and mode using ACP's authoritative
    * session/set_config_option (and session/set_model when given a full variant ID),
-   * and verifies the server-confirmed value instead of silently ignoring failures.
+   * skipping invalid/stale option keys cleanly with diagnostics.
    */
-  private async applyRuntimeConfig(patch: Partial<AdapterSessionConfig>): Promise<void> {
+  private async applyRuntimeConfig(
+    patch: Partial<AdapterSessionConfig> & { configOptions?: Record<string, string> },
+  ): Promise<void> {
     if (!this._nativeSessionId) return;
+
+    if (patch.configOptions) {
+      for (const [k, v] of Object.entries(patch.configOptions)) {
+        await this.setConfigOption(k, v);
+      }
+    }
 
     const requestedModel = patch.model ?? undefined;
     const requestedEffort = patch.reasoningEffort ?? undefined;
@@ -588,6 +1230,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
           )) as { configOptions?: AcpConfigOption[] };
           if (Array.isArray(res?.configOptions)) {
             this.configOptions = res.configOptions;
+            this.runtimeOpts.onConfigOptionsUpdated?.(this.configOptions);
           }
           const updatedModelOpt = this.configOptions.find(
             (c) => c.id === 'model' || c.category === 'model',
@@ -663,10 +1306,11 @@ class AcpSessionHandle implements AdapterSessionHandle {
     if (patch.permissionMode && (!this.permissionModeConfigured || patch.permissionMode !== this.permissionMode)) {
       const requested = mapPermissionModeToAcpMode(patch.permissionMode);
       const advertised = this.availableModes?.availableModes;
-      const acpMode = advertised?.find(({ id }) => id === requested)?.id ??
-        (this.agyBinary && patch.permissionMode !== 'plan'
-          ? advertised?.find(({ id }) => id === 'accept-edits')?.id ?? requested
-          : requested);
+      const acpMode = this.runtimeOpts.flavorPolicy.resolveModeId(
+        requested,
+        advertised,
+        patch.permissionMode,
+      );
       if (acpMode !== this.appliedModeId) {
         try {
           await this.rpc.request(
@@ -676,8 +1320,16 @@ class AcpSessionHandle implements AdapterSessionHandle {
           );
           this.appliedModeId = acpMode;
         } catch (err) {
-          if (this.agyBinary && (patch.permissionMode === 'plan' || this.appliedModeId === 'plan' || this.appliedModeId === 'auto')) throw err;
-          // Older custom ACP servers can omit mode switching.
+          if (this.runtimeOpts.flavorPolicy.shouldThrowOnModeError(patch.permissionMode, this.appliedModeId)) {
+            throw err;
+          }
+          // Older or strict ACP servers can omit mode switching; degrade with client guard notice
+          this.emit({
+            type: 'diagnostic.log',
+            level: 'warn',
+            stream: 'protocol',
+            message: `ACP session/set_mode "${acpMode}" unsupported; enforcing client_guard for ${patch.permissionMode}`,
+          });
         }
       }
       this.permissionMode = patch.permissionMode;
@@ -690,9 +1342,25 @@ class AcpSessionHandle implements AdapterSessionHandle {
     const effortOpt = this.configOptions.find(
       (c) => c.id === 'thought_level' || c.category === 'thought_level',
     );
-    if (!effortOpt) return;
+    if (!effortOpt) {
+      this.emit({
+        type: 'diagnostic.log',
+        level: 'warn',
+        stream: 'protocol',
+        message: `ACP thought_level "${effort}" skipped: option not advertised by agent`,
+      });
+      return;
+    }
     const allowed = new Set((effortOpt.options ?? []).map((o) => o.value));
-    if (allowed.size > 0 && !allowed.has(effort)) return;
+    if (allowed.size > 0 && !allowed.has(effort)) {
+      this.emit({
+        type: 'diagnostic.log',
+        level: 'warn',
+        stream: 'protocol',
+        message: `ACP thought_level "${effort}" skipped: not in advertised choices`,
+      });
+      return;
+    }
     try {
       const res = (await this.rpc.request(
         'session/set_config_option',
@@ -701,6 +1369,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
       )) as { configOptions?: AcpConfigOption[] };
       if (Array.isArray(res?.configOptions)) {
         this.configOptions = res.configOptions;
+        this.runtimeOpts.onConfigOptionsUpdated?.(this.configOptions);
       }
       const updated = this.configOptions.find(
         (c) => c.id === 'thought_level' || c.category === 'thought_level',
@@ -716,70 +1385,19 @@ class AcpSessionHandle implements AdapterSessionHandle {
     }
   }
 
-  async sendTurn(
+  private buildPromptBlocks(
     input: TurnInput,
-  ): Promise<{ driverUsed?: import('@harnessmate/protocol').ContextInjectionDriver }> {
-    if (!this._nativeSessionId) {
-      throw new Error('ACP session is not initialized');
-    }
-    if (input.cliCommand && this.agyBinary) {
-      const binary = this.agyBinary;
-      const command = input.cliCommand;
-      const nativeId = this.config.nativeSessionId || this.hasAcpTurn ? this._nativeSessionId : null;
-      if (command === '/compact' && !nativeId) throw new Error('当前 AGY 会话还没有可以压缩的上下文');
-      const abort = new AbortController();
-      this.nativeCommandAbort = abort;
-      this.currentTurnId = input.turnId;
-      this.emit({ type: 'turn.started', turnId: input.turnId });
-      this.nativeCommandTask = runAgyCommand(binary, {
-        ...this.config,
-        model: input.model,
-        reasoningEffort: input.reasoningEffort,
-        permissionMode: input.permissionMode ?? this.config.permissionMode,
-      }, command, nativeId, abort.signal).then((result) => {
-        if (this.currentTurnId !== input.turnId) return;
-        if (nativeId && result.conversation_id && result.conversation_id !== nativeId) {
-          throw new Error('AGY 命令返回了不同的原生会话');
-        }
-        if (result.conversation_id && result.conversation_id !== this._nativeSessionId) {
-          this._nativeSessionId = result.conversation_id;
-          this.emit({ type: 'native_session_ready', nativeSessionId: result.conversation_id });
-        }
-        if (result.response) this.emit({ type: 'message.assistant.completed', turnId: input.turnId, text: result.response });
-        this.currentTurnId = null;
-        this.emit({ type: 'turn.completed', turnId: input.turnId, stopReason: 'native_command' });
-      }).catch((err: Error) => {
-        if (this.currentTurnId !== input.turnId) return;
-        this.currentTurnId = null;
-        if (abort.signal.aborted) this.emit({ type: 'turn.cancelled', turnId: input.turnId });
-        else this.emit({ type: 'turn.failed', turnId: input.turnId, message: err.message });
-      }).finally(() => {
-        this.nativeCommandAbort = undefined;
-        this.nativeCommandTask = undefined;
-      });
-      return {};
-    }
-
-    // Ensure requested model/effort/mode is synced before sending turn
-    if (input.model || input.reasoningEffort || input.permissionMode) {
-      await this.applyRuntimeConfig({
-        model: input.model,
-        reasoningEffort: input.reasoningEffort,
-        permissionMode: input.permissionMode,
-      });
-    }
-
-    this.currentTurnId = input.turnId;
-    this.assistantAccum = '';
-    this.thinkingAccum = '';
-    this.emit({ type: 'turn.started', turnId: input.turnId });
-
-    const basePromptText = buildPromptWithFileAttachments(input.text, input.attachments);
+    basePromptText: string,
+    useEmbeddedContext: boolean,
+  ): {
+    promptBlocks: Array<Record<string, unknown>>;
+    driverUsed?: import('@harnessmate/protocol').ContextInjectionDriver;
+  } {
     const promptBlocks: Array<Record<string, unknown>> = [];
     let driverUsed: import('@harnessmate/protocol').ContextInjectionDriver | undefined;
 
     if (input.contextSync) {
-      if (this.supportsEmbeddedContext) {
+      if (useEmbeddedContext) {
         promptBlocks.push({
           type: 'resource',
           resource: {
@@ -822,18 +1440,142 @@ class AcpSessionHandle implements AdapterSessionHandle {
       }
     }
 
-    if (driverUsed && input.contextSync) input.contextSync.onDispatch?.(driverUsed, input.contextSync.deltaMarkdown);
-    void this.rpc
-      .request<{ stopReason?: string }>(
-        'session/prompt',
-        {
-          sessionId: this._nativeSessionId,
-          prompt: promptBlocks,
-        },
-        15 * 60_000,
-      )
+    return { promptBlocks, driverUsed };
+  }
+
+  async sendTurn(
+    input: TurnInput,
+  ): Promise<{ driverUsed?: import('@harnessmate/protocol').ContextInjectionDriver }> {
+    if (!this._nativeSessionId) {
+      throw new Error('ACP session is not initialized');
+    }
+    if (input.cliCommand && this.runtimeOpts.cliBinary && this.runtimeOpts.flavorPolicy.canRunNativeCliCommand()) {
+      const binary = this.runtimeOpts.cliBinary;
+      const command = input.cliCommand;
+      const nativeId = this.config.nativeSessionId || this.hasAcpTurn ? this._nativeSessionId : null;
+      if (command === '/compact' && !nativeId) throw new Error('当前会话还没有可以压缩的上下文');
+      const abort = new AbortController();
+      this.nativeCommandAbort = abort;
+      this.currentTurnId = input.turnId;
+      this.emit({ type: 'turn.started', turnId: input.turnId });
+      this.nativeCommandTask = this.runtimeOpts.flavorPolicy
+        .executeNativeCliCommand(
+          binary,
+          {
+            ...this.config,
+            model: input.model,
+            reasoningEffort: input.reasoningEffort,
+            permissionMode: input.permissionMode ?? this.config.permissionMode,
+          },
+          command,
+          nativeId,
+          abort.signal,
+          { env: this.runtimeOpts.spawnEnv, appDataDir: this.runtimeOpts.appDataDir },
+        )
+        .then((result) => {
+          if (this.currentTurnId !== input.turnId) return;
+          if (nativeId && result.conversation_id && result.conversation_id !== nativeId) {
+            throw new Error('原生命令返回了不同的原生会话');
+          }
+          if (result.conversation_id && result.conversation_id !== this._nativeSessionId) {
+            this._nativeSessionId = result.conversation_id;
+            this.emit({ type: 'native_session_ready', nativeSessionId: result.conversation_id });
+          }
+          if (result.response) {
+            this.emit({ type: 'message.assistant.completed', turnId: input.turnId, text: result.response });
+          }
+          this.currentTurnId = null;
+          this.emit({ type: 'turn.completed', turnId: input.turnId, stopReason: 'native_command' });
+        })
+        .catch((err: Error) => {
+          if (this.currentTurnId !== input.turnId) return;
+          this.currentTurnId = null;
+          if (abort.signal.aborted) this.emit({ type: 'turn.cancelled', turnId: input.turnId });
+          else {
+            const authErr = isAcpAuthRequiredError(err);
+            if (authErr) this.runtimeOpts.onAuthRequired?.();
+            this.emit({
+              type: 'turn.failed',
+              turnId: input.turnId,
+              message: err.message,
+              ...(authErr ? { code: 'unauthenticated' } : {}),
+            });
+          }
+        })
+        .finally(() => {
+          this.nativeCommandAbort = undefined;
+          this.nativeCommandTask = undefined;
+        });
+      return {};
+    }
+
+    // Ensure requested model/effort/mode is synced before sending turn
+    if (input.model || input.reasoningEffort || input.permissionMode) {
+      await this.applyRuntimeConfig({
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+        permissionMode: input.permissionMode,
+      });
+    }
+
+    this.currentTurnId = input.turnId;
+    this.assistantAccum = '';
+    this.thinkingAccum = '';
+    this.emit({ type: 'turn.started', turnId: input.turnId });
+
+    const basePromptText = buildPromptWithFileAttachments(input.text, input.attachments);
+    const { promptBlocks, driverUsed } = this.buildPromptBlocks(
+      input,
+      basePromptText,
+      this.supportsEmbeddedContext,
+    );
+
+    if (driverUsed && input.contextSync) {
+      input.contextSync.onDispatch?.(driverUsed, input.contextSync.deltaMarkdown);
+    }
+
+    const sessionId = this._nativeSessionId;
+    const runPrompt = async () => {
+      try {
+        return await this.rpc.request<{ stopReason?: string }>(
+          'session/prompt',
+          {
+            sessionId,
+            prompt: promptBlocks,
+          },
+          15 * 60_000,
+        );
+      } catch (err) {
+        if (driverUsed === 'acp_embedded_context' && isEmbeddedContextRejectionError(err)) {
+          this.supportsEmbeddedContext = false;
+          this.runtimeOpts.onEmbeddedContextSupportChanged?.(false);
+          this.emit({
+            type: 'diagnostic.log',
+            level: 'warn',
+            stream: 'protocol',
+            message: `ACP server rejected embeddedContext resource block (${err instanceof Error ? err.message : String(err)}); retrying inline`,
+          });
+          const fallback = this.buildPromptBlocks(input, basePromptText, false);
+          if (input.contextSync && fallback.driverUsed) {
+            input.contextSync.onDispatch?.(fallback.driverUsed, input.contextSync.deltaMarkdown);
+          }
+          return await this.rpc.request<{ stopReason?: string }>(
+            'session/prompt',
+            {
+              sessionId,
+              prompt: fallback.promptBlocks,
+            },
+            15 * 60_000,
+          );
+        }
+        throw err;
+      }
+    };
+
+    void runPrompt()
       .then((res) => {
         this.hasAcpTurn = true;
+        this.runtimeOpts.onAuthenticated?.();
         const turnId = this.currentTurnId;
         if (!turnId) return;
         this.currentTurnId = null;
@@ -856,7 +1598,16 @@ class AcpSessionHandle implements AdapterSessionHandle {
         const turnId = this.currentTurnId;
         if (!turnId) return;
         this.currentTurnId = null;
-        this.emit({ type: 'turn.failed', turnId, message: err.message });
+        const authErr = isAcpAuthRequiredError(err);
+        if (authErr) {
+          this.runtimeOpts.onAuthRequired?.();
+        }
+        this.emit({
+          type: 'turn.failed',
+          turnId,
+          message: err.message,
+          ...(authErr ? { code: 'unauthenticated' } : {}),
+        });
       });
 
     return { driverUsed };
@@ -928,27 +1679,16 @@ class AcpSessionHandle implements AdapterSessionHandle {
       const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;
       const rawOptions = Array.isArray(params.options) ? (params.options as AcpPermissionOption[]) : [];
 
-      if (this.agyBinary && (!this.currentTurnId || (typeof params.sessionId === 'string' && params.sessionId !== this._nativeSessionId))) {
-        this.rpc.respond(req.id, { outcome: { outcome: 'cancelled' } });
+      const policyOutcome = this.runtimeOpts.flavorPolicy.evaluatePermissionPolicy(
+        params,
+        rawOptions,
+        this.permissionMode,
+        this.currentTurnId,
+        this._nativeSessionId,
+      );
+      if (policyOutcome) {
+        this.rpc.respond(req.id, policyOutcome);
         return;
-      }
-      if (this.agyBinary) {
-        const kind = String(toolCall.kind ?? '').toLowerCase();
-        const readOnly = kind === 'read' || kind === 'search';
-        const edit = ['edit', 'write', 'create'].includes(kind);
-        const allow = this.permissionMode === 'auto' ||
-          (this.permissionMode === 'accept_edits' && (readOnly || edit)) ||
-          (this.permissionMode === 'plan' && readOnly);
-        const reject = this.permissionMode === 'plan' && (edit || ['delete', 'move', 'execute', 'shell', 'terminal'].includes(kind));
-        if (allow || reject) {
-          const chosen = pickAcpOption(rawOptions, reject ? 'deny' : 'allow_once', true);
-          if (chosen || reject) {
-            this.rpc.respond(req.id, { outcome: chosen
-              ? { outcome: 'selected', optionId: chosen.optionId }
-              : { outcome: 'cancelled' } });
-            return;
-          }
-        }
       }
 
       const toolName = String(toolCall.title ?? toolCall.kind ?? 'Tool Permission');
@@ -981,6 +1721,7 @@ class AcpSessionHandle implements AdapterSessionHandle {
 
   private handleNotification(method: string, rawParams: unknown): void {
     if (method !== 'session/update') return;
+    this.sessionLoadTracker?.notifyUpdate();
     const params = (rawParams ?? {}) as Record<string, unknown>;
     const update = (params.update ?? params) as Record<string, unknown>;
     const kind = String(update.sessionUpdate ?? update.type ?? '');
@@ -1051,10 +1792,91 @@ class AcpSessionHandle implements AdapterSessionHandle {
         break;
       }
 
+      case 'plan': {
+        const entries = Array.isArray(update.entries) ? update.entries : [];
+        const summaryLines = entries
+          .map((e) => {
+            if (!e || typeof e !== 'object') return '';
+            const rec = e as { content?: string; status?: string };
+            return rec.content ? `[${rec.status ?? 'pending'}] ${rec.content}` : '';
+          })
+          .filter(Boolean);
+        this.emit({
+          type: 'turn_block.ext',
+          turnId,
+          itemId: `acp_plan_${turnId}`,
+          blockType: 'ext:acp.plan',
+          title: 'Plan',
+          fallbackSummary: summaryLines.join('\n') || `${entries.length} plan entries`,
+          status: 'completed',
+          payload: { entries },
+        });
+        break;
+      }
+
+      case 'available_commands_update': {
+        const rawCommands = Array.isArray(update.availableCommands) ? update.availableCommands : [];
+        const commandNames = rawCommands
+          .map((c) => (c && typeof c === 'object' ? String((c as { name?: string }).name ?? '') : String(c ?? '')))
+          .filter(Boolean);
+        this.advertisedCommands = commandNames;
+        this.runtimeOpts.onAvailableCommandsUpdated?.(commandNames);
+        this.emit({
+          type: 'turn_block.ext',
+          turnId,
+          itemId: `acp_cmds_${Date.now()}`,
+          blockType: 'ext:acp.available_commands',
+          title: 'Available Commands',
+          fallbackSummary: commandNames.join(', ') || 'No commands advertised',
+          status: 'completed',
+          payload: { commands: rawCommands },
+        });
+        break;
+      }
+
+      case 'config_option_update': {
+        if (Array.isArray(update.configOptions)) {
+          this.configOptions = update.configOptions as AcpConfigOption[];
+        } else if (typeof update.configId === 'string') {
+          const idx = this.configOptions.findIndex((c) => c.id === update.configId);
+          if (idx >= 0) {
+            this.configOptions[idx] = {
+              ...this.configOptions[idx]!,
+              ...(typeof update.value === 'string' ? { currentValue: update.value } : {}),
+              ...(Array.isArray(update.options)
+                ? { options: update.options as AcpConfigOption['options'] }
+                : {}),
+            };
+          } else {
+            this.configOptions.push({
+              id: update.configId,
+              name: typeof update.name === 'string' ? update.name : update.configId,
+              type: typeof update.optionType === 'string' ? update.optionType : 'select',
+              currentValue: typeof update.value === 'string' ? update.value : undefined,
+              options: Array.isArray(update.options)
+                ? (update.options as AcpConfigOption['options'])
+                : undefined,
+            });
+          }
+        }
+        this.runtimeOpts.onConfigOptionsUpdated?.([...this.configOptions]);
+        break;
+      }
+
       default:
         break;
     }
   }
+}
+
+function isEmbeddedContextRejectionError(err: unknown): boolean {
+  if (err instanceof JsonRpcResponseError && (err.code === -32602 || err.code === -32600)) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /embedded.?context|resource|unsupported.*block|invalid params|unknown.*content.*type/i.test(
+    msg,
+  );
 }
 
 function mapPermissionModeToAcpMode(mode: PermissionMode): string {
