@@ -5,14 +5,87 @@ import type {
   CanonicalEvent,
   Session,
   SessionTaskState,
+  TaskFailedAttempt,
   TaskStep,
+  TaskVerification,
   UpdateTaskStateRequest,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
 import type { getGitStatusSummary } from './git-service.js';
 
 const VERIFICATION_CMD_RE =
-  /\b(test|vitest|jest|pytest|mocha|phpunit|rspec|typecheck|tsc|lint|eslint|biome|build|compile|check|gradle|gradlew|cargo\s+(test|check|build)|go\s+(test|vet|build)|pnpm\s+(test|build|typecheck|lint)|npm\s+(test|run\s+(test|build|lint|typecheck)))\b/i;
+  /\b(vitest|jest|pytest|mocha|phpunit|rspec|tsc|eslint|biome|gradle|gradlew)\b|\b(cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build))\b|\b((?:pnpm|npm|yarn|bun)\s+(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+|run\s+)*(?:\S*:)?(?:test|build|typecheck|lint|check)|npm\s+t)\b|\b(make|cmake|ninja|msbuild|dotnet)\s+(?:test|build|check)\b/i;
+
+const MAX_FAILED_ATTEMPTS = 12;
+const TRANSIENT_FAILURE_RE =
+  /\b(429|rate.?limit|quota|too many requests|unauthorized|auth_required|timed?\s*out|econnreset)\b/i;
+
+const READ_ONLY_EXECUTABLES = new Set([
+  'ls',
+  'll',
+  'la',
+  'dir',
+  'cat',
+  'bat',
+  'type',
+  'pwd',
+  'cd',
+  'pushd',
+  'popd',
+  'set-location',
+  'get-location',
+  'get-childitem',
+  'get-content',
+  'select-string',
+  'head',
+  'tail',
+  'less',
+  'more',
+  'echo',
+  'printf',
+  'write-output',
+  'rg',
+  'grep',
+  'egrep',
+  'fgrep',
+  'ag',
+  'ack',
+  'find',
+  'fd',
+  'tree',
+  'stat',
+  'wc',
+  'file',
+  'which',
+  'where',
+  'whereis',
+  'command',
+  'whoami',
+  'id',
+  'uname',
+  'date',
+  'env',
+  'printenv',
+  'ps',
+  'du',
+  'df',
+  'realpath',
+  'readlink',
+  'dirname',
+  'basename',
+]);
+
+interface WorkspaceLedgerMeta {
+  activeSessionId: string;
+  lastWrittenHash: string;
+  lastSnapshot: {
+    objective: string;
+    pinnedFacts: string[];
+    decisions: string[];
+    blockers: string[];
+  };
+  updatedAt: number;
+}
 
 export class TaskLedgerService {
   constructor(private readonly store: HarnessMateStore,
@@ -20,8 +93,14 @@ export class TaskLedgerService {
 
   syncSession(session: Session): void {
     const state = this.getOrCreate(session);
-    const ledgerFilePath = this.syncWorkspaceLedgerFile(session, state);
-    if (ledgerFilePath && ledgerFilePath !== state.ledgerFilePath) this.store.upsertTaskState({ ...state, ledgerFilePath });
+    const { ledgerFilePath, state: mergedState, conflictDetected } = this.syncWorkspaceLedgerWithMerge(session, state);
+    if (conflictDetected || (ledgerFilePath && ledgerFilePath !== state.ledgerFilePath)) {
+      this.store.upsertTaskState({
+        ...mergedState,
+        ...(ledgerFilePath ? { ledgerFilePath } : {}),
+        ...(conflictDetected ? { version: state.version + 1, updatedAt: Date.now() } : {}),
+      });
+    }
   }
 
   getOrCreate(session: Session): SessionTaskState {
@@ -44,8 +123,19 @@ export class TaskLedgerService {
     });
   }
 
-  updateManual(session: Session, patch: UpdateTaskStateRequest): SessionTaskState {
+  updateManual(
+    session: Session,
+    patch: UpdateTaskStateRequest & { failedAttempts?: TaskFailedAttempt[] },
+  ): SessionTaskState {
     const current = this.getOrCreate(session);
+    let nextFailedAttempts = current.failedAttempts;
+    if (patch.failedAttempts !== undefined) {
+      const normalized = patch.failedAttempts
+        .map((fa) => normalizeFailedAttempt(fa, session.harnessId, session.cwd))
+        .filter((fa): fa is TaskFailedAttempt => fa !== null);
+      nextFailedAttempts = mergeFailedAttempts([], normalized);
+    }
+
     const next: SessionTaskState = {
       ...current,
       objective: patch.objective !== undefined ? patch.objective.trim() : current.objective,
@@ -58,17 +148,48 @@ export class TaskLedgerService {
       blockers: patch.blockers !== undefined ? dedupeStrings(patch.blockers) : current.blockers,
       pinnedFacts:
         patch.pinnedFacts !== undefined ? dedupeStrings(patch.pinnedFacts) : current.pinnedFacts,
+      ...(nextFailedAttempts && nextFailedAttempts.length > 0 ? { failedAttempts: nextFailedAttempts } : {}),
       rollingSummary:
         patch.rollingSummary !== undefined ? patch.rollingSummary.trim() : current.rollingSummary,
       version: current.version + 1,
       updatedAt: Date.now(),
     };
 
-    const ledgerPath = this.syncWorkspaceLedgerFile(session, next);
-    if (ledgerPath) {
-      next.ledgerFilePath = ledgerPath;
+    const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
+    if (ledgerFilePath) {
+      mergedState.ledgerFilePath = ledgerFilePath;
     }
-    return this.store.upsertTaskState(next);
+    return this.store.upsertTaskState(mergedState);
+  }
+
+  recordFailedAttempt(
+    session: Session,
+    attempt: {
+      id?: string;
+      summary: string;
+      failureReason: string;
+      relatedFiles?: string[];
+      harnessInstanceId?: string | null;
+      recordedAt?: number;
+    },
+  ): SessionTaskState {
+    const current = this.getOrCreate(session);
+    const normalized = normalizeFailedAttempt(attempt, session.harnessId, session.cwd);
+    if (!normalized) return current;
+
+    const mergedAttempts = mergeFailedAttempts(current.failedAttempts ?? [], [normalized]);
+    const next: SessionTaskState = {
+      ...current,
+      failedAttempts: mergedAttempts,
+      version: current.version + 1,
+      updatedAt: Date.now(),
+    };
+
+    const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
+    if (ledgerFilePath) {
+      mergedState.ledgerFilePath = ledgerFilePath;
+    }
+    return this.store.upsertTaskState(mergedState);
   }
 
   /**
@@ -88,6 +209,9 @@ export class TaskLedgerService {
     const touchedFiles = new Set<string>(current.touchedFiles);
     const verifications = [...current.verifications];
     const blockers = [...current.blockers];
+    const incomingFailedAttempts: TaskFailedAttempt[] = [];
+    const turnTouchedFiles = new Set<string>();
+    let recordedTurnToolFailure = false;
 
     let userText = '';
     let assistantText = '';
@@ -112,15 +236,20 @@ export class TaskLedgerService {
         const toolName = String(p.toolName ?? '');
         const summary = String(p.summary ?? '');
         const extracted = extractFilePathsFromTool(toolKind, toolName, summary, p.input, session.cwd);
-        for (const f of extracted) touchedFiles.add(f);
+        for (const f of extracted) {
+          touchedFiles.add(f);
+          turnTouchedFiles.add(f);
+        }
       } else if (ev.type === 'tool.call.completed') {
         const toolName = String(p.toolName ?? '');
         const status = String(p.status ?? 'success');
         const output = String(p.output ?? '');
         const diff = String(p.diff ?? '');
 
-        for (const f of extractFilePathsFromDiff(diff)) {
+        const diffFiles = extractFilePathsFromDiff(diff);
+        for (const f of diffFiles) {
           touchedFiles.add(f);
+          turnTouchedFiles.add(f);
         }
 
         const matchingStart = turnEvents.find(
@@ -130,24 +259,60 @@ export class TaskLedgerService {
           extractShellCommand(matchingStart?.payload.input, String(matchingStart?.payload.summary ?? '')) ||
           toolName;
 
+        const isShellTool = matchingStart?.payload.toolKind === 'shell';
+        const isReadOnly = isShellTool && isAllReadOnlyShellCommand(cmdCandidate);
+
         if (isVerificationCommand(matchingStart, cmdCandidate)) {
-          verifications.push({
-            command: cmdCandidate.slice(0, 160),
-            status: status === 'success' ? 'pass' : status === 'error' ? 'fail' : 'unknown',
+          const normalizedCmd = compactSingleLine(cmdCandidate, 160);
+          const isFailStatus = status === 'error' || status === 'failed';
+          upsertVerification(verifications, {
+            command: normalizedCmd,
+            status: status === 'success' ? 'pass' : isFailStatus ? 'fail' : 'unknown',
             summary: compactSingleLine(output, 180) || (status === 'success' ? 'Exit 0' : 'Failed'),
             harnessId: turnHarnessId,
             timestamp: ev.createdAt,
           });
-          if (status === 'error') {
-            const failLine = `验证失败 (${cmdCandidate.slice(0, 80)}): ${compactSingleLine(output, 140) || '命令报错'}`;
+          if (isFailStatus) {
+            const failLine = `验证失败 (${normalizedCmd.slice(0, 80)}): ${compactSingleLine(output, 140) || '命令报错'}`;
             if (!blockers.includes(failLine)) blockers.push(failLine);
           } else if (status === 'success') {
-            const cmdKey = cmdCandidate.slice(0, 40);
+            const cmdKey = normalizedCmd.slice(0, 40);
             for (let i = blockers.length - 1; i >= 0; i--) {
               if (blockers[i]!.includes(cmdKey)) {
                 blockers.splice(i, 1);
               }
             }
+          }
+        }
+
+        if ((status === 'error' || status === 'failed') && !isReadOnly) {
+          const startFiles = matchingStart
+            ? extractFilePathsFromTool(
+                String(matchingStart.payload.toolKind ?? 'other'),
+                String(matchingStart.payload.toolName ?? ''),
+                String(matchingStart.payload.summary ?? ''),
+                matchingStart.payload.input,
+                session.cwd,
+              )
+            : [];
+          const relatedFiles = [...new Set([...diffFiles, ...startFiles])];
+          const attemptSummary = isShellTool
+            ? `Shell command \`${compactSingleLine(cmdCandidate, 180)}\` failed`
+            : `Tool \`${toolName || 'tool'}\` (${compactSingleLine(String(matchingStart?.payload.summary ?? toolName), 160)}) failed`;
+          const attempt = normalizeFailedAttempt(
+            {
+              summary: attemptSummary,
+              failureReason: compactSingleLine(output, 480) || 'Exited with error',
+              relatedFiles,
+              harnessInstanceId: turnHarnessId,
+              recordedAt: ev.createdAt,
+            },
+            turnHarnessId,
+            session.cwd,
+          );
+          if (attempt) {
+            incomingFailedAttempts.push(attempt);
+            recordedTurnToolFailure = true;
           }
         }
       } else if (ev.type === 'turn.failed') {
@@ -179,7 +344,29 @@ export class TaskLedgerService {
     if (turnFailedMessage) {
       const b = `[${turnHarnessId}] 轮次中断: ${compactSingleLine(turnFailedMessage, 160)}`;
       if (!blockers.includes(b)) blockers.push(b);
+
+      if (!TRANSIENT_FAILURE_RE.test(turnFailedMessage) && !recordedTurnToolFailure) {
+        const attempt = normalizeFailedAttempt(
+          {
+            summary: compactSingleLine(userText || assistantText || 'Turn execution failed', 280),
+            failureReason: compactSingleLine(turnFailedMessage, 480),
+            relatedFiles: [...turnTouchedFiles],
+            harnessInstanceId: turnHarnessId,
+            recordedAt: Date.now(),
+          },
+          turnHarnessId,
+          session.cwd,
+        );
+        if (attempt) {
+          incomingFailedAttempts.push(attempt);
+        }
+      }
     }
+
+    const mergedFailedAttempts = mergeFailedAttempts(
+      current.failedAttempts ?? [],
+      incomingFailedAttempts,
+    );
 
     const next: SessionTaskState = {
       ...current,
@@ -187,21 +374,22 @@ export class TaskLedgerService {
       steps: steps.slice(-24),
       decisions: dedupeStrings(decisions).slice(-20),
       touchedFiles: Array.from(touchedFiles).slice(-40),
-      verifications: verifications.slice(-16),
+      verifications: verifications.slice(-12),
       blockers: dedupeStrings(blockers).slice(-12),
       pinnedFacts: current.pinnedFacts,
+      ...(mergedFailedAttempts.length > 0 ? { failedAttempts: mergedFailedAttempts } : {}),
       rollingSummary: current.rollingSummary,
       summarizedUpToSeq: current.summarizedUpToSeq,
       version: current.version + 1,
       updatedAt: Date.now(),
     };
 
-    const ledgerPath = this.syncWorkspaceLedgerFile(session, next);
-    if (ledgerPath) {
-      next.ledgerFilePath = ledgerPath;
+    const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
+    if (ledgerFilePath) {
+      mergedState.ledgerFilePath = ledgerFilePath;
     }
 
-    return this.store.upsertTaskState(next);
+    return this.store.upsertTaskState(mergedState);
   }
 
   /**
@@ -273,9 +461,9 @@ export class TaskLedgerService {
       version: current.version + 1,
       updatedAt: Date.now(),
     };
-    const ledgerPath = this.syncWorkspaceLedgerFile(session, next);
-    if (ledgerPath) next.ledgerFilePath = ledgerPath;
-    return this.store.upsertTaskState(next);
+    const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
+    if (ledgerFilePath) mergedState.ledgerFilePath = ledgerFilePath;
+    return this.store.upsertTaskState(mergedState);
   }
 
   /**
@@ -331,6 +519,22 @@ export class TaskLedgerService {
       lines.push('');
     }
 
+    if ((state.failedAttempts?.length ?? 0) > 0) {
+      lines.push(
+        style === 'reference'
+          ? '## Previously Attempted Approaches (Failed)'
+          : '## Failed Attempts (DO NOT REPEAT)',
+        '',
+      );
+      for (const fa of state.failedAttempts!.slice(-8)) {
+        const files = fa.relatedFiles?.length
+          ? ` (files: ${fa.relatedFiles.slice(0, 5).map((f) => `\`${f}\``).join(', ')})`
+          : '';
+        lines.push(`- [${fa.harnessInstanceId || 'unknown'}] ${fa.summary} — Reason: ${fa.failureReason}${files}`);
+      }
+      lines.push('');
+    }
+
     if (state.touchedFiles.length > 0) {
       lines.push('## Touched Files', '');
       for (const f of state.touchedFiles) {
@@ -369,21 +573,93 @@ export class TaskLedgerService {
    * `<cwd>/.harnessmate/sessions/<sessionId>.md` using atomic rename writes.
    */
   syncWorkspaceLedgerFile(session: Session, state: SessionTaskState): string | null {
+    return this.syncWorkspaceLedgerWithMerge(session, state).ledgerFilePath;
+  }
+
+  private syncWorkspaceLedgerWithMerge(
+    session: Session,
+    state: SessionTaskState,
+  ): { ledgerFilePath: string | null; state: SessionTaskState; conflictDetected: boolean } {
     try {
-      if (!session.cwd || !fs.existsSync(session.cwd)) return null;
+      if (!session.cwd || !fs.existsSync(session.cwd)) {
+        return { ledgerFilePath: null, state, conflictDetected: false };
+      }
       const hmDir = path.join(session.cwd, '.harnessmate');
       const sessionsDir = path.join(hmDir, 'sessions');
       fs.mkdirSync(sessionsDir, { recursive: true });
 
-      const markdown = this.renderLedgerMarkdown(state, session);
       const activeLedgerPath = path.join(hmDir, 'task-ledger.md');
       const sessionLedgerPath = path.join(sessionsDir, `${session.id}.md`);
+      const metaPath = path.join(hmDir, '.task-ledger-meta.json');
+
+      const meta = readWorkspaceLedgerMeta(metaPath);
+      const diskContent = fs.existsSync(activeLedgerPath) ? fs.readFileSync(activeLedgerPath, 'utf8') : null;
+      const diskHash = diskContent !== null ? sha256Hex(diskContent) : null;
+
+      const isSameSessionConflict = Boolean(
+        diskContent !== null &&
+          meta &&
+          meta.activeSessionId === session.id &&
+          meta.lastWrittenHash &&
+          diskHash !== meta.lastWrittenHash,
+      );
+      const isPreAuthoredWithoutMeta = Boolean(
+        diskContent !== null && !meta && diskContent.trim().length > 0 && diskContent.includes('## '),
+      );
+
+      let mergedState = state;
+      const canReadActiveLedger =
+        diskContent !== null && (!meta?.activeSessionId || meta.activeSessionId === session.id);
+      const diskParsed = canReadActiveLedger ? parseWorkspaceLedgerMarkdown(diskContent) : null;
+      const customSections = diskParsed?.customSections ?? [];
+      const conflictDetected = isSameSessionConflict || isPreAuthoredWithoutMeta;
+
+      if (conflictDetected && diskParsed) {
+        const base = isSameSessionConflict && meta
+          ? meta.lastSnapshot
+          : { objective: '', pinnedFacts: [], decisions: [], blockers: [] };
+
+        const mergedObjective = mergeObjective(base.objective, diskParsed.objective, state.objective, session.title);
+        const mergedPinnedFacts = mergeStringLists(base.pinnedFacts, diskParsed.pinnedFacts, state.pinnedFacts);
+        const mergedDecisions = mergeStringLists(base.decisions, diskParsed.decisions, state.decisions);
+        const mergedBlockers = mergeStringLists(base.blockers, diskParsed.blockers, state.blockers);
+
+        mergedState = {
+          ...state,
+          objective: mergedObjective,
+          pinnedFacts: mergedPinnedFacts,
+          decisions: mergedDecisions,
+          blockers: mergedBlockers,
+        };
+      }
+
+      let markdown = this.renderLedgerMarkdown(mergedState, session);
+      if (customSections.length > 0) {
+        const extra = customSections
+          .map(({ heading, body }) => `## ${heading}\n\n${body}`.trim())
+          .join('\n\n');
+        markdown = `${markdown.trimEnd()}\n\n${extra}\n`;
+      }
 
       atomicWriteFile(activeLedgerPath, markdown);
       atomicWriteFile(sessionLedgerPath, markdown);
-      return activeLedgerPath;
+
+      const nextMeta: WorkspaceLedgerMeta = {
+        activeSessionId: session.id,
+        lastWrittenHash: sha256Hex(markdown),
+        lastSnapshot: {
+          objective: mergedState.objective,
+          pinnedFacts: [...mergedState.pinnedFacts],
+          decisions: [...mergedState.decisions],
+          blockers: [...mergedState.blockers],
+        },
+        updatedAt: Date.now(),
+      };
+      atomicWriteFile(metaPath, JSON.stringify(nextMeta, null, 2));
+
+      return { ledgerFilePath: activeLedgerPath, state: mergedState, conflictDetected };
     } catch {
-      return null;
+      return { ledgerFilePath: null, state, conflictDetected: false };
     }
   }
 }
@@ -424,7 +700,317 @@ function dedupeStrings(items: string[]): string[] {
 }
 
 function isVerificationCommand(start: CanonicalEvent | undefined, command: string): boolean {
-  return start?.payload.toolKind === 'shell' && VERIFICATION_CMD_RE.test(command);
+  if (start?.payload.toolKind !== 'shell') return false;
+  const activeSegments = splitShellSegments(command).filter((seg) => !isReadOnlyCommandSegment(seg));
+  if (activeSegments.length === 0) return false;
+  return activeSegments.some((seg) => VERIFICATION_CMD_RE.test(seg));
+}
+
+function isAllReadOnlyShellCommand(command: string): boolean {
+  const segments = splitShellSegments(command);
+  return segments.length > 0 && segments.every((seg) => isReadOnlyCommandSegment(seg));
+}
+
+function splitShellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && quote !== "'") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      if (quote === ch) quote = null;
+      else if (quote === null) quote = ch;
+      current += ch;
+      continue;
+    }
+    if (quote === null) {
+      if (ch === '\n' || ch === '\r' || ch === ';' || ch === '|') {
+        if (ch === '|' && command[i + 1] === '|') i += 1;
+        if (current.trim()) segments.push(current.trim());
+        current = '';
+        continue;
+      }
+      if (ch === '&' && command[i + 1] === '&') {
+        i += 1;
+        if (current.trim()) segments.push(current.trim());
+        current = '';
+        continue;
+      }
+    }
+    current += ch;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments;
+}
+
+function stripCommandWrappers(segment: string): string {
+  let cleaned = segment.trim();
+  if (!cleaned) return '';
+  if (cleaned.startsWith('& ')) {
+    cleaned = cleaned.slice(2).trim();
+  }
+  while (/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+|env\s+)/i.test(cleaned)) {
+    cleaned = cleaned.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+|env\s+)/i, '').trim();
+  }
+  return cleaned;
+}
+
+function extractExecutableBasename(cleaned: string): string {
+  if (!cleaned) return '';
+  let firstToken = '';
+  const first = cleaned[0];
+  if (first === '"' || first === "'") {
+    const closeIdx = cleaned.indexOf(first, 1);
+    firstToken = closeIdx > 1 ? cleaned.slice(1, closeIdx) : cleaned.slice(1);
+  } else {
+    firstToken = cleaned.split(/\s+/)[0] ?? '';
+  }
+  const base = firstToken.replace(/\\/g, '/').split('/').pop() ?? '';
+  return base.replace(/\.(?:exe|cmd|bat|ps1)$/i, '').toLowerCase();
+}
+
+function isReadOnlyCommandSegment(segment: string): boolean {
+  const cleaned = stripCommandWrappers(segment);
+  if (!cleaned) return true;
+  const exe = extractExecutableBasename(cleaned);
+  if (!exe) return true;
+  if (READ_ONLY_EXECUTABLES.has(exe)) return true;
+  if (
+    exe === 'git' &&
+    /^git\s+(?:-\S+(?:\s+\S+)?\s+)*(status|diff|log|show|branch|tag|remote|rev-parse|ls-files|ls-tree|blame|describe|shortlog|reflog|stash\s+list|config\s+(?:--get|--list))\b/i.test(
+      cleaned,
+    )
+  ) {
+    return true;
+  }
+  if (
+    (exe === 'pnpm' || exe === 'npm' || exe === 'yarn' || exe === 'bun') &&
+    /^(?:pnpm|npm|yarn|bun)\s+(?:list|ls|why|outdated|info|view|--version|-v)\b/i.test(cleaned)
+  ) {
+    return true;
+  }
+  if (exe === 'cargo' && /^cargo\s+(?:metadata|tree|version)\b/i.test(cleaned)) {
+    return true;
+  }
+  if (exe === 'go' && /^go\s+(?:version|env|list)\b/i.test(cleaned)) {
+    return true;
+  }
+  return false;
+}
+
+function upsertVerification(verifications: TaskVerification[], entry: TaskVerification): void {
+  const key = compactSingleLine(entry.command, 160).toLowerCase();
+  for (let i = verifications.length - 1; i >= 0; i--) {
+    if (compactSingleLine(verifications[i]!.command, 160).toLowerCase() === key) {
+      verifications.splice(i, 1);
+    }
+  }
+  verifications.push(entry);
+}
+
+function normalizeFailedAttempt(
+  input: {
+    id?: string;
+    summary: string;
+    failureReason: string;
+    relatedFiles?: string[];
+    harnessInstanceId?: string | null;
+    recordedAt?: number;
+  },
+  fallbackHarnessId: string | null,
+  cwd: string,
+): TaskFailedAttempt | null {
+  const summary = compactSingleLine(input.summary, 300);
+  if (!summary) return null;
+  const failureReason = compactSingleLine(input.failureReason || 'Failed without error message', 500);
+  const id = input.id?.trim() || `fail_${crypto.randomBytes(4).toString('hex')}`;
+  const files: string[] = [];
+  const seenFiles = new Set<string>();
+  for (const raw of input.relatedFiles ?? []) {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 260) continue;
+    const rel = cwd ? normalizeRelativePath(trimmed, cwd) : trimmed.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!rel || rel.startsWith('.harnessmate/') || seenFiles.has(rel)) continue;
+    seenFiles.add(rel);
+    files.push(rel);
+    if (files.length >= 12) break;
+  }
+  return {
+    id,
+    summary,
+    failureReason,
+    ...(files.length > 0 ? { relatedFiles: files } : {}),
+    harnessInstanceId: input.harnessInstanceId !== undefined ? input.harnessInstanceId : fallbackHarnessId,
+    recordedAt: typeof input.recordedAt === 'number' && Number.isFinite(input.recordedAt) ? input.recordedAt : Date.now(),
+  };
+}
+
+function mergeFailedAttempts(
+  existing: TaskFailedAttempt[],
+  incoming: TaskFailedAttempt[],
+  cap = MAX_FAILED_ATTEMPTS,
+): TaskFailedAttempt[] {
+  const merged = [...existing];
+  const keyOf = (a: TaskFailedAttempt) =>
+    `${a.summary.toLowerCase()}::${a.failureReason.slice(0, 120).toLowerCase()}`;
+
+  for (const item of incoming) {
+    const k = keyOf(item);
+    const idx = merged.findIndex((prev) => prev.id === item.id || keyOf(prev) === k);
+    if (idx >= 0) {
+      const prev = merged[idx]!;
+      merged.splice(idx, 1);
+      const files = [...new Set([...(prev.relatedFiles ?? []), ...(item.relatedFiles ?? [])])].slice(0, 12);
+      merged.push({
+        ...prev,
+        ...item,
+        id: prev.id,
+        recordedAt: Math.max(prev.recordedAt, item.recordedAt),
+        harnessInstanceId: item.harnessInstanceId ?? prev.harnessInstanceId ?? null,
+        ...(files.length > 0 ? { relatedFiles: files } : {}),
+      });
+    } else {
+      merged.push(item);
+    }
+  }
+  return merged.slice(-cap);
+}
+
+function sha256Hex(text: string): string {
+  return crypto.createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf8').digest('hex');
+}
+
+function readWorkspaceLedgerMeta(metaPath: string): WorkspaceLedgerMeta | null {
+  try {
+    if (!fs.existsSync(metaPath)) return null;
+    const raw = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as Partial<WorkspaceLedgerMeta>;
+    if (!raw || typeof raw.activeSessionId !== 'string' || typeof raw.lastWrittenHash !== 'string') {
+      return null;
+    }
+    return {
+      activeSessionId: raw.activeSessionId,
+      lastWrittenHash: raw.lastWrittenHash,
+      lastSnapshot: {
+        objective: typeof raw.lastSnapshot?.objective === 'string' ? raw.lastSnapshot.objective : '',
+        pinnedFacts: Array.isArray(raw.lastSnapshot?.pinnedFacts) ? raw.lastSnapshot.pinnedFacts.map(String) : [],
+        decisions: Array.isArray(raw.lastSnapshot?.decisions) ? raw.lastSnapshot.decisions.map(String) : [],
+        blockers: Array.isArray(raw.lastSnapshot?.blockers) ? raw.lastSnapshot.blockers.map(String) : [],
+      },
+      updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseWorkspaceLedgerMarkdown(markdown: string): {
+  objective: string;
+  pinnedFacts: string[];
+  decisions: string[];
+  blockers: string[];
+  customSections: Array<{ heading: string; body: string }>;
+} {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const sections: Array<{ heading: string; lines: string[] }> = [];
+  let current: { heading: string; lines: string[] } | null = null;
+
+  for (const line of lines) {
+    const match = line.match(/^##\s+(.+?)\s*$/);
+    if (match?.[1]) {
+      current = { heading: match[1].trim(), lines: [] };
+      sections.push(current);
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+
+  let objective = '';
+  const pinnedFacts: string[] = [];
+  const decisions: string[] = [];
+  const blockers: string[] = [];
+  const customSections: Array<{ heading: string; body: string }> = [];
+
+  const parseBullets = (sectionLines: string[], stripPinned = false): string[] => {
+    const out: string[] = [];
+    for (const l of sectionLines) {
+      const m = l.match(/^\s*[-*]\s+(.+)$/);
+      if (!m?.[1]) continue;
+      let val = m[1].trim();
+      if (stripPinned) val = val.replace(/^\[PINNED\]\s*/i, '').trim();
+      if (val) out.push(val);
+    }
+    return out;
+  };
+
+  for (const sec of sections) {
+    const norm = sec.heading.toLowerCase();
+    if (norm === 'objective' || norm === 'goal') {
+      objective = sec.lines.join('\n').trim();
+    } else if (norm.startsWith('pinned constraints') || norm === 'previously recorded constraints') {
+      pinnedFacts.push(...parseBullets(sec.lines, true));
+    } else if (norm === 'key decisions') {
+      decisions.push(...parseBullets(sec.lines));
+    } else if (norm === 'open blockers / errors') {
+      blockers.push(...parseBullets(sec.lines));
+    } else if (
+      norm === 'plan & progress' ||
+      norm === 'failed attempts (do not repeat)' ||
+      norm === 'previously attempted approaches (failed)' ||
+      norm === 'touched files' ||
+      norm === 'verification results' ||
+      norm === 'historical digest'
+    ) {
+      // known managed section
+    } else {
+      const body = sec.lines.join('\n').trim();
+      if (body) {
+        customSections.push({ heading: sec.heading, body });
+      }
+    }
+  }
+
+  return {
+    objective,
+    pinnedFacts: dedupeStrings(pinnedFacts),
+    decisions: dedupeStrings(decisions),
+    blockers: dedupeStrings(blockers),
+    customSections,
+  };
+}
+
+function mergeObjective(
+  baseObj: string,
+  diskObj: string,
+  incomingObj: string,
+  sessionTitle: string,
+): string {
+  if (!diskObj || diskObj === baseObj) {
+    return incomingObj;
+  }
+  if (!incomingObj || incomingObj === baseObj || incomingObj === sessionTitle) {
+    return diskObj;
+  }
+  return incomingObj;
+}
+
+function mergeStringLists(baseList: string[], diskList: string[], incomingList: string[]): string[] {
+  const baseSet = new Set(baseList);
+  const diskSet = new Set(diskList);
+  const kept = incomingList.filter((item) => !(baseSet.has(item) && !diskSet.has(item)));
+  const additions = diskList.filter((item) => !baseSet.has(item));
+  return dedupeStrings([...kept, ...additions]);
 }
 
 export function readRecordedTurnEvidence(events: CanonicalEvent[], cwd: string) {
@@ -445,9 +1031,25 @@ export function readRecordedTurnEvidence(events: CanonicalEvent[], cwd: string) 
     const status = payload.status;
     const tool = start?.payload;
     const command = extractShellCommand(tool?.input, String(tool?.summary ?? ''));
-    if (verifications.length < 12 && isVerificationCommand(start, command)) {
-      verifications.push({ command: compactSingleLine(command, 160),
-        status: status === 'success' ? 'pass' : status === 'error' ? 'fail' : 'unknown' });
+    if (isVerificationCommand(start, command)) {
+      const normalizedCmd = compactSingleLine(command, 160);
+      const key = normalizedCmd.toLowerCase();
+      for (let i = verifications.length - 1; i >= 0; i--) {
+        if (compactSingleLine(verifications[i]!.command, 160).toLowerCase() === key) {
+          verifications.splice(i, 1);
+        }
+      }
+      if (verifications.length < 12) {
+        verifications.push({
+          command: normalizedCmd,
+          status:
+            status === 'success'
+              ? 'pass'
+              : status === 'error' || status === 'failed'
+                ? 'fail'
+                : 'unknown',
+        });
+      }
     }
     if (files.size >= 24 || status !== 'success') continue;
     const paths = extractFilePathsFromDiff(typeof payload.diff === 'string' ? payload.diff : '');
