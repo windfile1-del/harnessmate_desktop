@@ -391,3 +391,248 @@ export function prepareAgyProfile(
     warnings,
   };
 }
+
+export type AgyProfileSkillsRootKind =
+  | 'profile_config_skills'
+  | 'profile_skills'
+  | 'profile_antigravity_skills'
+  | 'global_gemini_config_skills'
+  | 'global_gemini_skills'
+  | 'global_agents_skills';
+
+export interface AgyProfileSkillsRootStatus {
+  readonly kind: AgyProfileSkillsRootKind;
+  readonly precedenceRank: number;
+  readonly path: string;
+  readonly present: boolean;
+  readonly isSymlink: boolean;
+  readonly symlinkSafe: boolean;
+  readonly reasonCode?: string;
+}
+
+export interface AgyProfileScopeInspection {
+  readonly instanceId: string;
+  readonly isolationMode: AgyProfileConfig['isolationMode'];
+  readonly authMethod: AgyProfileConfig['authMethod'];
+  readonly geminiDir: string;
+  readonly appDataDirName: string;
+  readonly appDataPath: string;
+  readonly runtimeTempDir: string;
+  readonly linkGlobalSkills: boolean;
+  readonly syncGlobalRules: boolean;
+  readonly enterpriseIssue1610Affected: boolean;
+  readonly skillsRoots: readonly AgyProfileSkillsRootStatus[];
+  readonly warnings: readonly string[];
+}
+
+function isCanonicalSubpath(candidate: string, root: string, platform: NodeJS.Platform): boolean {
+  const normCandidate = platform === 'win32' ? candidate.toLowerCase() : candidate;
+  const normRoot = platform === 'win32' ? root.toLowerCase() : root;
+  if (normCandidate === normRoot) return true;
+  const withSep = normRoot.endsWith(path.sep) ? normRoot : `${normRoot}${path.sep}`;
+  return normCandidate.startsWith(withSep);
+}
+
+function inspectSkillsRootCandidate(opts: {
+  kind: AgyProfileSkillsRootKind;
+  precedenceRank: number;
+  targetPath: string;
+  allowedSymlinkRoots: readonly string[];
+  platform: NodeJS.Platform;
+  warnings: string[];
+}): AgyProfileSkillsRootStatus {
+  const { kind, precedenceRank, targetPath, allowedSymlinkRoots, platform, warnings } = opts;
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(targetPath);
+  } catch {
+    return {
+      kind,
+      precedenceRank,
+      path: targetPath,
+      present: false,
+      isSymlink: false,
+      symlinkSafe: true,
+      reasonCode: 'not_present',
+    };
+  }
+
+  const isSymlink = stat.isSymbolicLink();
+  if (!isSymlink && !stat.isDirectory()) {
+    warnings.push(`Skills 路径不是目录：${targetPath}`);
+    return {
+      kind,
+      precedenceRank,
+      path: targetPath,
+      present: false,
+      isSymlink: false,
+      symlinkSafe: false,
+      reasonCode: 'not_directory',
+    };
+  }
+
+  try {
+    const resolved = fs.realpathSync(targetPath);
+    const resolvedStat = fs.statSync(resolved);
+    if (!resolvedStat.isDirectory()) {
+      warnings.push(`Skills 链接目标不是目录：${targetPath}`);
+      return {
+        kind,
+        precedenceRank,
+        path: targetPath,
+        present: false,
+        isSymlink,
+        symlinkSafe: false,
+        reasonCode: 'target_not_directory',
+      };
+    }
+    const allowed = allowedSymlinkRoots.some((root) => {
+      try {
+        const rootReal = fs.realpathSync(root);
+        return isCanonicalSubpath(resolved, rootReal, platform);
+      } catch {
+        return false;
+      }
+    });
+    if (isSymlink && !allowed) {
+      warnings.push(`拒绝越界 Skills 符号链接/Junction：${targetPath}`);
+      return {
+        kind,
+        precedenceRank,
+        path: targetPath,
+        present: true,
+        isSymlink: true,
+        symlinkSafe: false,
+        reasonCode: 'symlink_escape_rejected',
+      };
+    }
+    return {
+      kind,
+      precedenceRank,
+      path: targetPath,
+      present: true,
+      isSymlink,
+      symlinkSafe: true,
+    };
+  } catch {
+    warnings.push(`Skills 路径无法解析：${targetPath}`);
+    return {
+      kind,
+      precedenceRank,
+      path: targetPath,
+      present: false,
+      isSymlink,
+      symlinkSafe: false,
+      reasonCode: 'unresolvable_link',
+    };
+  }
+}
+
+/**
+ * Strictly non-mutating read-only inspection of an AGY profile's directory
+ * boundaries, Windows/POSIX link safety, AGY 1.5.16 skills precedence roots,
+ * and upstream `#1610` enterprise isolation constraint.
+ */
+export function inspectAgyProfileScopeBoundary(
+  profile: AgyProfileConfig,
+  opts: {
+    profilesRootDir: string;
+    userHome?: string;
+    platform?: NodeJS.Platform;
+  },
+): AgyProfileScopeInspection {
+  const platform = opts.platform ?? process.platform;
+  const userHome = opts.userHome ?? os.homedir();
+  const appDataDirName = profile.appDataDirName?.trim() || 'antigravity-cli';
+  const dirs = resolveAgyProfileDirectories(opts.profilesRootDir, profile.instanceId);
+  const geminiDir =
+    profile.isolationMode === 'official_default'
+      ? profile.geminiDir?.trim()
+        ? path.resolve(profile.geminiDir.trim())
+        : path.join(userHome, '.gemini')
+      : profile.geminiDir?.trim()
+        ? path.resolve(profile.geminiDir.trim())
+        : dirs.geminiDir;
+  const appDataPath = path.join(geminiDir, appDataDirName);
+  const userGeminiDir = path.join(userHome, '.gemini');
+  const userAgentsSkillsDir = path.join(userHome, '.agents', 'skills');
+
+  const linkGlobalSkills = profile.defaults?.linkGlobalSkills !== false;
+  const syncGlobalRules = profile.defaults?.syncGlobalRules !== false;
+  const enterpriseIssue1610Affected =
+    profile.authMethod === 'oauth-business' && profile.isolationMode === 'profile_isolated';
+
+  const warnings: string[] = [];
+  if (enterpriseIssue1610Affected) {
+    warnings.push(
+      '企业账号 oauth-business 受上游 CLI #1610 限制，不保证并发文件级隔离。',
+    );
+  }
+
+  const allowedProfileSymlinkRoots = linkGlobalSkills ? [geminiDir, userGeminiDir] : [geminiDir];
+  const skillsRoots: AgyProfileSkillsRootStatus[] = [
+    inspectSkillsRootCandidate({
+      kind: 'profile_config_skills',
+      precedenceRank: 100,
+      targetPath: path.join(geminiDir, 'config', 'skills'),
+      allowedSymlinkRoots: allowedProfileSymlinkRoots,
+      platform,
+      warnings,
+    }),
+    inspectSkillsRootCandidate({
+      kind: 'profile_skills',
+      precedenceRank: 110,
+      targetPath: path.join(geminiDir, 'skills'),
+      allowedSymlinkRoots: allowedProfileSymlinkRoots,
+      platform,
+      warnings,
+    }),
+    inspectSkillsRootCandidate({
+      kind: 'profile_antigravity_skills',
+      precedenceRank: 120,
+      targetPath: path.join(geminiDir, 'antigravity', 'skills'),
+      allowedSymlinkRoots: allowedProfileSymlinkRoots,
+      platform,
+      warnings,
+    }),
+    inspectSkillsRootCandidate({
+      kind: 'global_gemini_config_skills',
+      precedenceRank: 130,
+      targetPath: path.join(userGeminiDir, 'config', 'skills'),
+      allowedSymlinkRoots: [userGeminiDir],
+      platform,
+      warnings,
+    }),
+    inspectSkillsRootCandidate({
+      kind: 'global_gemini_skills',
+      precedenceRank: 140,
+      targetPath: path.join(userGeminiDir, 'skills'),
+      allowedSymlinkRoots: [userGeminiDir],
+      platform,
+      warnings,
+    }),
+    inspectSkillsRootCandidate({
+      kind: 'global_agents_skills',
+      precedenceRank: 200,
+      targetPath: userAgentsSkillsDir,
+      allowedSymlinkRoots: [path.join(userHome, '.agents')],
+      platform,
+      warnings,
+    }),
+  ];
+
+  return {
+    instanceId: profile.instanceId,
+    isolationMode: profile.isolationMode,
+    authMethod: profile.authMethod,
+    geminiDir,
+    appDataDirName,
+    appDataPath,
+    runtimeTempDir: dirs.runtimeTempDir,
+    linkGlobalSkills,
+    syncGlobalRules,
+    enterpriseIssue1610Affected,
+    skillsRoots,
+    warnings,
+  };
+}
