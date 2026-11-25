@@ -1,0 +1,7 @@
+{"ms":334,"kind":"launch","profileSource":"dedicated_test","version":"1.5.16","protocol":1}
+{"ms":341,"kind":"send","id":1,"method":"initialize"}
+{"ms":739,"kind":"initialize","protocol":1,"name":"Antigravity ACP Server","version":"1.5.16","auth":["oauth-personal","oauth-business","gemini-api-key","agent-platform"],"capabilityKeys":["_meta","auth","loadSession","load_session","promptCapabilities","sessionCapabilities","session_capabilities"],"loadSession":true,"prompt":{"image":true,"audio":false,"embeddedContext":true},"sessionCapabilities":{"resume":{},"close":{},"load":{},"list":{},"additionalDirectories":{}}}
+{"ms":740,"kind":"send","id":2,"method":"session/new"}
+{"ms":847,"kind":"session-new","error":{"code":-32000,"authenticationRequired":true}}
+{"ms":2352,"kind":"end","reason":"session-not-opened","stderrBytes":0,"promptSent":false}
+{"ms":2371,"kind":"process-exit","exitCode":0}

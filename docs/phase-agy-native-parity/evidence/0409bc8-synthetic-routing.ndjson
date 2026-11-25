@@ -1,0 +1,3 @@
+{"kind":"synthetic","event":"turn.completed","turnId":"synthetic-user-turn","backgroundLease":true}
+{"kind":"synthetic","event":"message.assistant.delta","turnId":"turn_bg","backgroundLease":false}
+{"kind":"synthetic","event":"permission.response","outcome":"cancelled"}
