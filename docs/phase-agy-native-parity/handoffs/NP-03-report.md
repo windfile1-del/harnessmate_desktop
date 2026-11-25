@@ -11,8 +11,18 @@
 | 源码审计基线 | `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039` |
 | Reviewed Base（G0 快照） | `a01280176348974a0ddc00fd491afddc1d985c9e` (`docs(agy-np): record G0 worktree and verification setup`) |
 | 工作分支 | `np03_agy_workbench`（Worktree：`C:\Users\windfile\.gemini\antigravity\worktrees\harnessmate_desktop\np03_agy_workbench`，可按总指挥集成策略 cherry-pick / fast-forward 至 `codex/agy-np-03-frontend`） |
-| 核心代码提交 SHA | `fd855ee3af4e433650a447c5423bc015e4acc304` (`feat(agy-np-03): implement AGY Native Workbench shell, registry, client, and shared frontend projection`) |
+| 核心代码提交 SHA | `fd855ee3af4e433650a447c5423bc015e4acc304`（初始实现）· `a662bcb78d52f60cafd9fe580ac2f60198e61444`（03a R4 独立修复）· `f012d66ddae1fd891582c5868eb34f13d41311e0`（03b R1/R2/R3/R5 独立修复） |
 | 特性门控默认值 | `agyNativeWorkbenchEnabled = false`（通过 `localStorage['hm_agy_native_ui'] === '1'` 或 store action 显式开启；G2 前默认关闭，完整保留既有 AGY-5 组件与旧客户端体验） |
+
+## 1.1 针对独立评审（`NP-03-review-fb91c9c.md`）的逐项修复
+
+| 评审项 | 对应提交 | 修复要点与回归验证 |
+| --- | --- | --- |
+| **R4 · 03a 窄屏焦点、方向键选项卡与全宽焦点回返** | `a662bcb` | 新增 `focus-utils.ts`；窄屏 `role="dialog"` 打开后立即将焦点移入关闭按钮，监听 `Tab`/`Shift+Tab` 环绕与 `document` `focusin` 拦截，并在 `ChatStage` 背景聊天列设置 `inert` + `aria-hidden` 阻止背景控件获焦；`ArrowLeft`/`ArrowRight`/`Home`/`End` 同步切换选中态与实际 DOM `focus()`（经 `tabRefs` 与 `pendingTabFocusRef` 保障）；全宽→聊天通过 `pendingWorkbenchFocusRestoreRef` 在顶栏重挂载后回返触发按钮；`Escape` 跳过 IME、已消费事件、嵌套 `listbox/menu` 及外部顶层 modal。 |
+| **R1 · 03b 事件同步、缺口与旧代绑定回退** | `f012d66` | `applyNativeEventBatch` 严格要求 `runtimeId + generation` 一致并按 `retiredGenerations` 拒绝旧代 `native.runtime.changed` 回退（如 seq 1 旧绑定帧直接丢弃）；`NativeFeedController` 新增 `requestEpoch` 防乱序覆盖、保留 `hydrate()` 前队列并在补缺后排空、以 `pendingAfterGap` 保留缺口后缀并在前缀补齐后重放；分页缺口、补缺空页或触达 `maxPages` 上限时进入 `phase: 'incomplete'`（展示「数据未完成同步」+ 重试入口），绝不误标 `'live'`。 |
+| **R2 · 03b 作用域回执、意图幂等键与草稿/附件一致性** | `f012d66` | `submitNativeCommand` 仅在 `{sessionId, instanceId, runtimeId, generation, catalogRevision, capabilityId, actionKey, canonicalArgs}` 完整意图一致时复用幂等键，不同 prompt 分配不同 key；引入 `nativeScopeEpochBySession` 与 `nativeGlobalScopeEpoch`，清会话/切会话/切账号/登出/关门控后迟到回执被忽略且绝不重建 slice；`NativeControlMenu` 携带渲染时 `expectedBinding`，过期代次返回 `409 STALE_BINDING`；`ChatStage` 原生模式提交携带 `attachmentIds`/`terminalContextIds`，仅清理本次实际发出的草稿与附件，保留提交期间新增或编辑项。 |
+| **R3 · 03b 时间线作用域隔离、Delta 合并与旧事件可见性** | `f012d66` | `AgyWorkbenchShell` 抽出 `useScopedNativeTimeline`（供 Runtime Center 与 Subagent Manager 共用，补齐子 Agent 分页），按 `runtimeId:generation:kind:id` 切项时立即清空旧条目并中止首屏与 `loadMore` 请求；`app-store` 提供 `loadNativeTimeline`/`loadNativeWorkflowResource` 统一走注入 transport，`ChatStage` 与 `PluginSlotSync` 用稳定回调引用；`coalesceTimelineEntries` 记录 `mergedEntryIds` 且校验 `actorKind + actorId`，杜绝重复 delta 追加成 `abb` 或跨 Agent 串并；`ChatStage` 仅在存在健康 `live` 原生投影时隔离 `turn_bg`/`turn_unknown`，并渲染可展开 `detached-native-fallback` 保障旧记录随时可读。 |
+| **R5 · G1/G2 契约边界加固** | `f012d66` | `createHttpNativeTransport` 新增运行时响应结构校验（非法响应抛 `INVALID_RESPONSE`）；统一 `ChatStage` 全宽与分栏/窄屏两处 `AgyWorkbenchShell` 组装 props。真实协议冻结类型、WS 实时订阅闭环与原生控制放开仍严格保持 G1/G2 门控，不抬升真机能力等级。 |
 
 ## 2. 变更路径与写入范围核对
 
@@ -30,7 +40,8 @@
 - `packages/web/src/components/agy/native/shared/NativeControlMenu.tsx` — 证据门控原生控制菜单（仅在 `control === 'available'` 且动作 `gate === 'available'` 时开放）
 - `packages/web/src/components/agy/native/shared/NativeRequestCard.tsx` — 共享 Approval 数据 + 原生收据/作用域卡片（确证 child 归属跳转、未确认来源明示、禁止代选或以自由文本填固定选项、断连/崩溃只读收据）
 - `packages/web/src/components/agy/native/shared/AgyAgentModePicker.tsx` — 输入区单一工作模式选择器（未验证 Profile 可看说明不可运行、保留草稿与附件、选定不自动执行、仅点击发送走命令提交）
-- `packages/web/src/components/agy/native/shared/AgyWorkbenchShell.tsx` — 统一工作台 Shell（分栏/全宽/480px 窄屏全宽 `role="dialog"` 抽屉 + 焦点回返触发按钮 + 键盘 `ArrowLeft`/`ArrowRight`/`Escape`、内置 order=900 诚实降级视图）
+- `packages/web/src/components/agy/native/shared/AgyWorkbenchShell.tsx` — 统一工作台 Shell（分栏/全宽/480px 窄屏全宽 `role="dialog"` 抽屉 + 焦点进入/限制/回返 + 键盘 `ArrowLeft`/`ArrowRight`/`Home`/`End`/`Escape`、`useScopedNativeTimeline` 作用域隔离分页、内置 order=900 诚实降级视图）
+- `packages/web/src/components/agy/native/shared/focus-utils.ts` — 03a 窄屏焦点环绕、背景焦点拦截、选项卡方向键索引与嵌套弹窗 Escape 判定纯函数工具
 - `packages/web/src/components/agy/native/shared/fixtures.ts` — 脱敏合成测试夹具（Live Reactive、Unknown、Stale/Reconciling、Crashed/Disconnected、Unsupported/Upstream-Limited Studios、T18 100 child / 10k events / 20 pending 压测生成器及 `createStubNativeTransport`）
 - `packages/web/src/components/agy/native/shared/index.ts` — 公共导出入口
 - `packages/web/tests/np03-native-client.test.ts` — 客户端分页、`410 RESYNC_REQUIRED`、generation 栅栏、seq gap、delta 合并、409 草稿保留、账号切换清理、placeholder 隔离与 T18 压测
@@ -77,10 +88,10 @@ const dispose = agyWorkbenchRegistry.registerView({
 ### 执行命令与结果
 | 检查项 | 命令 | 退出码 | 结果摘要 | 验证类别 |
 | --- | --- | --- | --- | --- |
-| 全仓构建 | `pnpm build` | `0` | 6 个包（`plugin-api`、`plugin-sdk`、`protocol`、`daemon`、`web`、`electron`）及 Vite 生产构建通过 | build |
-| 全仓类型检查 | `pnpm typecheck` | `0` | 6 个包零错误通过 | static |
+| 全仓构建 / Web 生产构建 | `pnpm build`（首轮全仓）· `pnpm --filter @harnessmate/web build`（修复后复跑） | `0` | 6 个包及修复后 Vite 生产构建通过 | build |
+| Web 类型检查 | `pnpm --filter @harnessmate/web typecheck` | `0` | 修复后零错误通过 | static |
 | 插件契约校验 | `pnpm contracts:check` | `0` | Plugin API 4.0.0 公开插槽与 manifest 契约无漂移 | contract |
-| Web 全量单测（含 NP-03） | `pnpm --filter @harnessmate/web test` | `0` | **13 files / 62 tests passed**（含 `np03-native-client.test.ts` 7 项、`np03-workbench-ui.test.tsx` 5 项、`phase-agy-ui.test.tsx` 5 项、`projector.test.ts` 3 项、`ui-slots.test.tsx` 4 项及全部 phase2/3/4 回归） | synthetic |
+| Web 全量单测（含 NP-03 全部 R1–R4 回归） | `pnpm --filter @harnessmate/web test` | `0` | **13 files / 67 tests passed**（含 `np03-native-client.test.ts` 10 项、`np03-workbench-ui.test.tsx` 7 项、`phase-agy-ui.test.tsx` 5 项、`projector.test.ts` 3 项、`ui-slots.test.tsx` 4 项及全部 phase2/3/4 回归） | synthetic |
 | Protocol 单测 | `pnpm --filter @harnessmate/protocol test` | `0` | **1 file / 1 test passed** | synthetic |
 | Daemon 关键回归（含 AGY 1.5.14 回放与其他 Harness） | `pnpm --filter @harnessmate/daemon test -- --maxWorkers=2 tests/session-explorer-approval.test.ts tests/phase3-external-adapters.test.ts tests/agy-replay-protocol.test.ts` | `0` | **3 files / 14 tests passed**（Codex/Claude/DeepSeek/OpenCode/Session Explorer/Approval Center/AGY 1.5.14 回放全通） | replay_with_provenance + synthetic |
 | 空白/格式与作用域核对 | `git diff --check` | `0` | 无尾随空白或冲突标记，全部变更均在 NP-03 范围 | hygiene |
@@ -118,6 +129,6 @@ const dispose = agyWorkbenchRegistry.registerView({
 1. **零代码回滚（特性门控）**：确保 `localStorage.removeItem('hm_agy_native_ui')`（默认即关闭），或调用 `useAppStore.getState().setAgyNativeWorkbenchEnabled(false)`，即可完全回到 AGY-5 既有组件与旧 projector 行为。
 2. **Git 提交回滚**：
    ```powershell
-   git revert fd855ee3af4e433650a447c5423bc015e4acc304
+   git revert f012d66ddae1fd891582c5868eb34f13d41311e0 a662bcb78d52f60cafd9fe580ac2f60198e61444 fd855ee3af4e433650a447c5423bc015e4acc304
    ```
    本次变更不涉及 SQLite 表迁移或数据结构变更，回滚零数据风险。
