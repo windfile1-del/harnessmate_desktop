@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ApprovalAnnotationSchema, RiskLevelSchema, ToolKindSchema } from './canonical.js';
 
 // ── Contract Version & Migration Constants ─────────────────────────────
 
@@ -724,6 +725,70 @@ export const NativeRequestSummaryDtoSchema = z
   })
   .strict();
 export type NativeRequestSummaryDto = z.infer<typeof NativeRequestSummaryDtoSchema>;
+
+const NativeElicitationFieldDtoSchema = z.object({
+  name: z.string(),
+  type: z.enum(['string', 'number', 'integer', 'boolean', 'string_array']),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  required: z.boolean(),
+  enum: z.array(z.string()).optional(),
+  enumNames: z.array(z.string()).optional(),
+  minLength: z.number().optional(),
+  maxLength: z.number().optional(),
+  minimum: z.number().optional(),
+  maximum: z.number().optional(),
+  format: z.enum(['email', 'uri', 'date', 'date-time']).optional(),
+  defaultValue: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]).optional(),
+}).strict();
+
+const NativeRequestDetailDtoSchema = NativeRequestSummaryDtoSchema.extend({
+  scope: z.enum(['root', 'confirmed_child', 'confirmed_workflow', 'unknown_child']),
+  agentLabel: z.string().optional(),
+  workflowId: WorkflowIdSchema.optional(),
+  workflowKind: WorkflowKindSchema.optional(),
+  workflowLabel: z.string().optional(),
+  isDetached: z.boolean(),
+  forwardedToParentSession: z.boolean(),
+  provenanceReason: z.string(),
+  occurrence: z.number().int().positive(),
+  toolName: z.string(),
+  toolKind: ToolKindSchema,
+  summary: z.string(),
+  diffPreview: z.string().nullable().optional(),
+  riskLevel: RiskLevelSchema,
+  annotations: z.array(ApprovalAnnotationSchema),
+  securityWarnings: z.array(z.string()),
+  options: z.array(z.object({
+    optionId: z.string(),
+    name: z.string(),
+    kind: z.enum(['allow_once', 'allow_always', 'reject_once', 'reject_always', 'decline', 'custom']),
+    description: z.string().optional(),
+    securityWarning: z.string().optional(),
+    scopeWidening: z.boolean(),
+  }).strict()),
+  questionText: z.string().optional(),
+  formSpec: z.object({
+    message: z.string(),
+    mode: z.enum(['form', 'url']),
+    fields: z.array(NativeElicitationFieldDtoSchema),
+    requiredFields: z.array(z.string()),
+    additionalProperties: z.boolean(),
+    supported: z.boolean(),
+    unsupportedReason: z.string().optional(),
+  }).strict().optional(),
+  canAnswer: z.boolean(),
+  canCancel: z.boolean(),
+  unsupportedReason: z.string().optional(),
+  resolvedAt: z.number().optional(),
+  terminalReason: z.string().optional(),
+}).strict();
+
+export const NativeRequestDetailsResponseSchema = z.object({
+  schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
+  binding: RuntimeBindingSchema,
+  requests: z.array(NativeRequestDetailDtoSchema),
+}).strict();
 
 // ── Native Canonical Event Feed (schemaVersion: 1) ─────────────────────
 

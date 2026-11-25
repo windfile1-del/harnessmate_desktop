@@ -214,9 +214,20 @@ export function buildSubagentTreeProjection(
 
   const rootNodes: ChildTreeNode[] = [];
   const unresolvedOrConflicting: ChildTreeNode[] = [];
+  const confirmedLaunches = new Set(
+    projection.relations
+      .filter((relation) => agentById.get(relation.childAgentId)?.lineage === 'confirmed')
+      .map((relation) => relation.launchWorkId)
+      .filter((id): id is WorkId => id !== undefined),
+  );
 
   for (const agent of projection.agents) {
     if (agent.lineage !== 'confirmed') {
+      if (agent.lineage === 'unresolved' && agent.launchWorkIds.length > 0 &&
+        agent.launchWorkIds.every((id) => confirmedLaunches.has(id))) {
+        visited.add(agent.id);
+        continue;
+      }
       const linkedLaunchWork = agent.launchWorkIds
         .map((wid) => workById.get(wid))
         .filter((w): w is NativeWork => Boolean(w));

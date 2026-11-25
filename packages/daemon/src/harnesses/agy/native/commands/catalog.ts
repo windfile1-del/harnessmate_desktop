@@ -309,6 +309,7 @@ export class AgyNativeCommandCatalogService {
 
   constructor(
     private readonly baseDefinitions: readonly NativeCapabilityDefinition[] = BUILTIN_AGY_CAPABILITY_DEFINITIONS,
+    private readonly isActionConnected: (action: NativeCommandActionMetadata) => boolean = () => true,
   ) {}
 
   /**
@@ -656,7 +657,10 @@ export class AgyNativeCommandCatalogService {
       }
 
       const actions: CapabilityActionDescriptor[] = def.actions.map((act) => {
-        const evalResult = evaluateActionGate(def, act, signals, advertised, modelEffortOptions);
+        const runtimeGate = evaluateActionGate(def, act, signals, advertised, modelEffortOptions);
+        const evalResult: typeof runtimeGate = runtimeGate.gate === 'available' && !this.isActionConnected(act)
+          ? { gate: 'not_tested', reasonCode: 'native_action_not_connected' }
+          : runtimeGate;
         return {
           key: act.key,
           lane: act.lane,

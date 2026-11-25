@@ -890,5 +890,41 @@ describe('NP-05 versioned E06/CLI read-only parser, no parent transcript fallbac
 
     // Snapshot-only child NEVER gets cancel permission
     expect(router.authorizeChildCancel(binding, snapChildId).allowed).toBe(false);
+
+    const ingress = {
+      binding,
+      connectionId: 'g2-review',
+      channel: 'live' as const,
+      originSession: 'root_sql_1',
+    };
+    const launch = router.acceptFrame({
+      ...ingress,
+      ingressOrdinal: 1,
+      wire: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'review_launch',
+        title: 'invoke_subagent',
+        status: 'in_progress',
+      },
+    });
+    router.commitToRegistry(registry, binding, launch.commits);
+    const candidateId = launch.affectedAgentIds[0]!;
+    const announce = router.acceptFrame({
+      ...ingress,
+      ingressOrdinal: 2,
+      wire: {
+        sessionUpdate: 'subagent_update',
+        parentSessionId: 'root_sql_1',
+        childSessionId: 'review_child',
+        launchToolCallId: 'review_launch',
+        state: 'running',
+      },
+    });
+    router.commitToRegistry(registry, binding, announce.commits);
+    const confirmedId = announce.affectedAgentIds[0]!;
+    expect(confirmedId).toBe(candidateId);
+    const projected = registry.getProjectionForSession('sess_np05_sql', 'agy');
+    expect(projected.agents.filter((agent) => agent.launchWorkIds.includes(launch.affectedWorkIds[0]!)))
+      .toEqual([expect.objectContaining({ id: candidateId, lineage: 'confirmed' })]);
   });
 });

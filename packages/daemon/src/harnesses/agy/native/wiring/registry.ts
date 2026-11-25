@@ -24,6 +24,7 @@ import {
   DEFAULT_AGY_NATIVE_FEATURE_FLAGS,
   type AgyNativeFeatureFlags,
   type NativeCommandRouterPort,
+  type NativeConnectionPort,
   type NativeCommitMutation,
   type NativeEventDraft,
   type NativeLifecyclePort,
@@ -45,6 +46,7 @@ export class AgyNativeRuntimeRegistry {
   private lifecyclePort: NativeLifecyclePort | null = null;
   private permissionPort: NativePermissionPort | null = null;
   private commandRouterPort: NativeCommandRouterPort | null = null;
+  private connectionPort: NativeConnectionPort | null = null;
   private timelineReaderPort: NativeTimelineReaderPort | null = null;
   private workflowResourceReaderPort: NativeWorkflowResourceReaderPort | null = null;
   private settlementSink: NativeTurnSettlementSink | null = null;
@@ -102,6 +104,7 @@ export class AgyNativeRuntimeRegistry {
   }
 
   registerModules(registration: NativeRuntimeModuleRegistration): void {
+    if (registration.connection) this.connectionPort = registration.connection;
     if (registration.lifecycle) {
       this.lifecyclePort = registration.lifecycle;
       if (this.settlementSink) {
@@ -187,12 +190,12 @@ export class AgyNativeRuntimeRegistry {
 
     if (
       this.flags.enabled &&
-      this.flags.nativeLifecycle &&
       prev &&
       (prev.runtimeId !== nextBinding.runtimeId || prev.generation !== nextBinding.generation)
     ) {
       try {
-        this.lifecyclePort?.onProfileGenerationChanged?.(prev, nextBinding);
+        if (this.flags.nativePermissions) this.permissionPort?.handleGenerationChanged?.(prev, nextBinding);
+        if (this.flags.nativeLifecycle) this.lifecyclePort?.onProfileGenerationChanged?.(prev, nextBinding);
       } catch {
         // isolate observer failures
       }
@@ -223,9 +226,10 @@ export class AgyNativeRuntimeRegistry {
     };
     this.activeBindingsBySession.set(updated.sessionId, nextBinding);
 
-    if (this.flags.enabled && this.flags.nativeLifecycle && prevBinding) {
+    if (this.flags.enabled && prevBinding) {
       try {
-        this.lifecyclePort?.onProfileGenerationChanged?.(prevBinding, nextBinding);
+        if (this.flags.nativePermissions) this.permissionPort?.handleGenerationChanged?.(prevBinding, nextBinding);
+        if (this.flags.nativeLifecycle) this.lifecyclePort?.onProfileGenerationChanged?.(prevBinding, nextBinding);
       } catch {
         // isolate observer failures
       }
@@ -349,11 +353,31 @@ export class AgyNativeRuntimeRegistry {
         this.emitTransportFrame(frame, binding);
       },
       onIngressFrame: (envelope) => {
-        if (!this.flags.enabled || !this.flags.nativeLifecycle) return;
+        if (!this.flags.enabled) return;
         try {
+          if (this.connectionPort?.ingest(envelope)) return true;
+          if (!this.flags.nativeLifecycle) return;
+          if ((!this.flags.nativePermissions || !this.permissionPort) && envelope.wire &&
+            typeof envelope.wire === 'object' && 'id' in envelope.wire) return;
           this.lifecyclePort?.acceptFrame(envelope);
         } catch {
           // isolate lifecycle failures
+        }
+      },
+      onSessionReady: (handle) => {
+        if (!this.flags.enabled) return;
+        try {
+          this.connectionPort?.attach(binding, handle);
+        } catch {
+          // A projection failure must not break the live ACP connection.
+        }
+      },
+      onSessionSignalsChanged: (handle) => {
+        if (!this.flags.enabled) return;
+        try {
+          this.connectionPort?.refresh(binding, handle);
+        } catch {
+          // A projection failure must not break the live ACP connection.
         }
       },
       onIncomingServerRequest: (req) => {
@@ -371,11 +395,18 @@ export class AgyNativeRuntimeRegistry {
           return null;
         }
         try {
-          return this.permissionPort.onIncomingRequest({
+          const result = this.permissionPort.onIncomingRequest({
             binding,
             ...req,
           });
+          if (this.flags.nativeLifecycle && (!result?.handled || result.error || result.response !== undefined)) {
+            this.lifecyclePort?.resolveWirePendingRequest?.(binding, req.wireRequestId, 'cancelled', req.connectionId);
+          }
+          return result;
         } catch {
+          if (this.flags.nativeLifecycle) {
+            this.lifecyclePort?.resolveWirePendingRequest?.(binding, req.wireRequestId, 'cancelled', req.connectionId);
+          }
           return {
             handled: true,
             error: {
@@ -452,9 +483,10 @@ export class AgyNativeRuntimeRegistry {
     binding: RuntimeBinding | null,
     target?: { type: string; id: string },
   ): void {
-    if (!binding || !this.flags.enabled || !this.flags.nativeLifecycle) return;
+    if (!binding || !this.flags.enabled) return;
     try {
-      this.lifecyclePort?.onCancelRequested?.(binding, target);
+      if (this.flags.nativeLifecycle) this.lifecyclePort?.onCancelRequested?.(binding, target);
+      if (this.flags.nativePermissions) this.permissionPort?.handleStopRequested?.(binding, target);
     } catch {
       // isolate failures
     }
@@ -478,6 +510,11 @@ export class AgyNativeRuntimeRegistry {
     reason?: string,
   ): void {
     if (!binding) return;
+    try {
+      this.connectionPort?.close(binding, connectionId);
+    } catch {
+      // Continue disconnect cleanup even if a projection observer fails.
+    }
     if (this.persistence.getSchemaStatus().compatible) {
       try {
         this.persistence.invalidateApprovalReceiptsForRuntime(

@@ -8,6 +8,7 @@ import {
   NativeControlResponseSchema,
   NativeEventsQuerySchema,
   NativeEventsResponseSchema,
+  NativeRequestDetailsResponseSchema,
   NativeSnapshotResponseSchema,
   NativeTimelineQuerySchema,
   NativeTimelineResponseSchema,
@@ -125,13 +126,12 @@ function isControlAuthorizedByCatalog(
   const targetMatchesDescriptor = (descId: string): boolean => {
     switch (targetType) {
       case 'runtime':
+        return ['AGY-R01', 'AGY-R10', 'agy.acp.v1', 'agy.reactive.background'].includes(descId);
       case 'activity':
       case 'work':
-        return (
-          descId === 'agy.acp.v1' ||
+        return descId === 'agy.acp.v1' ||
           descId.startsWith('agy.reactive') ||
-          descId.startsWith('agy.workflow.')
-        );
+          descId.startsWith('agy.workflow.');
       case 'agent':
         return descId === 'agy.subagents' || descId.startsWith('agy.workflow.swarm');
       case 'workflow':
@@ -144,7 +144,7 @@ function isControlAuthorizedByCatalog(
     if (!targetMatchesDescriptor(desc.id)) continue;
     // If the descriptor declares explicit actions, the action key must be explicitly `available`
     if (desc.actions.length > 0) {
-      const matched = desc.actions.find((a) => a.key === action && a.gate === 'available');
+      const matched = desc.actions.find((a) => (a.key === action || (action === 'stop' && a.key === 'cancel')) && a.gate === 'available');
       if (matched) return true;
     } else {
       return true;
@@ -846,6 +846,26 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
     }
   });
 
+  app.get('/api/v1/sessions/:id/native/requests', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return sendNativeError(reply, 403, 'FORBIDDEN', 'Native request details require local desktop access');
+    }
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+    const flags = deps.nativeRegistry.getFeatureFlags();
+    if (!flags.enabled || !flags.nativePermissions) {
+      return sendNativeError(reply, 503, 'NATIVE_RUNTIME_DISABLED', 'Native request routing is disabled');
+    }
+    const binding = deps.nativeRegistry.getActiveBinding(id, ctx.session.harnessId);
+    if (!binding) return sendNativeError(reply, 404, 'NOT_FOUND', 'No native binding for this session');
+    return NativeRequestDetailsResponseSchema.parse({
+      schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+      binding,
+      requests: deps.nativeRegistry.getPermissionPort()?.listRequestDetails?.(binding) ?? [],
+    });
+  });
+
   // ── POST /api/v1/sessions/:id/native/requests/:approvalId/resolve ────
   app.post(
     '/api/v1/sessions/:id/native/requests/:approvalId/resolve',
@@ -948,7 +968,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       }
       if (
         parsed.data.outcome === 'form_submitted' &&
-        matchingPending.kind === 'permission' &&
+        matchingPending.kind !== 'elicitation' &&
         !matchingPending.allowsFreeText
       ) {
         return sendNativeError(
@@ -957,6 +977,17 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
           'INVALID_REQUEST',
           'Free-form payload is not accepted for fixed-option permission requests',
         );
+      }
+
+      const validation = permissionPort.validateResolutionInput?.(binding, approvalId, parsed.data);
+      if (validation && !validation.valid) {
+        if (validation.errorCode === 'STALE_GENERATION') {
+          return sendNativeError(reply, 409, 'STALE_BINDING', 'Native request belongs to a different binding');
+        }
+        if (validation.errorCode === 'REQUEST_NOT_PENDING' || validation.errorCode === 'REQUEST_EXPIRED') {
+          return sendNativeError(reply, 409, 'ALREADY_RESOLVED', 'Native request is no longer pending');
+        }
+        return sendNativeError(reply, 400, 'INVALID_REQUEST', 'Invalid option or form for the pending native request');
       }
 
       // Ensure durable receipt exists and acquire authoritative DB CAS BEFORE calling permissionPort!

@@ -13,6 +13,7 @@ import {
 import { ApprovalCenterService } from '../src/core/approval-center-service.js';
 import { AgyAdapter } from '../src/harnesses/agy/agy-driver.js';
 import { DEFAULT_AGY_APP_DATA_DIR_NAME } from '../src/harnesses/agy/agy-launch-context.js';
+import { AgyReactiveRuntimeController, createPermissionPortRequestStub } from '../src/harnesses/agy/native/runtime/index.js';
 import {
   JSON_RPC_INVALID_PARAMS,
   JSON_RPC_METHOD_NOT_FOUND,
@@ -55,6 +56,7 @@ async function createAgyTestEnv(opts?: {
   defaultDeadlineMs?: number;
   unknownChildDeadlineMs?: number;
   now?: () => number;
+  onRequestSettled?: NonNullable<ConstructorParameters<typeof NativePermissionRouter>[1]>['onRequestSettled'];
   permissionMode?: 'manual' | 'accept_edits';
 }) {
   const tmp = makeTempDir('hm-np07-');
@@ -128,6 +130,7 @@ async function createAgyTestEnv(opts?: {
     defaultDeadlineMs: opts?.defaultDeadlineMs,
     unknownChildDeadlineMs: opts?.unknownChildDeadlineMs,
     now: opts?.now,
+    onRequestSettled: opts?.onRequestSettled,
     approvalCenterBridge: {
       evaluateLocalAnnotations: (ctx) => approvalCenter.evaluateLocalRules(ctx),
       getSessionContext: (sid) => {
@@ -1176,8 +1179,146 @@ describe('NP-07 T06/T07/T14 Routing, Child Attribution, CAS, Expiry, Stop & Reco
   });
 });
 
+describe('G2 cross-domain regressions', () => {
+  async function createFixedQuestion() {
+    let lifecycle: AgyReactiveRuntimeController;
+    const env = await createAgyTestEnv({
+      onRequestSettled: (binding, rpcId, state, connectionId) =>
+        lifecycle.resolveWirePendingRequest(binding, rpcId, state, connectionId),
+    });
+    const wireWrites: unknown[] = [];
+    const request = {
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'nat_root_1',
+        toolCall: { toolCallId: 'interaction_001', title: 'Choose fixture target' },
+        options: [
+          { optionId: 'first', name: 'First' },
+          { optionId: 'second', name: 'Second' },
+        ],
+      },
+    };
+    const frame = {
+      binding: env.binding,
+      connectionId: 'conn_1',
+      ingressOrdinal: 1,
+      channel: 'live' as const,
+      wireRequestId: 41,
+    };
+    lifecycle = new AgyReactiveRuntimeController({
+      publisher: env.daemon.nativeRegistry,
+      pendingRequestStub: createPermissionPortRequestStub(env.router),
+    });
+    try {
+      lifecycle.acceptFrame({
+        ...frame,
+        originSession: 'nat_root_1',
+        wire: { jsonrpc: '2.0', id: frame.wireRequestId, ...request },
+      });
+      env.router.onIncomingRequest({
+        ...frame,
+        ...request,
+        respond: (response) => {
+          wireWrites.push(response);
+          return true;
+        },
+        respondError: () => true,
+      });
+      return { ...env, lifecycle, wireWrites, pending: env.router.listPendingRequests(env.binding)[0]! };
+    } catch (error) {
+      lifecycle.dispose();
+      throw error;
+    }
+  }
+
+  it('keeps the approval pending after invalid REST form input', async () => {
+    const { binding, daemon, lifecycle, pending, session, wireWrites } = await createFixedQuestion();
+    try {
+      const url = `/api/v1/sessions/${session.id}/native/requests/${pending.approvalId}/resolve`;
+      const invalid = await daemon.app.inject({
+        method: 'POST',
+        url,
+        payload: {
+          generation: binding.generation,
+          outcome: 'form_submitted',
+          formPayload: { answer: 'invalid text for fixed choice' },
+        },
+      });
+      expect(invalid.statusCode).toBe(400);
+      expect(daemon.nativeRegistry.persistence.getApprovalReceiptByApprovalId(pending.approvalId)?.state)
+        .toBe('pending');
+      const valid = await daemon.app.inject({
+        method: 'POST',
+        url,
+        payload: { generation: binding.generation, outcome: 'selected', optionId: 'second' },
+      });
+      expect(valid.statusCode).toBe(200);
+      expect(daemon.nativeRegistry.persistence.getApprovalReceiptByApprovalId(pending.approvalId)?.state)
+        .toBe('response_written');
+      expect(wireWrites).toHaveLength(1);
+    } finally {
+      lifecycle.dispose();
+    }
+  });
+
+  it('settles a legacy question via the same native CAS receipt', async () => {
+    const { daemon, lifecycle, pending, wireWrites } = await createFixedQuestion();
+    try {
+      const result = await daemon.sessionManager.resolveRuntimeRequest(
+        pending.approvalId, { questionAnswer: { selectedOptionIds: ['second'] } }, 'desktop',
+      );
+      expect(result.approval.status).toBe('resolved');
+      expect(daemon.nativeRegistry.persistence.getApprovalReceiptByApprovalId(pending.approvalId)?.state)
+        .toBe('response_written');
+      expect(wireWrites).toHaveLength(1);
+    } finally {
+      lifecycle.dispose();
+    }
+  });
+
+  it('delivers one wire response when the legacy and native endpoints race', async () => {
+    const { binding, daemon, lifecycle, pending, session, wireWrites } = await createFixedQuestion();
+    try {
+      const [native, legacy] = await Promise.all([
+        daemon.app.inject({
+          method: 'POST',
+          url: `/api/v1/sessions/${session.id}/native/requests/${pending.approvalId}/resolve`,
+          payload: { generation: binding.generation, outcome: 'selected', optionId: 'first' },
+        }),
+        daemon.sessionManager.resolveRuntimeRequest(
+          pending.approvalId, { questionAnswer: { selectedOptionIds: ['second'] } }, 'desktop',
+        ),
+      ]);
+      expect(Number(native.statusCode === 200) + Number(!legacy.conflict)).toBe(1);
+      expect(wireWrites).toHaveLength(1);
+      expect(daemon.nativeRegistry.persistence.getApprovalReceiptByApprovalId(pending.approvalId)?.state)
+        .toBe('response_written');
+    } finally {
+      lifecycle.dispose();
+    }
+  });
+
+  it('releases runtime retention when NP-07 responds', async () => {
+    const { binding, lifecycle, pending, router, wireWrites } = await createFixedQuestion();
+    try {
+      const result = await router.resolveWithCas({
+        binding,
+        approvalId: pending.approvalId,
+        request: { generation: binding.generation, outcome: 'selected', optionId: 'second' },
+        resolvedBy: 'desktop',
+      });
+      expect(result.receiptState).toBe('response_written');
+      expect(wireWrites).toHaveLength(1);
+      expect(router.listPendingRequests(binding)).toHaveLength(0);
+      expect(lifecycle.listRetentionReasons(binding).filter((reason) => reason.startsWith('pending_request:'))).toEqual([]);
+    } finally {
+      lifecycle.dispose();
+    }
+  });
+});
+
 describe('NP-07 End-to-End Real AcpSessionHandle + AgyAdapter + Stdio JSON-RPC Peer (synthetic + E05 replay shapes)', () => {
-  it('routes post-turn detached permission (number ID), interaction_* question (string ID), elicitation form, and unknown method (-32601) over real stdio JSON-RPC', async () => {
+  it('routes child and root timelines, requests and Stop through real Daemon startup', async () => {
     const tmp = makeTempDir('hm-np07-e2e-');
     const peerLogPath = path.join(tmp, 'peer-responses.ndjson');
     const peerScript = path.join(tmp, 'mock-acp-np07.mjs');
@@ -1195,6 +1336,7 @@ function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\\n');
 }
 
+let stopPromptId;
 rl.on('line', (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
@@ -1228,7 +1370,28 @@ rl.on('line', (line) => {
     });
     return;
   }
+  if (msg.method === 'session/cancel' && stopPromptId !== undefined) {
+    setTimeout(() => send({ jsonrpc: '2.0', id: stopPromptId, result: { stopReason: 'cancelled' } }), 180);
+    return;
+  }
   if (msg.method === 'session/prompt') {
+    if (msg.params.prompt[0]?.text === 'Stop fixture') {
+      stopPromptId = msg.id;
+      return;
+    }
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 'agy-e2e-sess-1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'main fixture' } },
+    } });
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 'agy-e2e-sess-1',
+      update: { sessionUpdate: 'subagent_update', parentSessionId: 'agy-e2e-sess-1',
+        childSessionId: 'child-e2e-sess', role: 'Verifier', state: 'running' },
+    } });
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId: 'child-e2e-sess',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'child fixture' } },
+    } });
     // Finish prompt immediately to simulate detached post-turn requests!
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
     setTimeout(() => {
@@ -1256,13 +1419,13 @@ rl.on('line', (line) => {
           ],
         },
       });
-      // 2. AGY interaction_* question with STRING id ("str-q-8102")
+      // 2. AGY interaction_* question with string ID "8101"
       send({
         jsonrpc: '2.0',
-        id: 'str-q-8102',
+        id: '8101',
         method: 'session/request_permission',
         params: {
-          sessionId: 'agy-e2e-sess-1',
+          sessionId: 'child-e2e-sess',
           toolCall: {
             toolCallId: 'interaction_001',
             title: 'Select target environment',
@@ -1327,6 +1490,7 @@ rl.on('line', (line) => {
       dataDir: path.join(tmp, 'data'),
       port: 0,
       webDistDir: null,
+      nativeFeatureFlags: { enabled: true, nativeLifecycle: true, nativePermissions: true, nativeCommands: true },
     });
     activeDaemons.push(daemon);
     await daemon.app.ready();
@@ -1373,34 +1537,13 @@ rl.on('line', (line) => {
       updatedAt: Date.now(),
     });
 
-    daemon.nativeRegistry.setFeatureFlags({
-      enabled: true,
-      nativeLifecycle: false,
-      nativePermissions: true,
-      nativeCommands: false,
-      observatoryTap: false,
-      acpV2Preview: false,
-    });
-
-    const resolver = new StubNativeRequestTargetResolver();
-    const router = new NativePermissionRouter(daemon.nativeRegistry, {
-      targetResolver: resolver,
-    });
-    activeRouters.push(router);
-    daemon.nativeRegistry.registerModules({ permissions: router });
+    const router = daemon.nativeRegistry.getPermissionPort()!;
 
     // Send a user turn so SessionManager creates the real AcpSessionHandle & binding
     await daemon.sessionManager.sendTurn(session.id, 'Run background workflow');
 
     const binding = daemon.nativeRegistry.getActiveBinding(session.id, 'agy-e2e');
     expect(binding).not.toBeNull();
-    resolver.registerRootSession(binding!, 'any', 'agy-e2e-sess-1');
-    resolver.setRootActivity(binding!, {
-      activityId: asActivityId('act_e2e_detached'),
-      turnId: null,
-      isDetached: true,
-    });
-
     // Wait for the 3 live requests to arrive after prompt settled
     const deadlineAt = Date.now() + 5_000;
     while (router.listPendingRequests(binding!).length < 3 && Date.now() < deadlineAt) {
@@ -1411,27 +1554,52 @@ rl.on('line', (line) => {
     expect(pending).toHaveLength(3);
 
     const permReq = pending.find((p) => p.wireRequestId === 8101)!;
-    const qReq = pending.find((p) => p.wireRequestId === 'str-q-8102')!;
+    const qReq = pending.find((p) => p.wireRequestId === '8101')!;
     const elicitReq = pending.find((p) => p.wireRequestId === 'str-elicit-8103')!;
 
     expect(permReq.kind).toBe('permission');
     expect(qReq.kind).toBe('question');
     expect(elicitReq.kind).toBe('elicitation');
 
-    // Resolve all 3 via real Fastify HTTP endpoints!
-    const rPerm = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/requests/${permReq.approvalId}/resolve`,
-      payload: { generation: binding!.generation, outcome: 'selected', optionId: 'allow_once' },
-    });
-    expect(rPerm.statusCode).toBe(200);
+    const sessionPath = `/api/v1/sessions/${session.id}/native`;
+    expect(qReq.agentId).toBeTruthy();
+    expect(permReq.agentId).toBeUndefined();
+    const snapshot = daemon.nativeRegistry.getProjectionForSession(session.id, 'agy-e2e');
+    expect(snapshot.agents).toHaveLength(2);
+    expect(snapshot.capabilitiesRevision).toBeGreaterThan(0);
+    const activity = snapshot.activities.find((item) => item.origin === 'user_turn')!;
+    const [rootTimeline, childTimeline, details] = await Promise.all([
+      daemon.app.inject(`${sessionPath}/activity/${activity.id}/timeline`),
+      daemon.app.inject(`${sessionPath}/agents/${qReq.agentId}/timeline`),
+      daemon.app.inject(`${sessionPath}/requests`),
+    ]);
+    expect(rootTimeline.statusCode).toBe(200);
+    expect(rootTimeline.body).toContain('main fixture');
+    expect(rootTimeline.body).not.toContain('child fixture');
+    expect(childTimeline.statusCode).toBe(200);
+    expect(childTimeline.body).toContain('child fixture');
+    expect(details.statusCode).toBe(200);
+    expect(details.json().requests.find((request: { approvalId: string }) => request.approvalId === qReq.approvalId))
+      .toMatchObject({ scope: 'confirmed_child', generation: binding!.generation, canAnswer: true });
+    expect(details.body).not.toMatch(/wireRequestId|actualNativeSessionId|child-e2e-sess/);
 
+    // Resolve requests out of ingress order, preserving original typed wire IDs.
     const rQ = await daemon.app.inject({
       method: 'POST',
       url: `/api/v1/sessions/${session.id}/native/requests/${qReq.approvalId}/resolve`,
       payload: { generation: binding!.generation, outcome: 'selected', optionId: 'production' },
     });
     expect(rQ.statusCode).toBe(200);
+
+    expect(daemon.nativeRegistry.listRetentionReasons(binding).filter((item) => item.startsWith('pending_request:')))
+      .toHaveLength(2);
+
+    const rPerm = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/requests/${permReq.approvalId}/resolve`,
+      payload: { generation: binding!.generation, outcome: 'selected', optionId: 'allow_once' },
+    });
+    expect(rPerm.statusCode).toBe(200);
 
     const rElicit = await daemon.app.inject({
       method: 'POST',
@@ -1467,12 +1635,27 @@ rl.on('line', (line) => {
     expect(byId.get('number:8101')?.result).toEqual({
       outcome: { outcome: 'selected', optionId: 'allow_once' },
     });
-    expect(byId.get('string:str-q-8102')?.result).toEqual({
+    expect(byId.get('string:8101')?.result).toEqual({
       outcome: { outcome: 'selected', optionId: 'production' },
     });
     expect(byId.get('string:str-elicit-8103')?.result).toEqual({
       action: 'accept',
       content: { channel: 'stable', canaryPct: 25 },
     });
+
+    expect(daemon.nativeRegistry.listRetentionReasons(binding).filter((item) => item.startsWith('pending_request:')))
+      .toHaveLength(0);
+    const { turnId } = await daemon.sessionManager.sendTurn(session.id, 'Stop fixture');
+    await daemon.sessionManager.interruptSession(session.id);
+    expect(daemon.store.getSession(session.id)?.status).toBe('running');
+    const activityState = () => daemon.nativeRegistry.getProjectionForSession(session.id, 'agy-e2e')
+      .activities.find((item) => item.turnId === turnId)?.state;
+    expect(activityState()).toBe('cancelling');
+    await expect.poll(activityState, { timeout: 3_000 }).toBe('cancelled');
+    expect(daemon.store.getSession(session.id)?.status).toBe('idle');
+    await daemon.sessionManager.closeSessionsForHarness('agy-e2e');
+    const disconnected = daemon.nativeRegistry.getProjectionForSession(session.id, 'agy-e2e');
+    expect(disconnected.status).toBe('disconnected');
+    expect(disconnected.agents.find((agent) => agent.id === qReq.agentId)?.foreground.kind).toBe('stale');
   }, 20_000);
 });

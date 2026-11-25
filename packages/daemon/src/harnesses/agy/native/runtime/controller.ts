@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   asActivityId,
   asNativeAgentId,
@@ -85,7 +86,8 @@ interface GenerationState {
   settledTurnKeys: Set<string>;
   cancelState: CancelStateRecord | null;
   requestsByApprovalId: Map<string, NativeRequestSummaryDto>;
-  wirePendingReqKeys: Set<string>;
+  wirePendingReqKeys: Map<string, string>;
+  connectionId?: string;
   timelines: Map<ActivityId, ActivityTimelineBuffer>;
   diagnostics: RuntimeDiagnosticEntry[];
   counters: {
@@ -182,7 +184,7 @@ export class AgyReactiveRuntimeController
 
   onPromptStarted(ctx: PromptContext): void {
     const gen = this.getOrInitCurrentGeneration(ctx.binding, 'attached');
-    if (!gen) {
+    if (!gen || gen.status === 'disconnected' || (gen.connectionId && gen.connectionId !== ctx.connectionId)) {
       this.recordStaleGenerationAttempt(ctx.binding, 'onPromptStarted', ctx.turnId);
       return;
     }
@@ -218,6 +220,7 @@ export class AgyReactiveRuntimeController
 
     gen.activities.set(activityId, activity);
     gen.lastActivityId = activityId;
+    gen.connectionId ??= ctx.connectionId;
     gen.status = 'attached';
 
     if (!ctx.isSteering) {
@@ -271,7 +274,7 @@ export class AgyReactiveRuntimeController
         },
   ): TurnSettlement {
     const gen = this.getCurrentGenerationIfMatches(ctx.binding);
-    if (!gen) {
+    if (!gen || gen.status === 'disconnected' || (gen.connectionId && gen.connectionId !== ctx.connectionId)) {
       this.recordStaleGenerationAttempt(ctx.binding, 'onPromptSettled', ctx.turnId);
       return { kind: 'eligible', outcome: 'cancelled', stopReason: 'stale_generation' };
     }
@@ -397,7 +400,9 @@ export class AgyReactiveRuntimeController
         gen.activeForegroundTurnId = null;
         gen.activeForegroundActivityId = null;
       }
-      this.confirmCancelIfActive(gen, 'prompt_stop_reason_cancelled');
+      if (gen.cancelState?.target.type === 'runtime') {
+        this.confirmCancelIfActive(gen, 'prompt_stop_reason_cancelled');
+      }
       if (activityId) {
         const act = gen.activities.get(activityId);
         if (act) {
@@ -419,6 +424,10 @@ export class AgyReactiveRuntimeController
       this.markTurnSettledLocally(gen, ctx.turnId);
       this.publishRuntimeStatus(gen, 'prompt_cancelled');
       return { kind: 'eligible', outcome: 'cancelled', stopReason: 'cancelled' };
+    }
+
+    if (gen.cancelState?.outcome === 'requested' && gen.cancelState.target.type === 'runtime') {
+      return { kind: 'held', reasonIds: ['native_cancel_pending'] };
     }
 
     // ── Normal/Early Prompt Response branch ──
@@ -549,6 +558,8 @@ export class AgyReactiveRuntimeController
       return;
     }
 
+    if (gen.status === 'disconnected' || (gen.connectionId && gen.connectionId !== envelope.connectionId)) return;
+    gen.connectionId = envelope.connectionId;
     const now = this.nowFn();
     gen.status = 'attached';
 
@@ -664,7 +675,6 @@ export class AgyReactiveRuntimeController
           if (gen.wirePendingReqKeys.size > 0 && this.listActivePendingRequestReasons(gen).length === 0) {
             // keep wire keys cleared when explicitly resolved via matching key
           }
-          gen.wirePendingReqKeys.delete(observation.approvalId);
           this.reevaluateHeldTurns(gen, now);
         }
         this.publishRuntimeStatus(gen, `request_${observation.receiptState}`);
@@ -683,11 +693,14 @@ export class AgyReactiveRuntimeController
     binding: RuntimeBinding,
     wireRequestId: RpcId,
     receiptState: NativeRequestReceiptState,
+    connectionId?: string,
   ): void {
     const gen = this.getCurrentGenerationIfMatches(binding);
-    if (!gen) return;
-    const key = `wire_req:${formatTypedRpcKey(wireRequestId)}`;
-    gen.wirePendingReqKeys.delete(key);
+    if (!gen || (connectionId && gen.connectionId !== connectionId)) return;
+    const wireKey = formatTypedRpcKey(wireRequestId);
+    const key = gen.wirePendingReqKeys.get(wireKey);
+    if (!key) return;
+    gen.wirePendingReqKeys.delete(wireKey);
     const existing = gen.requestsByApprovalId.get(key);
     const now = this.nowFn();
     if (existing) {
@@ -735,6 +748,8 @@ export class AgyReactiveRuntimeController
         : 'runtime';
     const targetId = target?.id ?? binding.runtimeId;
 
+    if (gen.cancelState?.outcome === 'requested' &&
+        gen.cancelState.target.type === normalizedType && gen.cancelState.target.id === targetId) return;
     gen.timers.cancelGrace?.cancel();
     gen.cancelState = {
       target: { type: normalizedType, id: targetId },
@@ -787,7 +802,7 @@ export class AgyReactiveRuntimeController
 
   handleTransportClosed(binding: RuntimeBinding, connectionId: string, reason?: string): void {
     const gen = this.getCurrentGenerationIfMatches(binding);
-    if (!gen || gen.status === 'disconnected') return;
+    if (!gen || gen.status === 'disconnected' || (gen.connectionId && gen.connectionId !== connectionId)) return;
 
     const now = this.nowFn();
     const closeReason = reason ?? 'transport_closed';
@@ -1070,6 +1085,14 @@ export class AgyReactiveRuntimeController
 
   // ── Inspection & Diagnostics API ─────────────────────────────────────
 
+  getWireRequestActivity(binding: RuntimeBinding, connectionId: string, rpcId: RpcId): Activity | undefined {
+    const gen = this.getCurrentGenerationIfMatches(binding);
+    if (!gen || gen.connectionId !== connectionId) return;
+    const key = gen.wirePendingReqKeys.get(formatTypedRpcKey(rpcId));
+    const activityId = key ? gen.requestsByApprovalId.get(key)?.activityId : undefined;
+    return activityId ? gen.activities.get(activityId) : undefined;
+  }
+
   getRuntimeSnapshot(binding: RuntimeBinding): ReactiveRuntimeSnapshot | null {
     const gen = this.getCurrentGenerationIfMatches(binding);
     if (!gen) return null;
@@ -1228,7 +1251,8 @@ export class AgyReactiveRuntimeController
       applied.work.state.kind === 'known' &&
       applied.work.state.value === 'cancelled' &&
       gen.cancelState?.outcome === 'requested' &&
-      (gen.cancelState.target.type === 'runtime' ||
+      ((gen.cancelState.target.type === 'runtime' && !gen.activeForegroundTurnId &&
+        gen.workTracker.listActiveBlockingWorkIds().length === 0) ||
         (gen.cancelState.target.type === 'work' && gen.cancelState.target.id === applied.work.id))
     ) {
       this.confirmCancelIfActive(gen, `work_cancelled:${applied.work.id}`);
@@ -1305,8 +1329,10 @@ export class AgyReactiveRuntimeController
     evidence: Evidence,
     now: number,
   ): void {
-    const reqKey = `wire_req:${formatTypedRpcKey(decoded.wireRequestId)}`;
-    gen.wirePendingReqKeys.add(reqKey);
+    const wireKey = formatTypedRpcKey(decoded.wireRequestId);
+    if (gen.wirePendingReqKeys.has(wireKey)) return;
+    const reqKey = `request_${randomUUID()}`;
+    gen.wirePendingReqKeys.set(wireKey, reqKey);
 
     let targetActivityId: ActivityId;
     if (gen.activeForegroundActivityId) {
@@ -1360,7 +1386,7 @@ export class AgyReactiveRuntimeController
         ? { actorId: resolvedChild.agentId }
         : {}),
       title: decoded.title ?? decoded.method,
-      text: `Native ${decoded.isInteraction ? 'interaction' : 'permission'} request (${decoded.rpcIdType} rpcId=${String(decoded.wireRequestId)})`,
+      text: decoded.isInteraction ? '原生交互请求' : '原生权限请求',
       status: 'requires_action',
       evidence,
     });
@@ -1486,6 +1512,7 @@ export class AgyReactiveRuntimeController
 
   private reevaluateHeldTurns(gen: GenerationState, now: number): void {
     if (gen.status === 'disconnected') return;
+    if (gen.cancelState?.outcome === 'requested' && gen.cancelState.target.type === 'runtime') return;
 
     for (const held of Array.from(gen.heldTurns.values())) {
       const blockingWorkIds = gen.workTracker.listActiveBlockingWorkIds(held.turnId);
@@ -1542,6 +1569,7 @@ export class AgyReactiveRuntimeController
   private handleHeldTurnQuiescence(binding: RuntimeBinding, turnId: string): void {
     const gen = this.getCurrentGenerationIfMatches(binding);
     if (!gen || gen.status === 'disconnected') return;
+    if (gen.cancelState?.outcome === 'requested' && gen.cancelState.target.type === 'runtime') return;
     gen.timers.quiescenceByTurn.delete(turnId);
 
     const held = gen.heldTurns.get(turnId);
@@ -1769,8 +1797,15 @@ export class AgyReactiveRuntimeController
       reasonCode: 'cancel_grace_expired',
     };
 
-    const filterWorkId = target.type === 'work' ? (target.id as WorkId) : undefined;
-    const staled = gen.workTracker.markNonTerminalAsStale('cancel_grace_expired', now, filterWorkId);
+    const staled = gen.workTracker.markNonTerminalAsStale('cancel_grace_expired', now, (work) => {
+      switch (target.type) {
+        case 'runtime': return work.blocking !== 'detached';
+        case 'work': return work.id === target.id;
+        case 'activity': return work.originActivityId === target.id;
+        case 'agent': return work.ownerAgentId === target.id;
+        case 'workflow': return work.workflowId === target.id;
+      }
+    });
     for (const w of staled) {
       this.publishWork(gen, w, null);
     }
@@ -1803,8 +1838,13 @@ export class AgyReactiveRuntimeController
 
     // Settle held turns ONCE so host session doesn't hang forever
     if (target.type === 'runtime') {
-      for (const held of Array.from(gen.heldTurns.values())) {
-        this.settleTurnOnce(gen, held.turnId, {
+      const turnIds = new Set(gen.heldTurns.keys());
+      if (gen.activeForegroundTurnId) turnIds.add(gen.activeForegroundTurnId);
+      gen.activeForegroundTurnId = null;
+      gen.activeForegroundActivityId = null;
+      gen.activeNativeActivityId = null;
+      for (const turnId of turnIds) {
+        this.settleTurnOnce(gen, turnId, {
           kind: 'eligible',
           outcome: 'cancelled',
           stopReason: 'cancel_grace_expired',
@@ -1921,7 +1961,7 @@ export class AgyReactiveRuntimeController
       settledTurnKeys: new Set(),
       cancelState: null,
       requestsByApprovalId: new Map(),
-      wirePendingReqKeys: new Set(),
+      wirePendingReqKeys: new Map(),
       timelines: new Map(),
       diagnostics: [],
       counters: {
@@ -1964,7 +2004,7 @@ export class AgyReactiveRuntimeController
 
   private listActivePendingRequestIds(gen: GenerationState): string[] {
     const ids = new Set<string>();
-    for (const key of gen.wirePendingReqKeys) {
+    for (const key of gen.wirePendingReqKeys.values()) {
       ids.add(key);
     }
     for (const req of gen.requestsByApprovalId.values()) {

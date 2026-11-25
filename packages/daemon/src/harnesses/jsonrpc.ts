@@ -185,8 +185,8 @@ export class StdioJsonRpcClient {
     return this.requestWithMeta<T>(method, params, timeoutMs).promise;
   }
 
-  notify(method: string, params?: unknown): void {
-    if (this.disposed) return;
+  notify(method: string, params?: unknown): boolean {
+    if (this.disposed) return false;
     const wirePayload = {
       jsonrpc: '2.0',
       method,
@@ -199,7 +199,7 @@ export class StdioJsonRpcClient {
       method,
       wire: wirePayload,
     });
-    this.writeLine(wirePayload);
+    return this.writeLine(wirePayload);
   }
 
   respond(id: string | number, result: unknown): boolean {

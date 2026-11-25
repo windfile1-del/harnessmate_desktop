@@ -192,6 +192,7 @@ export interface AdapterSessionHandle {
   runNativeCommand?(command: string, args: string): Promise<string>;
   injectContext?(payload: ContextSyncPayload): Promise<ContextInjectionDriver>;
   interrupt(): Promise<void>;
+  requestNativeSessionCancel?(): boolean;
   resolveApproval(nativeRequestId: string, decision: ApprovalDecision, comment?: string): Promise<void>;
   /** Optional zero-log in-memory channel for secret_request delivery directly to harness stdin/memory. */
   resolveSecret?(nativeRequestId: string, secretValue: string): Promise<void>;

@@ -128,6 +128,8 @@ import {
   mintAgyDispatchProvenance,
   registerAgyNativeRoutes,
 } from '../harnesses/agy/native/wiring/index.js';
+import { wireAgyNativeRuntime } from '../harnesses/agy/native/wiring/composition.js';
+import type { AgyNativeFeatureFlags } from '../harnesses/agy/native/wiring/types.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
@@ -152,6 +154,7 @@ export interface CreateDaemonOptions {
   binaryOverrides?: Record<string, string>;
   webDistDir?: string | null;
   pluginCrashPolicy?: CrashPolicy;
+  nativeFeatureFlags?: Partial<AgyNativeFeatureFlags>;
 }
 
 export interface DaemonInstance {
@@ -242,9 +245,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   let boundPort = config.port;
   const commandOutputHub = new CommandOutputHub();
   const outboxWorker = new EffectOutboxWorker(store);
-  const nativeRegistry = new AgyNativeRuntimeRegistry(store);
+  const nativeRegistry = new AgyNativeRuntimeRegistry(store, opts.nativeFeatureFlags);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
   const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
+  const disposeNativeRuntime = wireAgyNativeRuntime(nativeRegistry, sessionManager, registry, config.binaryOverrides);
   const agyAuthService = new AgyAuthService({
     getAdapter: (instanceId) => {
       const adapter = registry.get(instanceId);
@@ -381,6 +385,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         pluginBuilderV2.cancel();
         await terminalWorkspace.disposeAll();
         await sessionManager.shutdown();
+        disposeNativeRuntime();
         await app.close();
         await pluginManager.close();
         store.close();
@@ -2757,6 +2762,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       await agyAuthService.dispose();
       await terminalWorkspace.disposeAll();
       await sessionManager.shutdown();
+      disposeNativeRuntime();
       await app.close();
       await pluginManager.close();
       store.close();

@@ -1,7 +1,12 @@
 import { createDaemon } from './server/app.js';
 
 async function main(): Promise<void> {
-  const daemon = createDaemon();
+  const nativeTrial = process.env.HARNESSMATE_AGY_NATIVE_RUNTIME === '1';
+  const daemon = createDaemon({
+    nativeFeatureFlags: nativeTrial
+      ? { enabled: true, nativeLifecycle: true, nativePermissions: true, nativeCommands: true }
+      : undefined,
+  });
   const { host, port } = await daemon.start();
 
   console.log(

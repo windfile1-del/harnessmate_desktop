@@ -7,6 +7,7 @@ import {
   NativeControlRequestSchema,
   NativeControlResponseSchema,
   NativeEventsResponseSchema,
+  NativeRequestDetailsResponseSchema,
   NativeSnapshotResponseSchema,
   NativeWsClientFrameSchema,
   NativeWsServerFrameSchema,
@@ -1792,3 +1793,11 @@ export function createNativeIdempotencyKey(
 }
 
 export const defaultNativeTransport: NativeRuntimeTransport = createHttpNativeTransport();
+
+export function readNativeRequestDetails(sessionId: string, signal: AbortSignal) {
+  return nativeFetch(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/native/requests`,
+    NativeRequestDetailsResponseSchema,
+    { signal },
+  );
+}

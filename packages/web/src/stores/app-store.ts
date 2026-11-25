@@ -2409,10 +2409,9 @@ export const useAppStore = create<AppState>((set, get) => {
               [sessionId]: {
                 ...prev,
                 commandSubmission: {
-                  phase: res.modeEvidenceObserved ? 'confirmed' : 'sent_awaiting_evidence',
-                  message: res.modeEvidenceObserved
-                    ? '已收到原生模式确认'
-                    : '已发送，等待原生确认',
+                  phase: res.status === 'completed' || res.modeEvidenceObserved ? 'confirmed' : 'sent_awaiting_evidence',
+                  message: res.status === 'completed' ? res.output ?? '命令已返回结果'
+                    : res.modeEvidenceObserved ? '已收到原生模式确认' : '已发送，等待原生确认',
                   idempotencyKey: key,
                   intentSignature,
                   updatedAt: Date.now(),

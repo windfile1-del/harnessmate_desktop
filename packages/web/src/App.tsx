@@ -1,6 +1,8 @@
 import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
+import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
+import { registerSubagentManagerView } from './components/agy/native/child/register';
 import { ChatStage } from './components/ChatStage';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
@@ -76,6 +78,16 @@ export function App() {
   }, [init]);
 
   useEffect(() => trackComposition(window, composing), []);
+
+  useEffect(() => {
+    if (!agyNativeWorkbenchEnabled) return;
+    const unregisterRuntime = registerAgyNativeRuntimeView();
+    const unregisterSubagents = registerSubagentManagerView();
+    return () => {
+      unregisterSubagents();
+      unregisterRuntime();
+    };
+  }, [agyNativeWorkbenchEnabled]);
 
   useEffect(() => {
     if (!triageEnabled) {

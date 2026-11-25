@@ -453,10 +453,12 @@ export class ReactiveWorkTracker {
    * Marks all non-terminal works as `stale` (preserving last observed state) on transport close
    * or cancel grace expiry. NEVER fabricates `finished`, `succeeded`, or `cancelled`.
    */
-  markNonTerminalAsStale(reasonCode: string, now: number, filterWorkId?: WorkId): NativeWork[] {
+  markNonTerminalAsStale(
+    reasonCode: string, now: number, matches: (work: NativeWork) => boolean = () => true,
+  ): NativeWork[] {
     const updated: NativeWork[] = [];
     for (const rec of this.works.values()) {
-      if (filterWorkId && rec.work.id !== filterWorkId) continue;
+      if (!matches(rec.work)) continue;
       if (rec.work.state.kind === 'known' && isTerminalWorkState(rec.work.state.value)) continue;
       if (rec.work.state.kind === 'stale' && rec.work.state.reasonCode === reasonCode) continue;
 

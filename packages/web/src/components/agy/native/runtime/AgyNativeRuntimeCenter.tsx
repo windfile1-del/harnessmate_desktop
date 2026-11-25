@@ -2,6 +2,8 @@ import { Cpu, Layers, Server, Terminal } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   coalesceTimelineEntries,
+  defaultNativeTransport,
+  readNativeRequestDetails,
   type NativeTimelineEntry,
   type NativeWork,
 } from '../../../../lib/native-client';
@@ -17,6 +19,9 @@ import {
   toneStyle,
   type NativeWorkbenchViewProps,
 } from '../shared';
+import { NativeRequestQueuePanel } from '../requests/NativeRequestQueuePanel';
+import type { NativeRequestDisplayMeta } from '../requests/types';
+import { RuntimeCommandPanel } from './RuntimeCommandPanel';
 import { RuntimeStatusBanner } from './RuntimeStatusBanner';
 import { RuntimeStopPanel } from './RuntimeStopPanel';
 import {
@@ -198,6 +203,7 @@ function WorkKindPill({ work }: { work: NativeWork }) {
  * with zero edits to `ChatStage.tsx`, `AgyWorkbenchShell.tsx`, or `app-store.ts`.
  */
 export function AgyNativeRuntimeCenter({
+  session,
   projection,
   syncState,
   capabilities,
@@ -206,6 +212,7 @@ export function AgyNativeRuntimeCenter({
   onNavigate,
   onRefresh,
   onResolveRequest,
+  onSubmitCommand,
   onDispatchControl,
   loadTimeline,
 }: NativeWorkbenchViewProps) {
@@ -238,6 +245,27 @@ export function AgyNativeRuntimeCenter({
     loadTimeline,
   );
 
+  const pendingKey = Object.values(projection?.receipts ?? {})
+    .filter((receipt) => receipt.receiptState === 'pending')
+    .map((receipt) => receipt.approvalId)
+    .sort()
+    .join(',');
+  const [requestMetadata, setRequestMetadata] = useState<{
+    bindingKey: string;
+    items: Record<string, NativeRequestDisplayMeta>;
+  } | null>(null);
+  useEffect(() => {
+    if (!bindingKey || !pendingKey) return;
+    const controller = new AbortController();
+    void readNativeRequestDetails(session.id, controller.signal).then(({ binding, requests }) => {
+      if (controller.signal.aborted || `${binding.runtimeId}:${binding.generation}` !== bindingKey) return;
+      setRequestMetadata({ bindingKey, items: Object.fromEntries(requests.map((req) => [req.approvalId, req])) });
+    }).catch(() => {
+      // The snapshot still shows the receipt if details are unavailable.
+    });
+    return () => controller.abort();
+  }, [bindingKey, pendingKey, session.id]);
+
   if (!projection) {
     return (
       <CapabilityUnavailable
@@ -265,51 +293,26 @@ export function AgyNativeRuntimeCenter({
         onRefresh={onRefresh}
       />
 
-      {/* 2. Pending User Requests & Read-Only Receipts */}
-      {(pendingApprovals.length > 0 || receiptsList.length > 0) && (
-        <section className="space-y-2" aria-label="原生待处理请求与收据">
-          <h3 className="text-[11.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-            需要用户确认 ({pendingApprovals.length} 待处理 · {receiptsList.length} 收据)
-          </h3>
-          <div className="space-y-2">
-            {pendingApprovals.map((appr) => {
-              const receipt = projection.receipts?.[appr.id] ?? null;
-              const owner = receipt?.agentId
-                ? projection.agents.find((a) => a.id === receipt.agentId) ?? null
-                : null;
-              return (
-                <NativeRequestCard
-                  key={appr.id}
-                  approval={appr}
-                  receipt={receipt}
-                  ownerAgent={owner}
-                  onResolve={onResolveRequest}
-                  onJumpToAgent={(agentId) =>
-                    onNavigate({ surface: 'subagents', selectedAgentId: agentId })
-                  }
-                />
-              );
-            })}
-            {receiptsList
-              .filter((r) => !pendingApprovals.some((a) => a.id === r.approvalId))
-              .map((receipt) => {
-                const owner = receipt.agentId
-                  ? projection.agents.find((a) => a.id === receipt.agentId) ?? null
-                  : null;
-                return (
-                  <NativeRequestCard
-                    key={receipt.approvalId}
-                    receipt={receipt}
-                    ownerAgent={owner}
-                    onJumpToAgent={(agentId) =>
-                      onNavigate({ surface: 'subagents', selectedAgentId: agentId })
-                    }
-                  />
-                );
-              })}
-          </div>
-        </section>
+      <RuntimeCommandPanel key={bindingKey}
+        session={session} projection={projection} capabilities={capabilities}
+        onSubmitCommand={onSubmitCommand} onRefresh={onRefresh}
+      />
+
+      {(projection.requestIds.length > 0 || receiptsList.length > 0) && (
+        <NativeRequestQueuePanel
+          projection={projection}
+          approvals={pendingApprovals}
+          metadataByApprovalId={requestMetadata?.bindingKey === bindingKey ? requestMetadata?.items : undefined}
+          onResolveNative={(approvalId, request) =>
+            defaultNativeTransport.resolveNativeRequest(session.id, approvalId, request)}
+          onJumpToAgent={(agentId) => onNavigate({ surface: 'subagents', selectedAgentId: agentId })}
+          onJumpToActivity={(activityId) => onNavigate({ selectedActivityId: activityId })}
+        />
       )}
+      {pendingApprovals.filter((approval) => !projection.receipts?.[approval.id] &&
+        !projection.requestIds.includes(approval.id)).map((approval) => (
+        <NativeRequestCard key={approval.id} approval={approval} onResolve={onResolveRequest} />
+      ))}
 
       {/* 3. Finite Background Commands vs Detached Daemons vs Schedules / Unknown */}
       <section className="space-y-2" aria-label="有限任务与常驻 Daemon">

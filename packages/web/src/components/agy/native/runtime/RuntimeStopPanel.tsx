@@ -50,7 +50,9 @@ export function RuntimeStopPanel({
 
   const stopCap = findStopCapabilityAction(capabilities);
   const isAttached = projection.status === 'attached';
-  const canExecuteStop = Boolean(stopCap && onDispatchControl && isAttached && !submitting);
+  const canExecuteStop = Boolean(
+    stopCap && onDispatchControl && isAttached && !submitting && selectedCandidate.target.type === 'runtime',
+  );
 
   const stopSummary = deriveStopStatusSummary({
     target: selectedCandidate,
@@ -63,7 +65,7 @@ export function RuntimeStopPanel({
   const summaryStyle = toneStyle(stopSummary.tone);
 
   const handleStop = async () => {
-    if (!stopCap || !onDispatchControl || submitting || !isAttached) return;
+    if (!canExecuteStop || !stopCap || !onDispatchControl) return;
     setSubmitting(true);
     setRequestedTargetKey(selectedCandidate.key);
     setErrorMsg(null);

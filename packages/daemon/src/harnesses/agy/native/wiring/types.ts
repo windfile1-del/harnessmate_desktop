@@ -239,6 +239,7 @@ export interface NativeLifecyclePort {
   onProfileGenerationChanged?(prevBinding: RuntimeBinding | null, nextBinding: RuntimeBinding): void;
   onWarmPoolEvictCheck?(binding: RuntimeBinding): { allowEvict: boolean; reasons: string[] };
   onReconnect?(binding: RuntimeBinding, mode: 'resume' | 'load' | 'fresh'): void;
+  resolveWirePendingRequest?(binding: RuntimeBinding, rpcId: RpcId, state: NativeRequestReceiptState, connectionId: string): void;
 }
 
 export interface NativePermissionDecisionWireResult {
@@ -248,6 +249,19 @@ export interface NativePermissionDecisionWireResult {
 }
 
 export interface NativePermissionPort {
+  resolveLegacyWithCas?(input: {
+    readonly binding: RuntimeBinding;
+    readonly approvalId: string;
+    readonly request: import('@harnessmate/protocol').ResolveApprovalRequest;
+    readonly resolvedBy: 'desktop' | 'mobile';
+  }): Promise<{ readonly conflict: boolean }>;
+  validateResolutionInput?(binding: RuntimeBinding, approvalId: string, request: ResolveNativeRequestInput): {
+    readonly valid: boolean;
+    readonly errorCode?: string;
+    readonly message?: string;
+  };
+  handleStopRequested?(binding: RuntimeBinding, target?: { type: string; id: string }): void;
+  handleGenerationChanged?(previous: RuntimeBinding, next: RuntimeBinding): void;
   onIncomingRequest(
     req: {
       readonly binding: RuntimeBinding;
@@ -277,6 +291,7 @@ export interface NativePermissionPort {
 
   onConnectionClosed(binding: RuntimeBinding, connectionId: string): void;
   listPendingRequests(binding: RuntimeBinding): readonly PendingNativeRequest[];
+  listRequestDetails?(binding: RuntimeBinding): readonly import('../requests/types.js').NativeRequestDetailDto[];
 }
 
 export interface NativeCommandRouterPort {
@@ -335,7 +350,9 @@ export interface NativeRuntimeHooks {
   readonly binding: RuntimeBinding;
   readonly getFeatureFlags: () => AgyNativeFeatureFlags;
   readonly onTransportFrame?: (frame: NativeTransportFrame) => void;
-  readonly onIngressFrame?: (envelope: NativeIngress) => void;
+  readonly onIngressFrame?: (envelope: NativeIngress) => boolean | void;
+  readonly onSessionReady?: (handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle) => void;
+  readonly onSessionSignalsChanged?: (handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle) => void;
   readonly onIncomingServerRequest?: (req: {
     readonly connectionId: string;
     readonly ingressOrdinal: number;
@@ -362,12 +379,20 @@ export interface NativeRuntimeEventListener {
 }
 
 export interface NativeRuntimeModuleRegistration {
+  readonly connection?: NativeConnectionPort;
   readonly lifecycle?: NativeLifecyclePort;
   readonly permissions?: NativePermissionPort;
   readonly commandRouter?: NativeCommandRouterPort;
   readonly timelineReader?: NativeTimelineReaderPort;
   readonly workflowResourceReader?: NativeWorkflowResourceReaderPort;
   readonly transportObservers?: readonly NativeTransportObserver[];
+}
+
+export interface NativeConnectionPort {
+  attach(binding: RuntimeBinding, handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle): void;
+  refresh(binding: RuntimeBinding, handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle): void;
+  ingest(envelope: NativeIngress): boolean;
+  close(binding: RuntimeBinding, connectionId: string): void;
 }
 
 export interface NativeCommitMutation {

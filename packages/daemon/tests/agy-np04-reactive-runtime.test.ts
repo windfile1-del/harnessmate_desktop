@@ -426,7 +426,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       config: { quiescenceWindowMs: 1_000 },
     });
     ctrlNoWake.attachSettlementSink(sinkNoWake.sink);
-    const ctx2 = makePromptCtx(bindingNoWake, 'turn_nowake');
+    const ctx2 = makePromptCtx(bindingNoWake, 'turn_nowake', { connectionId: 'conn_2' });
     ctrlNoWake.onPromptStarted(ctx2);
     ctrlNoWake.acceptFrame({
       binding: bindingNoWake,
@@ -492,7 +492,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     ctrl.attachSettlementSink(sink);
 
     // 1. Synthetic 15min+ held finite work -> observation timeout marks work UNKNOWN (not finished/succeeded!)
-    const ctx = makePromptCtx(binding, 'turn_t03_15m');
+    const ctx = makePromptCtx(binding, 'turn_t03_15m', { connectionId: 'conn_t03' });
     ctrl.onPromptStarted(ctx);
     ctrl.acceptFrame({
       binding,
@@ -545,7 +545,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       config: { quiescenceWindowMs: 500 },
     });
     ctrlFail.attachSettlementSink(sinkFail.sink);
-    const ctxFail = makePromptCtx(bindingFail, 'turn_t03_fail');
+    const ctxFail = makePromptCtx(bindingFail, 'turn_t03_fail', { connectionId: 'conn_t03_f' });
     ctrlFail.onPromptStarted(ctxFail);
     ctrlFail.acceptFrame({
       binding: bindingFail,
@@ -609,7 +609,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     ctrl.attachSettlementSink(sink);
 
     const fixture = loadNdjson(path.join(NP01_FIXTURES_DIR, 't04-parallel-finite-and-daemon.ndjson'));
-    const ctx = makePromptCtx(binding, 'turn-t04-1', { requestOrdinal: 3, rpcId: 3 });
+    const ctx = makePromptCtx(binding, 'turn-t04-1', { requestOrdinal: 3, rpcId: 3, connectionId: 'conn_t04' });
     ctrl.onPromptStarted(ctx);
 
     const stdoutFrames = fixture
@@ -713,7 +713,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     });
     ctrl.attachSettlementSink(sink);
 
-    const ctx = makePromptCtx(binding, 'turn-t05-1');
+    const ctx = makePromptCtx(binding, 'turn-t05-1', { connectionId: 'conn_t05' });
     ctrl.onPromptStarted(ctx);
     const settled = ctrl.onPromptSettled(ctx, { ok: true, stopReason: 'end_turn', isCurrentTurn: true });
     expect(settled.kind).toBe('eligible');
@@ -804,7 +804,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       childIdentityStub: createStaticChildIdentityStub({ 't06-child-alpha': 'agt_child_alpha' }),
     });
 
-    const ctx = makePromptCtx(binding, 'turn-t06-1');
+    const ctx = makePromptCtx(binding, 'turn-t06-1', { connectionId: 'conn_t06' });
     ctrl.onPromptStarted(ctx);
     ctrl.onPromptSettled(ctx, { ok: true, stopReason: 'end_turn', isCurrentTurn: true });
 
@@ -821,7 +821,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       channel: 'live',
       wire: serverReqs[0],
     });
-    expect(ctrl.listRetentionReasons(binding)).toContain('pending_request:wire_req:n:9001');
+    expect(ctrl.listRetentionReasons(binding)).toEqual([expect.stringMatching(/^pending_request:request_/)]);
     expect(ctrl.onWarmPoolEvictCheck(binding).allowEvict).toBe(false);
 
     // 2. String RPC ID 'child-req-str-1' interaction_* with confirmed child stub
@@ -832,11 +832,10 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       channel: 'live',
       wire: serverReqs[1],
     });
-    expect(ctrl.listRetentionReasons(binding)).toContain('pending_request:wire_req:s:child-req-str-1');
+    expect(ctrl.listRetentionReasons(binding)).toHaveLength(2);
 
     const snap = ctrl.getRuntimeSnapshot(binding)!;
-    const numReq = snap.requests.find((r) => r.approvalId === 'wire_req:n:9001');
-    const strReq = snap.requests.find((r) => r.approvalId === 'wire_req:s:child-req-str-1');
+    const [numReq, strReq] = snap.requests;
     expect(numReq?.kind).toBe('permission');
     expect(numReq?.targetLineage).toBe('unresolved');
     expect(strReq?.kind).toBe('question');
@@ -864,6 +863,9 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     const ctx1 = makePromptCtx(binding, 'turn_1', { requestOrdinal: 1, rpcId: 101 });
     ctrl.onPromptStarted(ctx1);
     ctrl.onCancelRequested(binding);
+    clock.advanceBy(2_000);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.settlement).toMatchObject({ stopReason: 'cancel_grace_expired' });
     const ctx2 = makePromptCtx(binding, 'turn_2', { requestOrdinal: 2, rpcId: 102 });
     ctrl.onPromptStarted(ctx2);
 
@@ -908,7 +910,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     });
     ctrlGrace.attachSettlementSink(sinkGrace.sink);
 
-    const ctx3 = makePromptCtx(bindingGrace, 'turn_grace');
+    const ctx3 = makePromptCtx(bindingGrace, 'turn_grace', { connectionId: 'conn_g' });
     ctrlGrace.onPromptStarted(ctx3);
     ctrlGrace.acceptFrame({
       binding: bindingGrace,
@@ -959,7 +961,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
       config: { cancelGraceMs: 3_000, strictMode: false },
     });
     ctrlConfirm.attachSettlementSink(sinkConfirm.sink);
-    const ctx4 = makePromptCtx(bindingConfirm, 'turn_cancel_ok');
+    const ctx4 = makePromptCtx(bindingConfirm, 'turn_cancel_ok', { connectionId: 'conn_ok' });
     ctrlConfirm.onPromptStarted(ctx4);
     ctrlConfirm.acceptFrame({
       binding: bindingConfirm,
@@ -1035,7 +1037,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     expect(
       ctrlConfirm.getRuntimeSnapshot(bindingConfirm)!.work.find((w) => w.observedLabel === 'invoke_subagent')?.kind,
     ).toBe('unknown');
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
   });
 
   it('T14: transport exit marks active work stale (never cancelled), settles held turn ONCE as disconnected, and generation change fences old timers/frames', () => {
@@ -1050,7 +1052,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     });
     ctrl.attachSettlementSink(sink);
 
-    const ctx = makePromptCtx(binding1, 'turn_crash');
+    const ctx = makePromptCtx(binding1, 'turn_crash', { connectionId: 'conn_crash' });
     ctrl.onPromptStarted(ctx);
     ctrl.acceptFrame({
       binding: binding1,
@@ -1112,7 +1114,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     const binding = makeBinding('1514');
     const clock = new VirtualClockScheduler();
     const ctrl = createReactiveRuntimeController({ now: clock.now, scheduler: clock });
-    const ctx = makePromptCtx(binding, 'turn_1514');
+    const ctx = makePromptCtx(binding, 'turn_1514', { connectionId: 'conn_1514' });
     ctrl.onPromptStarted(ctx);
 
     const rows = loadNdjson(AGY_1514_FIXTURE_PATH);
@@ -1140,8 +1142,7 @@ describe('NP-04 Reactive Lifecycle Scenarios T02-T06, T08, T14 & AGY 1.5.14 Repl
     expect(sub).toBeDefined();
     expect(sub?.blocking).toBe('unknown');
     // Both numeric permissions (`8101` security, `8102` interaction_001) tracked with distinct kinds
-    expect(snap.requests.find((r) => r.approvalId === 'wire_req:n:8101')?.kind).toBe('permission');
-    expect(snap.requests.find((r) => r.approvalId === 'wire_req:n:8102')?.kind).toBe('question');
+    expect(snap.requests.map((req) => req.kind)).toEqual(['permission', 'question']);
 
     // Resolving both requests allows turn settlement even while schedule stays detached
     ctrl.resolveWirePendingRequest(binding, 8101, 'response_written');

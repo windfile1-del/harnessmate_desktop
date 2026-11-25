@@ -920,6 +920,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
   private hasAcpTurn = false;
   private sessionLoadTracker?: { notifyUpdate: () => void };
   private advertisedCommands: string[] = [];
+  private observedCommands: Array<{ name: string; description?: string; argumentHint?: string }> | undefined;
 
   // Authoritative server-side model/config state tracked from session/new + set_config_option
   private configOptions: AcpConfigOption[] = [];
@@ -1000,6 +1001,20 @@ export class AcpSessionHandle implements AdapterSessionHandle {
 
   getAvailableCommands(): string[] {
     return this.advertisedCommands;
+  }
+
+  getNativeSessionSignals() {
+    return {
+      advertisedCommands: this.observedCommands,
+      configOptions: this.configOptions,
+      advertisedModes: this.availableModes?.availableModes,
+      effectiveModel: this.activeConfirmedModel,
+      effectiveEffort: this.activeConfirmedEffort,
+      appliedModeId: this.appliedModeId,
+      effectivePermissionMode: this.permissionMode,
+      effectiveEnforcement: this.permissionEnforcement,
+      tierName: this.observedTierName,
+    };
   }
 
   async initialize(): Promise<void> {
@@ -1140,6 +1155,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     this.ingestSessionMetadata(sessRes);
 
     if (this._nativeSessionId) {
+      this.nativeHooks?.onSessionReady?.(this);
       this.emit({ type: 'native_session_ready', nativeSessionId: this._nativeSessionId });
 
       await this.applyRuntimeConfig({
@@ -1395,6 +1411,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       permissionEnforcement: this.permissionEnforcement,
       tierName: this.observedTierName,
     });
+    this.nativeHooks?.onSessionSignalsChanged?.(this);
   }
 
   private async applyEffortOption(effort: string): Promise<void> {
@@ -1796,6 +1813,11 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     }
   }
 
+  requestNativeSessionCancel(): boolean {
+    if (!this._nativeSessionId || this.nativeCommandAbort) return false;
+    return this.rpc.notify('session/cancel', { sessionId: this._nativeSessionId });
+  }
+
   async steerTurn(input: TurnInput): Promise<void> {
     if (!this._nativeSessionId) {
       throw new Error('ACP session is not initialized');
@@ -2057,7 +2079,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         rawParams && typeof rawParams === 'object' && typeof (rawParams as { sessionId?: unknown }).sessionId === 'string'
           ? (rawParams as { sessionId: string }).sessionId
           : undefined;
-      this.nativeHooks.onIngressFrame?.({
+      const routedByNativeChild = this.nativeHooks.onIngressFrame?.({
         binding: this.nativeHooks.binding,
         connectionId: meta?.connectionId ?? this.rpc.connectionId,
         ingressOrdinal: meta?.ingressOrdinal ?? this.rpc.currentIngressOrdinal,
@@ -2065,6 +2087,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         originSession,
         wire: { method, params: rawParams },
       });
+      if (routedByNativeChild && originSession && originSession !== this._nativeSessionId) return;
     }
     if (method !== 'session/update') return;
     this.sessionLoadTracker?.notifyUpdate();
@@ -2201,6 +2224,8 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           .filter((c): c is { name: string; description?: string; argumentHint?: string } => c !== null);
         const commandNames = detailedCommands.map((c) => c.name);
         this.advertisedCommands = commandNames;
+        this.observedCommands = detailedCommands;
+        this.nativeHooks?.onSessionSignalsChanged?.(this);
         this.runtimeOpts.onAvailableCommandsUpdated?.(commandNames);
         this.runtimeOpts.onDetailedCommandsUpdated?.(detailedCommands);
         this.emit({ type: 'commands.updated', commands: detailedCommands });
@@ -2245,6 +2270,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           }
         }
         this.runtimeOpts.onConfigOptionsUpdated?.([...this.configOptions]);
+        this.nativeHooks?.onSessionSignalsChanged?.(this);
         break;
       }
 

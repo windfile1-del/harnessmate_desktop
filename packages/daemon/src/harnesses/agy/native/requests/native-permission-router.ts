@@ -80,6 +80,7 @@ export class NativePermissionRouter implements NativePermissionPort {
   private readonly closedConnections = new Set<string>();
   private readonly targetResolver: NativeRequestTargetResolver;
   private readonly approvalCenterBridge?: NativeApprovalCenterBridge;
+  private readonly onRequestSettled?: NativePermissionRouterOptions['onRequestSettled'];
   private readonly unknownChildPolicy: UnknownChildRequestPolicy;
   private readonly defaultDeadlineMs: number;
   private readonly unknownChildDeadlineMs: number;
@@ -95,6 +96,7 @@ export class NativePermissionRouter implements NativePermissionPort {
   ) {
     this.targetResolver = options.targetResolver ?? new StubNativeRequestTargetResolver();
     this.approvalCenterBridge = options.approvalCenterBridge;
+    this.onRequestSettled = options.onRequestSettled;
     this.unknownChildPolicy = options.unknownChildPolicy ?? 'hold_bounded_cancel_only';
     this.defaultDeadlineMs = options.defaultDeadlineMs ?? DEFAULT_DEADLINE_MS;
     this.unknownChildDeadlineMs = options.unknownChildDeadlineMs ?? DEFAULT_UNKNOWN_CHILD_DEADLINE_MS;
@@ -172,6 +174,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     const target = this.targetResolver.resolveTarget({
       binding: req.binding,
       connectionId: req.connectionId,
+      wireRequestId: req.wireRequestId,
       actualNativeSessionId: parsed.actualNativeSessionId,
       rootNativeSessionId,
       toolCallId: parsed.toolCallId,
@@ -738,6 +741,14 @@ export class NativePermissionRouter implements NativePermissionPort {
     });
   }
 
+  async resolveLegacyWithCas(input: Omit<LegacyApprovalBridgeInput, 'receiptId'>): Promise<NativeRequestResolutionOutcome> {
+    const record = this.recordsByApprovalId.get(input.approvalId);
+    if (!record) {
+      return { approvalId: input.approvalId, receiptId: '', receiptState: 'expired', conflict: true };
+    }
+    return this.resolveWithCas({ ...input, request: this.mapLegacyRequestToNativeInput(record, input.request) });
+  }
+
   onConnectionClosed(binding: RuntimeBinding, connectionId: string): void {
     this.closedConnections.add(connectionId);
     const nowMs = this.now();
@@ -1281,6 +1292,13 @@ export class NativePermissionRouter implements NativePermissionPort {
     record: InternalPendingNativeRequestRecord,
     mutationKey: string,
   ): void {
+    if (record.receiptState !== 'pending' && record.receiptState !== 'claimed') {
+      try {
+        this.onRequestSettled?.(record.binding, record.wireRequestId, record.receiptState, record.connectionId);
+      } catch {
+        // The wire reply and its receipt remain authoritative if an observer fails.
+      }
+    }
     try {
       this.registry.commitAndPublish(
         record.binding,

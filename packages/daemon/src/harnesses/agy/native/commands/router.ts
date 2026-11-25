@@ -686,9 +686,9 @@ export class AgyNativeCommandRouter implements NativeCommandRouterPort {
         kind: 'model',
         value: targetModel,
       });
-      this.deps.catalog.updateBindingSignals(binding, {
-        effectiveModel: applied.effectiveValue,
-      });
+      if (applied.applied && applied.effectiveScope === 'immediate') {
+        this.deps.catalog.updateBindingSignals(binding, { effectiveModel: applied.effectiveValue });
+      }
       return {
         schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
         kind: 'inspect',
@@ -763,23 +763,25 @@ export class AgyNativeCommandRouter implements NativeCommandRouterPort {
         value: mode,
         enforcement: resolved.enforcement,
       });
-      this.deps.catalog.updateBindingSignals(binding, {
-        effectivePermissionMode: mode,
-        effectiveEnforcement: applied.enforcement ?? resolved.enforcement,
-      });
+      if (applied.applied && applied.effectiveScope === 'immediate' && applied.effectiveValue === mode) {
+        this.deps.catalog.updateBindingSignals(binding, {
+          effectivePermissionMode: mode,
+          effectiveEnforcement: applied.enforcement ?? resolved.enforcement,
+        });
+      }
       return {
         schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
         kind: 'inspect',
         receiptId,
         output:
           applied.note ??
-          `权限模式已切换为 ${mode}（执行边界: ${applied.enforcement ?? resolved.enforcement}）`,
+          `权限模式 ${applied.effectiveValue ?? '未知'}（${applied.effectiveScope}）`,
         summaryFields: {
           lane: 'config',
           command: '/permissions',
           applied: applied.applied,
           effectiveScope: applied.effectiveScope,
-          permissionMode: mode,
+          permissionMode: applied.effectiveValue,
           enforcement: applied.enforcement ?? resolved.enforcement,
         },
       };
@@ -794,68 +796,48 @@ export class AgyNativeCommandRouter implements NativeCommandRouterPort {
           'Session configuration handler is not attached',
         );
       }
-      if (text.toLowerCase() === 'off') {
-        const applied = await this.deps.applySessionConfig({
-          binding,
-          kind: 'permission_mode',
-          value: 'manual',
-          enforcement: 'native',
-        });
-        this.deps.catalog.updateBindingSignals(binding, {
-          effectivePermissionMode: 'manual',
-        });
-        return {
-          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-          kind: 'inspect',
-          receiptId,
-          output: applied.note ?? '已退出计划模式',
-          summaryFields: {
-            lane: 'config',
-            command: '/plan',
-            planMode: false,
-            applied: applied.applied,
-          },
-        };
-      }
-
-      await this.deps.applySessionConfig({
-        binding,
-        kind: 'permission_mode',
-        value: 'plan',
-        enforcement: 'native',
-      });
-      this.deps.catalog.updateBindingSignals(binding, {
-        effectivePermissionMode: 'plan',
-      });
-
-      if (!text) {
-        return {
-          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-          kind: 'inspect',
-          receiptId,
-          output: '已启用计划模式',
-          summaryFields: {
-            lane: 'config',
-            command: '/plan',
-            planMode: true,
-            applied: true,
-          },
-        };
-      }
-
-      if (!this.deps.dispatchLiveWorkflow) {
+      const mode = text.toLowerCase() === 'off' ? 'manual' : 'plan';
+      const task = mode === 'plan' ? text : '';
+      const dispatch = this.deps.dispatchLiveWorkflow;
+      if (task && !dispatch) {
         throw new NativeCommandRouterError(
-          'UNSUPPORTED_ACTION',
-          422,
-          'Live ACP session dispatcher is not attached for /plan <task>',
+          'UNSUPPORTED_ACTION', 422, 'Live ACP session dispatcher is not attached for /plan <task>',
         );
       }
-      const dispatched = await this.deps.dispatchLiveWorkflow({
+      const applied = await this.deps.applySessionConfig({
+        binding,
+        kind: 'permission_mode',
+        value: mode,
+        enforcement: 'native',
+      });
+      const confirmed = applied.applied && applied.effectiveScope === 'immediate' &&
+        applied.effectiveValue === mode && applied.enforcement !== 'client_guard';
+      if (confirmed) this.deps.catalog.updateBindingSignals(binding, { effectivePermissionMode: mode });
+
+      if (!task || !confirmed || !dispatch) {
+        return {
+          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+          kind: 'inspect',
+          receiptId,
+          output: applied.note ?? (confirmed
+            ? (mode === 'plan' ? '已启用计划模式' : '已退出计划模式')
+            : '原生会话未确认计划模式变更'),
+          summaryFields: {
+            lane: 'config',
+            command: '/plan',
+            planMode: applied.effectiveValue === null ? null : applied.effectiveValue === 'plan',
+            applied: confirmed,
+            effectiveScope: applied.effectiveScope,
+          },
+        };
+      }
+
+      const dispatched = await dispatch({
         binding,
         receiptId,
         capabilityId: 'AGY-W13',
         actionKey: action.key,
-        promptText: `/plan ${text}`,
+        promptText: `/plan ${task}`,
         attachmentIds: extractOrderedAttachmentIds(args),
         provenance,
       });

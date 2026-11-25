@@ -2231,7 +2231,7 @@ export class ChildSessionRouter implements ChildScopeResolverPort, NativeTimelin
       ? this.findUnresolvedCandidateByLaunchWork(state, params.launchWorkId)
       : null;
 
-    let agentId = existingBySession ?? existingByRecord;
+    let agentId = existingBySession ?? existingByRecord ?? unresolvedLaunchCandidate?.identity.id;
     if (!agentId) {
       if (state.agents.size >= this.limits.maxAgentsPerRuntime && !unresolvedLaunchCandidate) {
         const diag = this.pushDiagnostic(state, {

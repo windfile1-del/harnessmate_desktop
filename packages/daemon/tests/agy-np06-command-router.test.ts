@@ -291,6 +291,41 @@ describe('NP-06 Capability Discovery & Per-Binding Command Catalog (synthetic T0
 });
 
 describe('NP-06 Native Command Router: Lanes, Security Negative Cases & Live ACP Dispatch (synthetic T01/T06/T08)', () => {
+  it('keeps a rejected plan configuration from dispatching a task', async () => {
+    const catalog = new AgyNativeCommandCatalogService();
+    const binding = makeSyntheticBinding();
+    const { snapshot } = catalog.updateBindingSignals(binding, makeSyntheticVerifiedSignals());
+    const dispatched: LiveWorkflowDispatchInput[] = [];
+    const router = new AgyNativeCommandRouter({
+      catalog,
+      applySessionConfig: async () => ({
+        applied: false,
+        effectiveScope: 'immediate',
+        effectiveValue: 'manual',
+      }),
+      dispatchLiveWorkflow: async (input) => {
+        dispatched.push(input);
+        return { activityId: asActivityId('act_g2_review') };
+      },
+    });
+
+    const receipt = await router.executeCommand({
+      binding,
+      receiptId: 'g2_review_plan',
+      request: {
+        bindingGeneration: binding.generation,
+        catalogRevision: snapshot.capabilitiesRevision,
+        capabilityId: 'AGY-W13',
+        actionKey: 'set_plan_mode',
+        args: { text: 'Review fixture' },
+        idempotencyKey: 'g2_review_plan_idem',
+      },
+    });
+
+    expect(receipt).toMatchObject({ kind: 'inspect', summaryFields: { applied: false, planMode: false } });
+    expect(dispatched).toHaveLength(0);
+  });
+
   it('dispatches live workflows ONCE on the live session preserving slash-first attachment order, and rejects unauthorized/invalid commands', async () => {
     const catalog = new AgyNativeCommandCatalogService();
     const binding = makeSyntheticBinding();

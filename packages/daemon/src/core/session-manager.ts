@@ -133,6 +133,8 @@ type TurnOptions = {
   mode?: 'plugin_development';
   terminalContexts?: TerminalContextChip[];
   dispatchProvenance?: AgyDispatchProvenance;
+  expectedNativeHandle?: AdapterSessionHandle;
+  verifyNativeDispatch?: () => void;
 };
 
 export class SessionManager {
@@ -958,7 +960,7 @@ export class SessionManager {
 
   }
 
-  async updateSession(id: string, req: UpdateSessionRequest): Promise<Session> {
+  async updateSession(id: string, req: UpdateSessionRequest, configAlreadyApplied = false): Promise<Session> {
     const current = this.store.getSession(id);
     if (!current) throw new Error(`Session not found: ${id}`);
 
@@ -999,7 +1001,7 @@ export class SessionManager {
         await this.getActiveOrchestrator()?.cascadeStopChildren(id, 'Parent session archived');
       }
       await this.disposeSessionHandles(id);
-    } else if (configChanged && current.status === 'idle') {
+    } else if (!configAlreadyApplied && configChanged && current.status === 'idle') {
       const live = this.liveHandles.get(this.handleKey(id, updated.harnessId));
       if (live) {
         if (live.handle.updateConfig) {
@@ -1586,7 +1588,7 @@ export class SessionManager {
       }
       case 'skills':
       case 'skill': {
-        const skills = session.harnessKind === 'agy' ? await tools.listAgySkills(session.cwd)
+        const skills = session.harnessKind === 'agy' ? await tools.listAgySkillsForSession(session)
           : await (await getHandle()).listSkills?.() ?? [];
         const availableSkills = skills.filter((skill) => skill.enabled !== false);
         if (command === 'skills') {
@@ -1608,6 +1610,19 @@ export class SessionManager {
         return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
       }
     }
+  }
+
+  withIdleNativeHandle<T>(
+    binding: RuntimeBinding, handle: AdapterSessionHandle, apply: () => Promise<T>,
+  ): Promise<T> {
+    return this.withSessionStartup(binding.sessionId, () => {
+      const session = this.store.getSession(binding.sessionId);
+      if (session?.status !== 'idle' || session.harnessId !== binding.instanceId ||
+          this.liveHandles.get(this.handleKey(binding.sessionId, binding.instanceId))?.handle !== handle) {
+        throw new Error('The bound AGY session is no longer idle and attached');
+      }
+      return apply();
+    });
   }
 
   async sendTurn(
@@ -1648,6 +1663,15 @@ export class SessionManager {
         },
         turnOpts.dispatchProvenance,
       );
+    }
+
+    const expectedNativeHandle = turnOpts?.expectedNativeHandle;
+    turnOpts?.verifyNativeDispatch?.();
+    if (expectedNativeHandle && (
+      session.status !== 'idle' ||
+      this.liveHandles.get(this.handleKey(sessionId, session.harnessId))?.handle !== expectedNativeHandle
+    )) {
+      throw new Error('The bound AGY session is no longer idle and attached');
     }
 
     if (session.status === 'awaiting_approval') {
@@ -1887,12 +1911,17 @@ export class SessionManager {
           })
         : null;
 
-      const entry = await this.ensureLiveHandle(
-        sessionId,
-        session.harnessId,
-        Boolean(compiled?.syncNeeded && !native?.cliCommand),
-        true,
-      );
+      const entry = expectedNativeHandle
+        ? this.liveHandles.get(this.handleKey(sessionId, session.harnessId))
+        : await this.ensureLiveHandle(
+            sessionId,
+            session.harnessId,
+            Boolean(compiled?.syncNeeded && !native?.cliCommand),
+            true,
+          );
+      if (!entry || (expectedNativeHandle && entry.handle !== expectedNativeHandle)) {
+        throw new Error('The bound AGY connection changed before dispatch');
+      }
       const currentBinding = this.store.getSessionBinding(sessionId, session.harnessId);
       if (compiler?.options.autoAttach && !turnOpts?.omitHandoff && binding?.nativeSessionId &&
         currentBinding?.nativeSessionId !== binding.nativeSessionId) {
@@ -1906,13 +1935,16 @@ export class SessionManager {
         if (meta) meta.advanceWatermark = !compiled?.syncNeeded;
       }
 
+      turnOpts?.verifyNativeDispatch?.();
       const finalDriver = await dispatchTurn(entry.handle, { id: session.harnessId, kind: session.harnessKind }, {
         turnId,
         text: effectiveText,
         attachments,
-        model: session.model,
-        reasoningEffort: session.reasoningEffort,
-        permissionMode: session.permissionMode,
+        ...(expectedNativeHandle ? {} : {
+          model: session.model,
+          reasoningEffort: session.reasoningEffort,
+          permissionMode: session.permissionMode,
+        }),
         ...(turnOpts?.turnOptions ? { turnOptions: turnOpts.turnOptions } : {}),
         ...native,
       }, compiled, (type, payload) => { this.emitCanonical(sessionId, type, payload, turnId); });
@@ -1978,7 +2010,13 @@ export class SessionManager {
     if (targetHarnessId) {
       const entry = this.liveHandles.get(this.handleKey(sessionId, targetHarnessId));
       if (entry) {
-        this.nativeRegistry?.notifyCancelRequested(entry.nativeBinding ?? null);
+        const nativeFlags = this.nativeRegistry?.getFeatureFlags();
+        if (entry.nativeBinding && entry.handle.requestNativeSessionCancel &&
+          nativeFlags?.enabled && nativeFlags.nativeLifecycle &&
+          this.nativeRegistry?.getLifecyclePort()?.onCancelRequested && entry.handle.requestNativeSessionCancel()) {
+          this.nativeRegistry.notifyCancelRequested(entry.nativeBinding);
+          return;
+        }
         await entry.handle.interrupt();
       }
     }
@@ -2021,6 +2059,17 @@ export class SessionManager {
         const activeBinding = this.nativeRegistry.getActiveBinding(existing.sessionId);
         if (!activeBinding) {
           return { updated: false, conflict: true, approval: existing };
+        }
+        const permissionPort = this.nativeRegistry.getPermissionPort();
+        if (permissionPort?.resolveLegacyWithCas) {
+          const outcome = await permissionPort.resolveLegacyWithCas({
+            binding: activeBinding,
+            approvalId,
+            request: req,
+            resolvedBy,
+          });
+          const approval = this.store.getApproval(approvalId) ?? existing;
+          return { updated: !outcome.conflict && approval.status !== 'pending', conflict: outcome.conflict, approval };
         }
         const cas = this.nativeRegistry.persistence.claimApprovalReceiptCas({
           approvalId,
@@ -2138,6 +2187,7 @@ export class SessionManager {
             .join(' | ')
         : req.comment;
 
+      let written = false;
       for (const entry of this.liveHandles.values()) {
         if (
           entry.sessionId === approval.sessionId &&
@@ -2153,9 +2203,11 @@ export class SessionManager {
               formattedAnswer,
             );
           }
+          written = true;
           break;
         }
       }
+      finalizeNativeReceipt(written);
 
       const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
         approvalId: approval.id,
@@ -2259,6 +2311,45 @@ export class SessionManager {
       createdAt: approval.createdAt,
       updatedAt: createdAt,
     });
+  }
+
+  mirrorNativeApproval(approval: ApprovalRequest): void {
+    this.store.createApproval(approval);
+    const session = this.store.getSession(approval.sessionId);
+    if (!session) return;
+    const turnId = this.activeTurnMeta.get(session.id)?.turnId;
+    this.deltaCoalescer.flushSession(session.id);
+    this.setSessionStatus(session.id, 'awaiting_approval');
+    this.emitCanonical(session.id, 'approval.requested', { approval }, turnId);
+    this.emitCanonical(session.id, 'runtime_request.updated', { request: approval }, turnId);
+    this.getActiveOrchestrator()?.handleChildApprovalRequested(session.id, approval.id, approval.toolName);
+    this.eventBus.publishAttention({
+      kind: 'approval_needed',
+      sessionId: session.id,
+      sessionTitle: session.title,
+      harnessId: approval.instanceId ?? session.harnessId,
+      summary: approval.summary,
+      approvalId: approval.id,
+      timestamp: Date.now(),
+    });
+  }
+
+  syncNativeApproval({
+    approvalId, status, decision, resolvedBy, comment,
+  }: Parameters<NonNullable<import('../harnesses/agy/native/requests/types.js').NativeApprovalCenterBridge['syncResolvedApproval']>>[0]): void {
+    const updated = status === 'expired'
+      ? this.store.expireApprovalIfPending(approvalId)
+      : this.store.resolveApprovalIfPending(
+          approvalId, decision ?? 'deny', resolvedBy ?? 'auto', comment ?? undefined, { statusOverride: status },
+        ).updated;
+    const approval = updated ? this.store.getApproval(approvalId) : null;
+    if (!approval) return;
+    const event = this.emitCanonical(approval.sessionId, 'approval.resolved', {
+      approvalId, status: approval.status, decision: approval.decision, resolvedBy: approval.resolvedBy,
+    });
+    this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
+    this.recordRuntimeRequestReceipt(approval, event.seq, event.createdAt);
+    this.resumeSessionAfterApprovalIfClear(approval.sessionId);
   }
 
   private resumeSessionAfterApprovalIfClear(sessionId: string): void {

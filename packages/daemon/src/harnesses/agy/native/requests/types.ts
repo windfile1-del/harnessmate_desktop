@@ -81,6 +81,7 @@ export interface NativeRequestTargetResolverInput {
   readonly binding: RuntimeBinding;
   readonly connectionId: string;
   readonly actualNativeSessionId: string;
+  readonly wireRequestId: RpcId;
   readonly rootNativeSessionId?: string | null;
   readonly toolCallId?: string;
   readonly parentSessionHint?: string;
@@ -199,6 +200,12 @@ export interface NativeApprovalCenterBridge {
 }
 
 export interface NativePermissionRouterOptions {
+  readonly onRequestSettled?: (
+    binding: RuntimeBinding,
+    wireRequestId: InternalPendingNativeRequestRecord['wireRequestId'],
+    state: NativeRequestReceiptState,
+    connectionId: string,
+  ) => void;
   /** Target & child lineage resolver (NP-05 stub or real implementation). */
   readonly targetResolver?: NativeRequestTargetResolver;
   /** Optional read-only Approval Center bridge for risk annotations and legacy mirroring. */
