@@ -1,212 +1,123 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scanRecordForLeaks } from './sanitizer.mjs';
 
-export const ALLOWED_PLATFORMS = new Set(['win32', 'darwin', 'linux', 'unknown']);
-export const ALLOWED_ACCOUNT_CATEGORIES = new Set([
-  'none',
-  'dedicated_test_personal',
-  'dedicated_test_business',
-  'synthetic',
-  'replay_sanitized',
-]);
-export const ALLOWED_SOURCES = new Set([
-  'synthetic',
-  'replay_with_provenance',
-  'live_raw',
-  'live_hm',
-  'official_comparison',
-]);
-export const ALLOWED_PRODUCERS = new Set([
-  'observatory_cli',
-  'daemon_tap_callback',
-  'replay_harness',
-  'migrator',
-]);
-export const ALLOWED_LAYERS = new Set(['raw', 'normalized', 'native_canonical', 'ui']);
-export const ALLOWED_DIRECTIONS = new Set(['outbound', 'inbound', 'internal', 'stderr', 'lifecycle']);
-export const ALLOWED_MESSAGE_KINDS = new Set([
-  'capture_meta',
-  'capture_end',
-  'cli_catalog',
-  'rpc_request',
-  'rpc_response',
-  'rpc_error',
-  'rpc_notification',
-  'server_request',
-  'malformed_line',
-  'stderr_classified',
-  'process_exit',
-  'timeout',
-  'drop_overflow',
-  'adapter_normalized',
-  'native_canonical',
-  'ui_projection',
-]);
-export const ALLOWED_CHANNELS = new Set(['live', 'history_replay']);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+export const CAPTURE_V1_SCHEMA_PATH = path.join(__dirname, 'schema', 'capture-v1.schema.json');
+export const CAPTURE_V1_SCHEMA = JSON.parse(fs.readFileSync(CAPTURE_V1_SCHEMA_PATH, 'utf8'));
 
-const ALLOWED_TOP_KEYS = new Set([
-  'schemaVersion',
-  'captureId',
-  'scenario',
-  'platform',
-  'cliVersion',
-  'protocol',
-  'accountCategory',
-  'source',
-  'observedAt',
-  'producer',
-  'seq',
-  'monotonicMs',
-  'layer',
-  'direction',
-  'messageKind',
-  'latencyMs',
-  'provenance',
-  'correlation',
-  'shape',
-  'unknownKeys',
-  'truncated',
-  'droppedCount',
-]);
+function matchesJsonType(value, expectedType) {
+  if (expectedType === 'null') return value === null;
+  if (expectedType === 'array') return Array.isArray(value);
+  if (expectedType === 'object') return value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (expectedType === 'integer') return typeof value === 'number' && Number.isInteger(value);
+  if (expectedType === 'number') return typeof value === 'number' && Number.isFinite(value);
+  if (expectedType === 'string') return typeof value === 'string';
+  if (expectedType === 'boolean') return typeof value === 'boolean';
+  return false;
+}
 
-const ALLOWED_CORRELATION_KEYS = new Set([
-  'connectionId',
-  'generation',
-  'ingressOrdinal',
-  'channel',
-  'rpcIdAlias',
-  'rpcIdType',
-  'sessionAlias',
-  'childAlias',
-  'toolAlias',
-  'taskAlias',
-  'workflowAlias',
-  'approvalAlias',
-  'turnAlias',
-  'activityAlias',
-  'workAlias',
-  'agentAlias',
-  'diagnosticCode',
-]);
+/**
+ * Single-source JSON Schema Draft 2020-12 subset evaluator driven directly by
+ * `schema/capture-v1.schema.json`.
+ * Emits ONLY sanitized error codes (`<path>: <reasonCode>`) — never echoes raw invalid values
+ * or untrusted property names.
+ */
+function validateAgainstSchema(value, schema, fieldPath, errors) {
+  if (!schema || typeof schema !== 'object') return;
 
-const ID_RE = /^[a-zA-Z0-9._:-]{1,96}$/;
-const DIAG_CODE_RE = /^AGY-DIAG-v1:[a-zA-Z0-9._:-]{4,180}$/;
-const CLI_VER_RE = /^[a-zA-Z0-9._+-]{1,48}$/;
+  if ('const' in schema && value !== schema.const) {
+    errors.push(`${fieldPath}: invalid_const`);
+    return;
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    errors.push(`${fieldPath}: invalid_enum`);
+    return;
+  }
+
+  if (schema.type !== undefined) {
+    const allowedTypes = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const typeOk = allowedTypes.some((t) => matchesJsonType(value, t));
+    if (!typeOk) {
+      errors.push(`${fieldPath}: invalid_type`);
+      return;
+    }
+  }
+
+  if (value === null || value === undefined) return;
+
+  if (typeof value === 'string') {
+    if (typeof schema.minLength === 'number' && value.length < schema.minLength) {
+      errors.push(`${fieldPath}: min_length_violation`);
+    }
+    if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) {
+      errors.push(`${fieldPath}: max_length_violation`);
+    }
+    if (typeof schema.pattern === 'string') {
+      const re = new RegExp(schema.pattern);
+      if (!re.test(value)) {
+        errors.push(`${fieldPath}: pattern_mismatch`);
+      }
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) {
+      errors.push(`${fieldPath}: minimum_violation`);
+    }
+    if (typeof schema.maximum === 'number' && value > schema.maximum) {
+      errors.push(`${fieldPath}: maximum_violation`);
+    }
+  }
+
+  if (Array.isArray(value) && schema.items) {
+    for (let i = 0; i < value.length; i++) {
+      validateAgainstSchema(value[i], schema.items, `${fieldPath}[${i}]`, errors);
+    }
+  }
+
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const props = schema.properties ?? {};
+    if (Array.isArray(schema.required)) {
+      for (const reqKey of schema.required) {
+        if (!(reqKey in value) || value[reqKey] === undefined) {
+          errors.push(`${fieldPath}.${reqKey}: missing_required_property`);
+        }
+      }
+    }
+
+    let extraPropCount = 0;
+    for (const key of Object.keys(value)) {
+      if (key in props) {
+        validateAgainstSchema(value[key], props[key], `${fieldPath}.${key}`, errors);
+      } else if (schema.additionalProperties === false) {
+        extraPropCount++;
+      } else if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        validateAgainstSchema(value[key], schema.additionalProperties, `${fieldPath}.<dynamic>`, errors);
+      }
+    }
+    if (extraPropCount > 0) {
+      errors.push(`${fieldPath}: additional_property_not_allowed(count=${extraPropCount})`);
+    }
+  }
+}
 
 export function validateCaptureRecord(record, index = 0) {
   const errors = [];
-  if (!record || typeof record !== 'object' || Array.isArray(record)) {
-    return { valid: false, errors: [`record[${index}]: must be a JSON object`], leakFindings: [] };
-  }
+  validateAgainstSchema(record, CAPTURE_V1_SCHEMA, `record[${index}]`, errors);
 
-  for (const key of Object.keys(record)) {
-    if (!ALLOWED_TOP_KEYS.has(key)) {
-      errors.push(`record[${index}]: unexpected top-level property "${key}"`);
-    }
-  }
-
-  if (record.schemaVersion !== 1) {
-    errors.push(`record[${index}]: schemaVersion must be 1`);
-  }
-  if (typeof record.captureId !== 'string' || record.captureId.length < 4 || !ID_RE.test(record.captureId)) {
-    errors.push(`record[${index}]: invalid captureId`);
-  }
-  if (typeof record.scenario !== 'string' || record.scenario.length < 2 || !ID_RE.test(record.scenario)) {
-    errors.push(`record[${index}]: invalid scenario`);
-  }
-  if (!ALLOWED_PLATFORMS.has(record.platform)) {
-    errors.push(`record[${index}]: invalid platform "${record.platform}"`);
-  }
-  if (record.cliVersion !== null && (typeof record.cliVersion !== 'string' || !CLI_VER_RE.test(record.cliVersion))) {
-    errors.push(`record[${index}]: invalid cliVersion`);
-  }
-  if (record.protocol !== null && record.protocol !== 1 && record.protocol !== 2) {
-    errors.push(`record[${index}]: protocol must be 1, 2, or null`);
-  }
-  if (!ALLOWED_ACCOUNT_CATEGORIES.has(record.accountCategory)) {
-    errors.push(`record[${index}]: invalid accountCategory "${record.accountCategory}"`);
-  }
-  if (!ALLOWED_SOURCES.has(record.source)) {
-    errors.push(`record[${index}]: invalid source "${record.source}"`);
-  }
-  if (!Number.isInteger(record.observedAt) || record.observedAt < 0) {
-    errors.push(`record[${index}]: observedAt must be a non-negative integer`);
-  }
-  if (!ALLOWED_PRODUCERS.has(record.producer)) {
-    errors.push(`record[${index}]: invalid producer "${record.producer}"`);
-  }
-  if (!Number.isInteger(record.seq) || record.seq < 1) {
-    errors.push(`record[${index}]: seq must be an integer >= 1`);
-  }
-  if (typeof record.monotonicMs !== 'number' || !Number.isFinite(record.monotonicMs) || record.monotonicMs < 0) {
-    errors.push(`record[${index}]: monotonicMs must be a finite number >= 0`);
-  }
-  if (!ALLOWED_LAYERS.has(record.layer)) {
-    errors.push(`record[${index}]: invalid layer "${record.layer}"`);
-  }
-  if (!ALLOWED_DIRECTIONS.has(record.direction)) {
-    errors.push(`record[${index}]: invalid direction "${record.direction}"`);
-  }
-  if (!ALLOWED_MESSAGE_KINDS.has(record.messageKind)) {
-    errors.push(`record[${index}]: invalid messageKind "${record.messageKind}"`);
-  }
-  if (
-    record.latencyMs !== undefined &&
-    record.latencyMs !== null &&
-    (typeof record.latencyMs !== 'number' || !Number.isFinite(record.latencyMs) || record.latencyMs < 0)
-  ) {
-    errors.push(`record[${index}]: latencyMs must be null or a finite number >= 0`);
-  }
-
-  const corr = record.correlation;
-  if (!corr || typeof corr !== 'object' || Array.isArray(corr)) {
-    errors.push(`record[${index}]: correlation must be an object`);
-  } else {
-    for (const k of Object.keys(corr)) {
-      if (!ALLOWED_CORRELATION_KEYS.has(k)) {
-        errors.push(`record[${index}]: unexpected correlation property "${k}"`);
-      }
-    }
-    if (typeof corr.connectionId !== 'string' || corr.connectionId.length < 2 || !ID_RE.test(corr.connectionId)) {
-      errors.push(`record[${index}]: invalid correlation.connectionId`);
-    }
-    if (!Number.isInteger(corr.ingressOrdinal) || corr.ingressOrdinal < 0) {
-      errors.push(`record[${index}]: correlation.ingressOrdinal must be an integer >= 0`);
-    }
-    if (!ALLOWED_CHANNELS.has(corr.channel)) {
-      errors.push(`record[${index}]: invalid correlation.channel "${corr.channel}"`);
-    }
-    if (
-      corr.rpcIdType !== undefined &&
-      corr.rpcIdType !== null &&
-      corr.rpcIdType !== 'number' &&
-      corr.rpcIdType !== 'string'
-    ) {
-      errors.push(`record[${index}]: invalid correlation.rpcIdType`);
-    }
-    if (
-      corr.diagnosticCode !== undefined &&
-      corr.diagnosticCode !== null &&
-      (typeof corr.diagnosticCode !== 'string' || !DIAG_CODE_RE.test(corr.diagnosticCode))
-    ) {
-      errors.push(`record[${index}]: invalid correlation.diagnosticCode`);
-    }
-  }
-
-  if (record.unknownKeys !== undefined) {
-    if (!Array.isArray(record.unknownKeys) || record.unknownKeys.some((k) => typeof k !== 'string')) {
-      errors.push(`record[${index}]: unknownKeys must be string[]`);
-    }
-  }
-  if (record.droppedCount !== undefined && (!Number.isInteger(record.droppedCount) || record.droppedCount < 0)) {
-    errors.push(`record[${index}]: droppedCount must be a non-negative integer`);
-  }
-
-  const leakFindings = scanRecordForLeaks(record);
+  const leakFindings = record && typeof record === 'object' ? scanRecordForLeaks(record) : [];
   if (leakFindings.length > 0) {
-    errors.push(`record[${index}]: secret/PII/path leak detected (${leakFindings.join(', ')})`);
+    errors.push(`record[${index}]: leak_detected(${leakFindings.join(',')})`);
   }
 
-  return { valid: errors.length === 0, errors, leakFindings };
+  return {
+    valid: errors.length === 0,
+    errors,
+    leakFindings,
+  };
 }
 
 export function validateCaptureRecords(records) {
@@ -222,7 +133,7 @@ export function validateCaptureRecords(records) {
     const seq = records[i]?.seq;
     if (Number.isInteger(seq)) {
       if (seq <= prevSeq) {
-        errors.push(`record[${i}]: seq (${seq}) must strictly increase after ${prevSeq}`);
+        errors.push(`record[${i}].seq: non_monotonic_seq`);
       }
       prevSeq = seq;
     }
@@ -245,19 +156,19 @@ export function parseAndValidateNdjson(ndjsonText) {
   for (let i = 0; i < lines.length; i++) {
     try {
       records.push(JSON.parse(lines[i]));
-    } catch (err) {
-      parseErrors.push(`line[${i + 1}]: invalid JSON (${err instanceof Error ? err.message : String(err)})`);
+    } catch {
+      parseErrors.push(`line[${i + 1}]: invalid_json`);
     }
   }
   if (parseErrors.length > 0) {
     return {
       valid: false,
       recordCount: records.length,
-      records,
+      records: [],
       errors: parseErrors,
       leakFindings: [],
     };
   }
   const validation = validateCaptureRecords(records);
-  return { ...validation, records };
+  return { ...validation, records: validation.valid ? records : [] };
 }

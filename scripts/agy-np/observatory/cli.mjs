@@ -9,7 +9,7 @@ import { loadReplayFixture, runFourLayerBaselineCorrelation, runTransportReplay 
 import { parseAndValidateNdjson } from './schema-validator.mjs';
 
 function printHelp() {
-  console.log(`NP-01 AGY Protocol Observatory CLI
+  console.log(`NP-01 AGY Protocol Observatory CLI (v0.2.0)
 
 Usage:
   node scripts/agy-np/observatory/cli.mjs <command> [options]
@@ -17,16 +17,10 @@ Usage:
 Commands:
   record      Capture clean unauthenticated (default), --dry-run, --discover-confirmed,
               --reactive-confirmed --model <id>, or --login-test-profile on Windows.
-  validate    Validate an Observatory v1 NDJSON capture against schema & zero-leak rules.
-  migrate     Migrate legacy NP-00 probe or agy-1.5.14 stage fixtures to Observatory v1.
+  validate    Validate an Observatory v1 NDJSON capture against single-source schema & zero-leak rules.
+  migrate     Migrate legacy NP-00 probe or agy-1.5.14 stage fixtures to Observatory v1 (validate-before-write).
   summarize   Produce four-layer comparison table (json | markdown | np03).
   replay      Run a deterministic replay fixture (--mode transport | four-layer).
-
-Examples:
-  node scripts/agy-np/observatory/cli.mjs record --dry-run --agy C:\\path\\to\\agy.exe --scratch D:\\HarnessMate\\np00-research
-  node scripts/agy-np/observatory/cli.mjs validate --in docs/phase-agy-native-parity/evidence/scenarios/windows-1.5.16-clean-v1.ndjson
-  node scripts/agy-np/observatory/cli.mjs summarize --in capture.ndjson --format np03
-  node scripts/agy-np/observatory/cli.mjs replay --fixture packages/daemon/tests/fixtures/agy-np/t02-reactive-20s-wake.ndjson
 `);
 }
 
@@ -43,8 +37,15 @@ async function main() {
 
   if (command === 'record') {
     const res = await runLiveRecord(subArgs);
-    if (res && !res.dryRun && !res.validation?.valid) {
-      console.error('Capture validation failed:', res.validation?.errors);
+    if (!res?.success) {
+      console.error(
+        JSON.stringify({
+          error: 'record_failed',
+          outcome: res?.outcome ?? 'unknown',
+          reason: res?.reason ?? null,
+          validationErrors: res?.validation?.errors?.slice(0, 10) ?? [],
+        }),
+      );
       process.exitCode = 1;
     }
     return;
@@ -93,16 +94,28 @@ async function main() {
       captureId: values['capture-id'],
       origin: path.basename(values.in),
     });
+
+    // Hard validate-before-write gate: NEVER write invalid or leaking records to stdout or --out
+    if (!migrated.valid || !migrated.validation.valid) {
+      console.error(
+        JSON.stringify({
+          error: 'migration_validation_failed',
+          format: migrated.format,
+          errorCount: migrated.validation.errors.length,
+          leakCount: migrated.validation.leakFindings.length,
+          errors: migrated.validation.errors.slice(0, 20),
+        }),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
     const ndjson = `${migrated.records.map((r) => JSON.stringify(r)).join('\n')}\n`;
     if (values.out) {
       fs.mkdirSync(path.dirname(values.out), { recursive: true });
       fs.writeFileSync(values.out, ndjson, 'utf8');
     } else {
       process.stdout.write(ndjson);
-    }
-    if (!migrated.validation.valid) {
-      console.error('Migration validation failed:', migrated.validation.errors);
-      process.exitCode = 1;
     }
     return;
   }
@@ -120,7 +133,14 @@ async function main() {
     const text = fs.readFileSync(values.in, 'utf8');
     const parsed = parseAndValidateNdjson(text);
     if (!parsed.valid) {
-      throw new Error(`Input capture failed validation: ${parsed.errors.slice(0, 5).join('; ')}`);
+      console.error(
+        JSON.stringify({
+          error: 'summarize_input_invalid',
+          errors: parsed.errors.slice(0, 10),
+        }),
+      );
+      process.exitCode = 1;
+      return;
     }
     const summary = buildFourLayerSummary(parsed.records);
     let output;
@@ -158,11 +178,11 @@ async function main() {
       const loaded = loadReplayFixture(values.fixture);
       res = await runTransportReplay(loaded);
     }
-    if (values.out) {
+    if (res.validation.valid && values.out) {
       fs.mkdirSync(path.dirname(values.out), { recursive: true });
       fs.writeFileSync(values.out, `${res.records.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf8');
     }
-    if (values['summary-out']) {
+    if (res.validation.valid && values['summary-out']) {
       fs.mkdirSync(path.dirname(values['summary-out']), { recursive: true });
       fs.writeFileSync(values['summary-out'], `${JSON.stringify(res.summary, null, 2)}\n`, 'utf8');
     }
@@ -174,6 +194,7 @@ async function main() {
           recordCount: res.records.length,
           valid: res.validation.valid,
           verdictPassed: res.verdict ? res.verdict.passed : true,
+          failedChecks: res.verdict ? res.verdict.checks.filter((c) => !c.passed) : [],
           copyableDiagnosticCode: res.summary.np03DiagnosticInput.copyableDiagnosticCode,
           anomalies: res.summary.anomalies,
         },

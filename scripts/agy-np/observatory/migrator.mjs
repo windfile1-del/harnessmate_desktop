@@ -1,21 +1,21 @@
 import { ProtocolObservatoryRecorder } from './recorder.mjs';
 import { validateCaptureRecords } from './schema-validator.mjs';
-import { safeFieldNames, safeLabel } from './sanitizer.mjs';
+import { safeLabel, safeMetaToken } from './sanitizer.mjs';
 
 export function detectLegacyFormat(lines) {
   const parsed = lines.map((l) => JSON.parse(l));
   if (parsed.length === 0) return { format: 'empty', parsed };
   const first = parsed[0];
-  if (first.schemaVersion === 1 && first.correlation) {
+  if (first && typeof first === 'object' && first.schemaVersion === 1 && first.correlation) {
     return { format: 'observatory_v1', parsed };
   }
-  if (typeof first.stage === 'string' && first.frame && typeof first.frame === 'object') {
+  if (first && typeof first === 'object' && typeof first.stage === 'string' && first.frame && typeof first.frame === 'object') {
     return { format: 'agy_1_5_14_stage_fixture', parsed };
   }
-  if (typeof first.ms === 'number' && typeof first.kind === 'string') {
+  if (first && typeof first === 'object' && typeof first.ms === 'number' && typeof first.kind === 'string') {
     return { format: 'np00_probe_acp', parsed };
   }
-  if (first.kind === 'synthetic' && typeof first.event === 'string') {
+  if (first && typeof first === 'object' && first.kind === 'synthetic' && typeof first.event === 'string') {
     return { format: 'np00_synthetic_routing', parsed };
   }
   return { format: 'unknown', parsed };
@@ -25,37 +25,63 @@ export function detectLegacyFormat(lines) {
  * Migrates legacy NP-00 probe outputs, 0409bc8 synthetic routing outputs, or
  * sanitized agy-1.5.14 stage fixtures into Observatory Capture v1 NDJSON without
  * mutating the source file.
+ * Fails closed: returns `records: []` whenever validation fails so invalid/leaking records
+ * are never emitted to stdout or files.
  */
 export function migrateNdjsonToV1(ndjsonText, options = {}) {
   const lines = String(ndjsonText ?? '')
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
-  const { format, parsed } = detectLegacyFormat(lines);
+
+  let format;
+  let parsed;
+  try {
+    ({ format, parsed } = detectLegacyFormat(lines));
+  } catch {
+    return {
+      format: 'invalid_json',
+      valid: false,
+      records: [],
+      validation: { valid: false, recordCount: 0, errors: ['input: invalid_json'], leakFindings: [] },
+    };
+  }
 
   if (format === 'observatory_v1') {
     const validation = validateCaptureRecords(parsed);
-    return { format, records: parsed, validation };
+    return {
+      format,
+      valid: validation.valid,
+      records: validation.valid ? parsed : [],
+      validation,
+    };
   }
 
   if (format === 'empty') {
-    return { format, records: [], validation: { valid: true, recordCount: 0, errors: [], leakFindings: [] } };
+    return {
+      format,
+      valid: true,
+      records: [],
+      validation: { valid: true, recordCount: 0, errors: [], leakFindings: [] },
+    };
   }
+
+  const safeCaptureId = options.captureId ? safeMetaToken(options.captureId, 'migrated-capture').value : undefined;
+  const safeScenario = options.scenario ? safeMetaToken(options.scenario, 'migrated_scenario').value : undefined;
 
   if (format === 'np00_probe_acp') {
     const launch = parsed.find((r) => r.kind === 'launch') ?? {};
     const isDedicated = launch.profileSource === 'dedicated_test';
     const recorder = new ProtocolObservatoryRecorder({
-      captureId: options.captureId ?? 'migrated-np00-probe',
-      scenario: options.scenario ?? (launch.protocol === 2 ? 'clean_v2' : 'clean_v1'),
+      captureId: safeCaptureId ?? 'migrated-np00-probe',
+      scenario: safeScenario ?? (launch.protocol === 2 ? 'clean_v2' : 'clean_v1'),
       platform: options.platform ?? 'win32',
       cliVersion: launch.version ?? null,
-      protocol: launch.protocol ?? null,
+      protocol: null,
       accountCategory: isDedicated ? 'dedicated_test_personal' : 'none',
       source: options.source ?? 'live_raw',
       producer: 'migrator',
       salt: options.salt ?? 'np01-migrator-salt',
-      observedAt: options.observedAt,
       provenance: {
         origin: options.origin ?? 'np00_probe_acp_ndjson',
         migratedFrom: 'np00_probe_acp',
@@ -176,7 +202,7 @@ export function migrateNdjsonToV1(ndjsonText, options = {}) {
     }
 
     const validation = validateCaptureRecords(recorder.records);
-    return { format, records: recorder.records, validation };
+    return { format, valid: validation.valid, records: validation.valid ? recorder.records : [], validation };
   }
 
   if (format === 'agy_1_5_14_stage_fixture') {
@@ -184,8 +210,8 @@ export function migrateNdjsonToV1(ndjsonText, options = {}) {
     const cliVersion = initEntry?.frame?.result?.agentInfo?.version ?? '1.5.14';
     const protocol = initEntry?.frame?.result?.protocolVersion ?? 1;
     const recorder = new ProtocolObservatoryRecorder({
-      captureId: options.captureId ?? 'migrated-agy-1.5.14-fixture',
-      scenario: options.scenario ?? 'agy_1_5_14_replay',
+      captureId: safeCaptureId ?? 'migrated-agy-1.5.14-fixture',
+      scenario: safeScenario ?? 'agy_1_5_14_replay',
       platform: options.platform ?? 'unknown',
       cliVersion,
       protocol,
@@ -229,13 +255,13 @@ export function migrateNdjsonToV1(ndjsonText, options = {}) {
     }
     recorder.recordCaptureEnd({ reason: 'migration_complete', promptSent: false, stderrBytes: 0 }, { monotonicMs: ms });
     const validation = validateCaptureRecords(recorder.records);
-    return { format, records: recorder.records, validation };
+    return { format, valid: validation.valid, records: validation.valid ? recorder.records : [], validation };
   }
 
   if (format === 'np00_synthetic_routing') {
     const recorder = new ProtocolObservatoryRecorder({
-      captureId: options.captureId ?? 'migrated-0409bc8-synthetic-routing',
-      scenario: options.scenario ?? 'baseline_0409bc8_routing',
+      captureId: safeCaptureId ?? 'migrated-0409bc8-synthetic-routing',
+      scenario: safeScenario ?? 'baseline_0409bc8_routing',
       platform: options.platform ?? 'win32',
       cliVersion: null,
       protocol: 1,
@@ -270,8 +296,13 @@ export function migrateNdjsonToV1(ndjsonText, options = {}) {
     }
     recorder.recordCaptureEnd({ reason: 'migration_complete', promptSent: true, stderrBytes: 0 }, { monotonicMs: ms });
     const validation = validateCaptureRecords(recorder.records);
-    return { format, records: recorder.records, validation };
+    return { format, valid: validation.valid, records: validation.valid ? recorder.records : [], validation };
   }
 
-  throw new Error(`Unsupported legacy capture format (first record keys: ${safeFieldNames(parsed[0]).join(', ')})`);
+  return {
+    format: 'unknown',
+    valid: false,
+    records: [],
+    validation: { valid: false, recordCount: 0, errors: ['input: unsupported_capture_format'], leakFindings: [] },
+  };
 }

@@ -18,8 +18,24 @@ export const DEFAULT_TEST_MARKERS = [
   'NP01_STEER_OK',
 ];
 
-const SAFE_KEY_RE = /^[a-zA-Z0-9_.:-]{1,64}$/;
-const SAFE_LABEL_RE = /^[a-zA-Z0-9_./ :-]{1,80}$/;
+export const MAX_RAW_INPUT_CHARS = 32_768;
+
+// Strict protocol identifier token (no spaces, no paths, no emails, no query strings)
+const SAFE_PROTOCOL_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_.-]{0,47}$/;
+const SAFE_IDENTIFIER_RE = /^[a-zA-Z0-9_.:/-]{1,64}$/;
+const SAFE_META_TOKEN_RE = /^[a-zA-Z0-9._:-]{2,64}$/;
+const SAFE_VERSION_RE = /^[a-zA-Z0-9._+-]{1,48}$/;
+const SAFE_AGENT_NAMES = new Set([
+  'Antigravity ACP Server',
+  'antigravity-cli',
+  'harnessmate-np01-observatory',
+  'harnessmate-np01-replay',
+  'harnessmate-np00-probe',
+  'synthetic-acp',
+]);
+const SUSPICIOUS_KEY_RE = /(?:token|secret|password|passwd|cookie|authorization|bearer|apikey|api_key|email|ya29|aiza|sk-proj)/i;
+const HIGH_ENTROPY_RUN_RE = /[A-Za-z0-9+/=_-]{24,}/;
+
 const PUBLIC_OPTION_RE =
   /^(default|auto|plan|manual|accept-edits|accept_edits|low|medium|high|extra|max|xhigh|allow_once|allow_always|reject_once|reject_always|cancelled|selected|end_turn|max_tokens|refusal|tool_use|gemini[\w.:-]*|claude[\w.:-]*|gpt[\w.:-]*|orchestrator[\w.:-]*|oauth-personal|oauth-business|gemini-api-key|agent-platform)$/i;
 
@@ -64,12 +80,108 @@ const LEAK_PATTERNS = [
   { name: 'hm_internal_token', re: /HARNESSMATE_(?:LOCAL|SESSION_MCP)_TOKEN\s*=\s*\S+/i },
 ];
 
+export function clampRawText(text, maxChars = MAX_RAW_INPUT_CHARS) {
+  const str = typeof text === 'string' ? text : String(text ?? '');
+  if (str.length <= maxChars) return { text: str, truncated: false };
+  return { text: str.slice(0, maxChars), truncated: true };
+}
+
+export function scanTextForLeaks(text) {
+  const raw = typeof text === 'string' ? text : JSON.stringify(text);
+  if (!raw) return [];
+  const findings = [];
+  for (const { name, re } of LEAK_PATTERNS) {
+    if (re.test(raw)) {
+      findings.push(name);
+    }
+  }
+  return findings;
+}
+
+export function scanRecordForLeaks(record) {
+  return scanTextForLeaks(JSON.stringify(record));
+}
+
+export function isSafeProtocolKey(key) {
+  if (typeof key !== 'string' || !SAFE_PROTOCOL_KEY_RE.test(key)) return false;
+  if (SUSPICIOUS_KEY_RE.test(key)) return false;
+  if (scanTextForLeaks(key).length > 0) return false;
+  // Reject long random-looking token runs in dynamic keys (unless standard camelCase/snake_case <= 23 chars)
+  if (key.length >= 24 && HIGH_ENTROPY_RUN_RE.test(key) && !/^[a-z]+(?:[A-Z][a-z]+|_[a-z]+)*$/.test(key)) {
+    return false;
+  }
+  return true;
+}
+
 export function safeLabel(value) {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
-  if (!trimmed || !SAFE_LABEL_RE.test(trimmed)) return undefined;
+  if (!trimmed) return undefined;
   if (scanTextForLeaks(trimmed).length > 0) return undefined;
+  if (SAFE_AGENT_NAMES.has(trimmed)) return trimmed;
+  if (!SAFE_IDENTIFIER_RE.test(trimmed)) return undefined;
+  if (SUSPICIOUS_KEY_RE.test(trimmed)) return undefined;
   return trimmed;
+}
+
+export function safeMetaToken(value, fallback) {
+  if (typeof value !== 'string') return { value: fallback, sanitized: value !== undefined && value !== null };
+  const trimmed = value.trim();
+  if (!trimmed || !SAFE_META_TOKEN_RE.test(trimmed) || scanTextForLeaks(trimmed).length > 0) {
+    return { value: fallback, sanitized: true };
+  }
+  return { value: trimmed, sanitized: false };
+}
+
+export function safeVersion(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || !SAFE_VERSION_RE.test(trimmed) || scanTextForLeaks(trimmed).length > 0) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function safeProvenance(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { value: undefined, sanitized: false };
+  let sanitized = false;
+  const out = {};
+  if (raw.origin !== undefined) {
+    const t = typeof raw.origin === 'string' ? raw.origin.trim() : '';
+    if (t && /^[a-zA-Z0-9._:/ -]{1,128}$/.test(t) && scanTextForLeaks(t).length === 0) {
+      out.origin = t;
+    } else {
+      out.origin = 'redacted_origin';
+      sanitized = true;
+    }
+  }
+  if (raw.migratedFrom !== undefined) {
+    if (raw.migratedFrom === null) {
+      out.migratedFrom = null;
+    } else {
+      const t = typeof raw.migratedFrom === 'string' ? raw.migratedFrom.trim() : '';
+      if (t && /^[a-zA-Z0-9._:/ -]{1,128}$/.test(t) && scanTextForLeaks(t).length === 0) {
+        out.migratedFrom = t;
+      } else {
+        out.migratedFrom = 'redacted_source';
+        sanitized = true;
+      }
+    }
+  }
+  if (typeof raw.timingSynthetic === 'boolean') {
+    out.timingSynthetic = raw.timingSynthetic;
+  }
+  if (raw.notes !== undefined) {
+    const t = typeof raw.notes === 'string' ? raw.notes.trim().slice(0, 240) : '';
+    if (t && scanTextForLeaks(t).length === 0) {
+      out.notes = t;
+    } else if (raw.notes !== '') {
+      out.notes = 'redacted_note';
+      sanitized = true;
+    }
+  }
+  return { value: Object.keys(out).length > 0 ? out : undefined, sanitized };
 }
 
 export function safePublicOption(value) {
@@ -82,9 +194,18 @@ export function safePublicOption(value) {
 export function safeFieldNames(obj, maxKeys = 64) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return [];
   return Object.keys(obj)
-    .filter((key) => SAFE_KEY_RE.test(key))
+    .filter((key) => isSafeProtocolKey(key))
     .sort()
     .slice(0, maxKeys);
+}
+
+export function countRedactedKeys(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return 0;
+  let count = 0;
+  for (const key of Object.keys(obj)) {
+    if (!isSafeProtocolKey(key)) count++;
+  }
+  return count;
 }
 
 export function describeValueType(value) {
@@ -105,13 +226,29 @@ export function describeFieldTypes(obj, maxKeys = 40) {
   for (const key of safeFieldNames(obj, maxKeys)) {
     out[key] = describeValueType(obj[key]);
   }
+  const redactedCount = countRedactedKeys(obj);
+  if (redactedCount > 0) {
+    out._redactedKeyCount = redactedCount;
+  }
   return out;
 }
 
 export function extractUnknownKeys(obj, knownSet, maxKeys = 32) {
-  return safeFieldNames(obj, 128)
-    .filter((k) => !knownSet.has(k))
-    .slice(0, maxKeys);
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return { keys: [], redactedCount: 0 };
+  }
+  const keys = [];
+  let redactedCount = 0;
+  for (const rawKey of Object.keys(obj)) {
+    if (knownSet.has(rawKey)) continue;
+    if (isSafeProtocolKey(rawKey)) {
+      if (keys.length < maxKeys) keys.push(rawKey);
+    } else {
+      redactedCount++;
+    }
+  }
+  keys.sort();
+  return { keys, redactedCount };
 }
 
 export function saltedHash(salt, value, hexLength = 12) {
@@ -126,34 +263,46 @@ export class AliasTable {
   constructor(options = {}) {
     this.salt = options.salt ?? crypto.randomBytes(16).toString('hex');
     this.testMarkers = new Set(options.testMarkers ?? DEFAULT_TEST_MARKERS);
+    this.maxAliasesPerNamespace = options.maxAliasesPerNamespace ?? 512;
+    this.maxTotalAliases = options.maxTotalAliases ?? 2_048;
     this.maps = new Map();
     this.counters = new Map();
+    this.totalAllocated = 0;
+    this.overflowCount = 0;
   }
 
   alias(namespace, rawValue) {
     if (rawValue === undefined || rawValue === null || rawValue === '') return null;
     const typeTag = typeof rawValue === 'number' ? 'num' : 'str';
-    const key = `${typeTag}:${String(rawValue)}`;
+    const bounded = String(rawValue).slice(0, 512);
+    const key = `${typeTag}:${bounded}`;
     let nsMap = this.maps.get(namespace);
     if (!nsMap) {
       nsMap = new Map();
       this.maps.set(namespace, nsMap);
     }
-    let existing = nsMap.get(key);
-    if (!existing) {
-      const next = (this.counters.get(namespace) ?? 0) + 1;
-      this.counters.set(namespace, next);
-      existing = `${namespace}-${next}`;
-      nsMap.set(key, existing);
+    const existing = nsMap.get(key);
+    if (existing) return existing;
+
+    if (nsMap.size >= this.maxAliasesPerNamespace || this.totalAllocated >= this.maxTotalAliases) {
+      this.overflowCount++;
+      return `${namespace}-overflow`;
     }
-    return existing;
+
+    const next = (this.counters.get(namespace) ?? 0) + 1;
+    this.counters.set(namespace, next);
+    this.totalAllocated++;
+    const created = `${namespace}-${next}`;
+    nsMap.set(key, created);
+    return created;
   }
 
   correlateMarkerText(text) {
     if (typeof text !== 'string' || !text) return null;
+    const { text: bounded } = clampRawText(text);
     const matched = [];
     for (const marker of this.testMarkers) {
-      if (text.includes(marker)) {
+      if (bounded.includes(marker)) {
         matched.push({
           marker,
           saltedTag: `salted:${saltedHash(this.salt, `marker:${marker}`, 12)}`,
@@ -165,12 +314,12 @@ export class AliasTable {
 
   correlateFixedValue(namespace, value) {
     if (value === undefined || value === null || value === '') return null;
-    return `salted:${saltedHash(this.salt, `${namespace}:${String(value)}`, 12)}`;
+    return `salted:${saltedHash(this.salt, `${namespace}:${String(value).slice(0, 512)}`, 12)}`;
   }
 
   shapeHash(text) {
-    // Normalize numbers, quoted strings, paths, and tokens into structural skeleton before hashing
-    const normalized = String(text ?? '')
+    const { text: bounded } = clampRawText(text, 2048);
+    const normalized = bounded
       .replace(/[A-Za-z]:\\[^\s"'`]+/g, '<WIN_PATH>')
       .replace(/\/(?:Users|home|tmp|var)\/[^\s"'`]+/g, '<POSIX_PATH>')
       .replace(/[?&](?:code|access_token|refresh_token|id_token|state)=[^\s&"']+/gi, '?<OAUTH_PARAM>')
@@ -183,9 +332,9 @@ export class AliasTable {
 }
 
 export function classifyStderrLine(line, aliases) {
-  const raw = String(line ?? '');
-  const trimmed = raw.trim();
-  const byteLength = Buffer.byteLength(raw, 'utf8');
+  const { text: bounded, truncated } = clampRawText(line);
+  const trimmed = bounded.trim();
+  const byteLength = Buffer.byteLength(typeof line === 'string' ? line : String(line ?? ''), 'utf8');
   let category = 'unknown';
   if (/authentication required|please sign in|unauthenticated|-32000/i.test(trimmed)) {
     category = 'auth_required';
@@ -206,6 +355,7 @@ export function classifyStderrLine(line, aliases) {
     category,
     byteLength,
     lineCharCount: trimmed.length,
+    ...(truncated ? { lineTruncated: true } : {}),
     shapeHash: aliases.shapeHash(trimmed),
   };
 }
@@ -215,7 +365,8 @@ export function classifyErrorShape(errorObj, aliases) {
   const msg = typeof errorObj.message === 'string' ? errorObj.message : '';
   return {
     code: typeof errorObj.code === 'number' ? errorObj.code : undefined,
-    authenticationRequired: /authentication required|please sign in|unauthenticated/i.test(msg) || errorObj.code === -32000,
+    authenticationRequired:
+      /authentication required|please sign in|unauthenticated/i.test(msg) || errorObj.code === -32000,
     quotaExhausted: /quota_exhausted|quota|rate.?limit|resource_exhausted/i.test(msg) || errorObj.code === -32008,
     methodNotFound: errorObj.code === -32601,
     hasData: errorObj.data !== undefined,
@@ -249,7 +400,6 @@ function extractMarkersFromUnknown(value, aliases) {
   if (value === undefined || value === null) return null;
   if (typeof value === 'string') return aliases.correlateMarkerText(value);
   if (typeof value !== 'object') return null;
-  // Walk bounded strings only to detect fixed test markers without retaining raw content
   const found = new Map();
   const stack = [value];
   let visited = 0;
@@ -282,24 +432,21 @@ function classifyToolKindLabel(title, rawInput, kind) {
   else if (input.isBackground === true || input.IsDaemon === true || typeof input.backgroundTaskId === 'string') {
     detectedRole = input.IsDaemon === true ? 'daemon_command' : 'background_command';
   } else if (/^\/?goal\b/i.test(t)) detectedRole = 'goal';
-  else if (typeof t === 'string' && /^interaction_/i.test(t)) detectedRole = 'interaction';
+  else if (/^interaction_/i.test(t)) detectedRole = 'interaction';
   return {
     toolKind: k,
     detectedRole,
     isDaemon: typeof input.IsDaemon === 'boolean' ? input.IsDaemon : undefined,
     isBackground: typeof input.isBackground === 'boolean' ? input.isBackground : undefined,
     hasDurationSeconds: typeof input.DurationSeconds === 'number',
-    durationSeconds: typeof input.DurationSeconds === 'number' && Number.isFinite(input.DurationSeconds)
-      ? input.DurationSeconds
-      : undefined,
+    durationSeconds:
+      typeof input.DurationSeconds === 'number' && Number.isFinite(input.DurationSeconds)
+        ? input.DurationSeconds
+        : undefined,
     hasCronExpression: typeof input.CronExpression === 'string',
   };
 }
 
-/**
- * Reconstructs an outbound JSON-RPC frame purely from allowlisted structural metadata.
- * Never copies user prompt text, paths, tokens, or raw arguments.
- */
 export function reconstructOutboundFrame(frame, aliases) {
   const msg = frame && typeof frame === 'object' ? frame : {};
   const hasId = msg.id !== undefined && msg.id !== null;
@@ -315,16 +462,21 @@ export function reconstructOutboundFrame(frame, aliases) {
   else if (!hasMethod && hasId) messageKind = 'rpc_response';
 
   const sessionAlias = aliases.alias('sess', params.sessionId);
+  const topUnknown = extractUnknownKeys(msg, KNOWN_TOP_LEVEL_RPC_KEYS);
+  const redactedParamKeys = countRedactedKeys(params);
+
   const shape = {
     jsonrpc: msg.jsonrpc === '2.0' ? '2.0' : 'other',
     ...(method ? { method } : {}),
     paramKeys: safeFieldNames(params),
+    ...(redactedParamKeys > 0 ? { redactedParamKeyCount: redactedParamKeys } : {}),
+    ...(topUnknown.redactedCount > 0 ? { redactedUnknownKeyCount: topUnknown.redactedCount } : {}),
   };
 
   if (method === 'initialize') {
     shape.protocolVersion = typeof params.protocolVersion === 'number' ? params.protocolVersion : undefined;
     shape.clientName = safeLabel(params.clientInfo?.name);
-    shape.clientVersion = safeLabel(params.clientInfo?.version);
+    shape.clientVersion = safeVersion(params.clientInfo?.version) ?? undefined;
     shape.clientCapabilityKeys = safeFieldNames(params.clientCapabilities);
   } else if (method === 'session/new' || method === 'session/load' || method === 'session/resume') {
     shape.hasCwd = typeof params.cwd === 'string' && params.cwd.length > 0;
@@ -361,14 +513,10 @@ export function reconstructOutboundFrame(frame, aliases) {
     rpcIdType,
     sessionAlias,
     shape,
-    unknownKeys: extractUnknownKeys(msg, KNOWN_TOP_LEVEL_RPC_KEYS),
+    unknownKeys: topUnknown.keys,
   };
 }
 
-/**
- * Reconstructs an inbound JSON-RPC frame purely from allowlisted structural metadata.
- * Preserves stable aliases for sessions, children, tools, tasks, workflows, and requests.
- */
 export function reconstructInboundFrame(frame, aliases, context = {}) {
   const msg = frame && typeof frame === 'object' ? frame : {};
   const hasId = msg.id !== undefined && msg.id !== null;
@@ -382,7 +530,10 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
   else if (!hasMethod && hasId && msg.error) messageKind = 'rpc_error';
   else if (!hasMethod && hasId) messageKind = 'rpc_response';
 
-  const unknownKeys = extractUnknownKeys(msg, KNOWN_TOP_LEVEL_RPC_KEYS);
+  const topUnknown = extractUnknownKeys(msg, KNOWN_TOP_LEVEL_RPC_KEYS);
+  const unknownKeys = [...topUnknown.keys];
+  let redactedUnknownKeyCount = topUnknown.redactedCount;
+
   const correlation = {
     rpcIdAlias,
     rpcIdType,
@@ -402,6 +553,7 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
   if (messageKind === 'rpc_error') {
     shape.error = classifyErrorShape(msg.error, aliases);
     if (context.requestMethod) shape.responseForMethod = safeLabel(context.requestMethod);
+    if (redactedUnknownKeyCount > 0) shape.redactedUnknownKeyCount = redactedUnknownKeyCount;
     return { messageKind, correlation, shape, unknownKeys };
   }
 
@@ -410,18 +562,19 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
     const forMethod = context.requestMethod;
     if (forMethod) shape.responseForMethod = safeLabel(forMethod);
     shape.resultKeys = safeFieldNames(res);
+    const redactedResultKeys = countRedactedKeys(res);
+    if (redactedResultKeys > 0) shape.redactedResultKeyCount = redactedResultKeys;
 
     if (forMethod === 'initialize' || 'protocolVersion' in res || 'agentCapabilities' in res) {
       shape.protocolVersion = typeof res.protocolVersion === 'number' ? res.protocolVersion : undefined;
       shape.agentName = safeLabel(res.agentInfo?.name);
-      shape.agentVersion = safeLabel(res.agentInfo?.version);
+      shape.agentVersion = safeVersion(res.agentInfo?.version) ?? undefined;
       shape.authMethods = Array.isArray(res.authMethods)
         ? res.authMethods.map((m) => safePublicOption(m?.id) ?? safeLabel(m?.id)).filter(Boolean)
         : undefined;
       shape.capabilityKeys = safeFieldNames(res.agentCapabilities);
-      shape.loadSession = typeof res.agentCapabilities?.loadSession === 'boolean'
-        ? res.agentCapabilities.loadSession
-        : undefined;
+      shape.loadSession =
+        typeof res.agentCapabilities?.loadSession === 'boolean' ? res.agentCapabilities.loadSession : undefined;
       shape.promptCapabilities = res.agentCapabilities?.promptCapabilities
         ? {
             image: Boolean(res.agentCapabilities.promptCapabilities.image),
@@ -447,6 +600,7 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
     if (typeof res.stopReason === 'string') {
       shape.stopReason = safePublicOption(res.stopReason) ?? safeLabel(res.stopReason);
     }
+    if (redactedUnknownKeyCount > 0) shape.redactedUnknownKeyCount = redactedUnknownKeyCount;
     return { messageKind, correlation, shape, unknownKeys };
   }
 
@@ -467,16 +621,18 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
     shape.toolCallKind = safeLabel(tc.kind);
     shape.isInteraction = isInteraction;
     shape.optionCount = options.length;
-    shape.optionKinds = options.map((o) => safePublicOption(o?.kind) ?? safeLabel(o?.kind) ?? 'unspecified').slice(0, 16);
+    shape.optionKinds = options
+      .map((o) => safePublicOption(o?.kind) ?? safeLabel(o?.kind) ?? 'unspecified')
+      .slice(0, 16);
     shape.optionIdHashes = options
       .map((o) => (typeof o?.optionId === 'string' ? aliases.correlateFixedValue('option', o.optionId) : null))
       .filter(Boolean)
       .slice(0, 16);
     shape.hasSecurityWarning = options.some((o) => typeof o?._meta?.['agy.security.warning'] === 'string');
+    if (redactedUnknownKeyCount > 0) shape.redactedUnknownKeyCount = redactedUnknownKeyCount;
     return { messageKind, correlation, shape, unknownKeys };
   }
 
-  // Notification
   if (method === 'session/update') {
     const u = params.update && typeof params.update === 'object' ? params.update : {};
     const updateType = safeLabel(u.sessionUpdate ?? u.type) ?? 'unknown_update';
@@ -540,29 +696,17 @@ export function reconstructInboundFrame(frame, aliases, context = {}) {
     }
 
     const updateUnknown = extractUnknownKeys(u, KNOWN_UPDATE_KEYS);
-    for (const k of updateUnknown) {
-      if (!unknownKeys.includes(`update.${k}`)) unknownKeys.push(`update.${k}`);
+    redactedUnknownKeyCount += updateUnknown.redactedCount;
+    for (const k of updateUnknown.keys) {
+      const prefixed = `update.${k}`;
+      if (!unknownKeys.includes(prefixed) && unknownKeys.length < 32) unknownKeys.push(prefixed);
     }
+    if (redactedUnknownKeyCount > 0) shape.redactedUnknownKeyCount = redactedUnknownKeyCount;
     return { messageKind, correlation, shape, unknownKeys };
   }
 
   shape.paramKeys = safeFieldNames(params);
   shape.paramFieldTypes = describeFieldTypes(params, 24);
+  if (redactedUnknownKeyCount > 0) shape.redactedUnknownKeyCount = redactedUnknownKeyCount;
   return { messageKind, correlation, shape, unknownKeys };
-}
-
-export function scanTextForLeaks(text) {
-  const str = typeof text === 'string' ? text : JSON.stringify(text);
-  if (!str) return [];
-  const findings = [];
-  for (const { name, re } of LEAK_PATTERNS) {
-    if (re.test(str)) {
-      findings.push(name);
-    }
-  }
-  return findings;
-}
-
-export function scanRecordForLeaks(record) {
-  return scanTextForLeaks(JSON.stringify(record));
 }

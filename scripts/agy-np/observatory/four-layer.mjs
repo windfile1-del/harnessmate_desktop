@@ -2,7 +2,7 @@ import { safeLabel } from './sanitizer.mjs';
 
 const REASON_SAFE_RE = /^[a-zA-Z0-9._-]{1,48}$/;
 
-function sanitizeToken(value, fallback = 'none', maxLen = 40) {
+function sanitizeToken(value, fallback = 'none', maxLen = 36) {
   if (value === undefined || value === null || value === '') return fallback;
   const cleaned = String(value)
     .replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -11,25 +11,32 @@ function sanitizeToken(value, fallback = 'none', maxLen = 40) {
 }
 
 /**
- * Generates a copy-safe, PII-free diagnostic code consumable by NP-03 UI and issue reports.
- * Format: AGY-DIAG-v1:<captureId>:<scenario>:<connectionId>:<ingressOrdinal>:<layer>:<reasonCode>
+ * Generates a unique, copy-safe, PII-free diagnostic code consumable by NP-03 UI and issue reports.
+ * Format:
+ *   AGY-DIAG-v1:<captureId>:<scenario>:<connectionId>:<generation>:<channel>:<ingressOrdinal>:s<seq>:<layer>:<reasonCode>
  */
 export function formatDiagnosticCode({
   captureId,
   scenario,
   connectionId,
+  generation = 'gen-0',
+  channel = 'live',
   ingressOrdinal = 0,
+  seq = 0,
   layer = 'raw',
   reasonCode = 'observed',
 }) {
   const parts = [
     'AGY-DIAG-v1',
-    sanitizeToken(captureId, 'cap', 40),
+    sanitizeToken(captureId, 'cap', 36),
     sanitizeToken(scenario, 'scn', 24),
-    sanitizeToken(connectionId, 'conn-1', 24),
+    sanitizeToken(connectionId, 'conn-1', 20),
+    sanitizeToken(generation ?? 'gen-0', 'gen-0', 20),
+    channel === 'history_replay' ? 'replay' : 'live',
     String(Number.isInteger(ingressOrdinal) && ingressOrdinal >= 0 ? ingressOrdinal : 0),
+    `s${Number.isInteger(seq) && seq >= 0 ? seq : 0}`,
     sanitizeToken(layer, 'raw', 16),
-    sanitizeToken(reasonCode, 'observed', 36),
+    sanitizeToken(reasonCode, 'observed', 32),
   ];
   return parts.join(':');
 }
@@ -37,17 +44,21 @@ export function formatDiagnosticCode({
 export function parseDiagnosticCode(code) {
   if (typeof code !== 'string') return null;
   const parts = code.split(':');
-  if (parts.length !== 7 || parts[0] !== 'AGY-DIAG-v1') return null;
-  const ordinal = Number(parts[4]);
-  if (!Number.isInteger(ordinal) || ordinal < 0) return null;
+  if (parts.length !== 10 || parts[0] !== 'AGY-DIAG-v1') return null;
+  const ordinal = Number(parts[6]);
+  const seqMatch = /^s(\d+)$/.exec(parts[7]);
+  if (!Number.isInteger(ordinal) || ordinal < 0 || !seqMatch) return null;
   return {
     version: 'v1',
     captureId: parts[1],
     scenario: parts[2],
     connectionId: parts[3],
+    generation: parts[4],
+    channel: parts[5] === 'replay' ? 'history_replay' : 'live',
     ingressOrdinal: ordinal,
-    layer: parts[5],
-    reasonCode: parts[6],
+    seq: Number(seqMatch[1]),
+    layer: parts[8],
+    reasonCode: parts[9],
   };
 }
 
@@ -55,6 +66,9 @@ function summarizeLayerRecord(rec) {
   if (!rec) return null;
   const shape = rec.shape ?? {};
   const parts = [rec.messageKind];
+  if (rec.direction === 'outbound' && rec.messageKind === 'rpc_response') {
+    parts.push('outbound_reply');
+  }
   if (shape.method) parts.push(shape.method);
   if (shape.responseForMethod) parts.push(`reply:${shape.responseForMethod}`);
   if (shape.updateType) parts.push(shape.updateType);
@@ -78,57 +92,137 @@ function summarizeLayerRecord(rec) {
   };
 }
 
-function classifyRowAttribution(row) {
-  const { raw, normalized, native_canonical: canonical, ui } = row.layers;
-  if (!raw && (normalized || canonical || ui)) {
+function combineLayerEvents(events) {
+  if (!events || events.length === 0) return null;
+  const primary = events[0];
+  if (events.length === 1) {
+    return { ...primary, eventCount: 1, events };
+  }
+  return {
+    ...primary,
+    eventCount: events.length,
+    label: events.map((e) => e.label).join(' ; '),
+    diagnosticCode: events[events.length - 1].diagnosticCode ?? primary.diagnosticCode,
+    events,
+  };
+}
+
+function classifyRowAttribution(row, scopeContext) {
+  const rawEvents = row.layerEvents.raw;
+  const normEvents = row.layerEvents.normalized;
+  const canonEvents = row.layerEvents.native_canonical;
+  const uiEvents = row.layerEvents.ui;
+
+  const hasRaw = rawEvents.length > 0;
+  const hasNorm = normEvents.length > 0;
+  const hasCanon = canonEvents.length > 0;
+  const hasUi = uiEvents.length > 0;
+
+  if (!hasRaw && (hasNorm || hasCanon || hasUi)) {
     return { status: 'synthetic_or_local_only', reasonCode: 'no_raw_frame' };
   }
-  if (raw?.messageKind === 'malformed_line') {
+  if (rawEvents.some((e) => e.messageKind === 'malformed_line')) {
     return { status: 'transport_malformed', reasonCode: 'malformed_stdout_line' };
   }
-  if (raw?.messageKind === 'timeout') {
+  if (rawEvents.some((e) => e.messageKind === 'timeout')) {
     return { status: 'transport_timeout', reasonCode: 'rpc_timeout' };
   }
-  if (raw?.messageKind === 'process_exit') {
+  if (rawEvents.some((e) => e.messageKind === 'process_exit')) {
     return { status: 'process_exit', reasonCode: 'process_exited' };
   }
-  if (raw?.messageKind === 'server_request' && !normalized) {
-    return { status: 'dropped_before_adapter', reasonCode: 'server_request_not_normalized' };
+  if (rawEvents.some((e) => e.messageKind === 'drop_overflow')) {
+    return { status: 'observation_interrupted', reasonCode: 'recorder_drop_overflow' };
   }
-  if (normalized?.label.includes('slot=turn_bg') || normalized?.label.includes('slot=turn_unknown')) {
+
+  const isServerRequest = rawEvents.some((e) => e.messageKind === 'server_request');
+  const hasCancelledReply = rawEvents.some(
+    (e) => e.direction === 'outbound' && e.messageKind === 'rpc_response' && e.label.includes('outcome=cancelled'),
+  );
+  const isNotification = rawEvents.some((e) => e.messageKind === 'rpc_notification');
+
+  if (normEvents.some((e) => e.label.includes('slot=turn_bg') || e.label.includes('slot=turn_unknown'))) {
     return { status: 'adapter_misattributed_placeholder', reasonCode: 'placeholder_turn_slot' };
   }
-  if (raw && !normalized && (raw.messageKind === 'rpc_notification' || raw.messageKind === 'server_request')) {
+
+  // Only attribute missing downstream layer to a drop when that downstream layer was actually observed in this scope!
+  if (isServerRequest && !hasNorm) {
+    if (!scopeContext.observedLayers.normalized) {
+      return { status: 'layer_not_captured', reasonCode: 'normalized_layer_not_captured' };
+    }
+    if (scopeContext.observationInterrupted) {
+      return { status: 'observation_interrupted', reasonCode: 'observation_incomplete' };
+    }
+    return hasCancelledReply
+      ? { status: 'dropped_before_adapter', reasonCode: 'server_request_cancelled_before_adapter' }
+      : { status: 'dropped_before_adapter', reasonCode: 'server_request_not_normalized' };
+  }
+
+  if (isNotification && !hasNorm) {
+    if (!scopeContext.observedLayers.normalized) {
+      return { status: 'layer_not_captured', reasonCode: 'normalized_layer_not_captured' };
+    }
+    if (scopeContext.observationInterrupted) {
+      return { status: 'observation_interrupted', reasonCode: 'observation_incomplete' };
+    }
     return { status: 'raw_only_unmapped', reasonCode: 'raw_not_normalized' };
   }
-  if (normalized && !canonical) {
+
+  if (hasNorm && !hasCanon) {
+    if (!scopeContext.observedLayers.native_canonical) {
+      return { status: 'layer_not_captured', reasonCode: 'canonical_layer_not_captured' };
+    }
     return { status: 'normalized_not_persisted', reasonCode: 'missing_canonical_event' };
   }
-  if (canonical && !ui) {
+
+  if (hasCanon && !hasUi) {
+    if (!scopeContext.observedLayers.ui) {
+      return { status: 'layer_not_captured', reasonCode: 'ui_layer_not_captured' };
+    }
     return { status: 'canonical_not_projected', reasonCode: 'missing_ui_projection' };
   }
-  if (raw && normalized && canonical && ui) {
+
+  if (hasRaw && hasNorm && hasCanon && hasUi) {
     return { status: 'four_layer_aligned', reasonCode: 'aligned' };
   }
+
+  if (!scopeContext.observedLayers.normalized && hasRaw) {
+    return { status: 'layer_not_captured', reasonCode: 'raw_only_capture' };
+  }
+
   return { status: 'partial_observation', reasonCode: 'partial_layers' };
 }
 
 /**
- * Builds a comparable four-layer summary table (raw / normalized / native_canonical / ui)
- * plus a safe, copy-ready NP-03 diagnostic bundle.
+ * Builds a comparable four-layer summary table scoped by
+ * `connectionId + generation + channel + ingressOrdinal`, preserving multiple events and
+ * outbound replies per ingress frame, and distinguishing uncaptured layers from drops.
  */
 export function buildFourLayerSummary(records) {
   const first = records[0] ?? null;
   const captureId = first?.captureId ?? 'unknown-capture';
   const scenario = first?.scenario ?? 'unknown';
   const source = first?.source ?? 'synthetic';
-  const protocol = first?.protocol ?? null;
   const cliVersion = first?.cliVersion ?? null;
 
+  // Derive requested vs negotiated protocol accurately (avoid misreading v2 request as negotiated v2)
+  const metaRec = records.find((r) => r.messageKind === 'capture_meta');
+  const initReply = records.find(
+    (r) => r.messageKind === 'rpc_response' && r.shape?.responseForMethod === 'initialize',
+  );
+  const requestedProtocol =
+    typeof metaRec?.shape?.requestedProtocol === 'number' ? metaRec.shape.requestedProtocol : null;
+  const negotiatedProtocol =
+    typeof initReply?.shape?.protocolVersion === 'number'
+      ? initReply.shape.protocolVersion
+      : (records.findLast((r) => r.protocol !== null && r.protocol !== undefined)?.protocol ?? null);
+
+  const endRec = records.findLast((r) => r.messageKind === 'capture_end');
+  const exitRec = records.findLast((r) => r.messageKind === 'process_exit');
+
   const grouped = new Map();
+  const scopeLayerPresence = new Map();
   const layerCounts = { raw: 0, normalized: 0, native_canonical: 0, ui: 0 };
   const stderrCounts = {};
-  const anomalies = [];
   let droppedTotal = 0;
 
   for (const rec of records) {
@@ -143,30 +237,51 @@ export function buildFourLayerSummary(records) {
     }
 
     const conn = rec.correlation?.connectionId ?? 'conn-1';
+    const generation = rec.correlation?.generation ?? 'gen-0';
+    const channel = rec.correlation?.channel === 'history_replay' ? 'history_replay' : 'live';
+    const scopeKey = `${conn}|${generation}|${channel}`;
+
+    let presence = scopeLayerPresence.get(scopeKey);
+    if (!presence) {
+      presence = {
+        observedLayers: { raw: false, normalized: false, native_canonical: false, ui: false },
+        observationInterrupted: false,
+      };
+      scopeLayerPresence.set(scopeKey, presence);
+    }
+    if (rec.layer in presence.observedLayers) {
+      presence.observedLayers[rec.layer] = true;
+    }
+    if (rec.messageKind === 'drop_overflow' || rec.messageKind === 'timeout' || rec.truncated === true) {
+      presence.observationInterrupted = true;
+    }
+
     const ordinal = Number.isInteger(rec.correlation?.ingressOrdinal) ? rec.correlation.ingressOrdinal : 0;
-    // Key by connection + ingressOrdinal when > 0 so all 4 layers for the same ingress frame align on one row.
-    // Outbound / lifecycle / ordinal=0 records group by seq to preserve timeline order.
-    const rowKey = ordinal > 0 ? `${conn}#${ordinal}` : `${conn}#seq-${rec.seq}`;
+    const rowKey = ordinal > 0 ? `${scopeKey}#${ordinal}` : `${scopeKey}#seq-${rec.seq}`;
 
     let row = grouped.get(rowKey);
     if (!row) {
       row = {
         key: rowKey,
+        scopeKey,
         connectionId: conn,
-        generation: rec.correlation?.generation ?? null,
+        generation,
+        channel,
         ingressOrdinal: ordinal,
         firstSeq: rec.seq,
+        lastSeq: rec.seq,
         monotonicMs: rec.monotonicMs,
         aliases: {},
-        layers: {
-          raw: null,
-          normalized: null,
-          native_canonical: null,
-          ui: null,
+        layerEvents: {
+          raw: [],
+          normalized: [],
+          native_canonical: [],
+          ui: [],
         },
       };
       grouped.set(rowKey, row);
     }
+    row.lastSeq = Math.max(row.lastSeq, rec.seq);
 
     const aliasFields = [
       'rpcIdAlias',
@@ -187,39 +302,56 @@ export function buildFourLayerSummary(records) {
       }
     }
 
-    if (!row.layers[rec.layer]) {
-      row.layers[rec.layer] = summarizeLayerRecord(rec);
+    if (rec.layer in row.layerEvents) {
+      row.layerEvents[rec.layer].push(summarizeLayerRecord(rec));
     }
   }
 
+  const anomalies = [];
   const rows = [...grouped.values()]
     .sort((a, b) => a.firstSeq - b.firstSeq)
     .map((row) => {
-      const attribution = classifyRowAttribution(row);
+      const scopeContext = scopeLayerPresence.get(row.scopeKey) ?? {
+        observedLayers: { raw: true, normalized: false, native_canonical: false, ui: false },
+        observationInterrupted: false,
+      };
+      const layers = {
+        raw: combineLayerEvents(row.layerEvents.raw),
+        normalized: combineLayerEvents(row.layerEvents.normalized),
+        native_canonical: combineLayerEvents(row.layerEvents.native_canonical),
+        ui: combineLayerEvents(row.layerEvents.ui),
+      };
+      const attribution = classifyRowAttribution(row, scopeContext);
+      const primaryLayer = layers.ui
+        ? 'ui'
+        : layers.native_canonical
+          ? 'native_canonical'
+          : layers.normalized
+            ? 'normalized'
+            : 'raw';
       const diagnosticCode =
-        row.layers.ui?.diagnosticCode ??
-        row.layers.native_canonical?.diagnosticCode ??
-        row.layers.normalized?.diagnosticCode ??
-        row.layers.raw?.diagnosticCode ??
+        layers.ui?.diagnosticCode ??
+        layers.native_canonical?.diagnosticCode ??
+        layers.normalized?.diagnosticCode ??
+        layers.raw?.diagnosticCode ??
         formatDiagnosticCode({
           captureId,
           scenario,
           connectionId: row.connectionId,
+          generation: row.generation,
+          channel: row.channel,
           ingressOrdinal: row.ingressOrdinal,
-          layer: row.layers.ui
-            ? 'ui'
-            : row.layers.native_canonical
-              ? 'native_canonical'
-              : row.layers.normalized
-                ? 'normalized'
-                : 'raw',
+          seq: row.lastSeq,
+          layer: primaryLayer,
           reasonCode: attribution.reasonCode,
         });
 
-      if (
-        attribution.status !== 'four_layer_aligned' &&
-        attribution.status !== 'partial_observation'
-      ) {
+      const nonAnomalyStatuses = new Set([
+        'four_layer_aligned',
+        'partial_observation',
+        'layer_not_captured',
+      ]);
+      if (!nonAnomalyStatuses.has(attribution.status)) {
         anomalies.push({
           rowKey: row.key,
           status: attribution.status,
@@ -229,7 +361,16 @@ export function buildFourLayerSummary(records) {
       }
 
       return {
-        ...row,
+        key: row.key,
+        connectionId: row.connectionId,
+        generation: row.generation,
+        channel: row.channel,
+        ingressOrdinal: row.ingressOrdinal,
+        firstSeq: row.firstSeq,
+        lastSeq: row.lastSeq,
+        monotonicMs: row.monotonicMs,
+        aliases: row.aliases,
+        layers,
         attributionStatus: attribution.status,
         reasonCode: attribution.reasonCode,
         diagnosticCode,
@@ -243,20 +384,36 @@ export function buildFourLayerSummary(records) {
       captureId,
       scenario,
       connectionId: 'conn-1',
+      generation: 'gen-0',
+      channel: 'live',
       ingressOrdinal: 0,
+      seq: 0,
       layer: 'raw',
       reasonCode: 'empty',
     });
 
   return {
     schemaVersion: 1,
+    toolVersion: '0.2.0',
     captureId,
     scenario,
     source,
     cliVersion,
-    protocol,
+    requestedProtocol,
+    negotiatedProtocol,
+    protocol: negotiatedProtocol,
+    endReason: endRec?.shape?.reason ?? null,
+    promptSent: typeof endRec?.shape?.promptSent === 'boolean' ? endRec.shape.promptSent : false,
+    exitCode: typeof exitRec?.shape?.exitCode === 'number' ? exitRec.shape.exitCode : null,
+    truncatedCount: typeof endRec?.shape?.truncatedCount === 'number' ? endRec.shape.truncatedCount : 0,
     totalRecords: records.length,
     layerCounts,
+    observedLayers: {
+      raw: layerCounts.raw > 0,
+      normalized: layerCounts.normalized > 0,
+      native_canonical: layerCounts.native_canonical > 0,
+      ui: layerCounts.ui > 0,
+    },
     stderrCounts,
     droppedTotal,
     anomalyCount: anomalies.length,
@@ -264,14 +421,18 @@ export function buildFourLayerSummary(records) {
     rows,
     np03DiagnosticInput: {
       schemaVersion: 1,
+      toolVersion: '0.2.0',
       copyableDiagnosticCode: primaryDiagnosticCode,
       captureId,
       scenario,
       provenance: source,
       cliVersion,
-      protocol,
+      requestedProtocol,
+      negotiatedProtocol,
+      protocol: negotiatedProtocol,
       layerCoverage: layerCounts,
       anomalySummary: anomalies.slice(0, 10).map((a) => ({
+        rowKey: a.rowKey,
         status: a.status,
         reasonCode: a.reasonCode,
         diagnosticCode: a.diagnosticCode,
@@ -284,21 +445,24 @@ export function renderFourLayerMarkdownTable(summary) {
   const header = [
     `# Four-Layer Correlation Summary · ${summary.scenario} (${summary.captureId})`,
     '',
-    `- **Source / Provenance**: \`${summary.source}\` | **CLI**: \`${summary.cliVersion ?? 'unknown'}\` | **Protocol**: \`${summary.protocol ?? 'unknown'}\``,
+    `- **Tool Version**: \`${summary.toolVersion ?? '0.2.0'}\` | **Source / Provenance**: \`${summary.source}\` | **CLI**: \`${summary.cliVersion ?? 'unknown'}\``,
+    `- **Protocol**: requested=\`${summary.requestedProtocol ?? 'n/a'}\`, negotiated=\`${summary.negotiatedProtocol ?? 'unknown'}\` | **End Reason**: \`${summary.endReason ?? 'n/a'}\` | **Prompt Sent**: \`${summary.promptSent}\` | **Exit Code**: \`${summary.exitCode ?? 'n/a'}\``,
     `- **Copyable Diagnostic Code (NP-03)**: \`${summary.np03DiagnosticInput.copyableDiagnosticCode}\``,
     `- **Layer Counts**: raw=${summary.layerCounts.raw}, normalized=${summary.layerCounts.normalized}, native_canonical=${summary.layerCounts.native_canonical}, ui=${summary.layerCounts.ui} | **Dropped**: ${summary.droppedTotal}`,
     '',
-    '| Ordinal | ms | Aliases | Raw Transport | Normalized Adapter | Native Canonical | UI Projection | Attribution | Diagnostic Code |',
+    '| Scope / Ordinal | ms | Aliases | Raw Transport | Normalized Adapter | Native Canonical | UI Projection | Attribution | Diagnostic Code |',
     '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ];
 
   const escapeCell = (val) => String(val ?? '—').replace(/\|/g, '\\|');
   for (const row of summary.rows) {
-    const aliasText = Object.entries(row.aliases)
-      .map(([k, v]) => `${k.replace(/Alias$/, '')}=${v}`)
-      .join(', ') || '—';
+    const aliasText =
+      Object.entries(row.aliases)
+        .map(([k, v]) => `${k.replace(/Alias$/, '')}=${v}`)
+        .join(', ') || '—';
+    const scopeLabel = `${row.connectionId}/${row.generation}/${row.channel === 'history_replay' ? 'replay' : 'live'}#${row.ingressOrdinal}`;
     header.push(
-      `| ${row.connectionId}#${row.ingressOrdinal} | ${row.monotonicMs} | ${escapeCell(aliasText)} | ${escapeCell(row.layers.raw?.label)} | ${escapeCell(row.layers.normalized?.label)} | ${escapeCell(row.layers.native_canonical?.label)} | ${escapeCell(row.layers.ui?.label)} | ${escapeCell(row.attributionStatus)} | \`${row.diagnosticCode}\` |`,
+      `| ${escapeCell(scopeLabel)} | ${row.monotonicMs} | ${escapeCell(aliasText)} | ${escapeCell(row.layers.raw?.label)} | ${escapeCell(row.layers.normalized?.label)} | ${escapeCell(row.layers.native_canonical?.label)} | ${escapeCell(row.layers.ui?.label)} | ${escapeCell(row.attributionStatus)} | \`${row.diagnosticCode}\` |`,
     );
   }
   return `${header.join('\n')}\n`;

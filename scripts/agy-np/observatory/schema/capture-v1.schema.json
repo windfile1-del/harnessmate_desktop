@@ -29,10 +29,14 @@
     },
     "captureId": {
       "type": "string",
+      "minLength": 4,
+      "maxLength": 96,
       "pattern": "^[a-zA-Z0-9._:-]{4,96}$"
     },
     "scenario": {
       "type": "string",
+      "minLength": 2,
+      "maxLength": 64,
       "pattern": "^[a-zA-Z0-9._:-]{2,64}$"
     },
     "platform": {
@@ -41,6 +45,7 @@
     },
     "cliVersion": {
       "type": ["string", "null"],
+      "maxLength": 48,
       "pattern": "^[a-zA-Z0-9._+-]{1,48}$"
     },
     "protocol": {
@@ -125,10 +130,23 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "origin": { "type": "string", "maxLength": 128 },
-        "migratedFrom": { "type": ["string", "null"], "maxLength": 128 },
-        "timingSynthetic": { "type": "boolean" },
-        "notes": { "type": "string", "maxLength": 240 }
+        "origin": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9._:/ -]{1,128}$"
+        },
+        "migratedFrom": {
+          "type": ["string", "null"],
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9._:/ -]{1,128}$"
+        },
+        "timingSynthetic": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 240
+        }
       }
     },
     "correlation": {
@@ -136,23 +154,89 @@
       "additionalProperties": false,
       "required": ["connectionId", "ingressOrdinal", "channel"],
       "properties": {
-        "connectionId": { "type": "string", "pattern": "^[a-zA-Z0-9._:-]{2,64}$" },
-        "generation": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "ingressOrdinal": { "type": "integer", "minimum": 0 },
-        "channel": { "type": "string", "enum": ["live", "history_replay"] },
-        "rpcIdAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "rpcIdType": { "type": ["string", "null"], "enum": ["number", "string", null] },
-        "sessionAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "childAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "toolAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "taskAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "workflowAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "approvalAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "turnAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "activityAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "workAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "agentAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
-        "diagnosticCode": { "type": ["string", "null"], "pattern": "^AGY-DIAG-v1:[a-zA-Z0-9._:-]{4,180}$" }
+        "connectionId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{2,64}$"
+        },
+        "generation": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "ingressOrdinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["live", "history_replay"]
+        },
+        "rpcIdAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "rpcIdType": {
+          "type": ["string", "null"],
+          "enum": ["number", "string", null]
+        },
+        "sessionAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "childAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "toolAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "taskAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "workflowAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "approvalAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "turnAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "activityAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "workAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "agentAlias": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9._:-]{1,64}$"
+        },
+        "diagnosticCode": {
+          "type": ["string", "null"],
+          "maxLength": 240,
+          "pattern": "^AGY-DIAG-v1:[a-zA-Z0-9._:-]{4,220}$"
+        }
       }
     },
     "shape": {
@@ -163,7 +247,8 @@
       "type": "array",
       "items": {
         "type": "string",
-        "pattern": "^[a-zA-Z0-9_.:-]{1,64}$"
+        "maxLength": 64,
+        "pattern": "^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$"
       }
     },
     "truncated": {

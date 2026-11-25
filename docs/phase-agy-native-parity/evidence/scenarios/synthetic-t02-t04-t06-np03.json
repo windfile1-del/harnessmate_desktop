@@ -1,10 +1,13 @@
 {
   "schemaVersion": 1,
-  "copyableDiagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:8:ui:ghost_turn_bg",
+  "toolVersion": "0.2.0",
+  "copyableDiagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg",
   "captureId": "baseline-four-layer-t02-t04-t06",
   "scenario": "T02_T04_T06_baseline_four_layer",
   "provenance": "synthetic",
   "cliVersion": "1.5.16-synthetic-peer",
+  "requestedProtocol": 1,
+  "negotiatedProtocol": 1,
   "protocol": 1,
   "layerCoverage": {
     "raw": 17,
@@ -14,19 +17,22 @@
   },
   "anomalySummary": [
     {
+      "rowKey": "conn-1|gen-1|live#8",
       "status": "adapter_misattributed_placeholder",
       "reasonCode": "placeholder_turn_slot",
-      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:8:ui:ghost_turn_bg"
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg"
     },
     {
+      "rowKey": "conn-1|gen-1|live#9",
       "status": "adapter_misattributed_placeholder",
       "reasonCode": "placeholder_turn_slot",
-      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:9:ui:ghost_turn_bg"
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg"
     },
     {
+      "rowKey": "conn-1|gen-1|live#10",
       "status": "dropped_before_adapter",
-      "reasonCode": "server_request_not_normalized",
-      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:10:raw:session_request_permission"
+      "reasonCode": "server_request_cancelled_before_adapter",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response"
     }
   ]
 }

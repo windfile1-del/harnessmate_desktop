@@ -9,10 +9,6 @@ import { validateCaptureRecords } from './schema-validator.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 
-/**
- * Parses a replay scenario fixture file (NDJSON where line 1 is `{ kind: "scenario_meta", ... }`
- * followed by step events `{ step, trigger, delayMs, ... }`).
- */
 export function loadReplayFixture(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8');
   const lines = raw
@@ -34,9 +30,6 @@ export function loadReplayFixture(filePath) {
   return { meta, steps };
 }
 
-/**
- * Evaluates explicit verdict criteria encoded in a replay fixture against captured records and summary.
- */
 export function evaluateVerdictCriteria(criteria = {}, records = [], summary = null) {
   const checks = [];
   const check = (name, passed, detail) => checks.push({ name, passed: Boolean(passed), detail });
@@ -120,18 +113,19 @@ export function evaluateVerdictCriteria(criteria = {}, records = [], summary = n
 }
 
 /**
- * Runs a deterministic child-process stdio replay for a loaded fixture, feeding every inbound/outbound
- * frame, split chunk, malformed line, stderr line, timeout, and process exit through the opt-in
- * daemon tap callback interface.
+ * Runs a deterministic child-process stdio replay for a loaded fixture.
+ * Separates child startup readiness (via IPC `replay_ready`) from scenario timeline and watchdog,
+ * and waits for process exit + stream close before computing the final verdict.
  */
 export async function runTransportReplay(fixture, options = {}) {
   const { meta, steps } = fixture;
+  const simulateSlowStartMs = Number(options.simulateSlowStartMs ?? 0);
   const recorder = new ProtocolObservatoryRecorder({
     captureId: options.captureId ?? `replay-${meta.scenarioId}`,
     scenario: meta.scenarioId,
     platform: process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'darwin' : 'linux',
     cliVersion: meta.cliVersion ?? '1.5.16-replay',
-    protocol: meta.protocol ?? 1,
+    protocol: null,
     accountCategory: meta.accountCategory ?? 'synthetic',
     source: meta.source ?? 'replay_with_provenance',
     producer: 'replay_harness',
@@ -147,12 +141,15 @@ export async function runTransportReplay(fixture, options = {}) {
   const tap = createDaemonTapCallbacks(recorder);
   const connId = 'conn-1';
   const generation = meta.generation ?? 'gen-1';
-  recorder.recordCaptureMeta({ profileSource: meta.accountCategory ?? 'synthetic', mode: 'transport_replay' }, { connectionId: connId, generation });
+  recorder.recordCaptureMeta(
+    { profileSource: meta.accountCategory ?? 'synthetic', mode: 'transport_replay', requestedProtocol: meta.protocol ?? 1 },
+    { connectionId: connId, generation },
+  );
 
-  // Spawn an inline Node child that emits raw stdout/stderr bytes according to the fixture steps.
   const childScript = `
     import readline from 'node:readline';
     const steps = JSON.parse(process.env.NP01_REPLAY_STEPS || '[]');
+    const slowStartMs = Number(process.env.NP01_SLOW_START_MS || '0');
     const emitStep = async (step) => {
       if (step.delayMs) await new Promise((r) => setTimeout(r, step.delayMs));
       if (step.action === 'stdout_frame') {
@@ -185,7 +182,6 @@ export async function runTransportReplay(fixture, options = {}) {
     const enqueue = (trigger) => {
       chain = chain.then(() => runQueue(trigger));
     };
-    enqueue('immediate');
     const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
     rl.on('line', (line) => {
       let msg;
@@ -195,11 +191,18 @@ export async function runTransportReplay(fixture, options = {}) {
         : 'on_client_reply:' + String(msg.id);
       enqueue(trigger);
     });
+    if (slowStartMs > 0) await new Promise((r) => setTimeout(r, slowStartMs));
+    process.send?.({ type: 'replay_ready' });
+    enqueue('immediate');
   `;
 
   const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
-    env: { ...process.env, NP01_REPLAY_STEPS: JSON.stringify(steps) },
-    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      NP01_REPLAY_STEPS: JSON.stringify(steps),
+      NP01_SLOW_START_MS: String(simulateSlowStartMs),
+    },
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     windowsHide: true,
   });
 
@@ -215,17 +218,29 @@ export async function runTransportReplay(fixture, options = {}) {
   let stdoutBuf = '';
   let stderrBuf = '';
   let ordinal = 0;
+  let scenarioStarted = false;
+  let watchdogTimer = null;
+  let endReason = 'closed';
+  const scheduledTimers = [];
 
-  const donePromise = new Promise((resolve) => {
-    const timeoutMs = meta.replayTimeoutMs ?? 5_000;
-    const guard = setTimeout(() => {
+  const clearAllTimers = () => {
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    for (const t of scheduledTimers) clearTimeout(t);
+  };
+
+  const startScenarioTimeline = () => {
+    if (scenarioStarted) return;
+    scenarioStarted = true;
+    const watchdogMs = options.watchdogMs ?? meta.replayTimeoutMs ?? 8_000;
+    watchdogTimer = setTimeout(() => {
+      endReason = 'watchdog_timeout';
       tap.onTimeout({
         connectionId: connId,
         generation,
         method: meta.expectedTimeoutMethod ?? 'session/prompt',
         rpcId: meta.expectedTimeoutRpcId ?? 3,
-        timeoutMs,
-        scope: 'replay_forced_timeout',
+        timeoutMs: watchdogMs,
+        scope: 'replay_watchdog',
         forced: true,
       });
       try {
@@ -233,8 +248,42 @@ export async function runTransportReplay(fixture, options = {}) {
       } catch {
         // ignore
       }
-      resolve('forced_timeout');
-    }, timeoutMs);
+    }, watchdogMs);
+
+    for (const step of clientActions.filter((s) => !s.trigger || s.trigger === 'scheduled')) {
+      const t = setTimeout(() => {
+        if (step.action === 'client_frame') {
+          sendClient(step.frame, { turnId: step.turnId });
+        } else if (step.action === 'force_timeout') {
+          tap.onTimeout({
+            connectionId: connId,
+            generation,
+            method: step.method ?? 'session/prompt',
+            rpcId: step.rpcId ?? 3,
+            timeoutMs: step.timeoutMs ?? 900_000,
+            scope: 'rpc_request',
+            forced: true,
+          });
+        } else if (step.action === 'close_stdin') {
+          child.stdin?.end();
+        }
+      }, step.delayMs ?? 10);
+      scheduledTimers.push(t);
+    }
+  };
+
+  const donePromise = new Promise((resolve) => {
+    const readyGuard = setTimeout(() => {
+      // Fallback if IPC ready was missed
+      startScenarioTimeline();
+    }, Math.max(5_000, simulateSlowStartMs + 2_000));
+
+    child.on('message', (msg) => {
+      if (msg?.type === 'replay_ready') {
+        clearTimeout(readyGuard);
+        startScenarioTimeline();
+      }
+    });
 
     child.stdout.on('data', (chunk) => {
       stdoutBuf += chunk.toString('utf8');
@@ -262,20 +311,22 @@ export async function runTransportReplay(fixture, options = {}) {
         }
         tap.onInboundFrame({ connectionId: connId, generation, ingressOrdinal: ordinal, frame: parsed });
 
-        // Optionally project normalized/canonical/ui stub layers if fixture provides synthetic layer annotations
         if (meta.emitFourLayerStubs) {
           emitSyntheticDownstreamLayers(tap, { connId, generation, ordinal, parsed });
         }
 
-        // Handle automated client replies configured in fixture
         if (parsed.method && parsed.id !== undefined) {
           const replyStep = clientActions.find(
             (s) => s.trigger === `on_server_request:${parsed.method}` && (s.matchId === undefined || s.matchId === parsed.id),
           );
           if (replyStep) {
-            setTimeout(() => {
-              sendClient({ id: parsed.id, ...(replyStep.result ? { result: replyStep.result } : { error: replyStep.error }) }, { ingressOrdinal: ordinal });
+            const rt = setTimeout(() => {
+              sendClient(
+                { id: parsed.id, ...(replyStep.result ? { result: replyStep.result } : { error: replyStep.error }) },
+                { ingressOrdinal: ordinal },
+              );
             }, replyStep.delayMs ?? 5);
+            scheduledTimers.push(rt);
           }
         }
         nl = stdoutBuf.indexOf('\n');
@@ -294,36 +345,20 @@ export async function runTransportReplay(fixture, options = {}) {
     });
 
     child.on('close', (code, signal) => {
-      clearTimeout(guard);
+      clearTimeout(readyGuard);
+      clearAllTimers();
       if (stderrBuf.trim()) tap.onStderrLine({ connectionId: connId, generation, line: stderrBuf.trim() });
       tap.onProcessExit({ connectionId: connId, generation, exitCode: code, signal, reason: 'child_closed' });
-      resolve('closed');
+      resolve(endReason);
     });
   });
 
-  // Dispatch scheduled client steps
-  for (const step of clientActions.filter((s) => !s.trigger || s.trigger === 'scheduled')) {
-    setTimeout(() => {
-      if (step.action === 'client_frame') {
-        sendClient(step.frame, { turnId: step.turnId });
-      } else if (step.action === 'force_timeout') {
-        tap.onTimeout({
-          connectionId: connId,
-          generation,
-          method: step.method ?? 'session/prompt',
-          rpcId: step.rpcId ?? 3,
-          timeoutMs: step.timeoutMs ?? 900_000,
-          scope: 'rpc_request',
-          forced: true,
-        });
-      } else if (step.action === 'close_stdin') {
-        child.stdin?.end();
-      }
-    }, step.delayMs ?? 10);
-  }
-
-  const endReason = await donePromise;
-  recorder.recordCaptureEnd({ reason: endReason, promptSent: clientActions.some((s) => s.frame?.method === 'session/prompt') });
+  const finalReason = await donePromise;
+  recorder.recordCaptureEnd(
+    { reason: finalReason, promptSent: clientActions.some((s) => s.frame?.method === 'session/prompt') },
+    { connectionId: connId, generation },
+  );
+  await recorder.flush();
 
   const validation = validateCaptureRecords(recorder.records);
   const summary = buildFourLayerSummary(recorder.records);
@@ -331,7 +366,7 @@ export async function runTransportReplay(fixture, options = {}) {
 
   return {
     scenarioId: meta.scenarioId,
-    endReason,
+    endReason: finalReason,
     records: recorder.records,
     validation,
     summary,
@@ -435,12 +470,6 @@ function emitSyntheticDownstreamLayers(tap, { connId, generation, ordinal, parse
   }
 }
 
-/**
- * Runs a four-layer correlation trace against the REAL built baseline `AcpSessionHandle` and
- * `AntigravityAcpFlavorPolicy` without modifying any daemon production files.
- * Proves that a single AliasTable tracks the same connection/session/tool/request across:
- *   raw (stdio proxy) -> normalized (handle.onEvent) -> native_canonical (contract stub) -> ui (projection stub).
- */
 export async function runFourLayerBaselineCorrelation(options = {}) {
   const strictAcpPath = path.join(REPO_ROOT, 'packages', 'daemon', 'dist', 'harnesses', 'acp', 'strict-acp-adapter.js');
   const agyDriverPath = path.join(REPO_ROOT, 'packages', 'daemon', 'dist', 'harnesses', 'agy', 'agy-driver.js');
@@ -458,7 +487,7 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
     scenario: options.scenario ?? 'T02_T04_T06_baseline_four_layer',
     platform: process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'darwin' : 'linux',
     cliVersion: '1.5.16-synthetic-peer',
-    protocol: 1,
+    protocol: null,
     accountCategory: 'synthetic',
     source: 'synthetic',
     producer: 'replay_harness',
@@ -467,7 +496,7 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
       origin: 'real_baseline_AcpSessionHandle_with_synthetic_peer',
       migratedFrom: null,
       timingSynthetic: true,
-      notes: 'Demonstrates 4-layer correlation across raw stdio, real baseline adapter, canonical stub, and UI stub',
+      notes: 'Observatory v0.2: 4-layer correlation across raw stdio, real baseline adapter, canonical stub, and UI stub',
     },
   });
 
@@ -475,7 +504,10 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
   const connId = 'conn-1';
   const generation = 'gen-1';
   const parentSessionId = 'synthetic-parent-session';
-  recorder.recordCaptureMeta({ profileSource: 'synthetic', mode: 'four_layer_baseline_correlation' }, { connectionId: connId, generation });
+  recorder.recordCaptureMeta(
+    { profileSource: 'synthetic', mode: 'four_layer_baseline_correlation', requestedProtocol: 1 },
+    { connectionId: connId, generation },
+  );
 
   const mockPeerScript = `
     import readline from 'node:readline';
@@ -536,7 +568,6 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
     windowsHide: true,
   });
 
-  // Tap child.stdin.write & child.stdout data non-invasively before handing child to AcpSessionHandle
   let lastIngressOrdinal = 0;
   const origWrite = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk, ...rest) => {
@@ -545,7 +576,12 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
       if (!line.trim()) continue;
       try {
         const parsed = JSON.parse(line);
-        tap.onOutboundFrame({ connectionId: connId, generation, ingressOrdinal: parsed.method ? 0 : lastIngressOrdinal, frame: parsed });
+        tap.onOutboundFrame({
+          connectionId: connId,
+          generation,
+          ingressOrdinal: parsed.method ? 0 : lastIngressOrdinal,
+          frame: parsed,
+        });
       } catch {
         // ignore
       }
@@ -652,7 +688,9 @@ export async function runFourLayerBaselineCorrelation(options = {}) {
     await handle.dispose();
   }
 
-  recorder.recordCaptureEnd({ reason: 'four_layer_complete', promptSent: true });
+  recorder.recordCaptureEnd({ reason: 'four_layer_complete', promptSent: true }, { connectionId: connId, generation });
+  await recorder.flush();
+
   const validation = validateCaptureRecords(recorder.records);
   const summary = buildFourLayerSummary(recorder.records);
   return {
