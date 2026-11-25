@@ -13,7 +13,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type {
   CapabilityDescriptor,
   NativeAgentId,
@@ -24,6 +24,12 @@ import type {
 import { CapabilityUnavailable } from './CapabilityUnavailable';
 import { EntityStatusBadge } from './EntityStatusBadge';
 import { EvidenceDetails } from './EvidenceDetails';
+import {
+  computeNextTabIndex,
+  focusFirstInContainer,
+  handleDialogTabTrap,
+  shouldWorkbenchHandleEscape,
+} from './focus-utils';
 import { NativeControlMenu } from './NativeControlMenu';
 import { NativeRequestCard } from './NativeRequestCard';
 import { NativeTimeline } from './NativeTimeline';
@@ -936,54 +942,97 @@ export function AgyWorkbenchShell({
 }: AgyWorkbenchShellProps) {
   ensureDefaultWorkbenchViewsRegistered();
   const views = useSyncExternalStore(registry.subscribe, registry.getSnapshot, registry.getSnapshot);
+  const shellRef = useRef<HTMLElement>(null);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
+  const tabRefs = useRef<Partial<Record<WorkbenchSurfaceId, HTMLButtonElement | null>>>({});
+  const pendingTabFocusRef = useRef<WorkbenchSurfaceId | null>(null);
 
   const activeSurface: WorkbenchSurfaceId =
     viewProps.route.surface === 'chat' ? 'runtime' : viewProps.route.surface;
   const activeView = views.find((v) => v.id === activeSurface) ?? views[0] ?? null;
 
-  const handleClose = () => {
+  const handleClose = useCallback(() => {
     viewProps.onBackToChat();
     if (returnFocusToRef?.current) {
-      queueMicrotask(() => returnFocusToRef.current?.focus());
+      queueMicrotask(() => {
+        if (returnFocusToRef.current?.isConnected) {
+          returnFocusToRef.current.focus();
+        }
+      });
     }
-  };
+  }, [viewProps.onBackToChat, returnFocusToRef]);
 
+  // Narrow-viewport modal sheet: enter focus on open, trap Tab/Shift+Tab, and keep focus inside dialog
+  useEffect(() => {
+    if (!viewProps.isNarrowViewport) return;
+    const container = shellRef.current;
+    focusFirstInContainer(container, closeBtnRef.current);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Tab') {
+        handleDialogTabTrap(e, shellRef.current, document.activeElement);
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const dlg = shellRef.current;
+      if (!dlg) return;
+      const target = e.target as Node | null;
+      if (target && !dlg.contains(target)) {
+        focusFirstInContainer(dlg, closeBtnRef.current);
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      document.removeEventListener('focusin', onFocusIn, true);
+    };
+  }, [viewProps.isNarrowViewport]);
+
+  // Escape closes Workbench (unless consumed by IME, nested listbox/menu, or external modal)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        handleClose();
-      }
+      if (!shouldWorkbenchHandleEscape(e, shellRef.current)) return;
+      e.preventDefault();
+      handleClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  });
+  }, [handleClose]);
+
+  // Ensure keyboard-selected tab receives DOM focus after controlled route update commits
+  useEffect(() => {
+    if (pendingTabFocusRef.current === activeSurface) {
+      pendingTabFocusRef.current = null;
+      tabRefs.current[activeSurface]?.focus();
+    }
+  }, [activeSurface]);
 
   const handleTabKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (views.length === 0) return;
     const idx = views.findIndex((v) => v.id === activeSurface);
-    if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      const next = views[(idx + 1) % views.length]!;
-      viewProps.onNavigate({ surface: next.id });
-    } else if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      const prev = views[(idx - 1 + views.length) % views.length]!;
-      viewProps.onNavigate({ surface: prev.id });
-    }
+    const nextIdx = computeNextTabIndex(e.key, idx, views.length);
+    if (nextIdx === null) return;
+    e.preventDefault();
+    const target = views[nextIdx]!;
+    pendingTabFocusRef.current = target.id;
+    viewProps.onNavigate({ surface: target.id });
+    tabRefs.current[target.id]?.focus();
   };
 
   const shellContent = (
     <section
+      ref={shellRef}
+      tabIndex={viewProps.isNarrowViewport ? -1 : undefined}
       data-testid="agy-workbench-shell"
       data-layout-mode={viewProps.isNarrowViewport ? 'narrow_sheet' : viewProps.route.layout}
       data-active-surface={activeSurface}
       role={viewProps.isNarrowViewport ? 'dialog' : 'region'}
       aria-modal={viewProps.isNarrowViewport ? true : undefined}
       aria-label="AGY 原生工作台"
-      className="flex h-full min-h-0 w-full flex-col overflow-hidden"
+      className="flex h-full min-h-0 w-full flex-col overflow-hidden focus:outline-none"
       style={{
         backgroundColor: 'var(--bg-rail)',
         borderLeft: viewProps.isNarrowViewport ? 'none' : '1px solid var(--border-hairline)',
@@ -1071,6 +1120,9 @@ export function AgyWorkbenchShell({
           return (
             <button
               key={view.id}
+              ref={(el) => {
+                tabRefs.current[view.id] = el;
+              }}
               id={`agy-wb-tab-${view.id}`}
               type="button"
               role="tab"

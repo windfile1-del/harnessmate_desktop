@@ -463,6 +463,7 @@ export function ChatStage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const workbenchTriggerRef = useRef<HTMLButtonElement>(null);
+  const pendingWorkbenchFocusRestoreRef = useRef(false);
   const [isNarrowViewport, setIsNarrowViewport] = useState<boolean>(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
     return window.matchMedia('(max-width: 768px)').matches;
@@ -476,6 +477,16 @@ export function ChatStage() {
     mql.addEventListener?.('change', onChange);
     return () => mql.removeEventListener?.('change', onChange);
   }, []);
+
+  // Restore focus to the topbar trigger button once chat header remounts (including full-width -> chat close)
+  useEffect(() => {
+    if (nativeRoute.surface === 'chat' && pendingWorkbenchFocusRestoreRef.current) {
+      if (workbenchTriggerRef.current) {
+        pendingWorkbenchFocusRestoreRef.current = false;
+        workbenchTriggerRef.current.focus();
+      }
+    }
+  }, [nativeRoute.surface, nativeRoute.layout, isNarrowViewport]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -875,6 +886,7 @@ export function ChatStage() {
     nativeWorkbenchActive &&
     nativeRoute.surface !== 'chat' &&
     (isNarrowViewport || nativeRoute.layout === 'split');
+  const isNarrowSheetOpen = showSplitOrSheetWorkbench && isNarrowViewport;
 
   return (
     <div className="flex h-full min-w-0 flex-1 overflow-hidden">
@@ -889,7 +901,10 @@ export function ChatStage() {
             isNarrowViewport={false}
             returnFocusToRef={workbenchTriggerRef}
             onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
-            onBackToChat={() => setNativeWorkbenchRoute(session.id, { surface: 'chat' })}
+            onBackToChat={() => {
+              pendingWorkbenchFocusRestoreRef.current = true;
+              setNativeWorkbenchRoute(session.id, { surface: 'chat' });
+            }}
             onRefresh={() => void hydrateNativeRuntime(session.id)}
             onResolveRequest={resolveRuntimeRequest}
             onSubmitCommand={async (req) => {
@@ -913,7 +928,11 @@ export function ChatStage() {
           />
         </div>
       ) : (
-      <div className="atelier-canvas flex h-full min-w-0 flex-1 flex-col">
+      <div
+        aria-hidden={isNarrowSheetOpen || undefined}
+        inert={isNarrowSheetOpen ? true : undefined}
+        className="atelier-canvas flex h-full min-w-0 flex-1 flex-col"
+      >
         {/* Minimalist Session Top Bar */}
         <header
           className="app-drag flex h-[54px] shrink-0 items-center justify-between gap-2 px-4"
@@ -1902,7 +1921,10 @@ export function ChatStage() {
             isNarrowViewport={isNarrowViewport}
             returnFocusToRef={workbenchTriggerRef}
             onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
-            onBackToChat={() => setNativeWorkbenchRoute(session.id, { surface: 'chat' })}
+            onBackToChat={() => {
+              pendingWorkbenchFocusRestoreRef.current = true;
+              setNativeWorkbenchRoute(session.id, { surface: 'chat' });
+            }}
             onRefresh={() => void hydrateNativeRuntime(session.id)}
             onResolveRequest={resolveRuntimeRequest}
             onSubmitCommand={async (req) => {

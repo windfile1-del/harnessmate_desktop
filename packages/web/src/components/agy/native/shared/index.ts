@@ -63,6 +63,13 @@ export {
   type AgyWorkbenchShellProps,
 } from './AgyWorkbenchShell';
 export {
+  getFocusableElements,
+  focusFirstInContainer,
+  handleDialogTabTrap,
+  computeNextTabIndex,
+  shouldWorkbenchHandleEscape,
+} from './focus-utils';
+export {
   makeFixtureCapabilities,
   createLiveReactiveFixture,
   createUnknownFixture,

@@ -15,14 +15,18 @@ import {
   NativeControlMenu,
   NativeRequestCard,
   NativeTimeline,
+  computeNextTabIndex,
   createCrashedDisconnectedFixture,
   createLiveReactiveFixture,
   createStaleReconcilingFixture,
   createStressFixture,
   createUnknownFixture,
   createUnsupportedStudiosFixture,
+  focusFirstInContainer,
+  handleDialogTabTrap,
   registerDefaultWorkbenchViews,
   resolveAgyModeOptions,
+  shouldWorkbenchHandleEscape,
 } from '../src/components/agy/native/shared';
 import { ChatStage } from '../src/components/ChatStage';
 import { SlotRegistryProvider, SlotSessionProvider } from '../src/slots';
@@ -524,5 +528,81 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
     expect(chatEnabledHtml).toContain('data-testid="agy-native-composer-status"');
     expect(chatEnabledHtml).toContain('查看正在进行的工作');
     expect(chatEnabledHtml).toContain('draft preserved while busy');
+  });
+
+  it('R4 03a focus utils: traps Tab/Shift+Tab inside narrow sheet, computes tablist navigation, and guards nested popovers on Escape', () => {
+    const focusedLog: string[] = [];
+    const makeFakeEl = (id: string, opts?: { disabled?: boolean; tabIndex?: number; hidden?: boolean; closestMatch?: boolean }) => {
+      const el = {
+        id,
+        tabIndex: opts?.tabIndex ?? 0,
+        hasAttribute: (name: string) =>
+          (name === 'disabled' && Boolean(opts?.disabled)) ||
+          (name === 'hidden' && Boolean(opts?.hidden)),
+        getAttribute: () => null,
+        focus: () => {
+          focusedLog.push(id);
+        },
+        closest: () => (opts?.closestMatch ? {} : null),
+      } as unknown as HTMLElement;
+      return el;
+    };
+
+    const btnClose = makeFakeEl('close-btn');
+    const tabRuntime = makeFakeEl('tab-runtime');
+    const tabSubagents = makeFakeEl('tab-subagents');
+    const disabledBtn = makeFakeEl('disabled-btn', { disabled: true });
+    const outsideBtn = makeFakeEl('outside-bg-btn');
+
+    const dialogNodes = [btnClose, tabRuntime, tabSubagents, disabledBtn];
+    const container = {
+      querySelectorAll: () => dialogNodes,
+      querySelector: () => null,
+      contains: (node: Node | null) => dialogNodes.includes(node as unknown as HTMLElement),
+      focus: () => focusedLog.push('container'),
+    } as unknown as HTMLElement;
+
+    // 1. Focus enters preferred close button on narrow sheet open
+    expect(focusFirstInContainer(container, btnClose)).toBe(btnClose);
+    expect(focusedLog.at(-1)).toBe('close-btn');
+
+    // 2. Tab at last focusable wraps to first; Shift+Tab at first wraps to last; outside element redirects inside
+    let prevented = 0;
+    const makeTabEvent = (shiftKey: boolean) => ({
+      key: 'Tab',
+      shiftKey,
+      preventDefault: () => {
+        prevented += 1;
+      },
+    });
+    expect(handleDialogTabTrap(makeTabEvent(false), container, tabSubagents)).toBe(btnClose);
+    expect(handleDialogTabTrap(makeTabEvent(true), container, btnClose)).toBe(tabSubagents);
+    expect(handleDialogTabTrap(makeTabEvent(false), container, outsideBtn)).toBe(btnClose);
+    expect(prevented).toBe(3);
+
+    // 3. Tablist keyboard navigation supports ArrowRight, ArrowLeft, Home, End
+    expect(computeNextTabIndex('ArrowRight', 0, 7)).toBe(1);
+    expect(computeNextTabIndex('ArrowLeft', 0, 7)).toBe(6);
+    expect(computeNextTabIndex('Home', 4, 7)).toBe(0);
+    expect(computeNextTabIndex('End', 1, 7)).toBe(6);
+    expect(computeNextTabIndex('Enter', 1, 7)).toBeNull();
+
+    // 4. Escape respects defaultPrevented, IME composing, and nested listbox popovers
+    expect(
+      shouldWorkbenchHandleEscape({ key: 'Escape', defaultPrevented: false, isComposing: false }, container),
+    ).toBe(true);
+    expect(
+      shouldWorkbenchHandleEscape({ key: 'Escape', defaultPrevented: true, isComposing: false }, container),
+    ).toBe(false);
+    expect(
+      shouldWorkbenchHandleEscape({ key: 'Escape', defaultPrevented: false, isComposing: true }, container),
+    ).toBe(false);
+    const listboxItem = makeFakeEl('opt-1', { closestMatch: true });
+    expect(
+      shouldWorkbenchHandleEscape(
+        { key: 'Escape', defaultPrevented: false, target: listboxItem },
+        container,
+      ),
+    ).toBe(false);
   });
 });
