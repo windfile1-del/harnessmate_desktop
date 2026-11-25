@@ -649,7 +649,7 @@ export class GoalScheduleTasksObserver implements NativeWorkflowResourceReaderPo
         return this.applyScheduleCancelled(scope, decoded, evidence, observedAt);
 
       case 'wake_activity_signal':
-        return this.applyWakeSignal(scope, decoded, evidence, observedAt, opts);
+        return this.applyWakeSignal(scope, decoded, evidence, observedAt);
 
       case 'background_work_update':
         return this.applyBackgroundWorkUpdate(scope, decoded, evidence, observedAt, opts);
@@ -1678,7 +1678,9 @@ export class GoalScheduleTasksObserver implements NativeWorkflowResourceReaderPo
         ...(decoded.plannedAt !== undefined
           ? { plannedAt: { kind: 'known', value: decoded.plannedAt, evidence } }
           : {}),
-        actualTriggeredAt: { kind: 'known', value: decoded.actualTriggeredAt ?? observedAt, evidence },
+        ...(decoded.actualTriggeredAt !== undefined
+          ? { actualTriggeredAt: { kind: 'known', value: decoded.actualTriggeredAt, evidence } }
+          : {}),
         timezone: decoded.timezone
           ? { kind: 'known', value: decoded.timezone, evidence }
           : sched.timezone,
@@ -1894,43 +1896,24 @@ export class GoalScheduleTasksObserver implements NativeWorkflowResourceReaderPo
     decoded: Extract<DecodedTasksFrame, { kind: 'wake_activity_signal' }>,
     evidence: Evidence,
     observedAt: number,
-    opts?: { readonly activeTurnEnded?: boolean },
   ): TasksIngestResult {
-    const sched =
-      (decoded.nativeScheduleId
-        ? (() => {
-            const wid = scope.scheduleIdByNativeKey.get(decoded.nativeScheduleId!);
-            return wid ? scope.schedulesById.get(wid) : undefined;
-          })()
-        : undefined) ?? [...scope.schedulesById.values()].find((s) => s.lastTriggeredWorkId !== null);
-
-    if (!sched) return { accepted: false, deduplicated: false, commits: [] };
-
-    let workId =
-      (decoded.nativeOccurrenceId ? sched.workIdByNativeOccurrenceKey.get(decoded.nativeOccurrenceId) : undefined) ??
-      (decoded.sourceWorkIdHint ? asWorkId(decoded.sourceWorkIdHint) : undefined) ??
-      sched.lastTriggeredWorkId ??
-      undefined;
-
-    if (!workId || !sched.occurrencesByWorkId.has(workId)) {
-      const triggered = this.applyOccurrenceTriggered(
-        scope,
-        {
-          kind: 'schedule_occurrence_triggered',
-          nativeScheduleId: sched.nativeScheduleId,
-          nativeOccurrenceId: decoded.nativeOccurrenceId,
-          summary: decoded.summary,
-          state: { op: 'set', value: decoded.completed ? 'finished' : 'running' },
-          outcome: decoded.outcome ? { op: 'set', value: decoded.outcome } : { op: 'omit' },
-        },
-        evidence,
-        observedAt,
-        { ...opts, activeTurnEnded: true },
-      );
-      return triggered;
+    let matched: { schedule: InternalScheduleState; occurrence: ScheduleOccurrenceRecord } | undefined;
+    for (const schedule of scope.schedulesById.values()) {
+      if (decoded.nativeScheduleId && schedule.nativeScheduleId !== decoded.nativeScheduleId) continue;
+      const occurrenceWorkId = decoded.nativeOccurrenceId
+        ? schedule.workIdByNativeOccurrenceKey.get(decoded.nativeOccurrenceId)
+        : decoded.sourceWorkIdHint;
+      if (!occurrenceWorkId || (decoded.sourceWorkIdHint && decoded.sourceWorkIdHint !== occurrenceWorkId)) continue;
+      const occurrence = schedule.occurrencesByWorkId.get(asWorkId(occurrenceWorkId));
+      if (!occurrence) continue;
+      if (matched) return { accepted: false, deduplicated: false, commits: [] };
+      matched = { schedule, occurrence };
     }
+    if (!matched) return { accepted: false, deduplicated: false, commits: [] };
 
-    let occ = sched.occurrencesByWorkId.get(workId)!;
+    const sched = matched.schedule;
+    let occ = matched.occurrence;
+    const workId = occ.workId;
     const wakeActivityId =
       occ.latestWakeActivityId ??
       asActivityId(`act_wake_${shortToken(`${workId}:${observedAt}:${++scope.seqCounter}`)}`);

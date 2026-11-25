@@ -157,6 +157,27 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       url: `/api/v1/sessions/${session.id}/native/workflows/${workflow?.id}/logs`,
     });
     expect(NativeWorkflowResourceResponseSchema.parse(resource.json())).toMatchObject({ available: true });
+    const frame = (ingressOrdinal: number, update: Record<string, unknown>): NativeIngress => ({
+      ...env, ingressOrdinal,
+      wire: { method: 'session/update', params: { sessionId: 'nat_root_t09', update } },
+    });
+    hooks.onIngressFrame?.(frame(2, {
+      sessionUpdate: 'schedule_triggered', status: 'running',
+      occurrence: { scheduleId: 'schedule_1', occurrenceId: 'occ_1' },
+    }));
+    const latestWorkflow = projection().workflows.find((item) => item.id === workflow?.id);
+    const detail = latestWorkflow?.detail;
+    const occurrenceWorkId = detail?.kind === 'schedule' ? detail.occurrenceWorkIds[0] : undefined;
+    expect(occurrenceWorkId).toBeDefined();
+    const work = () => projection().work.find((item) => item.id === occurrenceWorkId);
+    const wake = (ordinal: number, scheduleId: string) => frame(ordinal, {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'finished' },
+      _meta: { wakeFromScheduleId: scheduleId, occurrenceId: 'occ_1', wakeCompleted: true },
+    });
+    hooks.onIngressFrame?.(wake(3, 'other_schedule'));
+    expect(work()?.state).toMatchObject({ kind: 'known', value: 'running' });
+    hooks.onIngressFrame?.(wake(4, 'schedule_1'));
+    expect(work()?.state).toMatchObject({ kind: 'known', value: 'finished' });
   });
 
   it('T09: handles one-shot schedule with ended user turn, separate WorkId vs wake ActivityId, and registry commit', async () => {
