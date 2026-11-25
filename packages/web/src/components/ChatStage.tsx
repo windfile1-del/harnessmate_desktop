@@ -19,6 +19,7 @@ import type {
 } from '@harnessmate/protocol';
 import { HarnessCommandNameSchema, ReasoningEffortSchema } from '@harnessmate/protocol';
 import {
+  Activity as ActivityIcon,
   AlertTriangle,
   ArrowRightLeft,
   ArrowUp,
@@ -83,6 +84,14 @@ import {
 import { useAppStore } from '../stores/app-store';
 import type { FileLink } from '../lib/file-links';
 import { Slot, SlotTurnProvider } from '../slots';
+import {
+  AgyWorkbenchShell,
+  DEFAULT_WORKBENCH_ROUTE,
+  EntityStatusBadge,
+  NativeActivityLink,
+  resolveAgyModeOptions,
+} from './agy/native/shared';
+import { defaultNativeTransport } from '../lib/native-client';
 import {
   ComposerPendingRequestBar,
   GlobalAttentionStrip,
@@ -207,6 +216,13 @@ export function ChatStage() {
     clearDraft,
     pushToast,
     isPluginEnabled,
+    agyNativeWorkbenchEnabled,
+    selectedNativeRuntime,
+    agyAuthStates,
+    setNativeWorkbenchRoute,
+    hydrateNativeRuntime,
+    submitNativeCommand,
+    dispatchNativeControl,
   } = useAppStore(useShallow((state) => ({
     sessions: state.sessions,
     pendingApprovals: state.pendingApprovals,
@@ -255,6 +271,13 @@ export function ChatStage() {
     clearDraft: state.clearDraft,
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
+    agyNativeWorkbenchEnabled: state.agyNativeWorkbenchEnabled,
+    selectedNativeRuntime: state.selectedSessionId ? state.nativeRuntimeBySession[state.selectedSessionId] : undefined,
+    agyAuthStates: state.agyAuthStates,
+    setNativeWorkbenchRoute: state.setNativeWorkbenchRoute,
+    hydrateNativeRuntime: state.hydrateNativeRuntime,
+    submitNativeCommand: state.submitNativeCommand,
+    dispatchNativeControl: state.dispatchNativeControl,
   })));
 
   const session = useMemo(
@@ -282,10 +305,34 @@ export function ChatStage() {
   const visibleTurnItems = turnItems ?? NO_TURN_ITEMS;
   const taskState = selectedTaskState ?? null;
   const contextPreview = selectedContextPreview ?? null;
+  const nativeWorkbenchActive = Boolean(
+    session && session.harnessKind === 'agy' && agyNativeWorkbenchEnabled,
+  );
+  const nativeProjection = nativeWorkbenchActive ? (selectedNativeRuntime?.projection ?? null) : null;
+  const nativeCapabilities = nativeWorkbenchActive ? (selectedNativeRuntime?.capabilities ?? []) : [];
+  const nativeRoute = nativeWorkbenchActive
+    ? (selectedNativeRuntime?.route ?? DEFAULT_WORKBENCH_ROUTE)
+    : DEFAULT_WORKBENCH_ROUTE;
+  const nativeSelectedModeId = nativeWorkbenchActive
+    ? (selectedNativeRuntime?.selectedModeId ?? 'normal')
+    : 'normal';
+  const nativeCommandSubmission = nativeWorkbenchActive
+    ? (selectedNativeRuntime?.commandSubmission ?? null)
+    : null;
+  const nativeModeOptions = useMemo(() => {
+    if (!nativeWorkbenchActive || !session) return [];
+    const profileVerified =
+      agyAuthStates[session.harnessId]?.phase === 'authenticated' ||
+      Boolean(nativeProjection && nativeProjection.capabilitiesRevision > 0);
+    return resolveAgyModeOptions(nativeCapabilities, profileVerified);
+  }, [nativeWorkbenchActive, session, agyAuthStates, nativeProjection, nativeCapabilities]);
+  const activeNativeMode = nativeModeOptions.find((m) => m.id === nativeSelectedModeId) ?? null;
+
   const project = useMemo(() => createSessionEventProjector(), [selectedSessionId]);
   const baseTimeline = project(
     visibleEvents,
     session ? { id: session.harnessId, kind: session.harnessKind } : undefined,
+    { isolateNativePlaceholders: nativeWorkbenchActive },
   );
   const timeline = useMemo(
     () =>
@@ -415,6 +462,20 @@ export function ChatStage() {
   const previousSessionId = useRef<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const workbenchTriggerRef = useRef<HTMLButtonElement>(null);
+  const [isNarrowViewport, setIsNarrowViewport] = useState<boolean>(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    return window.matchMedia('(max-width: 768px)').matches;
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia('(max-width: 768px)');
+    const onChange = (event: MediaQueryListEvent) => setIsNarrowViewport(event.matches);
+    setIsNarrowViewport(mql.matches);
+    mql.addEventListener?.('change', onChange);
+    return () => mql.removeEventListener?.('change', onChange);
+  }, []);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -636,6 +697,36 @@ export function ChatStage() {
     const trimmed = inputText.trim();
     if ((!trimmed && attachments.length === 0 && pendingTerminalChips.length === 0) || sending || (isRunning && !isGoalControl && !canSteerActive) ||
       (activeSuggestion && !suggestionChoice)) return;
+    if (
+      nativeWorkbenchActive &&
+      activeNativeMode &&
+      activeNativeMode.id !== 'normal' &&
+      activeNativeMode.capabilityId
+    ) {
+      if (activeNativeMode.gate !== 'available') {
+        pushToast({
+          kind: 'warning',
+          title: `${activeNativeMode.label} 当前不可运行`,
+          body: `${activeNativeMode.sourceNote} · 官方入口：${activeNativeMode.officialEntry}`,
+        });
+        return;
+      }
+      setSending(true);
+      try {
+        const ok = await submitNativeCommand(session.id, {
+          capabilityId: activeNativeMode.capabilityId,
+          actionKey: activeNativeMode.id,
+          args: { prompt: trimmed },
+        });
+        if (ok && useAppStore.getState().draftTextBySession[session.id] === inputText) {
+          clearDraft(session.id);
+        }
+      } finally {
+        setSending(false);
+        textareaRef.current?.focus();
+      }
+      return;
+    }
     const panelCommand = nativeCommands.some(({ command }) => command === typedCommand) ? undefined
       : panelCommands.find(({ command }) => command === typedCommand);
     if (panelCommand) {
@@ -761,8 +852,67 @@ export function ChatStage() {
     }
   };
 
+  const activeNativeWorkCount = nativeProjection
+    ? nativeProjection.work.filter(
+        (w) => w.state.kind === 'known' && (w.state.value === 'running' || w.state.value === 'waiting'),
+      ).length
+    : 0;
+  const nativeContinuationActivities = nativeProjection
+    ? nativeProjection.activities.filter(
+        (act) =>
+          act.origin !== 'user_turn' ||
+          act.state === 'waiting_background' ||
+          act.state === 'requires_action' ||
+          act.state === 'reconciling',
+      )
+    : [];
+  const showFullWorkbench =
+    nativeWorkbenchActive &&
+    nativeRoute.surface !== 'chat' &&
+    !isNarrowViewport &&
+    nativeRoute.layout === 'full';
+  const showSplitOrSheetWorkbench =
+    nativeWorkbenchActive &&
+    nativeRoute.surface !== 'chat' &&
+    (isNarrowViewport || nativeRoute.layout === 'split');
+
   return (
     <div className="flex h-full min-w-0 flex-1 overflow-hidden">
+      {showFullWorkbench ? (
+        <div className="flex h-full min-w-0 flex-1 overflow-hidden">
+          <AgyWorkbenchShell
+            session={session}
+            projection={nativeProjection}
+            capabilities={nativeCapabilities}
+            pendingApprovals={sessionPendingRequests}
+            route={nativeRoute}
+            isNarrowViewport={false}
+            returnFocusToRef={workbenchTriggerRef}
+            onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
+            onBackToChat={() => setNativeWorkbenchRoute(session.id, { surface: 'chat' })}
+            onRefresh={() => void hydrateNativeRuntime(session.id)}
+            onResolveRequest={resolveRuntimeRequest}
+            onSubmitCommand={async (req) => {
+              await submitNativeCommand(session.id, req);
+            }}
+            onDispatchControl={(req) => dispatchNativeControl(session.id, req)}
+            loadTimeline={(scope, pageToken, signal) =>
+              scope.kind === 'activity'
+                ? defaultNativeTransport.getActivityTimeline(session.id, scope.id, { pageToken }, signal)
+                : defaultNativeTransport.getAgentTimeline(session.id, scope.id, { pageToken }, signal)
+            }
+            loadWorkflowResource={(workflowId, resource, pageToken, signal) =>
+              defaultNativeTransport.getWorkflowResource(
+                session.id,
+                workflowId,
+                resource,
+                { pageToken },
+                signal,
+              )
+            }
+          />
+        </div>
+      ) : (
       <div className="atelier-canvas flex h-full min-w-0 flex-1 flex-col">
         {/* Minimalist Session Top Bar */}
         <header
@@ -880,6 +1030,49 @@ export function ChatStage() {
           </div>
 
           <div className="app-no-drag flex shrink-0 items-center gap-1.5">
+            {nativeWorkbenchActive && (
+              <button
+                ref={workbenchTriggerRef}
+                type="button"
+                data-testid="agy-runtime-topbar-trigger"
+                aria-expanded={nativeRoute.surface !== 'chat'}
+                onClick={() =>
+                  setNativeWorkbenchRoute(session.id, {
+                    surface: nativeRoute.surface === 'chat' ? 'runtime' : 'chat',
+                  })
+                }
+                title="打开或收起 AGY 原生工作台（切换视图不会停止 AGY）"
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1 text-[11.5px] font-medium transition-colors hover:bg-[var(--bg-hover)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--border-focus)]"
+                style={{
+                  backgroundColor:
+                    nativeRoute.surface !== 'chat' ? 'var(--bg-active)' : 'var(--bg-surface)',
+                  color:
+                    nativeRoute.surface !== 'chat'
+                      ? 'var(--accent-indigo)'
+                      : 'var(--text-secondary)',
+                  border: `1px solid ${
+                    nativeRoute.surface !== 'chat' ? 'var(--border-focus)' : 'var(--border-hairline)'
+                  }`,
+                }}
+              >
+                <ActivityIcon size={13} className="text-[var(--accent-indigo)]" aria-hidden="true" />
+                <span className="hidden sm:inline">AGY 工作台</span>
+                {nativeProjection && (
+                  <EntityStatusBadge kind="runtime" status={nativeProjection.status} compact />
+                )}
+                {activeNativeWorkCount > 0 && (
+                  <span className="font-mono-code text-[10px] text-[var(--accent-indigo)]">
+                    {activeNativeWorkCount} 运行
+                  </span>
+                )}
+                {sessionPendingRequests.length > 0 && (
+                  <span className="rounded-full bg-[var(--accent-star-soft)] px-1.5 py-0.2 font-mono-code text-[10px] font-semibold text-[var(--accent-star)]">
+                    {sessionPendingRequests.length}
+                  </span>
+                )}
+              </button>
+            )}
+
             {contextMeter && (
               <button
                 type="button"
@@ -1101,6 +1294,35 @@ export function ChatStage() {
                   加载更早的消息（{firstVisible}）
                 </button>
               )}
+              {nativeWorkbenchActive && nativeContinuationActivities.length > 0 && (
+                <div className="space-y-2" data-testid="native-continuation-strip">
+                  {nativeContinuationActivities.map((act) => {
+                    const relatedWork = act.workId
+                      ? nativeProjection?.work.find((w) => w.id === act.workId) ?? null
+                      : null;
+                    const actPending = sessionPendingRequests.filter(
+                      (req) => nativeProjection?.receipts?.[req.id]?.activityId === act.id,
+                    ).length;
+                    return (
+                      <NativeActivityLink
+                        key={act.id}
+                        activity={act}
+                        relatedWork={relatedWork}
+                        pendingCount={actPending}
+                        onOpenWorkbench={(target) =>
+                          setNativeWorkbenchRoute(session.id, {
+                            surface: target.agentId ? 'subagents' : 'runtime',
+                            selectedActivityId: target.id,
+                            selectedWorkId: target.workId ?? null,
+                            selectedAgentId: target.agentId ?? null,
+                          })
+                        }
+                      />
+                    );
+                  })}
+                </div>
+              )}
+
               {timeline.items.length === 0 ? (
                 <SessionReadyPlaceholder
                   session={session}
@@ -1404,6 +1626,37 @@ export function ChatStage() {
               }}
             />
 
+            {nativeWorkbenchActive && (nativeCommandSubmission || (isRunning && !canSteerActive)) && (
+              <div
+                role="status"
+                data-testid="agy-native-composer-status"
+                className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-1.5 text-[11px]"
+                style={{
+                  backgroundColor:
+                    nativeCommandSubmission?.phase === 'conflict' || nativeCommandSubmission?.phase === 'failed'
+                      ? 'var(--accent-rose-soft)'
+                      : 'var(--bg-elevated)',
+                  border: '1px solid var(--border-hairline)',
+                  color:
+                    nativeCommandSubmission?.phase === 'conflict' || nativeCommandSubmission?.phase === 'failed'
+                      ? 'var(--accent-rose)'
+                      : 'var(--text-secondary)',
+                }}
+              >
+                <span>
+                  {nativeCommandSubmission?.message ??
+                    '当前轮次运行中，草稿已保留；可查看正在进行的工作，等待原生完成后再发送。'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setNativeWorkbenchRoute(session.id, { surface: 'runtime' })}
+                  className="shrink-0 cursor-pointer font-medium text-[var(--accent-indigo)] underline"
+                >
+                  查看正在进行的工作
+                </button>
+              </div>
+            )}
+
             <textarea
               ref={textareaRef}
               data-session-composer
@@ -1423,10 +1676,14 @@ export function ChatStage() {
                 draggingOver
                   ? '松开鼠标即可附带图片或文件...'
                   : isRunning
-                    ? 'Agent 正在执行本轮任务，可随时点击右侧停止...'
+                    ? nativeWorkbenchActive && !canSteerActive
+                      ? '运行期间可继续编辑草稿，或在工作台查看正在进行的工作...'
+                      : 'Agent 正在执行本轮任务，可随时点击右侧停止...'
                     : pluginMode
                       ? '描述你要开发的插件功能…'
-                      : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · / 对话命令 · @ 引用文件 · Ctrl+V 贴图`
+                      : nativeWorkbenchActive && activeNativeMode && activeNativeMode.id !== 'normal'
+                        ? activeNativeMode.placeholder
+                        : `向 ${harness?.displayName ?? session.harnessId} 发送指令 · / 对话命令 · @ 引用文件 · Ctrl+V 贴图`
               }
               className="max-h-[180px] w-full resize-none bg-transparent px-2.5 py-1.5 text-[13.8px] leading-relaxed text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
             />
@@ -1626,6 +1883,49 @@ export function ChatStage() {
           </div>
         </div>
       </div>
+      )}
+
+      {showSplitOrSheetWorkbench && (
+        <div
+          className={
+            isNarrowViewport
+              ? ''
+              : 'h-full w-[440px] max-w-[48vw] shrink-0 overflow-hidden'
+          }
+        >
+          <AgyWorkbenchShell
+            session={session}
+            projection={nativeProjection}
+            capabilities={nativeCapabilities}
+            pendingApprovals={sessionPendingRequests}
+            route={nativeRoute}
+            isNarrowViewport={isNarrowViewport}
+            returnFocusToRef={workbenchTriggerRef}
+            onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
+            onBackToChat={() => setNativeWorkbenchRoute(session.id, { surface: 'chat' })}
+            onRefresh={() => void hydrateNativeRuntime(session.id)}
+            onResolveRequest={resolveRuntimeRequest}
+            onSubmitCommand={async (req) => {
+              await submitNativeCommand(session.id, req);
+            }}
+            onDispatchControl={(req) => dispatchNativeControl(session.id, req)}
+            loadTimeline={(scope, pageToken, signal) =>
+              scope.kind === 'activity'
+                ? defaultNativeTransport.getActivityTimeline(session.id, scope.id, { pageToken }, signal)
+                : defaultNativeTransport.getAgentTimeline(session.id, scope.id, { pageToken }, signal)
+            }
+            loadWorkflowResource={(workflowId, resource, pageToken, signal) =>
+              defaultNativeTransport.getWorkflowResource(
+                session.id,
+                workflowId,
+                resource,
+                { pageToken },
+                signal,
+              )
+            }
+          />
+        </div>
+      )}
 
       {inspectorOpen && <InspectorDrawer session={session} diagnostics={timeline.diagnostics} />}
 

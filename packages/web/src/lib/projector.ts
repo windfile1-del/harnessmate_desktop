@@ -90,6 +90,22 @@ export interface ProjectedTimeline {
   turns: ProjectedTurn[];
   diagnostics: DiagnosticEntry[];
   pendingApprovals: ApprovalRequest[];
+  /** Legacy native placeholder events (`turn_bg`, `turn_unknown`) isolated when native workbench UI is enabled. */
+  detachedNativeEvents?: CanonicalEvent[];
+}
+
+export interface SessionProjectorOptions {
+  /**
+   * When true, legacy AGY placeholder turns (`turn_bg`, `turn_unknown`) are kept out of
+   * `items`/`turns` and recorded in `detachedNativeEvents`, preventing ghost turns in ChatStage.
+   */
+  isolateNativePlaceholders?: boolean;
+}
+
+const NATIVE_PLACEHOLDER_TURN_IDS = new Set(['turn_bg', 'turn_unknown']);
+
+export function isNativePlaceholderTurnId(turnId: string | null | undefined): boolean {
+  return typeof turnId === 'string' && NATIVE_PLACEHOLDER_TURN_IDS.has(turnId);
 }
 
 const KNOWN_STANDARD_RECORD_TYPES = new Set([
@@ -414,8 +430,9 @@ export function projectSessionEvents(
   events: CanonicalEvent[],
   fallbackHarness?: { id: string; kind: HarnessKind },
   turnItems?: readonly TurnBlockRecord[],
+  options?: SessionProjectorOptions,
 ): ProjectedTimeline {
-  const base = createSessionEventProjector()(events, fallbackHarness);
+  const base = createSessionEventProjector()(events, fallbackHarness, options);
   return turnItems && turnItems.length > 0 ? mergeTurnBlockRecords(base, turnItems) : base;
 }
 
@@ -424,20 +441,29 @@ export function createSessionEventProjector() {
   let previous: CanonicalEvent[] = [];
   let harnessId: string | undefined;
   let harnessKind: HarnessKind | undefined;
+  let isolateNativePlaceholders = false;
   return (
     events: CanonicalEvent[],
     fallbackHarness?: { id: string; kind: HarnessKind },
+    options?: SessionProjectorOptions,
   ): ProjectedTimeline => {
+    const nextIsolate = Boolean(options?.isolateNativePlaceholders);
     // Live batches retain event identities. Merging missing history can change the prefix.
     const appendOnly =
       events.length >= previous.length &&
       (!previous.length ||
         (events[0] === previous[0] && events[previous.length - 1] === previous.at(-1)));
-    if (!appendOnly || fallbackHarness?.id !== harnessId || fallbackHarness?.kind !== harnessKind) {
-      projection = createProjection(fallbackHarness);
+    if (
+      !appendOnly ||
+      fallbackHarness?.id !== harnessId ||
+      fallbackHarness?.kind !== harnessKind ||
+      nextIsolate !== isolateNativePlaceholders
+    ) {
+      projection = createProjection(fallbackHarness, { isolateNativePlaceholders: nextIsolate });
       previous = [];
       harnessId = fallbackHarness?.id;
       harnessKind = fallbackHarness?.kind;
+      isolateNativePlaceholders = nextIsolate;
     }
     projection.apply(events, previous.length);
     previous = events;
@@ -453,7 +479,11 @@ function classifyFailureFromPayload(p: Record<string, unknown>, message: string)
   return 'provider_error';
 }
 
-function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
+function createProjection(
+  fallbackHarness?: { id: string; kind: HarnessKind },
+  options?: SessionProjectorOptions,
+) {
+  const isolateNativePlaceholders = Boolean(options?.isolateNativePlaceholders);
   const items: ProjectedTimelineItem[] = [];
   const turns: ProjectedTurn[] = [];
   const turnMap = new Map<string, ProjectedTurn>();
@@ -463,12 +493,19 @@ function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
   const activeReasoningBlockMap = new Map<string, Extract<TurnBlock, { type: 'reasoning' }>>();
   const approvalMap = new Map<string, ApprovalRequest>();
   const diagnostics: DiagnosticEntry[] = [];
+  const detachedNativeEvents: CanonicalEvent[] = [];
   const toolOwners = new Map<string, ProjectedTurn>();
   const approvalOwners = new Map<string, ProjectedTurn>();
   const pending = new Set<string>();
   const snapshots = new WeakMap<ProjectedTurn, ProjectedTurn>();
   const dirty = new Set<ProjectedTurn>();
-  let result: ProjectedTimeline = { items: [], turns: [], diagnostics: [], pendingApprovals: [] };
+  let result: ProjectedTimeline = {
+    items: [],
+    turns: [],
+    diagnostics: [],
+    pendingApprovals: [],
+    ...(isolateNativePlaceholders ? { detachedNativeEvents: [] } : {}),
+  };
 
   const getOrCreateTurn = (turnId: string | null, ts: number): ProjectedTurn => {
     const key = turnId || 'turn_default';
@@ -533,6 +570,16 @@ function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
 
   function applyEvent(ev: CanonicalEvent) {
     const p = ev.payload;
+
+    if (
+      isolateNativePlaceholders &&
+      isNativePlaceholderTurnId(ev.turnId) &&
+      ev.type !== 'diagnostic.log' &&
+      ev.type !== 'session.harness_switched'
+    ) {
+      detachedNativeEvents.push(ev);
+      return;
+    }
 
     switch (ev.type) {
       case 'handoff.snapshot': {
@@ -976,7 +1023,12 @@ function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
     },
     snapshot(): ProjectedTimeline {
       const timelineChanged = dirty.size > 0 || items.length !== result.items.length;
-      if (!timelineChanged && diagnostics.length === result.diagnostics.length) return result;
+      const detachedChanged =
+        isolateNativePlaceholders &&
+        detachedNativeEvents.length !== (result.detachedNativeEvents?.length ?? 0);
+      if (!timelineChanged && diagnostics.length === result.diagnostics.length && !detachedChanged) {
+        return result;
+      }
       for (const turn of dirty) {
         snapshots.set(turn, {
           ...turn,
@@ -997,6 +1049,13 @@ function createProjection(fallbackHarness?: { id: string; kind: HarnessKind }) {
         pendingApprovals: timelineChanged
           ? [...pending].map((id) => ({ ...approvalMap.get(id)! }))
           : result.pendingApprovals,
+        ...(isolateNativePlaceholders
+          ? {
+              detachedNativeEvents: detachedChanged
+                ? detachedNativeEvents.slice()
+                : result.detachedNativeEvents,
+            }
+          : {}),
       };
       return result;
     },
