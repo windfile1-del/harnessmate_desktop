@@ -1,0 +1,42 @@
+export {
+  NativeRequestValidationError,
+  type InternalPendingNativeRequestRecord,
+  type LegacyApprovalBridgeInput,
+  type NativeApprovalCenterBridge,
+  type NativeElicitationFieldSchema,
+  type NativeElicitationFieldType,
+  type NativeElicitationFormSpec,
+  type NativeElicitationStringFormat,
+  type NativePermissionRouterOptions,
+  type NativeRequestDetailDto,
+  type NativeRequestOption,
+  type NativeRequestOptionKind,
+  type NativeRequestResolutionOutcome,
+  type NativeRequestTargetResolution,
+  type NativeRequestTargetResolver,
+  type NativeRequestTargetResolverInput,
+  type NativeRequestTargetScope,
+  type NativeRequestValidationErrorCode,
+  type NativeRequestValidationResult,
+  type ParsedIncomingWireRequest,
+  type ResolveNativeRequestWithCasInput,
+  type UnknownChildRequestPolicy,
+} from './types.js';
+export {
+  JSON_RPC_INVALID_PARAMS,
+  JSON_RPC_METHOD_NOT_FOUND,
+  SUPPORTED_ELICITATION_METHODS,
+  SUPPORTED_PERMISSION_METHOD,
+  buildCancelWireResponse,
+  encodeNativeWireResponse,
+  parseIncomingWireRequest,
+  validateElicitationFormPayload,
+  type ParseWireRequestResult,
+} from './wire-codec.js';
+export {
+  StubNativeRequestTargetResolver,
+  type StubActivityAttribution,
+  type StubChildSessionEntry,
+  type StubWorkflowAttributionEntry,
+} from './target-resolver.js';
+export { NativePermissionRouter } from './native-permission-router.js';
