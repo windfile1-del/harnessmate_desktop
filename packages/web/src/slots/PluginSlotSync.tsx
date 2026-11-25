@@ -19,6 +19,10 @@ import {
 import { AgyComposerControls } from '../components/agy/AgyComposerControls';
 import { AgySettingsSlot } from '../components/agy/AgySettingsSlot';
 import { AgyStudioBlockCard } from '../components/agy/AgyStudioBlocks';
+import {
+  AgyWorkbenchShell,
+  DEFAULT_WORKBENCH_ROUTE,
+} from '../components/agy/native/shared';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
@@ -228,8 +232,93 @@ function collectPluginIframeSlots(
  * Effect-driven synchronizer that projects installed/active plugins (V1 panels, V2 dataPanels,
  * V4/V5 manifest/runtime iframe slots, and built-in adapters) into the typed UI SlotRegistry.
  */
+function AgyNativeSidebarBadge({ session }: { session: Session }) {
+  const slice = useAppStore((state) => state.nativeRuntimeBySession[session.id]);
+  const pendingApprovals = useAppStore((state) => state.pendingApprovals);
+  if (session.harnessKind !== 'agy' || !slice?.projection) return null;
+  const runningCount = slice.projection.work.filter(
+    (w) => w.state.kind === 'known' && (w.state.value === 'running' || w.state.value === 'waiting'),
+  ).length;
+  const pendingCount = pendingApprovals.filter(
+    (a) => a.sessionId === session.id && a.status === 'pending',
+  ).length;
+  if (runningCount === 0 && pendingCount === 0 && slice.projection.status === 'attached') {
+    return null;
+  }
+  return (
+    <span
+      data-testid="agy-native-sidebar-badge"
+      title={`AGY 原生运行时：${runningCount} 活跃任务 · ${pendingCount} 待处理`}
+      className="rounded px-1 py-0.2 font-mono-code text-[9.5px]"
+      style={{
+        backgroundColor:
+          pendingCount > 0 ? 'var(--accent-star-soft)' : 'var(--accent-indigo-soft)',
+        color: pendingCount > 0 ? 'var(--accent-star)' : 'var(--accent-indigo)',
+      }}
+    >
+      {pendingCount > 0 ? `需操作 ${pendingCount}` : slice.projection.status === 'reconciling' ? '校准中' : `原生 ${runningCount}`}
+    </span>
+  );
+}
+
+function AgyNativeInspectorAdapter({ session }: { session: Session }) {
+  const slice = useAppStore((state) => state.nativeRuntimeBySession[session.id]);
+  const pendingApprovals = useAppStore((state) => state.pendingApprovals);
+  const setRoute = useAppStore((state) => state.setNativeWorkbenchRoute);
+  const hydrate = useAppStore((state) => state.hydrateNativeRuntime);
+  const resolveRuntimeRequest = useAppStore((state) => state.resolveRuntimeRequest);
+  const dispatchControl = useAppStore((state) => state.dispatchNativeControl);
+  const loadNativeTimeline = useAppStore((state) => state.loadNativeTimeline);
+  const loadNativeWorkflowResource = useAppStore((state) => state.loadNativeWorkflowResource);
+
+  const stableLoadTimeline = useMemo(
+    () => (scope: { kind: 'activity' | 'agent'; id: string }, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeTimeline(session.id, scope, pageToken, signal),
+    [session.id, loadNativeTimeline],
+  );
+  const stableLoadWorkflowResource = useMemo(
+    () => (workflowId: import('../lib/native-client').WorkflowId, resource: string, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeWorkflowResource(session.id, workflowId, resource, pageToken, signal),
+    [session.id, loadNativeWorkflowResource],
+  );
+
+  if (session.harnessKind !== 'agy') {
+    return (
+      <div className="p-3 text-[12px] text-[var(--text-muted)]">
+        AGY 原生工作台仅在 AGY 会话中可用。
+      </div>
+    );
+  }
+
+  const sessionPending = pendingApprovals.filter(
+    (a) => a.sessionId === session.id && a.status === 'pending',
+  );
+
+  return (
+    <div className="h-[520px] min-h-0">
+      <AgyWorkbenchShell
+        session={session}
+        projection={slice?.projection ?? null}
+        syncState={slice?.syncState ?? null}
+        capabilities={slice?.capabilities ?? []}
+        pendingApprovals={sessionPending}
+        route={slice?.route ?? { ...DEFAULT_WORKBENCH_ROUTE, surface: 'runtime' }}
+        isNarrowViewport={false}
+        onNavigate={(patch) => setRoute(session.id, patch)}
+        onBackToChat={() => setRoute(session.id, { surface: 'chat' })}
+        onRefresh={() => void hydrate(session.id)}
+        onResolveRequest={resolveRuntimeRequest}
+        onDispatchControl={(req) => dispatchControl(session.id, req)}
+        loadTimeline={stableLoadTimeline}
+        loadWorkflowResource={stableLoadWorkflowResource}
+      />
+    </div>
+  );
+}
+
 export function PluginSlotSync() {
   const plugins = useAppStore((state) => state.plugins);
+  const agyNativeWorkbenchEnabled = useAppStore((state) => state.agyNativeWorkbenchEnabled);
   const registry = useSlotRegistry();
 
   useEffect(() => {
@@ -688,6 +777,35 @@ export function PluginSlotSync() {
           render: ({ session }) => <AgyEcosystemPanel session={session} />,
         }),
       );
+
+      if (agyNativeWorkbenchEnabled) {
+        disposers.push(
+          registry.register({
+            slot: 'inspector.tabs',
+            id: 'agy-native-runtime',
+            pluginId: 'core.harness.agy',
+            pluginName: 'Antigravity (AGY)',
+            title: 'AGY Native Runtime',
+            key: 'agy-native-runtime',
+            order: 80,
+            sourceKind: 'builtin',
+            render: ({ session }) => <AgyNativeInspectorAdapter session={session} />,
+          }),
+        );
+
+        disposers.push(
+          registry.register({
+            slot: 'session.sidebar.badge',
+            id: 'agy-native-runtime-badge',
+            pluginId: 'core.harness.agy',
+            pluginName: 'Antigravity (AGY)',
+            title: 'AGY 原生运行时状态徽标',
+            order: 40,
+            sourceKind: 'builtin',
+            render: ({ session }) => <AgyNativeSidebarBadge session={session} />,
+          }),
+        );
+      }
     }
 
     // 1. V2 dataPanels -> inspector.tabs, sidebar.tools, composer.actions
@@ -847,7 +965,7 @@ export function PluginSlotSync() {
     return () => {
       for (const dispose of disposers.reverse()) dispose();
     };
-  }, [plugins, registry]);
+  }, [plugins, agyNativeWorkbenchEnabled, registry]);
 
   return null;
 }

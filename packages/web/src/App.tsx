@@ -48,6 +48,8 @@ export function App() {
     openModal,
     toasts,
     dismissToast,
+    agyNativeWorkbenchEnabled,
+    setNativeWorkbenchRoute,
   } = useAppStore(useShallow((state) => ({
     init: state.init,
     sessions: state.sessions,
@@ -60,6 +62,8 @@ export function App() {
     openModal: state.openModal,
     toasts: state.toasts,
     dismissToast: state.dismissToast,
+    agyNativeWorkbenchEnabled: state.agyNativeWorkbenchEnabled,
+    setNativeWorkbenchRoute: state.setNativeWorkbenchRoute,
   })));
 
   const selectedSession = useMemo(
@@ -107,13 +111,36 @@ export function App() {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
         e.preventDefault();
         setInspectorOpen(!inspectorOpen);
+      } else if (
+        agyNativeWorkbenchEnabled &&
+        selectedSession?.harnessKind === 'agy' &&
+        !activeModal &&
+        ((e.altKey && e.shiftKey && e.key.toLowerCase() === 'a') ||
+          ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'g'))
+      ) {
+        e.preventDefault();
+        const curSurface =
+          useAppStore.getState().nativeRuntimeBySession[selectedSession.id]?.route.surface ?? 'chat';
+        setNativeWorkbenchRoute(selectedSession.id, {
+          surface: curSurface === 'chat' ? 'runtime' : 'chat',
+        });
       } else if (e.key === 'Escape' && activeModal) {
         openModal(null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [sidebarCollapsed, inspectorOpen, activeModal, setSidebarCollapsed, setInspectorOpen, openModal]);
+  }, [
+    sidebarCollapsed,
+    inspectorOpen,
+    activeModal,
+    agyNativeWorkbenchEnabled,
+    selectedSession,
+    setSidebarCollapsed,
+    setInspectorOpen,
+    openModal,
+    setNativeWorkbenchRoute,
+  ]);
 
   return (
     <SlotRegistryProvider>

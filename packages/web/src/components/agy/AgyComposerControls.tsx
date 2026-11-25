@@ -1,6 +1,7 @@
 import type { Session } from '@harnessmate/protocol';
 import { ArrowRightLeft, Lock, Navigation, Workflow } from 'lucide-react';
 import { useAppStore } from '../../stores/app-store';
+import { AgyAgentModePicker } from './native/shared/AgyAgentModePicker';
 
 export function AgyComposerControls({
   session,
@@ -11,6 +12,10 @@ export function AgyComposerControls({
 }) {
   const harnesses = useAppStore((s) => s.harnesses);
   const switchHarness = useAppStore((s) => s.switchHarness);
+  const agyNativeWorkbenchEnabled = useAppStore((s) => s.agyNativeWorkbenchEnabled);
+  const nativeSlice = useAppStore((s) => s.nativeRuntimeBySession[session.id]);
+  const agyAuthState = useAppStore((s) => s.agyAuthStates[session.harnessId]);
+  const setNativeAgentMode = useAppStore((s) => s.setNativeAgentMode);
 
   if (session.harnessKind !== 'agy') return null;
 
@@ -21,9 +26,22 @@ export function AgyComposerControls({
   const activeModel = session.actualModel ?? session.model ?? '';
   const isOrchestrator = activeModel.startsWith('gemini-pro-orchestrator');
   const supportsSteering = Boolean(activeHarness?.capabilitiesV2?.supportsActiveSteering);
+  const profileVerified =
+    agyAuthState?.phase === 'authenticated' ||
+    Boolean(nativeSlice?.projection && nativeSlice.projection.capabilitiesRevision > 0);
 
   return (
     <div className="inline-flex flex-wrap items-center gap-1.5 text-[11px]">
+      {agyNativeWorkbenchEnabled && (
+        <AgyAgentModePicker
+          selectedModeId={nativeSlice?.selectedModeId ?? 'normal'}
+          capabilities={nativeSlice?.capabilities ?? []}
+          profileVerified={profileVerified}
+          disabled={isRunning && !supportsSteering}
+          onSelectMode={(mode) => setNativeAgentMode(session.id, mode.id)}
+        />
+      )}
+
       {isOrchestrator && (
         <span
           className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium"

@@ -1,10 +1,36 @@
 import type { Session } from '@harnessmate/protocol';
-import { Bot, CheckCircle2, ChevronDown, ChevronRight, Clock, FileText, ListChecks, Target } from 'lucide-react';
+import { ArrowUpRight, Bot, CheckCircle2, ChevronDown, ChevronRight, Clock, FileText, ListChecks, Target } from 'lucide-react';
 import { useState } from 'react';
 import { daemonApi, type AgySubagentDetailDto } from '../../api/client';
 import type { TurnBlock } from '../../lib/work-groups';
+import { useAppStore } from '../../stores/app-store';
+import type { WorkbenchSurfaceId } from './native/shared/workbench-registry';
 
 type ExtBlock = Extract<TurnBlock, { type: `ext:${string}` }>;
+
+function WorkbenchJumpButton({
+  sessionId,
+  surface,
+  label = '工作台',
+}: {
+  sessionId: string;
+  surface: WorkbenchSurfaceId;
+  label?: string;
+}) {
+  const enabled = useAppStore((s) => s.agyNativeWorkbenchEnabled);
+  const setRoute = useAppStore((s) => s.setNativeWorkbenchRoute);
+  if (!enabled) return null;
+  return (
+    <button
+      type="button"
+      onClick={() => setRoute(sessionId, { surface })}
+      className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+    >
+      <span>{label}</span>
+      <ArrowUpRight size={10.5} aria-hidden="true" />
+    </button>
+  );
+}
 
 export function AgyStudioBlockCard({
   session,
@@ -106,15 +132,18 @@ export function AgyStudioBlockCard({
             <Bot size={13} className="text-[var(--accent-indigo)]" />
             {block.title}
           </span>
-          {toolCallId && (
-            <button
-              type="button"
-              onClick={() => void loadTrace()}
-              className="cursor-pointer rounded border border-[var(--border-hairline)] px-2 py-0.5 text-[10.5px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-            >
-              {loadingTrace ? '读取中…' : expanded ? '收起轨迹' : '查看只读轨迹'}
-            </button>
-          )}
+          <div className="flex items-center gap-1.5">
+            <WorkbenchJumpButton sessionId={session.id} surface="subagents" label="Subagents" />
+            {toolCallId && (
+              <button
+                type="button"
+                onClick={() => void loadTrace()}
+                className="cursor-pointer rounded border border-[var(--border-hairline)] px-2 py-0.5 text-[10.5px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+              >
+                {loadingTrace ? '读取中…' : expanded ? '收起轨迹' : '查看只读轨迹'}
+              </button>
+            )}
+          </div>
         </div>
         <div className="mt-1 text-[11px] text-[var(--text-muted)]">{block.fallbackSummary}</div>
         {expanded && subagentDetail && (
@@ -139,7 +168,10 @@ export function AgyStudioBlockCard({
           <Clock size={12.5} className="text-[var(--accent-star)]" />
           {block.title}
         </span>
-        <span className="truncate text-[var(--text-secondary)]">{block.fallbackSummary}</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-[var(--text-secondary)]">{block.fallbackSummary}</span>
+          <WorkbenchJumpButton sessionId={session.id} surface="runtime" label="Runtime" />
+        </div>
       </div>
     );
   }
@@ -174,7 +206,10 @@ export function AgyStudioBlockCard({
         <Target size={12.5} className="text-[var(--accent-indigo)]" />
         {block.title}
       </span>
-      <span className="truncate text-[var(--text-secondary)]">{block.fallbackSummary}</span>
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-[var(--text-secondary)]">{block.fallbackSummary}</span>
+        <WorkbenchJumpButton sessionId={session.id} surface="tasks" label="Tasks" />
+      </div>
     </div>
   );
 }

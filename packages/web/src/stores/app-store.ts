@@ -63,8 +63,68 @@ import type {
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
 import { ApiHttpError, DaemonWsClient, daemonApi } from '../api/client';
+import {
+  DEFAULT_WORKBENCH_ROUTE,
+  type WorkbenchRouteState,
+} from '../components/agy/native/shared/workbench-registry';
 import { loadSavedTraitValues, persistTraitValues } from '../components/TraitsPicker';
+import {
+  NativeClientError,
+  NativeFeedController,
+  applyNativeEventBatch,
+  createNativeIdempotencyKey,
+  defaultNativeTransport,
+  type ActivityId,
+  type CapabilityDescriptor,
+  type NativeAgentId,
+  type NativeCanonicalEvent,
+  type NativeCommandSubmitRequest,
+  type NativeControlRequest,
+  type NativeFeedSyncState,
+  type NativeRuntimeProjection,
+  type NativeRuntimeTransport,
+  type NativeTimelinePageResponse,
+  type NativeWorkflowResourcePageResponse,
+  type RuntimeBinding,
+  type WorkflowId,
+} from '../lib/native-client';
 import { isTriageEnabled, mergeTriageState, type TriageStateBySession } from '../lib/triage';
+
+export interface NativeCommandSubmissionState {
+  phase: 'idle' | 'submitting' | 'sent_awaiting_evidence' | 'confirmed' | 'conflict' | 'failed';
+  message?: string;
+  idempotencyKey?: string;
+  intentSignature?: string;
+  updatedAt: number;
+}
+
+export interface NativeSessionRuntimeSlice {
+  projection: NativeRuntimeProjection | null;
+  capabilities: CapabilityDescriptor[];
+  syncState: NativeFeedSyncState;
+  route: WorkbenchRouteState;
+  selectedModeId: string;
+  commandSubmission: NativeCommandSubmissionState | null;
+}
+
+const DEFAULT_NATIVE_SYNC_STATE: NativeFeedSyncState = {
+  phase: 'idle',
+  resyncCount: 0,
+  droppedStaleEvents: 0,
+  lastError: null,
+  lastSyncedAt: null,
+};
+
+function createEmptyNativeSlice(): NativeSessionRuntimeSlice {
+  return {
+    projection: null,
+    capabilities: [],
+    syncState: { ...DEFAULT_NATIVE_SYNC_STATE },
+    route: { ...DEFAULT_WORKBENCH_ROUTE },
+    selectedModeId: 'normal',
+    commandSubmission: null,
+  };
+}
 
 export type ActiveModal =
   | 'new_session'
@@ -108,6 +168,9 @@ interface AppState {
 
   harnesses: HarnessInfo[];
   agyAuthStates: Record<string, AgyAuthState>;
+  /** Feature gate for NP-03 AGY Native Workbench UI. Defaults to `false` pre-G2 to preserve AGY-5 components. */
+  agyNativeWorkbenchEnabled: boolean;
+  nativeRuntimeBySession: Record<string, NativeSessionRuntimeSlice>;
   workspaces: Workspace[];
   sessions: Session[];
   pendingApprovals: ApprovalRequest[];
@@ -317,11 +380,122 @@ interface AppState {
 
   pushToast: (toast: Omit<ToastNotice, 'id'>) => void;
   dismissToast: (id: string) => void;
+
+  // NP-03 AGY Native Workbench & Runtime Projection Actions
+  setAgyNativeWorkbenchEnabled: (enabled: boolean) => void;
+  setNativeTransport: (transport: NativeRuntimeTransport | null) => void;
+  hydrateNativeRuntime: (sessionId: string) => Promise<void>;
+  applyNativeEvents: (sessionId: string, events: readonly NativeCanonicalEvent[]) => void;
+  ingestNativeProjectionFixture: (
+    sessionId: string,
+    projection: NativeRuntimeProjection,
+    capabilities?: readonly CapabilityDescriptor[],
+  ) => void;
+  setNativeWorkbenchRoute: (sessionId: string, patch: Partial<WorkbenchRouteState>) => void;
+  setNativeAgentMode: (sessionId: string, modeId: string) => void;
+  submitNativeCommand: (
+    sessionId: string,
+    req: Omit<NativeCommandSubmitRequest, 'bindingGeneration' | 'catalogRevision' | 'idempotencyKey'> & {
+      idempotencyKey?: string;
+      expectedBinding?: RuntimeBinding;
+      expectedCapabilitiesRevision?: number;
+    },
+  ) => Promise<boolean>;
+  dispatchNativeControl: (
+    sessionId: string,
+    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'> & {
+      idempotencyKey?: string;
+      expectedBinding?: RuntimeBinding;
+    },
+  ) => Promise<void>;
+  loadNativeTimeline: (
+    sessionId: string,
+    scope: { kind: 'activity' | 'agent'; id: string },
+    pageToken?: string | null,
+    signal?: AbortSignal,
+  ) => Promise<NativeTimelinePageResponse>;
+  loadNativeWorkflowResource: (
+    sessionId: string,
+    workflowId: WorkflowId,
+    resource: string,
+    pageToken?: string | null,
+    signal?: AbortSignal,
+  ) => Promise<NativeWorkflowResourcePageResponse>;
+  clearNativeSessionState: (sessionId: string) => void;
 }
 
 let wsClient: DaemonWsClient | null = null;
 const commandOutputRefCounts = new Map<string, number>();
 const terminalOutputRefCounts = new Map<string, number>();
+const nativeFeedControllers = new Map<string, NativeFeedController>();
+const nativeScopeEpochBySession = new Map<string, number>();
+const inFlightCommandKeyByIntent = new Map<string, string>();
+let nativeGlobalScopeEpoch = 0;
+let activeNativeTransport: NativeRuntimeTransport = defaultNativeTransport;
+let nativeKeyCounter = 0;
+
+function getNativeScopeEpoch(sessionId: string): number {
+  return nativeScopeEpochBySession.get(sessionId) ?? 0;
+}
+
+function bumpNativeScopeEpoch(sessionId: string): number {
+  const next = getNativeScopeEpoch(sessionId) + 1;
+  nativeScopeEpochBySession.set(sessionId, next);
+  for (const intentKey of [...inFlightCommandKeyByIntent.keys()]) {
+    if (intentKey.startsWith(`${sessionId}|`)) {
+      inFlightCommandKeyByIntent.delete(intentKey);
+    }
+  }
+  return next;
+}
+
+function canonicalizeArgs(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalizeArgs).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalizeArgs(v)}`).join(',')}}`;
+}
+
+function buildNativeCommandIntentSignature(params: {
+  sessionId: string;
+  instanceId: string;
+  runtimeId: string;
+  generation: string;
+  catalogRevision: number;
+  capabilityId: string;
+  actionKey: string;
+  args: Record<string, unknown>;
+}): string {
+  return [
+    params.sessionId,
+    params.instanceId,
+    params.runtimeId,
+    params.generation,
+    String(params.catalogRevision),
+    params.capabilityId,
+    params.actionKey,
+    canonicalizeArgs(params.args),
+  ].join('|');
+}
+
+function disposeNativeFeedController(sessionId: string): void {
+  const controller = nativeFeedControllers.get(sessionId);
+  if (controller) {
+    controller.dispose();
+    nativeFeedControllers.delete(sessionId);
+  }
+}
+
+function getInitialAgyNativeWorkbenchEnabled(): boolean {
+  try {
+    return localStorage.getItem('hm_agy_native_ui') === '1';
+  } catch {
+    return false;
+  }
+}
 
 function contiguousCursor(events: CanonicalEvent[]): number {
   let seq = 0;
@@ -609,6 +783,8 @@ export const useAppStore = create<AppState>((set, get) => {
     terminalPtyAvailable: false,
     terminalOutputById: {},
     agyAuthStates: {},
+    agyNativeWorkbenchEnabled: getInitialAgyNativeWorkbenchEnabled(),
+    nativeRuntimeBySession: {},
     toasts: [],
 
     init: async () => {
@@ -694,12 +870,24 @@ export const useAppStore = create<AppState>((set, get) => {
             } else if (frame.op === 'plugins_changed') {
               void get().refreshPlugins().catch(() => {});
             } else if (frame.op === 'agy_auth_state') {
-              set((state) => ({
-                agyAuthStates: {
+              set((state) => {
+                const nextAuth = {
                   ...state.agyAuthStates,
                   [frame.state.instanceId]: frame.state,
-                },
-              }));
+                };
+                if (frame.state.phase === 'unauthenticated' || frame.state.phase === 'failed') {
+                  const nextNative = { ...state.nativeRuntimeBySession };
+                  for (const sess of state.sessions) {
+                    if (sess.harnessId === frame.state.instanceId) {
+                      disposeNativeFeedController(sess.id);
+                      bumpNativeScopeEpoch(sess.id);
+                      delete nextNative[sess.id];
+                    }
+                  }
+                  return { agyAuthStates: nextAuth, nativeRuntimeBySession: nextNative };
+                }
+                return { agyAuthStates: nextAuth };
+              });
             } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
               ingestTriage([frame.session]);
               if (frame.event) {
@@ -1258,6 +1446,11 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     selectSession: async (sessionId) => {
+      const prevSessionId = get().selectedSessionId;
+      if (prevSessionId && prevSessionId !== sessionId) {
+        disposeNativeFeedController(prevSessionId);
+        bumpNativeScopeEpoch(prevSessionId);
+      }
       set({ selectedSessionId: sessionId, focusedTurn: null });
       if (!sessionId) return;
 
@@ -1304,6 +1497,9 @@ export const useAppStore = create<AppState>((set, get) => {
         void get().refreshTurnItems(sessionId);
         void get().refreshCheckpoints(sessionId);
         void get().refreshFailoverPolicy();
+        if (get().agyNativeWorkbenchEnabled && detail.session.harnessKind === 'agy') {
+          void get().hydrateNativeRuntime(sessionId);
+        }
         if (get().inspectorOpen) {
           void get().refreshGitStatus(sessionId);
         }
@@ -1368,10 +1564,15 @@ export const useAppStore = create<AppState>((set, get) => {
 
     deleteSession: async (id) => {
       await daemonApi.deleteSession(id);
+      disposeNativeFeedController(id);
+      bumpNativeScopeEpoch(id);
       set((state) => {
         const nextSessions = state.sessions.filter((s) => s.id !== id);
+        const nextNative = { ...state.nativeRuntimeBySession };
+        delete nextNative[id];
         return {
           sessions: nextSessions,
+          nativeRuntimeBySession: nextNative,
           selectedSessionId:
             state.selectedSessionId === id ? (nextSessions[0]?.id ?? null) : state.selectedSessionId,
         };
@@ -1381,6 +1582,8 @@ export const useAppStore = create<AppState>((set, get) => {
     switchHarness: async (sessionId, req) => {
       try {
         const res = await daemonApi.switchHarness(sessionId, req);
+        // Switching account/profile or harness clears stale native subscriptions and selections
+        get().clearNativeSessionState(sessionId);
         set((state) => ({
           sessions: state.sessions.map((s) => (s.id === sessionId ? res.session : s)),
           contextPreviewBySession: {
@@ -1388,6 +1591,9 @@ export const useAppStore = create<AppState>((set, get) => {
             [sessionId]: res.contextPreview,
           },
         }));
+        if (get().agyNativeWorkbenchEnabled && res.session.harnessKind === 'agy') {
+          void get().hydrateNativeRuntime(sessionId);
+        }
         const preview = res.contextPreview;
         const syncSummary = preview.syncNeeded
           ? `发送下条消息时将自动同步 ${preview.unsyncedTurnCount} 轮增量上下文 (~${preview.estimatedTokens} tokens)`
@@ -1917,5 +2123,405 @@ export const useAppStore = create<AppState>((set, get) => {
 
     dismissToast: (id) =>
       set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
+
+    setAgyNativeWorkbenchEnabled: (enabled) => {
+      try {
+        if (enabled) localStorage.setItem('hm_agy_native_ui', '1');
+        else localStorage.removeItem('hm_agy_native_ui');
+      } catch {
+        // ignore storage errors
+      }
+      if (!enabled) {
+        nativeGlobalScopeEpoch += 1;
+        inFlightCommandKeyByIntent.clear();
+        for (const sid of [...nativeFeedControllers.keys()]) {
+          disposeNativeFeedController(sid);
+          bumpNativeScopeEpoch(sid);
+        }
+        for (const sid of Object.keys(get().nativeRuntimeBySession)) {
+          bumpNativeScopeEpoch(sid);
+        }
+      }
+      set({ agyNativeWorkbenchEnabled: enabled });
+    },
+
+    setNativeTransport: (transport) => {
+      activeNativeTransport = transport ?? defaultNativeTransport;
+    },
+
+    hydrateNativeRuntime: async (sessionId) => {
+      if (!get().agyNativeWorkbenchEnabled) return;
+      const globalEpoch = nativeGlobalScopeEpoch;
+      const scopeEpoch = getNativeScopeEpoch(sessionId);
+      const sessionSnapshot = get().sessions.find((s) => s.id === sessionId);
+      const expectedInstanceId = sessionSnapshot?.harnessId;
+      disposeNativeFeedController(sessionId);
+      const controller = new NativeFeedController({
+        sessionId,
+        transport: activeNativeTransport,
+        onUpdate: ({ projection, capabilities, syncState }) => {
+          const cur = get();
+          if (
+            !cur.agyNativeWorkbenchEnabled ||
+            nativeGlobalScopeEpoch !== globalEpoch ||
+            getNativeScopeEpoch(sessionId) !== scopeEpoch
+          ) {
+            return;
+          }
+          if (expectedInstanceId) {
+            const liveSession = cur.sessions.find((s) => s.id === sessionId);
+            if (!liveSession || liveSession.harnessId !== expectedInstanceId) return;
+          }
+          set((state) => {
+            const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+            return {
+              nativeRuntimeBySession: {
+                ...state.nativeRuntimeBySession,
+                [sessionId]: {
+                  ...prev,
+                  projection,
+                  capabilities,
+                  syncState,
+                },
+              },
+            };
+          });
+        },
+      });
+      nativeFeedControllers.set(sessionId, controller);
+      await controller.hydrate();
+    },
+
+    applyNativeEvents: (sessionId, events) => {
+      if (events.length === 0 || !get().agyNativeWorkbenchEnabled) return;
+      const controller = nativeFeedControllers.get(sessionId);
+      if (controller) {
+        controller.enqueueLiveEvents(events);
+        return;
+      }
+      set((state) => {
+        const prev = state.nativeRuntimeBySession[sessionId];
+        if (!prev?.projection) return state;
+        const outcome = applyNativeEventBatch(prev.projection, events);
+        if (outcome.appliedCount === 0 && outcome.droppedStaleGenerationCount === 0) return state;
+        return {
+          nativeRuntimeBySession: {
+            ...state.nativeRuntimeBySession,
+            [sessionId]: {
+              ...prev,
+              projection: outcome.projection,
+              capabilities: outcome.updatedCapabilities ?? prev.capabilities,
+              syncState: {
+                ...prev.syncState,
+                droppedStaleEvents:
+                  prev.syncState.droppedStaleEvents + outcome.droppedStaleGenerationCount,
+              },
+            },
+          },
+        };
+      });
+    },
+
+    ingestNativeProjectionFixture: (sessionId, projection, capabilities) =>
+      set((state) => {
+        const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+        return {
+          nativeRuntimeBySession: {
+            ...state.nativeRuntimeBySession,
+            [sessionId]: {
+              ...prev,
+              projection,
+              capabilities: capabilities ? [...capabilities] : prev.capabilities,
+              syncState: {
+                phase: 'live',
+                resyncCount: 0,
+                droppedStaleEvents: 0,
+                incompleteReason: null,
+                lastError: null,
+                lastSyncedAt: Date.now(),
+              },
+            },
+          },
+        };
+      }),
+
+    setNativeWorkbenchRoute: (sessionId, patch) =>
+      set((state) => {
+        const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+        return {
+          nativeRuntimeBySession: {
+            ...state.nativeRuntimeBySession,
+            [sessionId]: {
+              ...prev,
+              route: { ...prev.route, ...patch },
+            },
+          },
+        };
+      }),
+
+    setNativeAgentMode: (sessionId, modeId) =>
+      set((state) => {
+        const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+        return {
+          nativeRuntimeBySession: {
+            ...state.nativeRuntimeBySession,
+            [sessionId]: {
+              ...prev,
+              selectedModeId: modeId,
+              commandSubmission: null,
+            },
+          },
+        };
+      }),
+
+    submitNativeCommand: async (sessionId, req) => {
+      if (!get().agyNativeWorkbenchEnabled) return false;
+      const slice = get().nativeRuntimeBySession[sessionId];
+      const projection = slice?.projection;
+      const session = get().sessions.find((s) => s.id === sessionId);
+      if (!projection || !session) {
+        get().pushToast({
+          kind: 'warning',
+          title: '原生运行时尚未就绪',
+          body: '请刷新能力探测或先以普通对话模式发送。',
+        });
+        return false;
+      }
+
+      const binding = req.expectedBinding ?? projection.binding;
+      const catalogRevision = req.expectedCapabilitiesRevision ?? projection.capabilitiesRevision;
+
+      // Reject if rendered binding or revision is already stale against live projection
+      if (
+        binding.runtimeId !== projection.binding.runtimeId ||
+        binding.generation !== projection.binding.generation ||
+        binding.instanceId !== session.harnessId ||
+        projection.status === 'disconnected'
+      ) {
+        set((state) => {
+          const cur = state.nativeRuntimeBySession[sessionId];
+          if (!cur) return state;
+          return {
+            nativeRuntimeBySession: {
+              ...state.nativeRuntimeBySession,
+              [sessionId]: {
+                ...cur,
+                commandSubmission: {
+                  phase: 'conflict',
+                  message: '当前绑定已变更或断开，已保留草稿，请刷新后再提交。',
+                  updatedAt: Date.now(),
+                },
+              },
+            },
+          };
+        });
+        return false;
+      }
+
+      const capturedScope = {
+        globalEpoch: nativeGlobalScopeEpoch,
+        scopeEpoch: getNativeScopeEpoch(sessionId),
+        instanceId: session.harnessId,
+        runtimeId: binding.runtimeId,
+        generation: binding.generation,
+      };
+
+      const intentSignature = buildNativeCommandIntentSignature({
+        sessionId,
+        instanceId: session.harnessId,
+        runtimeId: binding.runtimeId,
+        generation: binding.generation,
+        catalogRevision,
+        capabilityId: req.capabilityId,
+        actionKey: req.actionKey,
+        args: req.args,
+      });
+
+      // Only reuse idempotency key for an identical in-flight intent (never across different prompts/args)
+      const existingKey = inFlightCommandKeyByIntent.get(intentSignature);
+      const key =
+        req.idempotencyKey ??
+        existingKey ??
+        createNativeIdempotencyKey(
+          req.capabilityId,
+          req.actionKey,
+          `${Date.now().toString(36)}_${(++nativeKeyCounter).toString(36)}`,
+        );
+      inFlightCommandKeyByIntent.set(intentSignature, key);
+
+      const isScopeStillValid = () => {
+        const cur = get();
+        if (!cur.agyNativeWorkbenchEnabled) return false;
+        if (nativeGlobalScopeEpoch !== capturedScope.globalEpoch) return false;
+        if (getNativeScopeEpoch(sessionId) !== capturedScope.scopeEpoch) return false;
+        const curSession = cur.sessions.find((s) => s.id === sessionId);
+        if (!curSession || curSession.harnessId !== capturedScope.instanceId) return false;
+        const curSlice = cur.nativeRuntimeBySession[sessionId];
+        if (!curSlice?.projection) return false;
+        return (
+          curSlice.projection.binding.runtimeId === capturedScope.runtimeId &&
+          curSlice.projection.binding.generation === capturedScope.generation
+        );
+      };
+
+      set((state) => {
+        const prev = state.nativeRuntimeBySession[sessionId];
+        if (!prev) return state;
+        return {
+          nativeRuntimeBySession: {
+            ...state.nativeRuntimeBySession,
+            [sessionId]: {
+              ...prev,
+              commandSubmission: {
+                phase: 'submitting',
+                message: '正在发起原生命令…',
+                idempotencyKey: key,
+                intentSignature,
+                updatedAt: Date.now(),
+              },
+            },
+          },
+        };
+      });
+
+      try {
+        const res = await activeNativeTransport.submitCommand(sessionId, {
+          bindingGeneration: binding.generation,
+          catalogRevision,
+          capabilityId: req.capabilityId,
+          actionKey: req.actionKey,
+          args: req.args,
+          idempotencyKey: key,
+        });
+        if (inFlightCommandKeyByIntent.get(intentSignature) === key) {
+          inFlightCommandKeyByIntent.delete(intentSignature);
+        }
+        // Ignore late receipt if session was cleared, switched, logged out, or gate disabled
+        if (!isScopeStillValid()) return false;
+
+        set((state) => {
+          const prev = state.nativeRuntimeBySession[sessionId];
+          if (!prev) return state;
+          return {
+            nativeRuntimeBySession: {
+              ...state.nativeRuntimeBySession,
+              [sessionId]: {
+                ...prev,
+                commandSubmission: {
+                  phase: res.modeEvidenceObserved ? 'confirmed' : 'sent_awaiting_evidence',
+                  message: res.modeEvidenceObserved
+                    ? '已收到原生模式确认'
+                    : '已发送，等待原生确认',
+                  idempotencyKey: key,
+                  intentSignature,
+                  updatedAt: Date.now(),
+                },
+              },
+            },
+          };
+        });
+        return true;
+      } catch (err) {
+        if (inFlightCommandKeyByIntent.get(intentSignature) === key) {
+          inFlightCommandKeyByIntent.delete(intentSignature);
+        }
+        if (!isScopeStillValid()) return false;
+
+        const isConflict = err instanceof NativeClientError && err.status === 409;
+        set((state) => {
+          const prev = state.nativeRuntimeBySession[sessionId];
+          if (!prev) return state;
+          return {
+            nativeRuntimeBySession: {
+              ...state.nativeRuntimeBySession,
+              [sessionId]: {
+                ...prev,
+                commandSubmission: {
+                  phase: isConflict ? 'conflict' : 'failed',
+                  message: isConflict
+                    ? '会话绑定或状态已变化，已保留草稿并正在刷新能力目录。'
+                    : err instanceof Error
+                      ? err.message
+                      : String(err),
+                  idempotencyKey: key,
+                  intentSignature,
+                  updatedAt: Date.now(),
+                },
+              },
+            },
+          };
+        });
+        if (isConflict && isScopeStillValid()) {
+          void get().hydrateNativeRuntime(sessionId);
+        }
+        return false;
+      }
+    },
+
+    dispatchNativeControl: async (sessionId, req) => {
+      if (!get().agyNativeWorkbenchEnabled) {
+        throw new Error('AGY 原生工作台门控已关闭');
+      }
+      const projection = get().nativeRuntimeBySession[sessionId]?.projection;
+      if (!projection) {
+        throw new Error('原生运行时未连接，无法执行控制操作');
+      }
+      const binding = req.expectedBinding ?? projection.binding;
+      if (
+        binding.runtimeId !== projection.binding.runtimeId ||
+        binding.generation !== projection.binding.generation
+      ) {
+        throw new NativeClientError('绑定代次已过期，拒绝发送旧目标控制命令', 409, 'STALE_BINDING');
+      }
+      const key =
+        req.idempotencyKey ??
+        createNativeIdempotencyKey(
+          `ctrl_${req.target.type}`,
+          `${req.target.id}_${req.action}`,
+          `${Date.now().toString(36)}_${(++nativeKeyCounter).toString(36)}`,
+        );
+      await activeNativeTransport.dispatchControl(sessionId, {
+        generation: binding.generation,
+        target: req.target,
+        action: req.action,
+        expectedRevision: req.expectedRevision,
+        idempotencyKey: key,
+      });
+    },
+
+    loadNativeTimeline: (sessionId, scope, pageToken, signal) =>
+      scope.kind === 'activity'
+        ? activeNativeTransport.getActivityTimeline(
+            sessionId,
+            scope.id as ActivityId,
+            { pageToken },
+            signal,
+          )
+        : activeNativeTransport.getAgentTimeline(
+            sessionId,
+            scope.id as NativeAgentId,
+            { pageToken },
+            signal,
+          ),
+
+    loadNativeWorkflowResource: (sessionId, workflowId, resource, pageToken, signal) =>
+      activeNativeTransport.getWorkflowResource(
+        sessionId,
+        workflowId,
+        resource,
+        { pageToken },
+        signal,
+      ),
+
+    clearNativeSessionState: (sessionId) => {
+      disposeNativeFeedController(sessionId);
+      bumpNativeScopeEpoch(sessionId);
+      set((state) => {
+        if (!state.nativeRuntimeBySession[sessionId]) return state;
+        const next = { ...state.nativeRuntimeBySession };
+        delete next[sessionId];
+        return { nativeRuntimeBySession: next };
+      });
+    },
   };
 });
