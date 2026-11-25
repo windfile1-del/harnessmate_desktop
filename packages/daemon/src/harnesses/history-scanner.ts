@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 import { createZstdDecompress } from 'node:zlib';
@@ -73,9 +73,75 @@ export function clearScannerCache(): void {
 }
 
 const agySources = { agy_desktop: 'antigravity', agy_cli: 'antigravity-cli' } as const;
+const DEFAULT_MAX_AGY_SQLITE_BYTES = 256 * 1024 * 1024; // 256 MiB
+const DEFAULT_MAX_AGY_HISTORY_MESSAGES = 5_000;
+const DEFAULT_MAX_AGY_HISTORY_BYTES = 16 * 1024 * 1024; // 16 MiB
 
 export function agyDataDirectory(source: DiscoveredCliSession['source']): string | undefined {
   return source === 'agy_desktop' ? agySources.agy_desktop : undefined;
+}
+
+function sameCanonicalAgyPath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function isWithinCanonicalAgyRoot(rootReal: string, candidateReal: string): boolean {
+  const rel = path.relative(
+    process.platform === 'win32' ? rootReal.toLowerCase() : rootReal,
+    process.platform === 'win32' ? candidateReal.toLowerCase() : candidateReal,
+  );
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/**
+ * Resolves a child path strictly beneath an AGY profile root.
+ * Resolves an existing top-level junction at `root` once, then rejects any descendant
+ * symlink or Windows junction/reparse point and verifies canonical containment.
+ */
+function resolveSafeAgyPath(
+  root: string,
+  segments: readonly string[],
+  expectKind: 'file' | 'directory',
+): { ok: true; path: string; size: number } | { ok: false; reason: 'root_missing' | 'reparse_or_escape_blocked' | 'missing' } {
+  let rootReal: string;
+  try {
+    rootReal = fs.realpathSync(root);
+    if (!fs.statSync(rootReal).isDirectory()) {
+      return { ok: false, reason: 'root_missing' };
+    }
+  } catch {
+    return { ok: false, reason: 'root_missing' };
+  }
+
+  let current = rootReal;
+  let info: fs.Stats | undefined;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (!seg || seg === '.' || seg === '..' || seg.includes('/') || seg.includes('\\')) {
+      return { ok: false, reason: 'reparse_or_escape_blocked' };
+    }
+    current = path.join(current, seg);
+    try {
+      info = fs.lstatSync(current);
+    } catch {
+      return { ok: false, reason: 'missing' };
+    }
+    const expectFile = expectKind === 'file' && i === segments.length - 1;
+    if (info.isSymbolicLink() || (expectFile ? !info.isFile() : !info.isDirectory())) {
+      return { ok: false, reason: 'reparse_or_escape_blocked' };
+    }
+  }
+
+  if (!info) return { ok: false, reason: 'missing' };
+  try {
+    const resolved = fs.realpathSync(current);
+    if (!sameCanonicalAgyPath(resolved, current) || !isWithinCanonicalAgyRoot(rootReal, resolved)) {
+      return { ok: false, reason: 'reparse_or_escape_blocked' };
+    }
+    return { ok: true, path: resolved, size: info.size };
+  } catch {
+    return { ok: false, reason: 'reparse_or_escape_blocked' };
+  }
 }
 
 function isSqliteBusyError(err: unknown): boolean {
@@ -83,33 +149,48 @@ function isSqliteBusyError(err: unknown): boolean {
   return /SQLITE_BUSY|database is locked/i.test(msg);
 }
 
-function openReadOnlySqliteWithBackoff<T>(
+/**
+ * Opens an AGY SQLite database strictly read-only without creating `-wal` or `-shm`
+ * side-effect files when they are absent on disk.
+ */
+function openAgyReadOnlySqlite<T>(
   dbPath: string,
   reader: (db: DatabaseSync) => T,
   fallback: T,
-): T {
-  if (!fs.existsSync(dbPath)) return fallback;
+  maxDbBytes = DEFAULT_MAX_AGY_SQLITE_BYTES,
+): { ok: true; value: T } | { ok: false; reason: 'db_missing' | 'db_too_large' | 'sqlite_unreadable'; value: T } {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(dbPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      return { ok: false, reason: 'db_missing', value: fallback };
+    }
+  } catch {
+    return { ok: false, reason: 'db_missing', value: fallback };
+  }
+  if (stat.size > maxDbBytes) {
+    return { ok: false, reason: 'db_too_large', value: fallback };
+  }
+
+  const hasWal = fs.existsSync(`${dbPath}-wal`);
+  const hasShm = fs.existsSync(`${dbPath}-shm`);
+  const target = hasWal && hasShm ? dbPath : `${pathToFileURL(dbPath).href}?immutable=1`;
+
   const maxAttempts = 3;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let db: DatabaseSync | undefined;
     try {
-      db = new DatabaseSync(dbPath, { readOnly: true });
-      try {
-        db.exec('PRAGMA busy_timeout = 300;');
-      } catch {
-        // read-only pragma may be ignored on some builds
-      }
-      return reader(db);
+      db = new DatabaseSync(target, { readOnly: true });
+      return { ok: true, value: reader(db) };
     } catch (err) {
       if (isSqliteBusyError(err) && attempt < maxAttempts - 1) {
-        // Brief non-blocking backoff in sync path (bounded to <30ms)
         const waitUntil = Date.now() + 10 * (attempt + 1);
         while (Date.now() < waitUntil) {
           /* short spin for locked external SQLite */
         }
         continue;
       }
-      return fallback;
+      return { ok: false, reason: 'sqlite_unreadable', value: fallback };
     } finally {
       try {
         db?.close();
@@ -118,7 +199,150 @@ function openReadOnlySqliteWithBackoff<T>(
       }
     }
   }
-  return fallback;
+  return { ok: false, reason: 'sqlite_unreadable', value: fallback };
+}
+
+function openReadOnlySqliteWithBackoff<T>(
+  dbPath: string,
+  reader: (db: DatabaseSync) => T,
+  fallback: T,
+): T {
+  return openAgyReadOnlySqlite(dbPath, reader, fallback).value;
+}
+
+export interface AgyIndexedHistoryReadOptions {
+  readonly maxMessages?: number;
+  readonly maxTotalBytes?: number;
+  readonly maxDbBytes?: number;
+}
+
+export interface AgyIndexedHistoryReadResult {
+  readonly messages: HistoryMessage[];
+  readonly partial: boolean;
+  readonly truncatedReason?: 'max_messages' | 'max_bytes';
+  readonly rootVerified: boolean;
+  readonly skippedReason?:
+    | 'root_missing'
+    | 'reparse_or_escape_blocked'
+    | 'db_missing'
+    | 'db_too_large'
+    | 'invalid_session_id'
+    | 'sqlite_unreadable';
+  readonly observedAt: number;
+}
+
+function isValidAgyConversationId(nativeSessionId: string): boolean {
+  if (!nativeSessionId || nativeSessionId.length > 128) return false;
+  return /^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(nativeSessionId);
+}
+
+export function readAgyIndexedHistoryDetailedFromRoot(
+  root: string,
+  nativeSessionId: string,
+  opts?: AgyIndexedHistoryReadOptions,
+): AgyIndexedHistoryReadResult {
+  const observedAt = Date.now();
+  if (!isValidAgyConversationId(nativeSessionId)) {
+    return {
+      messages: [],
+      partial: false,
+      rootVerified: false,
+      skippedReason: 'invalid_session_id',
+      observedAt,
+    };
+  }
+
+  const resolved = resolveSafeAgyPath(root, ['conversation_summaries.db'], 'file');
+  if (!resolved.ok) {
+    return {
+      messages: [],
+      partial: false,
+      rootVerified: resolved.reason !== 'root_missing' && resolved.reason !== 'reparse_or_escape_blocked',
+      skippedReason: resolved.reason === 'missing' ? 'db_missing' : resolved.reason,
+      observedAt,
+    };
+  }
+
+  const maxMessages = Math.max(1, opts?.maxMessages ?? DEFAULT_MAX_AGY_HISTORY_MESSAGES);
+  const maxTotalBytes = Math.max(256, opts?.maxTotalBytes ?? DEFAULT_MAX_AGY_HISTORY_BYTES);
+  const maxDbBytes = Math.max(1024, opts?.maxDbBytes ?? DEFAULT_MAX_AGY_SQLITE_BYTES);
+
+  const opened = openAgyReadOnlySqlite<{
+    messages: HistoryMessage[];
+    truncatedReason?: 'max_messages' | 'max_bytes';
+  }>(
+    resolved.path,
+    (db) => {
+      const messages = new Map<string, HistoryMessage & { index: number }>();
+      let totalBytes = 0;
+      let truncatedReason: 'max_messages' | 'max_bytes' | undefined;
+      const rows = db.prepare(`SELECT user_body, agent_body, user_step_byte_offsets, agent_step_byte_offsets
+        FROM conversations_fts WHERE conversation_id = ? AND chunk_index >= 0 ORDER BY chunk_index`)
+        .iterate(nativeSessionId);
+      for (const row of rows) {
+        if (truncatedReason) break;
+        for (const [role, body, offsets] of [
+          ['user', row.user_body, row.user_step_byte_offsets],
+          ['assistant', row.agent_body, row.agent_step_byte_offsets],
+        ] as const) {
+          if (truncatedReason) break;
+          if (typeof body !== 'string' || !body || !offsets) continue;
+          const bytes = Buffer.from(body, 'utf8');
+          const offsetsText = typeof offsets === 'string' ? offsets
+            : offsets instanceof Uint8Array ? Buffer.from(offsets).toString('utf8') : '';
+          let positions: unknown;
+          try { positions = JSON.parse(offsetsText); } catch { continue; }
+          if (!Array.isArray(positions)) continue;
+          for (const [entry, position] of positions.entries()) {
+            if (!Array.isArray(position)) continue;
+            const [index, start] = position;
+            const end = positions[entry + 1]?.[1] ?? bytes.length;
+            if (!Number.isSafeInteger(index) || index < 0 || !Number.isSafeInteger(start)
+              || !Number.isSafeInteger(end) || start < 0 || start >= end || end > bytes.length) continue;
+            const text = bytes.subarray(start, end).toString('utf8').trim();
+            if (!text) continue;
+            const key = `${index}:${role}`;
+            const entryBytes = Buffer.byteLength(text, 'utf8');
+            if (!messages.has(key) && messages.size >= maxMessages) {
+              truncatedReason = 'max_messages';
+              break;
+            }
+            if (totalBytes + entryBytes > maxTotalBytes) {
+              truncatedReason = 'max_bytes';
+              break;
+            }
+            totalBytes += entryBytes;
+            messages.set(key, { index, role, text });
+          }
+        }
+      }
+      return {
+        messages: [...messages.values()].sort((a, b) => a.index - b.index)
+          .map(({ role, text }) => ({ role, text })),
+        truncatedReason,
+      };
+    },
+    { messages: [] },
+    maxDbBytes,
+  );
+
+  if (!opened.ok) {
+    return {
+      messages: [],
+      partial: false,
+      rootVerified: true,
+      skippedReason: opened.reason,
+      observedAt,
+    };
+  }
+
+  return {
+    messages: opened.value.messages,
+    partial: Boolean(opened.value.truncatedReason),
+    ...(opened.value.truncatedReason ? { truncatedReason: opened.value.truncatedReason } : {}),
+    rootVerified: true,
+    observedAt,
+  };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -140,42 +364,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 export function readAgyIndexedHistoryFromRoot(root: string, nativeSessionId: string): HistoryMessage[] {
-  const dbPath = path.join(root, 'conversation_summaries.db');
-  return openReadOnlySqliteWithBackoff(
-    dbPath,
-    (db) => {
-      const messages = new Map<string, HistoryMessage & { index: number }>();
-      const rows = db.prepare(`SELECT user_body, agent_body, user_step_byte_offsets, agent_step_byte_offsets
-        FROM conversations_fts WHERE conversation_id = ? AND chunk_index >= 0 ORDER BY chunk_index`)
-        .iterate(nativeSessionId);
-      for (const row of rows) {
-        for (const [role, body, offsets] of [
-          ['user', row.user_body, row.user_step_byte_offsets],
-          ['assistant', row.agent_body, row.agent_step_byte_offsets],
-        ] as const) {
-          if (typeof body !== 'string' || !body || !offsets) continue;
-          const bytes = Buffer.from(body, 'utf8');
-          const offsetsText = typeof offsets === 'string' ? offsets
-            : offsets instanceof Uint8Array ? Buffer.from(offsets).toString('utf8') : '';
-          let positions: unknown;
-          try { positions = JSON.parse(offsetsText); } catch { continue; }
-          if (!Array.isArray(positions)) continue;
-          for (const [entry, position] of positions.entries()) {
-            if (!Array.isArray(position)) continue;
-            const [index, start] = position;
-            const end = positions[entry + 1]?.[1] ?? bytes.length;
-            if (!Number.isSafeInteger(index) || index < 0 || !Number.isSafeInteger(start)
-              || !Number.isSafeInteger(end) || start < 0 || start >= end || end > bytes.length) continue;
-            const text = bytes.subarray(start, end).toString('utf8').trim();
-            if (text) messages.set(`${index}:${role}`, { index, role, text });
-          }
-        }
-      }
-      return [...messages.values()].sort((a, b) => a.index - b.index)
-        .map(({ role, text }) => ({ role, text }));
-    },
-    [],
-  );
+  return readAgyIndexedHistoryDetailedFromRoot(root, nativeSessionId).messages;
 }
 
 export function readAgyIndexedHistory(session: DiscoveredCliSession): HistoryMessage[] {
@@ -517,17 +706,19 @@ export function scanAgyRoot(
   id?: string,
   scannerId?: string,
 ): DiscoveredCliSession[] {
-  const dbPath = path.join(root, 'conversation_summaries.db');
+  const resolvedDb = resolveSafeAgyPath(root, ['conversation_summaries.db'], 'file');
   const found = new Map<string, DiscoveredCliSession>();
 
-  const rows = openReadOnlySqliteWithBackoff(
-    dbPath,
-    (db) =>
-      db.prepare(`SELECT conversation_id, title, workspace_uris, last_modified_time
-        FROM conversation_summaries ${id ? 'WHERE conversation_id = ?' : ''}
-        ORDER BY last_modified_time DESC LIMIT ?`).all(...(id ? [id, limit] : [limit])) as Array<Record<string, unknown>>,
-    [],
-  );
+  const rows = resolvedDb.ok
+    ? openReadOnlySqliteWithBackoff(
+        resolvedDb.path,
+        (db) =>
+          db.prepare(`SELECT conversation_id, title, workspace_uris, last_modified_time
+            FROM conversation_summaries ${id ? 'WHERE conversation_id = ?' : ''}
+            ORDER BY last_modified_time DESC LIMIT ?`).all(...(id ? [id, limit] : [limit])) as Array<Record<string, unknown>>,
+        [],
+      )
+    : [];
 
   for (const row of rows) {
     if (typeof row.conversation_id !== 'string' || !/^[\da-f-]{36}$/i.test(row.conversation_id)) continue;
@@ -553,10 +744,16 @@ export function scanAgyRoot(
     });
   }
 
-  if (found.size < limit) {
-    for (const { file, mtimeMs, size } of collectFiles(path.join(root, 'conversations'), 0,
+  const resolvedConversationsDir = resolveSafeAgyPath(root, ['conversations'], 'directory');
+  if (found.size < limit && resolvedConversationsDir.ok) {
+    for (const { file, mtimeMs, size } of collectFiles(resolvedConversationsDir.path, 0,
       (name) => /^[\da-f-]{36}\.(db|pb)$/i.test(name) && (!id || name.startsWith(`${id}.`)))) {
       if (found.size >= limit) break;
+      try {
+        if (fs.lstatSync(file).isSymbolicLink()) continue;
+      } catch {
+        continue;
+      }
       const nativeSessionId = path.basename(file, path.extname(file));
       if (!found.has(nativeSessionId)) found.set(nativeSessionId, {
         harnessKind: 'agy',
