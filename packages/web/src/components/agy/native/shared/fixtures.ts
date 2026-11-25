@@ -815,6 +815,7 @@ export function createStubNativeTransport(config: {
     }),
     getCapabilities: async () => ({
       schemaVersion: 1,
+      binding: currentSnapshot.binding,
       capabilitiesRevision: currentSnapshot.capabilitiesRevision,
       descriptors: config.capabilities,
     }),

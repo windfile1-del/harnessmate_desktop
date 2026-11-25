@@ -689,8 +689,19 @@ describe('NP-01 Protocol Observatory: Format Migration & U01 Boundary Guards (R1
             });
           }
         } else if (msg.method === 'session/prompt') {
-          write({ method: 'session/update', params: { sessionId: 'mock-sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'NP00_FINITE_DONE' } } } });
+          if (mode === 'prompt-error') {
+            write({ id: msg.id, error: { code: -32001, message: 'Fixture prompt rejected' } });
+            return;
+          }
+          const update = (fields) => write({ method: 'session/update', params: { sessionId: 'mock-sess-1', update: fields } });
+          if (mode === 'success') {
+            update({ sessionUpdate: 'tool_call', toolCallId: 'finite-fixture', kind: 'execute', status: 'in_progress', rawInput: { isBackground: true, IsDaemon: false } });
+          }
           write({ id: msg.id, result: { stopReason: 'end_turn' } });
+          if (mode === 'success') {
+            update({ sessionUpdate: 'tool_call_update', toolCallId: 'finite-fixture', status: 'completed', rawOutput: { stdout: 'NP00_FINITE_DONE' } });
+            update({ sessionUpdate: 'tool_call', toolCallId: 'follow-up-fixture', kind: 'read', status: 'completed' });
+          }
         }
       });
       `,
@@ -745,6 +756,18 @@ describe('NP-01 Protocol Observatory: Format Migration & U01 Boundary Guards (R1
     );
     expect(ok.success).toBe(true);
     expect(ok.outcome).toBe('reactive_observed');
+
+    for (const [mode, success, outcome] of [
+      ['no-wake', true, 'reactive_not_observed'],
+      ['prompt-error', false, 'reactive_failed_prompt-rpc-error'],
+    ] as const) {
+      const observation = await runLiveRecord(
+        ['--agy', 'mock', '--scratch', mockScratch, '--test-profile', mockProfile,
+          '--reactive-confirmed', '--model', 'gemini-3.8-flash'],
+        commonHooks(mode),
+      );
+      expect(observation).toMatchObject({ success, outcome });
+    }
     expect(ok.promptSent).toBe(true);
 
     // 5) Clean v2 request downgraded to v1 -> success: true, requestedProtocol=2, negotiatedProtocol=1

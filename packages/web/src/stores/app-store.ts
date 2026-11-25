@@ -2279,7 +2279,8 @@ export const useAppStore = create<AppState>((set, get) => {
       const slice = get().nativeRuntimeBySession[sessionId];
       const projection = slice?.projection;
       const session = get().sessions.find((s) => s.id === sessionId);
-      if (!projection || !session) {
+      if (!projection || !session ||
+          (activeNativeTransport.mode === 'http' && (!projection.enabled || slice?.syncState.phase !== 'live'))) {
         get().pushToast({
           kind: 'warning',
           title: '原生运行时尚未就绪',
@@ -2427,7 +2428,7 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         if (!isScopeStillValid()) return false;
 
-        const isConflict = err instanceof NativeClientError && err.status === 409;
+        const isConflict = err instanceof NativeClientError && err.code === 'STALE_BINDING';
         set((state) => {
           const prev = state.nativeRuntimeBySession[sessionId];
           if (!prev) return state;
@@ -2462,8 +2463,10 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!get().agyNativeWorkbenchEnabled) {
         throw new Error('AGY 原生工作台门控已关闭');
       }
-      const projection = get().nativeRuntimeBySession[sessionId]?.projection;
-      if (!projection) {
+      const slice = get().nativeRuntimeBySession[sessionId];
+      const projection = slice?.projection;
+      if (!projection ||
+          (activeNativeTransport.mode === 'http' && (!projection.enabled || slice?.syncState.phase !== 'live'))) {
         throw new Error('原生运行时未连接，无法执行控制操作');
       }
       const binding = req.expectedBinding ?? projection.binding;

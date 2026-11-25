@@ -595,11 +595,17 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         receiptId: claimed.receipt.receiptId,
       });
       const validatedResponse = NativeCommandResponseSchema.parse(rawResponse);
-      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      const completed = deps.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'completed',
         validatedResponse,
       );
+      if (!completed) {
+        return sendNativeError(reply, 409, 'DELIVERY_UNKNOWN', 'Runtime changed before its receipt could be completed', {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: 'delivery_unknown' },
+        });
+      }
       return reply
         .code(validatedResponse.kind === 'accepted' ? 202 : 200)
         .send(validatedResponse);
@@ -809,11 +815,17 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         receiptId: claimed.receipt.receiptId,
       });
       const validatedResponse = NativeControlResponseSchema.parse(rawResponse);
-      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      const completed = deps.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'completed',
         validatedResponse,
       );
+      if (!completed) {
+        return sendNativeError(reply, 409, 'DELIVERY_UNKNOWN', 'Runtime changed before its receipt could be completed', {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: 'delivery_unknown' },
+        });
+      }
       return reply.code(200).send(validatedResponse);
     } catch {
       deps.nativeRegistry.persistence.completeIdempotentReceipt(
@@ -995,12 +1007,18 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         });
 
         const finalState = outcome.receiptState;
-        deps.nativeRegistry.persistence.transitionApprovalReceiptState(
+        const transition = deps.nativeRegistry.persistence.transitionApprovalReceiptState(
           cas.receipt.receiptId,
           ['claimed'],
           finalState,
           { outcome: parsed.data.outcome },
         );
+        if (!transition.transitioned) {
+          return sendNativeError(reply, 409, 'DELIVERY_UNKNOWN', 'Runtime changed before its approval receipt could be completed', {
+            retryable: false,
+            details: { receiptId: cas.receipt.receiptId, receiptState: transition.receipt?.state ?? 'delivery_unknown' },
+          });
+        }
 
         const body = ResolveNativeRequestResponseSchema.parse({
           schemaVersion: AGY_NATIVE_CONTRACT_VERSION,

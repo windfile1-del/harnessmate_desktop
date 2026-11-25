@@ -312,11 +312,21 @@ export class NativeRuntimeStore {
     }
   }
 
-  private assertBindingMatchesCurrent(bindingRow: BindingRow, binding: RuntimeBinding): void {
+  private isLatestBinding(db: DatabaseSync, binding: BindingRow): boolean {
+    const latest = db.prepare(
+      `SELECT runtime_id FROM native_runtime_bindings
+       WHERE session_id = ? AND instance_id = ?
+       ORDER BY binding_revision DESC LIMIT 1`,
+    ).get(binding.session_id, binding.instance_id) as { runtime_id: string } | undefined;
+    return latest?.runtime_id === binding.runtime_id;
+  }
+
+  private assertBindingMatchesCurrent(db: DatabaseSync, bindingRow: BindingRow, binding: RuntimeBinding): void {
     if (
       bindingRow.session_id !== binding.sessionId ||
       bindingRow.instance_id !== binding.instanceId ||
-      bindingRow.current_generation !== binding.generation
+      bindingRow.current_generation !== binding.generation ||
+      !this.isLatestBinding(db, bindingRow)
     ) {
       throw new NativePersistenceError(
         'STALE_BINDING',
@@ -330,6 +340,7 @@ export class NativeRuntimeStore {
     runtimeId: string,
     now: number,
     generation?: string,
+    retireDispatches = false,
   ): { lostCount: number; unknownCount: number } {
     const lostRes = generation
       ? db
@@ -352,16 +363,18 @@ export class NativeRuntimeStore {
           .prepare(
             `UPDATE native_runtime_receipts
              SET state = 'delivery_unknown', updated_at = ?
-             WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'claimed'`,
+             WHERE runtime_id = ? AND generation = ? AND state = 'claimed'
+                 AND (kind = 'approval' OR (? = 1 AND kind IN ('command', 'control')))`,
           )
-          .run(now, runtimeId, generation)
+          .run(now, runtimeId, generation, Number(retireDispatches))
       : db
           .prepare(
             `UPDATE native_runtime_receipts
              SET state = 'delivery_unknown', updated_at = ?
-             WHERE runtime_id = ? AND kind = 'approval' AND state = 'claimed'`,
+             WHERE runtime_id = ? AND state = 'claimed'
+                 AND (kind = 'approval' OR (? = 1 AND kind IN ('command', 'control')))`,
           )
-          .run(now, runtimeId);
+          .run(now, runtimeId, Number(retireDispatches));
 
     return {
       lostCount: Number(lostRes.changes),
@@ -393,7 +406,7 @@ export class NativeRuntimeStore {
         if (existing.profile_ref !== params.profileRef || existing.source_ref !== sourceRef) {
           // Immutable profile/source ref changed: invalidate prior binding receipts and allocate a fresh runtimeId/generation
           const now = Date.now();
-          this.invalidateReceiptsInTx(db, existing.runtime_id, now);
+          this.invalidateReceiptsInTx(db, existing.runtime_id, now, undefined, true);
           db.prepare(
             `UPDATE native_runtime_bindings SET status = 'disconnected', retention_reasons_json = '[]', updated_at = ?
              WHERE runtime_id = ?`,
@@ -429,7 +442,7 @@ export class NativeRuntimeStore {
 
         if (params.advanceIfExisting) {
           const now = Date.now();
-          this.invalidateReceiptsInTx(db, existing.runtime_id, now, existing.current_generation);
+          this.invalidateReceiptsInTx(db, existing.runtime_id, now, existing.current_generation, true);
           const nextGen =
             params.generation ?? asBindingGeneration(`gen_${crypto.randomBytes(5).toString('hex')}`);
           db.prepare(
@@ -520,8 +533,11 @@ export class NativeRuntimeStore {
         throw new NativePersistenceError('BINDING_NOT_FOUND', `Native runtime binding not found: ${runtimeId}`);
       }
       const now = Date.now();
-      // Fence and invalidate any in-flight/pending approvals from the outgoing generation
-      this.invalidateReceiptsInTx(db, runtimeId, now, existing.current_generation);
+      if (!this.isLatestBinding(db, existing)) {
+        throw new NativePersistenceError('STALE_BINDING', 'Cannot advance a retired runtime binding');
+      }
+      // Fence in-flight receipts before changing generation
+      this.invalidateReceiptsInTx(db, runtimeId, now, existing.current_generation, true);
 
       const nextGen =
         opts?.generation ?? asBindingGeneration(`gen_${crypto.randomBytes(5).toString('hex')}`);
@@ -603,7 +619,7 @@ export class NativeRuntimeStore {
       }
 
       // Strict generation & binding scope fence (runs BEFORE mutationKey check!)
-      this.assertBindingMatchesCurrent(bindingRow, binding);
+      this.assertBindingMatchesCurrent(db, bindingRow, binding);
 
       if (eventDraft.mutationKey) {
         const existingEventRow = db
@@ -1213,7 +1229,7 @@ export class NativeRuntimeStore {
           `Native runtime binding not found: ${params.binding.runtimeId}`,
         );
       }
-      this.assertBindingMatchesCurrent(bindingRow, params.binding);
+      this.assertBindingMatchesCurrent(db, bindingRow, params.binding);
 
       const existing = db
         .prepare(
@@ -1265,17 +1281,28 @@ export class NativeRuntimeStore {
     responseJson: unknown,
   ): StoredNativeReceipt | null {
     this.assertSchemaCompatible();
-    const now = Date.now();
-    const db = this.store.getDatabaseSync();
-    db.prepare(
-      `UPDATE native_runtime_receipts
-       SET state = ?, response_json = ?, updated_at = ?
-       WHERE receipt_id = ?`,
-    ).run(state, JSON.stringify(responseJson), now, receiptId);
-    const updated = db
-      .prepare('SELECT * FROM native_runtime_receipts WHERE receipt_id = ?')
-      .get(receiptId) as unknown as ReceiptRow | undefined;
-    return updated ? mapReceiptRow(updated) : null;
+    return this.store.runInImmediateTransaction((db) => {
+      const result = db.prepare(
+        `UPDATE native_runtime_receipts AS receipt
+         SET state = ?, response_json = ?, updated_at = ?
+         WHERE receipt_id = ? AND state = 'claimed' AND kind IN ('command', 'control')
+           AND EXISTS (
+             SELECT 1 FROM native_runtime_bindings AS binding
+             WHERE binding.runtime_id = receipt.runtime_id
+               AND binding.current_generation = receipt.generation
+               AND NOT EXISTS (
+                 SELECT 1 FROM native_runtime_bindings AS newer
+                 WHERE newer.session_id = binding.session_id AND newer.instance_id = binding.instance_id
+                   AND newer.binding_revision > binding.binding_revision
+               )
+           )`,
+      ).run(state, JSON.stringify(responseJson), Date.now(), receiptId);
+      if (Number(result.changes) !== 1) return null;
+      const updated = db.prepare(
+        'SELECT * FROM native_runtime_receipts WHERE receipt_id = ?',
+      ).get(receiptId) as unknown as ReceiptRow;
+      return mapReceiptRow(updated);
+    });
   }
 
   createPendingApprovalReceipt(params: {
@@ -1293,7 +1320,7 @@ export class NativeRuntimeStore {
           `Native runtime binding not found: ${params.binding.runtimeId}`,
         );
       }
-      this.assertBindingMatchesCurrent(bindingRow, params.binding);
+      this.assertBindingMatchesCurrent(db, bindingRow, params.binding);
 
       const existing = db
         .prepare(
@@ -1369,7 +1396,9 @@ export class NativeRuntimeStore {
         .get(existing.runtime_id) as unknown as BindingRow | undefined;
 
       const now = Date.now();
-      if (!bindingRow || bindingRow.current_generation !== existing.generation) {
+      if (!bindingRow ||
+          bindingRow.current_generation !== existing.generation ||
+          !this.isLatestBinding(db, bindingRow)) {
         // Stale-generation receipt: invalidate if still pending so it can never be claimed
         if (existing.state === 'pending') {
           db.prepare(
@@ -1433,7 +1462,12 @@ export class NativeRuntimeStore {
         .get(receiptId) as unknown as ReceiptRow | undefined;
       if (!existing) return { transitioned: false, receipt: null };
 
-      if (!fromStates.includes(existing.state as NativeRequestReceiptState)) {
+      const binding = db.prepare(
+        'SELECT * FROM native_runtime_bindings WHERE runtime_id = ?',
+      ).get(existing.runtime_id) as unknown as BindingRow | undefined;
+      if (!binding || binding.current_generation !== existing.generation ||
+          !this.isLatestBinding(db, binding) ||
+          !fromStates.includes(existing.state as NativeRequestReceiptState)) {
         return { transitioned: false, receipt: mapReceiptRow(existing) };
       }
       const now = Date.now();

@@ -396,7 +396,7 @@ function summarizeConfigOptions(configOptions) {
   });
 }
 
-function extractMarkersFromUnknown(value, aliases) {
+export function extractMarkersFromUnknown(value, aliases) {
   if (value === undefined || value === null) return null;
   if (typeof value === 'string') return aliases.correlateMarkerText(value);
   if (typeof value !== 'object') return null;

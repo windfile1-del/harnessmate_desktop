@@ -7,7 +7,7 @@ import { createInterface as interactiveReadline } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { buildFourLayerSummary } from './four-layer.mjs';
 import { ProtocolObservatoryRecorder } from './recorder.mjs';
-import { safePublicOption } from './sanitizer.mjs';
+import { extractMarkersFromUnknown, safePublicOption } from './sanitizer.mjs';
 import { validateCaptureRecords } from './schema-validator.mjs';
 
 export const GEMINI_38_FLASH_RE = /^gemini-3\.8-flash(?:[-_.:][a-z0-9._:-]{1,64})?$/i;
@@ -216,7 +216,7 @@ function findModelConfig(options) {
   return Array.isArray(options) ? options.find((o) => o?.category === 'model' || o?.id === 'model') : undefined;
 }
 
-export function evaluateCaptureOutcome({ mode, protocol, reason, negotiatedProtocol, authRequiredObserved, promptSent, validationValid }) {
+export function evaluateCaptureOutcome({ mode, protocol, reason, negotiatedProtocol, authRequiredObserved, promptSent, reactiveObserved, validationValid }) {
   if (!validationValid) {
     return { success: false, outcome: 'validation_failed' };
   }
@@ -237,7 +237,7 @@ export function evaluateCaptureOutcome({ mode, protocol, reason, negotiatedProto
   }
   if (mode === 'reactive_confirmed') {
     if (reason === 'post-response-observation-window' && promptSent) {
-      return { success: true, outcome: 'reactive_observed' };
+      return { success: true, outcome: reactiveObserved ? 'reactive_observed' : 'reactive_not_observed' };
     }
     return { success: false, outcome: `reactive_failed_${reason}` };
   }
@@ -488,6 +488,11 @@ export async function runLiveRecord(argv = process.argv.slice(2), internalTestHo
     let finalized = false;
     let promptSent = false;
     let authRequiredObserved = false;
+    let promptResponseSeen = false;
+    let completedBackgroundTool = null;
+    let reactiveObserved = false;
+    const backgroundTools = new Set();
+    const seenTools = new Set();
     let negotiatedProtocol = null;
     let tailTimer = null;
     let closeWaitTimer = null;
@@ -529,6 +534,7 @@ export async function runLiveRecord(argv = process.argv.slice(2), internalTestHo
         negotiatedProtocol,
         authRequiredObserved,
         promptSent,
+        reactiveObserved,
         validationValid: preValidation.valid,
       });
 
@@ -724,7 +730,28 @@ export async function runLiveRecord(argv = process.argv.slice(2), internalTestHo
 
       if (msg.method === 'session/update') {
         const u = msg.params?.update ?? {};
-        if (cfg.live && parentSession && msg.params?.sessionId === parentSession && u.sessionUpdate === 'config_option_update') {
+        const belongsToProbe = cfg.live && parentSession && msg.params?.sessionId === parentSession;
+        if (belongsToProbe && promptSent && rec && !rec.truncated && !rec.correlation.childAlias) {
+          const tool = rec.correlation.toolAlias;
+          if (u.sessionUpdate === 'tool_call' && tool) {
+            if (!promptResponseSeen && rec.shape.detectedRole === 'background_command' &&
+                (u.status === 'pending' || u.status === 'in_progress')) {
+              backgroundTools.add(tool);
+            }
+            if (completedBackgroundTool && !seenTools.has(tool)) {
+              reactiveObserved = true;
+            }
+            seenTools.add(tool);
+          } else if (u.sessionUpdate === 'tool_call_update' && tool && backgroundTools.has(tool) &&
+                     ['completed', 'failed', 'cancelled'].includes(u.status)) {
+            backgroundTools.delete(tool);
+            if (promptResponseSeen && u.status === 'completed' &&
+                extractMarkersFromUnknown(u.rawOutput, recorder.aliases)?.some(({ marker }) => marker === 'NP00_FINITE_DONE')) {
+              completedBackgroundTool = tool;
+            }
+          }
+        }
+        if (belongsToProbe && u.sessionUpdate === 'config_option_update') {
           const model = findModelConfig(u.configOptions);
           if (model && model.id === modelConfigId && typeof model.currentValue === 'string') {
             selectedModel = model.currentValue;
@@ -775,7 +802,10 @@ export async function runLiveRecord(argv = process.argv.slice(2), internalTestHo
         }
         modelResponseAccepted = true;
         confirmPrompt();
-      } else if (msg.id === 3) {
+      } else if (msg.id === 3 && promptSent && !promptResponseSeen) {
+        if (msg.error) return initiateStop('prompt-rpc-error');
+        if (msg.result?.stopReason !== 'end_turn') return initiateStop('prompt-not-successful');
+        promptResponseSeen = true;
         tailTimer = setTimeout(
           () => initiateStop('post-response-observation-window'),
           cfg.allowMockBinaryForTest ? Math.min(cfg.postResponseWindowMs, 150) : cfg.postResponseWindowMs,

@@ -78,6 +78,12 @@ node scripts/agy-np/observatory/cli.mjs summarize --in D:\HarnessMate\np00-resea
 node scripts/agy-np/observatory/cli.mjs summarize --in D:\HarnessMate\np00-research\four-layer.ndjson --format np03
 ```
 
+### U01 结果判读
+
+- `reactive_observed` 需要同会话、同工具 ID 的有限后台任务在 Prompt 返回后完成、工具结果包含固定测试标记，随后观察到新的工具调用。
+- `reactive_not_observed` 表示采集窗口结束且保留了有效记录，仍缺唤醒证据。不要把此结果登记为能力通过。
+- `reactive_failed_prompt-rpc-error` 等失败结果保留脱敏证据。遵守 U01 一次授权试验范围，重新调用前等待新的授权。
+
 ## 2. 给 NP-03 的安全诊断编号输入格式（v0.2 唯一编号）
 
 每条记录均按 `connectionId + generation + channel + ingressOrdinal + seq` 生成全局唯一且无敏感信息的可复制编号：

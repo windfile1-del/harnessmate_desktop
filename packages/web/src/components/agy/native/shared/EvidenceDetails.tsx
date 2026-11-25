@@ -37,12 +37,16 @@ export function EvidenceDetails({
 }: EvidenceDetailsProps) {
   const [open, setOpen] = useState(defaultOpen);
   const effectiveReason = reasonCode ?? evidence?.reasonCode ?? null;
-  const freshnessLabel =
-    evidence?.freshness === 'fresh'
-      ? '最新'
-      : evidence?.freshness === 'stale'
-        ? '已过期 (Stale)'
-        : '未知 (Unknown)';
+  const freshnessLabels: Record<EvidenceDto['freshness'], string> = {
+    fresh: '最新',
+    live: '实时',
+    snapshot: '快照',
+    stale: '已过期 (Stale)',
+    replay: '历史回放',
+    host: '本机观测',
+    unknown: '未知 (Unknown)',
+  };
+  const freshnessLabel = freshnessLabels[evidence?.freshness ?? 'unknown'];
 
   return (
     <div

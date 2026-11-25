@@ -1,10 +1,19 @@
-import type { CanonicalEvent, Session } from '@harnessmate/protocol';
+import {
+  AGY_NATIVE_CONTRACT_REVISION,
+  NativeCanonicalEventSchema,
+  NativeCommandResponseSchema,
+  NativeEventsResponseSchema,
+  createKnownEmptyNativeProjection,
+  type CanonicalEvent,
+  type Session,
+} from '@harnessmate/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   NativeClientError,
   NativeFeedController,
   applyNativeEventBatch,
   coalesceTimelineEntries,
+  createHttpNativeTransport,
   type ActivityId,
   type BindingGeneration,
   type NativeAgentId,
@@ -31,6 +40,193 @@ afterEach(() => {
   useAppStore.getState().setNativeTransport(null);
   useAppStore.setState(initialStore, true);
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+describe('NP-02 / NP-03 shared wire integration', () => {
+  it('reads a 202 receipt and projects the daemon approval event shape', async () => {
+    const { projection } = createLiveReactiveFixture('sess_contract');
+    const wireBinding = createKnownEmptyNativeProjection({
+      sessionId: projection.binding.sessionId,
+      instanceId: projection.binding.instanceId,
+      runtimeId: projection.binding.runtimeId,
+      generation: projection.binding.generation,
+    }).binding;
+    const seq = projection.asOfSeq + 1;
+    const event = NativeCanonicalEventSchema.parse({
+      schemaVersion: 1,
+      runtimeId: wireBinding.runtimeId,
+      sessionId: wireBinding.sessionId,
+      generation: wireBinding.generation,
+      seq,
+      turnId: null,
+      createdAt: 100,
+      type: 'native.request.changed',
+      payload: { approvalId: 'approval_contract', receiptId: 'receipt_approval', kind: 'permission', receiptState: 'pending' },
+    });
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(NativeCommandResponseSchema.parse({
+        schemaVersion: 1, kind: 'accepted', receiptId: 'receipt_command', activityId: 'activity_contract',
+      }), { status: 202 }))
+      .mockResolvedValueOnce(Response.json(NativeEventsResponseSchema.parse({
+        schemaVersion: 1, binding: wireBinding, runtimeId: wireBinding.runtimeId,
+        generation: wireBinding.generation, asOfSeq: seq, events: [event],
+        nextSeq: seq, nextCursor: 'cursor-fixture', hasMore: false,
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = createHttpNativeTransport();
+    await expect(transport.submitCommand(wireBinding.sessionId, {
+      bindingGeneration: wireBinding.generation,
+      catalogRevision: 0, capabilityId: 'agy.workflow.goal', actionKey: 'launch',
+      idempotencyKey: 'contract-req', args: {},
+    })).resolves.toMatchObject({ status: 'accepted', receiptId: 'receipt_command' });
+    const page = await transport.getEvents(wireBinding.sessionId, {
+      afterSeq: projection.asOfSeq, generation: wireBinding.generation,
+    });
+    expect(fetchMock.mock.calls[1]?.[0]).toContain('generation=');
+    const next = applyNativeEventBatch(projection, page.events).projection;
+    expect(next.requestIds).toContain('approval_contract');
+    expect(next.receipts?.approval_contract).toMatchObject({
+      receiptState: 'pending', receiptId: 'receipt_approval', generation: wireBinding.generation,
+    });
+  });
+
+  it('keeps mismatched capability bindings or revisions out of the selected runtime', async () => {
+    const { projection, capabilities } = createLiveReactiveFixture('sess_caps_contract');
+    const transport = createStubNativeTransport({ snapshot: projection, capabilities });
+    const readCapabilities = transport.getCapabilities.bind(transport);
+    const controller = new NativeFeedController({
+      sessionId: projection.binding.sessionId, transport, onUpdate: () => {},
+    });
+    try {
+      const cap = await readCapabilities(projection.binding.sessionId);
+      for (const mismatch of [
+        { ...cap, binding: { ...cap.binding, generation: 'gen_retired' as BindingGeneration } },
+        { ...cap, capabilitiesRevision: cap.capabilitiesRevision + 1 },
+      ]) {
+        transport.getCapabilities = async () => mismatch;
+        await controller.hydrate();
+        expect(controller.getSnapshot()).toMatchObject({
+          capabilities: [], syncState: { phase: 'incomplete', incompleteReason: 'capabilities_binding_mismatch' },
+        });
+      }
+      transport.getCapabilities = readCapabilities;
+      await controller.hydrate();
+      expect(controller.getSnapshot()).toMatchObject({ capabilities, syncState: { phase: 'live' } });
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  it('lets a new hydration finish while the retired page request is still pending', async () => {
+    const { projection, capabilities } = createLiveReactiveFixture('sess_refresh_contract');
+    const transport = createStubNativeTransport({ snapshot: projection, capabilities });
+    const readEvents = transport.getEvents.bind(transport);
+    let reportPage: (page: Awaited<ReturnType<typeof readEvents>>) => void = () => {};
+    const pending = new Promise<Awaited<ReturnType<typeof readEvents>>>(resolve => { reportPage = resolve; });
+    let reportStarted = () => {};
+    const started = new Promise<void>(resolve => { reportStarted = resolve; });
+    const getEvents = vi.fn(readEvents).mockImplementationOnce(() => {
+      reportStarted();
+      return pending;
+    });
+    transport.getEvents = getEvents;
+    const controller = new NativeFeedController({
+      sessionId: projection.binding.sessionId, transport, onUpdate: () => {},
+    });
+    const request = { afterSeq: projection.asOfSeq };
+    const first = controller.hydrate();
+    try {
+      await started;
+      await controller.hydrate();
+      expect(getEvents).toHaveBeenCalledTimes(2);
+      expect(controller.getSnapshot().syncState.phase).toBe('live');
+    } finally {
+      reportPage(await readEvents(projection.binding.sessionId, request));
+      await first;
+      controller.dispose();
+    }
+  });
+
+  it('subscribes from the hydrated watermark and reconnects with a fresh snapshot', async () => {
+    vi.useFakeTimers();
+    const sockets: FixtureSocket[] = [];
+    class FixtureSocket extends EventTarget {
+      readonly send = vi.fn();
+      readonly close = vi.fn();
+      constructor(readonly url: URL) {
+        super();
+        sockets.push(this);
+      }
+      receive(frame: unknown) {
+        this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(frame) }));
+      }
+    }
+    vi.stubGlobal('WebSocket', FixtureSocket);
+    vi.stubGlobal('window', { location: { href: 'http://localhost/' } });
+    const projection = createKnownEmptyNativeProjection({
+      sessionId: 'sess_socket', instanceId: 'agy', enabled: true,
+    });
+    const { binding } = projection;
+    const rev = AGY_NATIVE_CONTRACT_REVISION;
+    let snapshotSeq = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      if (input.endsWith('/snapshot')) return Response.json({ schemaVersion: 1, contractRevision: rev, enabled: true, projection: { ...projection, asOfSeq: snapshotSeq } });
+      if (input.endsWith('/capabilities')) return Response.json({
+        schemaVersion: 1, contractRevision: rev, enabled: true, binding, capabilitiesRevision: 0, descriptors: [],
+      });
+      return Response.json({
+        schemaVersion: 1, binding, runtimeId: binding.runtimeId, generation: binding.generation,
+        asOfSeq: snapshotSeq, nextSeq: snapshotSeq, nextCursor: 'cursor_fixture', hasMore: false, events: [],
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new NativeFeedController({
+      sessionId: binding.sessionId, transport: createHttpNativeTransport(), onUpdate: () => {},
+    });
+    const accept = (socket: FixtureSocket) => socket.receive({
+      op: 'native_hello', schemaVersion: 1, contractRevision: rev, sessionId: binding.sessionId,
+      runtimeId: binding.runtimeId, generation: binding.generation, enabled: true,
+    });
+    const finishReplay = (socket: FixtureSocket, lastSeq: number) => socket.receive({
+      op: 'native_replay_complete', schemaVersion: 1, runtimeId: binding.runtimeId,
+      generation: binding.generation, lastSeq, nextCursor: 'cursor_fixture',
+    });
+    try {
+      await controller.hydrate();
+      expect(controller.getSnapshot().syncState.phase).toBe('catching_up');
+      const first = sockets[0]!;
+      expect(String(first.url)).toBe('ws://localhost/api/v1/sessions/sess_socket/native/ws');
+      accept(first);
+      expect(JSON.parse(first.send.mock.calls[0]![0])).toMatchObject({
+        op: 'subscribe_native', afterSeq: 0, generation: binding.generation,
+      });
+      first.receive({
+        op: 'native_event', schemaVersion: 1, event: {
+          schemaVersion: 1, ...binding, instanceId: undefined, seq: 1, turnId: null, createdAt: 100,
+          type: 'native.request.changed', payload: { approvalId: 'approval_socket', kind: 'permission', receiptState: 'pending' },
+        },
+      });
+      finishReplay(first, 1);
+      expect(controller.getSnapshot()).toMatchObject({
+        projection: { asOfSeq: 1, requestIds: ['approval_socket'] }, syncState: { phase: 'live' },
+      });
+      snapshotSeq = 1;
+      first.dispatchEvent(new Event('close'));
+      expect(controller.getSnapshot().syncState.phase).toBe('incomplete');
+      await vi.advanceTimersByTimeAsync(300);
+      const second = sockets[1]!;
+      accept(second);
+      finishReplay(second, snapshotSeq);
+      expect(first.close).toHaveBeenCalledOnce();
+      expect(controller.getSnapshot().syncState.phase).toBe('live');
+      expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/snapshot'))).toHaveLength(2);
+    } finally {
+      controller.dispose();
+    }
+    expect(sockets[1]?.close).toHaveBeenCalledOnce();
+  });
 });
 
 describe('NP-03 Native Client & Projection Reducer (03b)', () => {

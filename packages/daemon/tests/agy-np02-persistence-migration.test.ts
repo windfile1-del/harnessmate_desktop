@@ -597,6 +597,29 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
       expect(gen2EventsBefore.events).toHaveLength(0);
     }
 
+    const lateCommand = registry.persistence.claimIdempotentReceipt({
+      binding: gen2Binding,
+      kind: 'command',
+      idempotencyKey: 'retiring-command',
+      payloadDigest: computePayloadDigest({ action: 'fixture' }),
+    });
+    const current = registry.ensureRuntimeBinding({ sessionId, instanceId: 'agy', profileRef: 'agy:other' });
+    expect(current.runtimeId).not.toBe(gen2Binding.runtimeId);
+    const lateEvent = {
+      type: 'native.runtime.changed',
+      turnId: null,
+      payload: { status: 'attached', retentionReasons: [], revision: 3 },
+    } as const;
+    expect(() => registry.commitAndPublish(gen2Binding, { status: 'attached' }, lateEvent))
+      .toThrowError(expect.objectContaining({ code: 'STALE_BINDING' }));
+    expect(() => registry.persistence.advanceGeneration(gen2Binding.runtimeId))
+      .toThrowError(expect.objectContaining({ code: 'STALE_BINDING' }));
+    expect(() => registry.persistence.createPendingApprovalReceipt({ binding: gen2Binding, approvalId: 'late' }))
+      .toThrowError(expect.objectContaining({ code: 'STALE_BINDING' }));
+    expect(registry.persistence.completeIdempotentReceipt(lateCommand.receipt.receiptId, 'completed', {}))
+      .toBeNull();
+    expect(registry.persistence.getBinding(gen2Binding.runtimeId)?.status).toBe('disconnected');
+
     store.close();
   });
 });
