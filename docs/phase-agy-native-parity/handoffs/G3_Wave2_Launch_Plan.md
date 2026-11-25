@@ -1,6 +1,6 @@
 # G3 第二批开发安排 · NP-12 至 NP-15
 
-四个 Coding Agent 会话可以从固定源码基线 `agy-np-g2 @ fdd1193cf2b36dbacf9ef9d4cba9f19dcc920a9c` 同时开工。先读各自的完整提示词、[共享契约](../08_Shared_Contracts.md) 和 [测试策略](../12_Test_Strategy.md)。[第一批联合审查](../reviews/G3-wave1-intake.md) 记录了后续联测依赖和已复现的连接归属问题。G3 第一批候选仍在修复验证阶段。
+同时开四个独立 Coding Agent 会话，统一从本地标签 `agy-np-g3-wave1` 的提交开工。该标签含修复后的第一批源码和四份更新后的提示词。共同审查源码为 `5711a8266bdca72fd34a5dd07f59aedfb108a237`。开工前记录各自解析出的相同标签 SHA，并读各自的提示词、[共享契约](../08_Shared_Contracts.md)、[测试策略](../12_Test_Strategy.md) 和 [第一批复验](../reviews/G3-wave1-verification.md)。
 
 | 会话与独立提示词 | 建议分支 | 单独验收内容 |
 | --- | --- | --- |
@@ -15,15 +15,24 @@ Git 示例使用不同的 D 盘路径，已有合适 Worktree 可复用。四个
 
 ~~~powershell
 $repo = 'D:\HarnessMate\harnessmate_desktop'
-$base = git -C $repo rev-parse --verify 'agy-np-g2^{commit}'
-if ($LASTEXITCODE -ne 0 -or $base -ne 'fdd1193cf2b36dbacf9ef9d4cba9f19dcc920a9c') {
-    throw 'The reviewed G2 checkpoint is unavailable'
-}
+$base = git -C $repo rev-parse --verify 'agy-np-g3-wave1^{commit}'
+if ($LASTEXITCODE -ne 0) { throw 'The reviewed G3 wave-one checkpoint is unavailable' }
+git -C $repo merge-base --is-ancestor '5711a8266bdca72fd34a5dd07f59aedfb108a237' $base
+if ($LASTEXITCODE -ne 0) { throw 'The checkpoint is missing the reviewed source' }
 git -C $repo worktree list
 git -C $repo worktree add -b codex/agy-np-12-goal-tasks 'D:\HarnessMate\agy-np-worktrees\np-12' $base
 ~~~
 
-NP-13 至 NP-15 按表替换分支和 Worktree 末级目录。各会话写入自己的领域目录和测试，所有权以提示词为准。共享协议、数据库编号、`SessionManager`、ACP 传输、`wiring/**`、目录与公共 App/Store 接线由总指挥归口。任务遇到共享契约缺口，提交包含输入、输出、模拟夹具、失败语义与回滚的提议。账户、依赖缓存及测试临时目录沿用 D 盘隔离方案。
+NP-13 至 NP-15 按表替换分支和 Worktree 末级目录。各会话写入自己的领域目录和测试，所有权以提示词为准。
+
+| 会话 | 主要文件与模块 |
+| --- | --- |
+| NP-12 | Daemon `native/workflows/tasks/**`、Web `agy/native/tasks/**`、专项用例。 |
+| NP-13 | Daemon `native/ecosystem/**`、`agy-ecosystem.ts`、`agy-config-scope.ts`、限定 AGY Profile 作用域；Web `agy/native/settings/**`、`AgySettingsSlot.tsx`。 |
+| NP-14 | Daemon `native/artifacts/**`、`agy-artifacts.ts`；Web `agy/native/review/**`、`AgyArtifactReviewPanel.tsx`。消费 Teamwork 与 Dynamic 的审阅端口。 |
+| NP-15 | Daemon `native/recovery/**`、`harnesses/history-scanner.ts` 的 AGY 作用域、恢复专项用例。 |
+
+共享协议、数据库编号、`SessionManager`、ACP 传输、`wiring/**`、目录与公共 App/Store 接线由总指挥归口。任务遇到共享契约缺口，提交包含输入、输出、模拟夹具、失败语义与回滚的提议。账户、依赖缓存及测试临时目录沿用 D 盘隔离方案。
 
 ## 联测与交付
 

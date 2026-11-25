@@ -1,8 +1,10 @@
 # 独立开发提示词 · NP-12 Goal、Schedule 与 Native Tasks
 
-你负责 HarnessMate Desktop 的 **NP-12 Goal、Schedule 与 Native Tasks**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
+你负责 HarnessMate Desktop 的 **NP-12 Goal、Schedule 与 Native Tasks**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。从本地标签 `agy-np-g3-wave1` 切分支，按 [第二批开工安排](../handoffs/G3_Wave2_Launch_Plan.md) 校验提交。你的成果由总指挥及独立审查者集成。
 
 ## 目标与开工条件
+
+在本域保存 occurrence 的原生来源和状态，和 NP-15 对齐恢复证据。由总指挥在第一批观察门控内接入经过审查的只读投影。
 
 把原生 Goal 和定时 occurrence 接入 Runtime Center，允许当前用户 turn 结束后仍真实观测后续工作。
 

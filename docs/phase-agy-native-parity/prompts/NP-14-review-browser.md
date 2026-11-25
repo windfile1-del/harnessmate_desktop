@@ -1,8 +1,10 @@
 # 独立开发提示词 · NP-14 Plan、Artifact Review 与 Browser Agent
 
-你负责 HarnessMate Desktop 的 **NP-14 Plan、Artifact Review 与 Browser Agent**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
+你负责 HarnessMate Desktop 的 **NP-14 Plan、Artifact Review 与 Browser Agent**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。从本地标签 `agy-np-g3-wave1` 切分支，按 [第二批开工安排](../handoffs/G3_Wave2_Launch_Plan.md) 校验提交。你的成果由总指挥及独立审查者集成。
 
 ## 目标与开工条件
+
+参考 [Teamwork 审阅端口](../../../packages/daemon/src/harnesses/agy/native/workflows/teamwork/ports.ts) 和 [Dynamic Artifact 端口](../../../packages/daemon/src/harnesses/agy/native/workflows/dynamic/ports.ts)。真机支持证据齐备前，桥接限于只读及合成用例。批准关联须包含同绑定、连接、当前 Artifact 和请求 ID。
 
 把 AGY 的计划、原生产物、diff、审阅和浏览器角色清晰地接入安全工作台。
 
