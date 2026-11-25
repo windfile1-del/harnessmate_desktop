@@ -24,6 +24,7 @@ import type {
   TurnOptionsMap,
   UserQuestionSpec,
 } from '@harnessmate/protocol';
+import type { NativeRuntimeHooks } from './agy/native/wiring/types.js';
 
 export interface PortableHistoryMessage {
   type: 'message';
@@ -60,6 +61,8 @@ export interface AdapterSessionConfig {
   handoffContinuity?: boolean;
   onContinuityNotice?: (channel: 'developer_instructions' | 'system_append', text: string) => void;
   pluginMcp?: PluginMcpConnection;
+  /** Optional dependency-injected native runtime hooks (AGY Native Parity). Inert/omitted for other harnesses. */
+  nativeRuntimeHooks?: NativeRuntimeHooks;
 }
 
 export const handoffContinuityNotice =
@@ -199,6 +202,10 @@ export interface AdapterSessionHandle {
   steerTurn?(input: TurnInput): Promise<void>;
   /** True when non-daemon background processes or scheduled timers keep the native session alive. */
   hasActiveBackgroundWork?(): boolean;
+  /** Optional structured retention reasons keeping the handle alive in the warm pool (AGY Native Parity). */
+  listRetentionReasons?(): string[];
+  /** Optional transport connection identifier for native runtime correlation. */
+  getConnectionId?(): string | null;
   dispose(): Promise<void>;
   onEvent(listener: (event: NormalizedAdapterEvent) => void): () => void;
 }

@@ -6,6 +6,11 @@ import {
   type InstanceBillingTier,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
+import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
+import {
+  evaluateAgyConsumerProvenance,
+  mintAgyDispatchProvenance,
+} from '../harnesses/agy/native/wiring/provenance.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { UsageService } from './usage-service.js';
 
@@ -261,12 +266,33 @@ export class FailoverCoordinator {
     let canAutoFailover = false;
     let downgradedToManualReason: string | null = null;
 
+    const targetAdapter = firstAvailable
+      ? (adapterById.get(firstAvailable.instanceId) ?? this.registry.get(firstAvailable.instanceId))
+      : undefined;
+    const consumerFailoverDecision = firstAvailable
+      ? evaluateAgyConsumerProvenance(
+          {
+            instanceId: firstAvailable.instanceId,
+            driverId: firstAvailable.driverId,
+            profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
+          },
+          mintAgyDispatchProvenance('auto_failover', 'system', 'failover.recommendFailover'),
+        )
+      : null;
+
     if (failedDriverId === 'agy' && firstAvailable?.driverId === 'agy') {
       // Compliance guardrail: multi-account AGY quota rotation is strictly prohibited;
       // users may only perform an explicit manual switch.
       canAutoFailover = false;
       downgradedToManualReason =
         '合规护栏：多 AGY Google 账号仅支持手动一键切换，禁止自动额度轮换。';
+    } else if (firstAvailable && consumerFailoverDecision && !consumerFailoverDecision.allowed) {
+      // Compliance guardrail: automated failover from any harness into a consumer OAuth AGY
+      // instance is downgraded to explicit manual switch.
+      canAutoFailover = false;
+      downgradedToManualReason =
+        consumerFailoverDecision.reason ??
+        '合规护栏：个人 AGY 账号仅支持用户手动切换，禁止自动故障转移。';
     } else if (firstAvailable && !pingPongBlocked && policy.mode !== 'manual_one_click') {
       if (
         policy.mode === 'auto_same_tier' &&

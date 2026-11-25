@@ -2,6 +2,24 @@ import type { UserQuestionOption, UserQuestionSpec } from '@harnessmate/protocol
 import type { AcpPermissionOption } from '../acp/strict-acp-adapter.js';
 import type { NormalizedAdapterEvent } from '../types.js';
 
+export const AGY_DEFAULT_ACP_PROTOCOL_VERSION = 1 as const;
+
+/**
+ * Resolves the requested ACP protocol version for AGY sessions.
+ * Always defaults to v1; v2 Preview remains disabled unless explicitly opted in.
+ */
+export function resolveAgyRequestedProtocolVersion(flags?: {
+  readonly acpV2Preview?: boolean;
+}): 1 | 2 {
+  return flags?.acpV2Preview === true ? 2 : AGY_DEFAULT_ACP_PROTOCOL_VERSION;
+}
+
+export function extractAgyOriginSessionId(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const sessionId = (params as { sessionId?: unknown }).sessionId;
+  return typeof sessionId === 'string' && sessionId.trim().length > 0 ? sessionId.trim() : undefined;
+}
+
 export function supportsAgyActiveSteering(version: string | null | undefined): boolean {
   if (!version) return false;
   const match = version.trim().match(/(\d+)\.(\d+)(?:\.(\d+))?/);

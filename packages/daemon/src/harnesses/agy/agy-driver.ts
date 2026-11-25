@@ -307,8 +307,16 @@ export class AntigravityAcpFlavorPolicy implements AcpFlavorPolicy {
     permissionMode: PermissionMode,
     currentTurnId: string | null,
     nativeSessionId: string | null,
+    opts?: { nativePermissionsActive?: boolean },
   ): { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } | null {
-    if (!currentTurnId || (typeof params.sessionId === 'string' && params.sessionId !== nativeSessionId)) {
+    const outOfTurnOrForeignSession =
+      !currentTurnId || (typeof params.sessionId === 'string' && params.sessionId !== nativeSessionId);
+    if (outOfTurnOrForeignSession) {
+      // When NP-07 NativePermissionPort is active, defer detached/child requests to the native router;
+      // when feature gate is off, preserve legacy AGY behavior unchanged.
+      if (opts?.nativePermissionsActive) {
+        return null;
+      }
       return { outcome: { outcome: 'cancelled' } };
     }
     const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;

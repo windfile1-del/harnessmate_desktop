@@ -27,6 +27,7 @@ import type {
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
+  RuntimeBinding,
   RuntimeRequestKind,
   Session,
   SessionCheckpointRecord,
@@ -50,6 +51,11 @@ import type { HarnessMateStore } from '../db/sqlite.js';
 import { AcpAdapter } from '../harnesses/acp-adapter.js';
 import { findLocalSession, readJsonlHistory } from '../harnesses/history-scanner.js';
 import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
+import {
+  assertAgyConsumerProvenance,
+  type AgyDispatchProvenance,
+} from '../harnesses/agy/native/wiring/provenance.js';
+import type { AgyNativeRuntimeRegistry } from '../harnesses/agy/native/wiring/registry.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type {
   AdapterSessionConfig,
@@ -96,6 +102,7 @@ interface LiveHandleEntry {
   lastUsedAt: number;
   pluginToolKey: string;
   pluginToolLease?: PluginToolLease;
+  nativeBinding?: RuntimeBinding;
 }
 
 interface ActiveTurnMeta {
@@ -123,6 +130,7 @@ type TurnOptions = {
   literalText?: boolean;
   mode?: 'plugin_development';
   terminalContexts?: TerminalContextChip[];
+  dispatchProvenance?: AgyDispatchProvenance;
 };
 
 export class SessionManager {
@@ -145,6 +153,7 @@ export class SessionManager {
     private readonly pluginCapabilities?: PluginCapabilities,
     commandOutputHub?: CommandOutputHub,
     private readonly terminalWorkspace?: TerminalWorkspaceService,
+    private readonly nativeRegistry?: AgyNativeRuntimeRegistry,
   ) {
     this.commandOutputHub = commandOutputHub ?? new CommandOutputHub();
     this.deltaCoalescer = new TextDeltaCoalescer({
@@ -185,8 +194,13 @@ export class SessionManager {
     }
   }
 
+  getNativeRegistry(): AgyNativeRuntimeRegistry | undefined {
+    return this.nativeRegistry;
+  }
+
   private recoverStaleSessions(): void {
     this.store.recoverCrashStateOnStartup();
+    this.nativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
     for (const approval of this.store.listUnpublishedExpiredApprovals()) {
       this.publishExpiredApproval(approval);
     }
@@ -1606,6 +1620,22 @@ export class SessionManager {
   ): Promise<{ turnId: string }> {
     let session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
+
+    // Enforce unforgeable AGY consumer provenance whenever caller supplies explicit dispatchProvenance
+    if (turnOpts?.dispatchProvenance !== undefined) {
+      const targetId = turnOpts.harnessId ?? session.harnessId;
+      const targetAdapter = this.registry.get(targetId);
+      const targetDriverId = targetAdapter?.driverId ?? targetAdapter?.kind ?? session.harnessKind;
+      assertAgyConsumerProvenance(
+        {
+          instanceId: targetId,
+          driverId: targetDriverId,
+          profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
+        },
+        turnOpts.dispatchProvenance,
+      );
+    }
+
     if (session.status === 'awaiting_approval') {
       throw new Error('Session already has a pending approval blocking the turn.');
     }
@@ -1934,6 +1964,7 @@ export class SessionManager {
     if (targetHarnessId) {
       const entry = this.liveHandles.get(this.handleKey(sessionId, targetHarnessId));
       if (entry) {
+        this.nativeRegistry?.notifyCancelRequested(entry.nativeBinding ?? null);
         await entry.handle.interrupt();
       }
     }
@@ -2301,6 +2332,28 @@ export class SessionManager {
     // Evict oldest idle handle if warm pool is full
     await this.evictWarmPoolIfNeeded(sessionId);
 
+    // Optional AGY Native Runtime binding + generation + DI hooks (inert when feature gates are OFF)
+    let nativeBinding: RuntimeBinding | undefined;
+    if (
+      adapter.kind === 'agy' &&
+      this.nativeRegistry &&
+      this.nativeRegistry.getSchemaStatus().compatible
+    ) {
+      const storedBinding = this.nativeRegistry.ensureRuntimeBinding({
+        sessionId,
+        instanceId: adapter.id,
+        profileRef: adapter.continuationKey ?? adapter.id,
+        sourceRef: nativeHistory?.source ?? 'acp',
+        advanceGeneration: Boolean(existing),
+      });
+      nativeBinding = {
+        runtimeId: storedBinding.runtimeId,
+        sessionId: storedBinding.sessionId,
+        instanceId: storedBinding.instanceId,
+        generation: storedBinding.generation,
+      };
+    }
+
     const config: AdapterSessionConfig = {
       cwd: session.cwd,
       model: session.model,
@@ -2315,6 +2368,9 @@ export class SessionManager {
         this.emitCanonical(sessionId, 'handoff.system_notice', { harnessId, channel, text },
           this.activeTurnMeta.get(sessionId)?.turnId);
       },
+      ...(nativeBinding && this.nativeRegistry
+        ? { nativeRuntimeHooks: this.nativeRegistry.createAdapterRuntimeHooks(nativeBinding) }
+        : {}),
     };
     const shouldAttachMcpLease =
       Boolean(adapter.pluginMcpTransport) &&
@@ -2371,8 +2427,13 @@ export class SessionManager {
       lastUsedAt: Date.now(),
       pluginToolKey,
       pluginToolLease: lease,
+      ...(nativeBinding ? { nativeBinding } : {}),
     };
     this.liveHandles.set(key, entry);
+    if (nativeBinding && this.nativeRegistry) {
+      const reconnectMode = nativeSessionId ? 'resume' : 'fresh';
+      this.nativeRegistry.notifyReconnect(nativeBinding, reconnectMode);
+    }
     return entry;
   }
 
@@ -2382,6 +2443,9 @@ export class SessionManager {
       .filter((e) => {
         if (e.sessionId === protectedSessionId) return false;
         if (e.handle.hasActiveBackgroundWork?.()) return false;
+        if ((e.handle.listRetentionReasons?.().length ?? 0) > 0) return false;
+        const nativeEvict = this.nativeRegistry?.checkWarmPoolEvict(e.nativeBinding ?? null);
+        if (nativeEvict && !nativeEvict.allowEvict) return false;
         const s = this.store.getSession(e.sessionId);
         return !s || (s.status !== 'running' && s.status !== 'awaiting_approval');
       })
@@ -2397,6 +2461,11 @@ export class SessionManager {
     const entry = this.liveHandles.get(key);
     if (!entry) return;
     this.liveHandles.delete(key);
+    this.nativeRegistry?.handleTransportClosed(
+      entry.nativeBinding ?? null,
+      entry.handle.getConnectionId?.() ?? 'disposed',
+      'handle_disposed',
+    );
     entry.unsubscribe();
     entry.pluginToolLease?.release();
     await entry.handle.dispose();
@@ -2578,6 +2647,26 @@ export class SessionManager {
       }
 
       case 'turn.completed': {
+        if (eventHarnessKind === 'agy' && this.nativeRegistry) {
+          const liveEntry = this.liveHandles.get(this.handleKey(sessionId, eventHarnessId));
+          const settlement = this.nativeRegistry.decideTurnSettlement(
+            ev.turnId,
+            liveEntry?.nativeBinding ?? null,
+          );
+          if (settlement?.kind === 'held') {
+            // Native lifecycle holds user turn settlement until blocking native work completes.
+            break;
+          }
+          if (
+            this.nativeRegistry.getFeatureFlags().enabled &&
+            this.nativeRegistry.getFeatureFlags().nativeLifecycle &&
+            meta &&
+            meta.turnId !== ev.turnId
+          ) {
+            // Single-settlement guard: ignore stale completion for an already-replaced turn.
+            break;
+          }
+        }
         this.deltaCoalescer.flushSession(sessionId);
         this.expireSessionApprovals(sessionId);
         if (meta) {

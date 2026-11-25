@@ -1,6 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
-import type {
-  ApprovalAnnotationDto,
+import {
+  AGY_NATIVE_MIGRATION_COMPONENT,
+  AGY_NATIVE_MIGRATION_VERSION,
+  type ApprovalAnnotationDto,
   ApprovalDecision,
   ApprovalRequest,
   ApprovalStatus,
@@ -214,9 +216,24 @@ export interface LocalInstanceUsageAggregate extends LocalHarnessUsageAggregate 
   dailyBuckets: DailyTokenBucket[];
 }
 
+export interface NativeRuntimeSchemaStatus {
+  component: typeof AGY_NATIVE_MIGRATION_COMPONENT;
+  supportedVersion: number;
+  storedVersion: number;
+  compatible: boolean;
+  newerThanReader: boolean;
+}
+
 export class HarnessMateStore {
   private readonly db: DatabaseSync;
   private closed = false;
+  private nativeSchemaStatus: NativeRuntimeSchemaStatus = {
+    component: AGY_NATIVE_MIGRATION_COMPONENT,
+    supportedVersion: AGY_NATIVE_MIGRATION_VERSION,
+    storedVersion: 0,
+    compatible: true,
+    newerThanReader: false,
+  };
 
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
@@ -617,6 +634,184 @@ export class HarnessMateStore {
 
     // Idempotent backfill for existing v0.1/v0.2 sessions -> unified multi-harness bindings + task ledger
     this.backfillLegacySessions();
+
+    // Additive component migration for AGY Native Parity (component='agy-native-runtime', version 1)
+    this.migrateAgyNativeRuntimeComponent();
+  }
+
+  /**
+   * Additive, retryable BEGIN IMMEDIATE component migration for `agy-native-runtime`.
+   * - Preserves all legacy tables and rows untouched.
+   * - If stored version is newer than this reader supports, marks incompatible without failing startup
+   *   so legacy HM sessions remain readable while native routes fail closed.
+   */
+  private migrateAgyNativeRuntimeComponent(): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS component_schema_migrations (
+          component TEXT PRIMARY KEY,
+          version INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+      `);
+
+      const row = this.db
+        .prepare('SELECT version FROM component_schema_migrations WHERE component = ?')
+        .get(AGY_NATIVE_MIGRATION_COMPONENT) as { version?: number } | undefined;
+      const storedVersion = typeof row?.version === 'number' ? row.version : 0;
+
+      if (storedVersion > AGY_NATIVE_MIGRATION_VERSION) {
+        this.db.exec('COMMIT');
+        this.nativeSchemaStatus = {
+          component: AGY_NATIVE_MIGRATION_COMPONENT,
+          supportedVersion: AGY_NATIVE_MIGRATION_VERSION,
+          storedVersion,
+          compatible: false,
+          newerThanReader: true,
+        };
+        return;
+      }
+
+      if (storedVersion < 1) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS native_runtime_bindings (
+            runtime_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            instance_id TEXT NOT NULL,
+            binding_revision INTEGER NOT NULL DEFAULT 1,
+            profile_ref TEXT NOT NULL,
+            source_ref TEXT NOT NULL DEFAULT 'acp',
+            current_generation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'disconnected',
+            as_of_seq INTEGER NOT NULL DEFAULT 0,
+            capabilities_revision INTEGER NOT NULL DEFAULT 0,
+            retention_reasons_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (session_id, instance_id, binding_revision)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_bindings_session_updated
+            ON native_runtime_bindings(session_id, updated_at DESC);
+
+          CREATE TABLE IF NOT EXISTS native_runtime_entities (
+            runtime_id TEXT NOT NULL REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+            entity_kind TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 1,
+            generation TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            lineage_scope TEXT,
+            payload_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (runtime_id, entity_kind, entity_id)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_entities_session_kind_rev
+            ON native_runtime_entities(session_id, entity_kind, revision);
+          CREATE INDEX IF NOT EXISTS idx_native_entities_runtime_lineage
+            ON native_runtime_entities(runtime_id, lineage_scope);
+
+          CREATE TABLE IF NOT EXISTS native_runtime_aliases (
+            runtime_id TEXT NOT NULL REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+            namespace TEXT NOT NULL,
+            generation TEXT NOT NULL,
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            native_value TEXT NOT NULL,
+            target_entity_kind TEXT NOT NULL,
+            target_entity_id TEXT NOT NULL,
+            incarnation TEXT,
+            evidence_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (runtime_id, namespace, generation, origin_session_id, native_value)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_aliases_target
+            ON native_runtime_aliases(runtime_id, target_entity_kind, target_entity_id);
+
+          CREATE TABLE IF NOT EXISTS native_runtime_relations (
+            runtime_id TEXT NOT NULL REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+            parent_agent_id TEXT NOT NULL,
+            child_agent_id TEXT NOT NULL,
+            generation TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            launch_work_id TEXT,
+            evidence_json TEXT NOT NULL,
+            revoked_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (runtime_id, child_agent_id)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_relations_parent
+            ON native_runtime_relations(runtime_id, parent_agent_id);
+
+          CREATE TABLE IF NOT EXISTS native_runtime_events (
+            runtime_id TEXT NOT NULL REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            generation TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            turn_id TEXT,
+            hm_anchor_seq INTEGER,
+            type TEXT NOT NULL,
+            mutation_key TEXT,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (runtime_id, seq),
+            UNIQUE (runtime_id, mutation_key)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_events_session_runtime_seq
+            ON native_runtime_events(session_id, runtime_id, seq);
+
+          CREATE TABLE IF NOT EXISTS native_runtime_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            runtime_id TEXT NOT NULL REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            generation TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            idempotency_key TEXT,
+            payload_digest TEXT,
+            approval_id TEXT,
+            state TEXT NOT NULL,
+            response_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (runtime_id, kind, idempotency_key)
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_native_receipts_approval
+            ON native_runtime_receipts(approval_id);
+          CREATE INDEX IF NOT EXISTS idx_native_receipts_session_kind_state
+            ON native_runtime_receipts(session_id, kind, state);
+        `);
+
+        this.db
+          .prepare(
+            `INSERT INTO component_schema_migrations (component, version, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(component) DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at`,
+          )
+          .run(AGY_NATIVE_MIGRATION_COMPONENT, AGY_NATIVE_MIGRATION_VERSION, Date.now());
+      }
+
+      this.db.exec('COMMIT');
+      this.nativeSchemaStatus = {
+        component: AGY_NATIVE_MIGRATION_COMPONENT,
+        supportedVersion: AGY_NATIVE_MIGRATION_VERSION,
+        storedVersion: Math.max(storedVersion, AGY_NATIVE_MIGRATION_VERSION),
+        compatible: true,
+        newerThanReader: false,
+      };
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure if transaction never started
+      }
+      throw err;
+    }
   }
 
   private backfillLegacySessions(): void {
@@ -677,6 +872,31 @@ export class HarnessMateStore {
 
   isOpen(): boolean {
     return !this.closed;
+  }
+
+  getNativeRuntimeSchemaStatus(): NativeRuntimeSchemaStatus {
+    return { ...this.nativeSchemaStatus };
+  }
+
+  runInImmediateTransaction<T>(fn: (db: DatabaseSync) => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn(this.db);
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  /** Internal database handle exposed exclusively to co-owned persistence modules (e.g. AGY native runtime store). */
+  getDatabaseSync(): DatabaseSync {
+    return this.db;
   }
 
   close(): void {

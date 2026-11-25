@@ -27,6 +27,7 @@ import type {
   NormalizedAdapterEvent,
   TurnInput,
 } from '../types.js';
+import type { NativeRuntimeHooks, PromptContext } from '../agy/native/wiring/types.js';
 import { pluginMcpServerName } from '../types.js';
 import { pluginMcpStdioConfig } from '../plugin-mcp-stdio.js';
 
@@ -240,6 +241,7 @@ export interface AcpFlavorPolicy {
     permissionMode: PermissionMode,
     currentTurnId: string | null,
     nativeSessionId: string | null,
+    opts?: { nativePermissionsActive?: boolean },
   ): { outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } } | null;
 }
 
@@ -928,18 +930,29 @@ export class AcpSessionHandle implements AdapterSessionHandle {
   private observedTierName: string | null = null;
   private backgroundWorkUntilMs = 0;
   private supportsEmbeddedContext = false;
+  private isHistoryReplayActive = false;
+  private capabilitySnapshotRevision = 0;
+  private readonly nativeHooks?: NativeRuntimeHooks;
 
   constructor(
     child: ReturnType<typeof spawnCliProcess>,
     private readonly config: AdapterSessionConfig,
     private readonly runtimeOpts: AcpSessionRuntimeOptions,
   ) {
+    this.nativeHooks = config.nativeRuntimeHooks;
     this.rpc = new StdioJsonRpcClient(child, {
-      onNotification: (method, params) => this.handleNotification(method, params),
+      onNotification: (method, params, meta) => this.handleNotification(method, params, meta),
       onServerRequest: (req) => this.handleServerRequest(req),
       onDiagnostic: (stream, message) =>
         this.emit({ type: 'diagnostic.log', level: 'info', stream, message }),
+      onTransportFrame: (frame) => {
+        this.nativeHooks?.onTransportFrame?.(frame);
+      },
       onExit: (code, signal) => {
+        this.nativeHooks?.onTransportClosed?.(
+          this.rpc.connectionId,
+          `ACP server exited (code=${code}, signal=${signal})`,
+        );
         if (this.currentTurnId && !this.nativeCommandAbort) {
           this.emit({
             type: 'turn.failed',
@@ -954,6 +967,16 @@ export class AcpSessionHandle implements AdapterSessionHandle {
 
   get nativeSessionId(): string | null {
     return this._nativeSessionId;
+  }
+
+  getConnectionId(): string | null {
+    return this.rpc.connectionId;
+  }
+
+  listRetentionReasons(): string[] {
+    const reasons = this.nativeHooks?.listRetentionReasons?.() ?? [];
+    if (reasons.length > 0) return reasons;
+    return this.hasActiveBackgroundWork() ? ['legacy_background_ttl'] : [];
   }
 
   getConfigOptions(): AcpConfigOption[] {
@@ -1023,22 +1046,27 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     const requestSession = async (method: string, params: Record<string, unknown>) => {
       const callMethod = async (callParams: Record<string, unknown>) => {
         if (method === 'session/load') {
-          return requestSessionLoadWithIdleGap(
-            this.rpc,
-            callParams,
-            this.runtimeOpts.sessionLoadReplayIdleMs,
-            (tracker) => {
-              this.sessionLoadTracker = tracker;
-            },
-            () => {
-              this.emit({
-                type: 'diagnostic.log',
-                level: 'info',
-                stream: 'protocol',
-                message: `ACP session/load resolved via replay idle gap (${this.runtimeOpts.sessionLoadReplayIdleMs}ms)`,
-              });
-            },
-          );
+          this.isHistoryReplayActive = true;
+          try {
+            return await requestSessionLoadWithIdleGap(
+              this.rpc,
+              callParams,
+              this.runtimeOpts.sessionLoadReplayIdleMs,
+              (tracker) => {
+                this.sessionLoadTracker = tracker;
+              },
+              () => {
+                this.emit({
+                  type: 'diagnostic.log',
+                  level: 'info',
+                  stream: 'protocol',
+                  message: `ACP session/load resolved via replay idle gap (${this.runtimeOpts.sessionLoadReplayIdleMs}ms)`,
+                });
+              },
+            );
+          } finally {
+            this.isHistoryReplayActive = false;
+          }
         }
         return this.rpc.request<AcpSessionNewResult>(method, callParams, 25_000);
       };
@@ -1555,13 +1583,15 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     }
 
     const sessionId = this._nativeSessionId;
+    const capturedTurnId = input.turnId;
     const beforeToken =
       sessionId && this.runtimeOpts.flavorPolicy.beforeTurnPrompt
         ? this.runtimeOpts.flavorPolicy.beforeTurnPrompt(sessionId)
         : undefined;
+    let promptContext: PromptContext | null = null;
     const runPrompt = async () => {
       try {
-        return await this.rpc.request<{ stopReason?: string }>(
+        const reqMeta = this.rpc.requestWithMeta<{ stopReason?: string }>(
           'session/prompt',
           {
             sessionId,
@@ -1569,6 +1599,20 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           },
           15 * 60_000,
         );
+        if (this.nativeHooks) {
+          promptContext = {
+            turnId: capturedTurnId,
+            requestOrdinal: reqMeta.requestOrdinal,
+            rpcId: reqMeta.rpcId,
+            binding: this.nativeHooks.binding,
+            connectionId: this.rpc.connectionId,
+            capabilitySnapshotRevision: this.capabilitySnapshotRevision,
+            startedAt: Date.now(),
+            isSteering: false,
+          };
+          this.nativeHooks.onPromptStarted?.(promptContext);
+        }
+        return await reqMeta.promise;
       } catch (err) {
         if (driverUsed === 'acp_embedded_context' && isEmbeddedContextRejectionError(err)) {
           this.supportsEmbeddedContext = false;
@@ -1583,7 +1627,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           if (input.contextSync && fallback.driverUsed) {
             input.contextSync.onDispatch?.(fallback.driverUsed, input.contextSync.deltaMarkdown);
           }
-          return await this.rpc.request<{ stopReason?: string }>(
+          const retryMeta = this.rpc.requestWithMeta<{ stopReason?: string }>(
             'session/prompt',
             {
               sessionId,
@@ -1591,6 +1635,20 @@ export class AcpSessionHandle implements AdapterSessionHandle {
             },
             15 * 60_000,
           );
+          if (this.nativeHooks) {
+            promptContext = {
+              turnId: capturedTurnId,
+              requestOrdinal: retryMeta.requestOrdinal,
+              rpcId: retryMeta.rpcId,
+              binding: this.nativeHooks.binding,
+              connectionId: this.rpc.connectionId,
+              capabilitySnapshotRevision: this.capabilitySnapshotRevision,
+              startedAt: Date.now(),
+              isSteering: false,
+            };
+            this.nativeHooks.onPromptStarted?.(promptContext);
+          }
+          return await retryMeta.promise;
         }
         throw err;
       }
@@ -1600,55 +1658,73 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       .then((res) => {
         this.hasAcpTurn = true;
         this.runtimeOpts.onAuthenticated?.();
-        const turnId = this.currentTurnId;
-        if (!turnId) return;
+        const stopReason = res?.stopReason ?? 'end_turn';
+        const nativeSettlement = promptContext
+          ? this.nativeHooks?.onPromptSettled?.(promptContext, { ok: true, stopReason }) ?? null
+          : null;
+
+        // Captured PromptContext guard: never allow a stale response from an earlier cancelled turn
+        // to overwrite or settle a newer turn currently occupying `currentTurnId`.
+        if (this.currentTurnId !== capturedTurnId) return;
+        if (nativeSettlement?.kind === 'held') {
+          return;
+        }
         this.currentTurnId = null;
 
         if (this.thinkingAccum) {
-          this.emit({ type: 'thinking.completed', turnId, text: this.thinkingAccum });
+          this.emit({ type: 'thinking.completed', turnId: capturedTurnId, text: this.thinkingAccum });
         }
         if (this.assistantAccum) {
-          this.emit({ type: 'message.assistant.completed', turnId, text: this.assistantAccum });
+          this.emit({
+            type: 'message.assistant.completed',
+            turnId: capturedTurnId,
+            text: this.assistantAccum,
+          });
         }
 
-        const stopReason = res?.stopReason ?? 'end_turn';
         if (stopReason === 'cancelled') {
-          this.emit({ type: 'turn.cancelled', turnId });
+          this.emit({ type: 'turn.cancelled', turnId: capturedTurnId });
         } else {
           const outcome =
             sessionId && this.runtimeOpts.flavorPolicy.afterTurnPrompt
               ? this.runtimeOpts.flavorPolicy.afterTurnPrompt(
                   sessionId,
                   beforeToken,
-                  turnId,
+                  capturedTurnId,
                   (ev) => this.emit(ev),
                 )
               : null;
           if (outcome?.failed) {
             this.emit({
               type: 'turn.failed',
-              turnId,
+              turnId: capturedTurnId,
               message: outcome.message || 'Agent turn failed silently',
               ...(outcome.code ? { code: outcome.code } : {}),
               ...(outcome.failureClass ? { failureClass: outcome.failureClass } : {}),
               ...(outcome.resetAt !== undefined ? { resetAt: outcome.resetAt } : {}),
             });
           } else {
-            this.emit({ type: 'turn.completed', turnId, stopReason });
+            this.emit({ type: 'turn.completed', turnId: capturedTurnId, stopReason });
           }
         }
       })
       .catch((err: Error) => {
-        const turnId = this.currentTurnId;
-        if (!turnId) return;
-        this.currentTurnId = null;
         const authErr = isAcpAuthRequiredError(err);
+        if (promptContext) {
+          this.nativeHooks?.onPromptSettled?.(promptContext, {
+            ok: false,
+            message: err.message,
+            ...(authErr ? { code: 'unauthenticated' } : {}),
+          });
+        }
+        if (this.currentTurnId !== capturedTurnId) return;
+        this.currentTurnId = null;
         if (authErr) {
           this.runtimeOpts.onAuthRequired?.();
         }
         this.emit({
           type: 'turn.failed',
-          turnId,
+          turnId: capturedTurnId,
           message: err.message,
           ...(authErr ? { code: 'unauthenticated' } : {}),
         });
@@ -1682,7 +1758,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       basePromptText,
       this.supportsEmbeddedContext,
     );
-    await this.rpc.request(
+    const reqMeta = this.rpc.requestWithMeta<{ stopReason?: string }>(
       'session/prompt',
       {
         sessionId: this._nativeSessionId,
@@ -1690,6 +1766,37 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       },
       15 * 60_000,
     );
+    let steerCtx: PromptContext | null = null;
+    if (this.nativeHooks) {
+      steerCtx = {
+        turnId: input.turnId,
+        requestOrdinal: reqMeta.requestOrdinal,
+        rpcId: reqMeta.rpcId,
+        binding: this.nativeHooks.binding,
+        connectionId: this.rpc.connectionId,
+        capabilitySnapshotRevision: this.capabilitySnapshotRevision,
+        startedAt: Date.now(),
+        isSteering: true,
+      };
+      this.nativeHooks.onPromptStarted?.(steerCtx);
+    }
+    try {
+      const res = await reqMeta.promise;
+      if (steerCtx) {
+        this.nativeHooks?.onPromptSettled?.(steerCtx, {
+          ok: true,
+          stopReason: res?.stopReason ?? 'end_turn',
+        });
+      }
+    } catch (err) {
+      if (steerCtx) {
+        this.nativeHooks?.onPromptSettled?.(steerCtx, {
+          ok: false,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
+    }
   }
 
   hasActiveBackgroundWork(): boolean {
@@ -1770,11 +1877,46 @@ export class AcpSessionHandle implements AdapterSessionHandle {
   private handleServerRequest(req: JsonRpcServerRequest): void {
     const turnId = this.currentTurnId ?? 'turn_unknown';
     const params = (req.params ?? {}) as Record<string, unknown>;
+    const connectionId = req.connectionId ?? this.rpc.connectionId;
+    const ingressOrdinal = req.ingressOrdinal ?? this.rpc.currentIngressOrdinal;
+
+    if (this.nativeHooks) {
+      this.nativeHooks.onIngressFrame?.({
+        binding: this.nativeHooks.binding,
+        connectionId,
+        ingressOrdinal,
+        channel: this.isHistoryReplayActive ? 'history_replay' : 'live',
+        originSession: typeof params.sessionId === 'string' ? params.sessionId : undefined,
+        wire: { id: req.id, method: req.method, params },
+      });
+
+      const nativePermResult = this.nativeHooks.onIncomingServerRequest?.({
+        connectionId,
+        ingressOrdinal,
+        wireRequestId: req.id,
+        method: req.method,
+        params,
+        respond: (result) => this.rpc.respond(req.id, result),
+        respondError: (code, message) => this.rpc.respondError(req.id, code, message),
+      });
+      if (nativePermResult?.handled) {
+        if (nativePermResult.error) {
+          this.rpc.respondError(req.id, nativePermResult.error.code, nativePermResult.error.message);
+        } else if (nativePermResult.response !== undefined) {
+          this.rpc.respond(req.id, nativePermResult.response);
+        }
+        return;
+      }
+    }
 
     if (req.method === 'session/request_permission') {
       const nativeRequestId = `acp_req_${String(req.id)}`;
       const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;
       const rawOptions = Array.isArray(params.options) ? (params.options as AcpPermissionOption[]) : [];
+      const nativePermissionsActive = Boolean(
+        this.nativeHooks?.getFeatureFlags().enabled &&
+          this.nativeHooks?.getFeatureFlags().nativePermissions,
+      );
 
       const policyOutcome = this.runtimeOpts.flavorPolicy.evaluatePermissionPolicy(
         params,
@@ -1782,6 +1924,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         this.permissionMode,
         this.currentTurnId,
         this._nativeSessionId,
+        { nativePermissionsActive },
       );
       if (policyOutcome) {
         this.rpc.respond(req.id, policyOutcome);
@@ -1838,7 +1981,25 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     this.rpc.respondError(req.id, -32601, `Unsupported ACP client method: ${req.method}`);
   }
 
-  private handleNotification(method: string, rawParams: unknown): void {
+  private handleNotification(
+    method: string,
+    rawParams: unknown,
+    meta?: { connectionId: string; ingressOrdinal: number },
+  ): void {
+    if (this.nativeHooks) {
+      const originSession =
+        rawParams && typeof rawParams === 'object' && typeof (rawParams as { sessionId?: unknown }).sessionId === 'string'
+          ? (rawParams as { sessionId: string }).sessionId
+          : undefined;
+      this.nativeHooks.onIngressFrame?.({
+        binding: this.nativeHooks.binding,
+        connectionId: meta?.connectionId ?? this.rpc.connectionId,
+        ingressOrdinal: meta?.ingressOrdinal ?? this.rpc.currentIngressOrdinal,
+        channel: this.isHistoryReplayActive ? 'history_replay' : 'live',
+        originSession,
+        wire: { method, params: rawParams },
+      });
+    }
     if (method !== 'session/update') return;
     this.sessionLoadTracker?.notifyUpdate();
     const params = (rawParams ?? {}) as Record<string, unknown>;
