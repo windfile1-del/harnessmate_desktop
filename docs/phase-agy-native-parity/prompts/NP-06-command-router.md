@@ -4,6 +4,10 @@
 
 ## 目标与开工条件
 
+**已审 G1 开工点**　本地标签 `agy-np-g1`，源码验收提交 `966451ceaa2d8cfbf268b05a973dbb400715b616`。先读 [G2 开工安排](../handoffs/G2_Launch_Plan.md) 和 [G1 验收](../reviews/G1-final-966451c.md)。
+
+使用 `NativeCommandRouterPort`、`NativeCommandRequestSchema` 和 `NativeCommandResponseSchema`。当前命令回执使用 `kind: accepted | inspect`。同键领取和重复回执由共享接线负责，领域模块只返回已观测的结果。
+
 运行时发现的原生命令真正走正确执行通道，阻止交互工作流无意落到 final-only 辅助进程。
 
 **依赖与可并行范围**　G1（NP-01/02）。独立用 capability/command fixtures；G2 与 reactive、approval 和 UI 对照。

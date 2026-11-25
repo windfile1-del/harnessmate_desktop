@@ -4,6 +4,10 @@
 
 ## 目标与开工条件
 
+**已审 G1 开工点**　本地标签 `agy-np-g1`，源码验收提交 `966451ceaa2d8cfbf268b05a973dbb400715b616`。先读 [G2 开工安排](../handoffs/G2_Launch_Plan.md) 和 [G1 验收](../reviews/G1-final-966451c.md)。
+
+使用 `NativeLifecyclePort` 和 `NativeTurnSettlementSink`，以 `(runtimeId, generation, turnId)` 结算同一 held turn。晚帧仅由原生事件开启 activity，`reactive_not_observed` 的采样要保留缺口。
+
 修复真实 AGY wake 后工作、有限命令/daemon 持有、多并行任务与 Stop 的生命周期；诊断 upstream 和 HM 失效点。
 
 **依赖与可并行范围**　G1（NP-01/02）。在 NP-05/07 真实 child/request 接线前可用契约 stub；G2 要与 03b/05/07 联合验收。

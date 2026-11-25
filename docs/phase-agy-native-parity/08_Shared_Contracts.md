@@ -1,5 +1,13 @@
 # 08 · 公共接口与数据契约 v0.1 提案
 
+## G1 已冻结的实现
+
+源码开工点 `966451ceaa2d8cfbf268b05a973dbb400715b616`，发布在专项集成分支。`@harnessmate/protocol` 的 [Zod v1 定义](../../packages/protocol/src/agy-native-v1.ts) 和后端 [wiring ports](../../packages/daemon/src/harnesses/agy/native/wiring/types.ts) 是实现契约。本文后续的 v0.1 类型用于理解设计。
+
+Web transport 使用共享 schema 校验 REST/专用 WS，命令结果用 `kind`；投影适配只在 Web 边界。Feed 以完整绑定和序号为范围，能力目录也需匹配投影绑定与修订。SQLite 组件迁移仍为 1，旧 runtime 保留历史读取。
+
+[验收证据](reviews/G1-final-966451c.md) · [G2 开工安排](handoffs/G2_Launch_Plan.md)
+
 工作包以本稿对齐。NP-02 接管实现时用 Zod 与 TypeScript 单一来源、版本化事件和 fixture 冻结 v1。以下代码为 HarnessMate 内部类型设计。与 Google/ACP wire 的映射和核验范围在 [协议证据](06_Protocol_Evidence.md) 中。旧 `SessionStatus` 和公共 Plugin API 基线另有契约。
 
 ## 身份、证据和状态

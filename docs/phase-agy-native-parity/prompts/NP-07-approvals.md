@@ -4,6 +4,10 @@
 
 ## 目标与开工条件
 
+**已审 G1 开工点**　本地标签 `agy-np-g1`，源码验收提交 `966451ceaa2d8cfbf268b05a973dbb400715b616`。先读 [G2 开工安排](../handoffs/G2_Launch_Plan.md) 和 [G1 验收](../reviews/G1-final-966451c.md)。
+
+使用 `NativePermissionPort`、`PendingNativeRequest`、`ResolveNativeRequestInputSchema` 及审批 CAS。共享路由把已领取的 `receiptId` 交给 port，使用原连接和原类型 RPC ID 回复。保持旧运行时审批中心可用。
+
 原生审批与提问在原轮次、轮次外、已知 child 和 Workflow 均能显示并可靠回应同一条请求。
 
 **依赖与可并行范围**　G1（NP-01/02），可先用 NP-05 child resolver stub。G2 起在 04/05/03b 上联测真实归属与延迟。

@@ -4,6 +4,10 @@
 
 ## 目标与开工条件
 
+**已审 G1 开工点**　本地标签 `agy-np-g1`，源码验收提交 `966451ceaa2d8cfbf268b05a973dbb400715b616`。先读 [G2 开工安排](../handoffs/G2_Launch_Plan.md) 和 [G1 验收](../reviews/G1-final-966451c.md)。
+
+使用 `NativeIngress` 与协议包的 `AgentIdentity`、`NativeRelationship`、`NativeAlias`。先与 NP-07 提交共同的 child scope 测试签名，旧 runtime/代次的证据只用于历史解释。
+
 将 native child、launch tool、batch、原生记录和权限目标在可验证时关联，提供真实独立子时间线。
 
 **依赖与可并行范围**　G1（NP-01/02），NP-07 可依赖 ChildSessionRouter 契约先并行。G2 需要共同验收。
