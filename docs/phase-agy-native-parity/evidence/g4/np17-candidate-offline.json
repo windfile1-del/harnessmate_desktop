@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "contractRevision": "agy-native-v1.0.0",
+  "migrationComponent": "agy-native-runtime",
+  "migrationVersion": 1,
+  "generatedAt": "2026-11-25T19:29:14.923Z",
+  "overallStatus": "passed",
+  "checks": [
+    {
+      "id": "A1_origin_security_gate",
+      "status": "passed",
+      "httpStatus": 403
+    },
+    {
+      "id": "A2_native_ws_handshake",
+      "status": "passed",
+      "frameOps": [
+        "native_hello"
+      ]
+    },
+    {
+      "id": "A3_reactive_turn_and_projection",
+      "status": "passed",
+      "completedCount": 1,
+      "nativeWorkCount": 4,
+      "nativeEventCount": 19,
+      "timelineCount": 5,
+      "wsEventFrames": 19
+    },
+    {
+      "id": "A4_commands_control_and_idempotency",
+      "status": "passed",
+      "inspectModelsStatus": 200,
+      "planGatedStatus": 422,
+      "workflowGatedStatus": 422,
+      "badCancelStatus": 422
+    },
+    {
+      "id": "A5_out_of_turn_permission_and_question_cas",
+      "status": "passed",
+      "permResolvedTextObserved": true,
+      "questionTurnCompleted": true
+    },
+    {
+      "id": "A6_production_wiring_audit_probes",
+      "status": "passed",
+      "legacyEcosystemStatus": 200,
+      "nativeEcosystemCatalogRouteStatus": 404,
+      "nativeArtifactsRouteStatus": 404,
+      "note": "Legacy ecosystem is readable. The native ecosystem and artifact routes are absent from this candidate. Recovery wiring needs its own acceptance."
+    },
+    {
+      "id": "B1_gate_off_rollback_and_post_rollback_rerun",
+      "status": "passed",
+      "snapshotGateOffStatus": 200,
+      "oldSessionEventsCount": 17,
+      "postRollbackEventsCount": 30,
+      "handoffTargetHarness": "codex"
+    },
+    {
+      "id": "B2_forward_schema_isolation",
+      "status": "passed",
+      "schemaStatus": {
+        "component": "agy-native-runtime",
+        "supportedVersion": 1,
+        "storedVersion": 99,
+        "compatible": false,
+        "newerThanReader": true
+      },
+      "schemaGuardCode": "NATIVE_SCHEMA_NEWER_THAN_READER",
+      "legacySessionStatus": 200,
+      "nativeRouteBlockedStatus": 503
+    },
+    {
+      "id": "C1_independent_replay_and_1514_compat",
+      "status": "passed",
+      "replayRecords": 33,
+      "replayLayers": {
+        "raw": 15,
+        "normalized": 6,
+        "native_canonical": 6,
+        "ui": 6
+      },
+      "migrated1514Records": 9,
+      "checklistItems": 7
+    },
+    {
+      "id": "D1_live_clean_agy_cli_probe",
+      "status": "skipped",
+      "reason": "No live CLI probe requested"
+    }
+  ]
+}
