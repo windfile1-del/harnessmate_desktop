@@ -1,5 +1,7 @@
 # 独立开发提示词 · NP-09 Boost 多段推理
 
+开工前核对 [G3 第一批开发安排](../handoffs/G3_Launch_Plan.md) 与 [G2 修复复验](../reviews/G2-candidate-verification.md)。以 `agy-np-g2` 解析到的同一个提交为基础。先交付本任务的离线 observer、工作台、降级行为与回放。原生触发和控制依据已验字段与明确的测试授权逐步接通。
+
 你负责 HarnessMate Desktop 的 **NP-09 Boost 多段推理**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
 
 ## 目标与开工条件
@@ -8,7 +10,7 @@
 
 **依赖与可并行范围**　G2（04/05/06/07、03b）。付费试验需用户确认账号资格和单场景预算。
 
-**接口契约**　WorkflowDetail.boost、NativeStage、source and revision；无字段 phase 列表省略；用户明确选用 live_workflow。
+**接口契约**　`WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'boost'` 分支、NativeStage、source and revision；无字段 phase 列表省略；用户明确选用 live_workflow。
 
 使用建议分支 `codex/agy-np-09-boost`，在自己的 D 盘 Worktree 工作。先读 [总进度](../MASTER_PROGRESS.md)、[源码审计](../05_Source_Audit.md)、[协议证据](../06_Protocol_Evidence.md)、[总体架构](../07_Architecture.md)、[共享契约](../08_Shared_Contracts.md)、[前端设计](../09_Frontend_Design.md)、[测试方案](../12_Test_Strategy.md)、[Git 协作](../13_Git_Collaboration.md) 与 [风险](../14_Risk_Register.md)，再读 [本任务卡](../tasks/NP-09-boost.md) 和以下源码。第三方实现用于对照。
 

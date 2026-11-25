@@ -1,14 +1,16 @@
 # 独立开发提示词 · NP-10 Teamwork 访谈、项目与里程碑
 
+开工前核对 [G3 第一批开发安排](../handoffs/G3_Launch_Plan.md) 与 [G2 修复复验](../reviews/G2-candidate-verification.md)。以 `agy-np-g2` 解析到的同一个提交为基础。先交付本任务的离线 observer、工作台、降级行为与回放。原生触发和控制依据已验字段与明确的测试授权逐步接通。
+
 你负责 HarnessMate Desktop 的 **NP-10 Teamwork 访谈、项目与里程碑**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
 
 ## 目标与开工条件
 
 用官方 AGY Teamwork 的访谈、批准契约和项目级执行语义构建工作台。
 
-**依赖与可并行范围**　G2（04/05/06/07、03b）。审阅控制联合 NP-14，前端骨架 可用现成契约及 disabled props 先并行。付费时另授权。
+**依赖与可并行范围**　G2（04/05/06/07、03b）。审阅控制联合 NP-14，前端骨架可用现成契约及 disabled props 先并行。付费时另授权。
 
-**接口契约**　WorkflowDetail.teamwork、typed request/Artifact opaque ID、项目已证 scope、里程碑与 gate。项目路径从原生 event 或授权来源。
+**接口契约**　`WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'teamwork'` 分支、typed request/Artifact opaque ID、项目已证 scope、里程碑与 gate。项目路径从原生 event 或授权来源。
 
 使用建议分支 `codex/agy-np-10-teamwork`，在自己的 D 盘 Worktree 工作。先读 [总进度](../MASTER_PROGRESS.md)、[源码审计](../05_Source_Audit.md)、[协议证据](../06_Protocol_Evidence.md)、[总体架构](../07_Architecture.md)、[共享契约](../08_Shared_Contracts.md)、[前端设计](../09_Frontend_Design.md)、[测试方案](../12_Test_Strategy.md)、[Git 协作](../13_Git_Collaboration.md) 与 [风险](../14_Risk_Register.md)，再读 [本任务卡](../tasks/NP-10-teamwork.md) 和以下源码。第三方实现用于对照。
 

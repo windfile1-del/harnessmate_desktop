@@ -4,8 +4,8 @@
 
 | 项目 | 约定 |
 | --- | --- |
-| 依赖 | G2（04/05/06/07、03b）。审阅控制联合 NP-14，前端骨架 可用现成契约及 disabled props 先并行。付费时另授权。 |
-| 契约 | WorkflowDetail.teamwork、typed request/Artifact opaque ID、项目已证 scope、里程碑与 gate。项目路径从原生 event 或授权来源。 |
+| 依赖 | G2（04/05/06/07、03b）。审阅控制联合 NP-14，前端骨架可用现成契约及 disabled props 先并行。付费时另授权。 |
+| 契约 | `WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'teamwork'` 分支、typed request/Artifact opaque ID、项目已证 scope、里程碑与 gate。项目路径从原生 event 或授权来源。 |
 | Git | `codex/agy-np-10-teamwork`，建议 Worktree `D:\HarnessMate\agy-np-worktrees\np-10` |
 | 写入范围 | `packages/daemon/src/harnesses/agy/native/workflows/teamwork/**`、`packages/web/src/components/agy/native/teamwork/**` 与专属 schemas/fixture（私有 DTO）。 |
 | 潜在冲突 | NP-14 拥有实际 Artifact reader/control，07 负责原生答复，05 管 lineage/有效作用域。团队专属匿名时间线依 03 props。 |

@@ -5,7 +5,7 @@
 | 项目 | 约定 |
 | --- | --- |
 | 依赖 | G2（04/05/06/07、03b）。付费试验需用户确认账号资格和单场景预算。 |
-| 契约 | WorkflowDetail.boost、NativeStage、source and revision；无字段 phase 列表省略；用户明确选用 live_workflow。 |
+| 契约 | `WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'boost'` 分支、NativeStage、source and revision；无字段 phase 列表省略；用户明确选用 live_workflow。 |
 | Git | `codex/agy-np-09-boost`，建议 Worktree `D:\HarnessMate\agy-np-worktrees\np-09` |
 | 写入范围 | `packages/daemon/src/harnesses/agy/native/workflows/boost/**`、`packages/web/src/components/agy/native/boost/**` 和专属 tests。 |
 | 潜在冲突 | 使用 05、06、07 公共子路由/权限，自己的 projection 与 UI 独立，不能驱动其它包的工作流。 |

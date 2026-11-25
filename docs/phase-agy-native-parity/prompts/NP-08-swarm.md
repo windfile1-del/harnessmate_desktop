@@ -1,5 +1,7 @@
 # 独立开发提示词 · NP-08 Swarm 与共享 Board
 
+开工前核对 [G3 第一批开发安排](../handoffs/G3_Launch_Plan.md) 与 [G2 修复复验](../reviews/G2-candidate-verification.md)。以 `agy-np-g2` 解析到的同一个提交为基础。先交付本任务的离线 observer、工作台、降级行为与回放。原生触发和控制依据已验字段与明确的测试授权逐步接通。
+
 你负责 HarnessMate Desktop 的 **NP-08 Swarm 与共享 Board**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
 
 ## 目标与开工条件
@@ -8,7 +10,7 @@
 
 **依赖与可并行范围**　G2（04/05/06/07、03b）。低成本真机使用单一账号和一个经授权的 worker 场景。
 
-**接口契约**　WorkflowDetail.swarm、worker identity、runtime scope、命令 descriptor 与 native request receipt，Board resource/帖子稳定 ID 分页。
+**接口契约**　`WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'swarm'` 分支、worker identity、runtime scope、命令 descriptor 与 native request receipt，Board resource/帖子稳定 ID 分页。
 
 使用建议分支 `codex/agy-np-08-swarm`，在自己的 D 盘 Worktree 工作。先读 [总进度](../MASTER_PROGRESS.md)、[源码审计](../05_Source_Audit.md)、[协议证据](../06_Protocol_Evidence.md)、[总体架构](../07_Architecture.md)、[共享契约](../08_Shared_Contracts.md)、[前端设计](../09_Frontend_Design.md)、[测试方案](../12_Test_Strategy.md)、[Git 协作](../13_Git_Collaboration.md) 与 [风险](../14_Risk_Register.md)，再读 [本任务卡](../tasks/NP-08-swarm.md) 和以下源码。第三方实现用于对照。
 
@@ -39,7 +41,7 @@
 2. 按当前可用数据完成本域模块。遇到缺接口，先用冻结的 stub，给 owner 附用例的变更提议。真实模式无法验证时保留 gate，提交可审查的降级或限制证据。
 3. T10 观察 worker idle、真实 mention 后活性、权限、失败与 coordinator settle。对缺帧源测试禁动作与不显示假进度。
 4. 运行适用的包测试及 `pnpm typecheck`，检查 `git diff --check` 与文件范围。进入 G2/G3/G4 前按 [全量门禁](../12_Test_Strategy.md) 执行。未跑的检查和原因写在报告中。
-5. Swarm observer、Studio、原生证据或上游结案、对应接口和率先覆盖的功能列表。。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
+5. Swarm observer、Studio、原生证据或上游结案、对应接口和率先覆盖的功能列表。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
 
 **合并和回滚**　经 [独立审查](../reviews/README.md) 后按 [依赖图](../10_Task_Dependency_Graph.md) 合入。关闭 Swarm gate 或 Board 单独 gate，保留已捕获的 coordinator 轨迹。
 

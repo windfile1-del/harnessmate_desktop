@@ -5,7 +5,7 @@
 | 项目 | 约定 |
 | --- | --- |
 | 依赖 | G2（04/05/06/07、03b）。低成本真机使用单一账号和一个经授权的 worker 场景。 |
-| 契约 | WorkflowDetail.swarm、worker identity、runtime scope、命令 descriptor 与 native request receipt，Board resource/帖子稳定 ID 分页。 |
+| 契约 | `WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'swarm'` 分支、worker identity、runtime scope、命令 descriptor 与 native request receipt，Board resource/帖子稳定 ID 分页。 |
 | Git | `codex/agy-np-08-swarm`，建议 Worktree `D:\HarnessMate\agy-np-worktrees\np-08` |
 | 写入范围 | `packages/daemon/src/harnesses/agy/native/workflows/swarm/**`、`packages/web/src/components/agy/native/swarm/**` 与专属 fixture/tests。 |
 | 潜在冲突 | NP-05 的 child/lineage、07 的请求、06 的 live lane 是前置。03 负责 shell，08 提供专属页及 capability 间接注册。 |

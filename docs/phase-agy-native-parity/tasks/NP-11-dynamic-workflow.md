@@ -5,7 +5,7 @@
 | 项目 | 约定 |
 | --- | --- |
 | 依赖 | G2（04/05/06/07、03b），按 T13 单次授权后录制。Artifact 类型读取走 NP-14 的接口。 |
-| 契约 | WorkflowDetail.dynamic、steps/edges 可选、results artifacts、held activity 和原生审批。Stage ID 和 append events 来自实录证据。 |
+| 契约 | `WorkflowDetailSchema` 与 `WorkflowDetailDtoSchema` 的 `kind: 'dynamic'` 分支、steps/edges 可选、results artifacts、held activity 和原生审批。Stage ID 和 append events 来自实录证据。 |
 | Git | `codex/agy-np-11-dynamic-workflow`，建议 Worktree `D:\HarnessMate\agy-np-worktrees\np-11` |
 | 写入范围 | `packages/daemon/src/harnesses/agy/native/workflows/dynamic/**`、`packages/web/src/components/agy/native/workflow/**`、独立 fixtures/tests。 |
 | 潜在冲突 | 07 批准、05 Child、04 lease、14 安全 Artifact 访问均经共享 port，11 只维护 Workflow 视图。 |
