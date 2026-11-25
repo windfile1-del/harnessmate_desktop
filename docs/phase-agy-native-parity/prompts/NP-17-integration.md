@@ -2,6 +2,12 @@
 
 你负责 HarnessMate Desktop 的 **NP-17 集成与独立验收**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
 
+## 本轮开工
+
+可从本地 `agy-np-g3-wave2` 并行准备验收装置、只读样本和清单。正式独立验收等待总指挥提供含 NP-16 验证的固定 SHA。分别记录合成、回放、实机 ACP 与官方 Windows App 对照。U01 使用 Gemini 3.8 Flash 和专用 Profile。
+
+见 [开工安排](../handoffs/G4_Launch_Plan.md) 和 [G3 第二批复验](../reviews/G3-wave2-verification.md)。
+
 ## 目标与开工条件
 
 复核每个工作包和整个专项的 Windows App/CLI/ACP 对照，形成可交付的 L0–L5 结论。
@@ -43,7 +49,7 @@
 2. 按当前可用数据完成本域模块。遇到缺接口，先用冻结的 stub，给 owner 附用例的变更提议。真实模式无法验证时保留 gate，提交可审查的降级或限制证据。
 3. T01–T18 按优先级；全量测试/span 录制；持续真机+降级互斥；发布测试需显式安装与部署范围。
 4. 运行适用的包测试及 `pnpm typecheck`，检查 `git diff --check` 与文件范围。进入 G2/G3/G4 前按 [全量门禁](../12_Test_Strategy.md) 执行。未跑的检查和原因写在报告中。
-5. 按 Capability ID 的验收对照表、完整证据引用、发布与回滚建议、阻塞与未通过列表。。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
+5. 按 Capability ID 的验收对照表、完整证据引用、发布与回滚建议、阻塞与未通过列表。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
 
 **合并和回滚**　经 [独立审查](../reviews/README.md) 后按 [依赖图](../10_Task_Dependency_Graph.md) 合入。按 gates/单个 merge revert 回退，旧数据可读，验收报告附回退后复跑。
 

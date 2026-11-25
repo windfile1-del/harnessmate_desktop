@@ -2,6 +2,12 @@
 
 你负责 HarnessMate Desktop 的 **NP-16 性能、安全与隔离审查**。项目在 AGY-0 至 AGY-6 后启动 Native Parity。NP-00 已做研究和最小探针，源码审计基线为 `0409bc8a4ea85d05ef6b0ee85fc2d0b980f06039`。以总指挥交给你的已审 checkpoint commit 为 coding base。你的成果由总指挥及独立审查者集成。
 
+## 本轮开工
+
+从本地 `agy-np-g3-wave2` 开工。第一轮锁定 T15/T17/T18 和基线测量，额外验证四个 G3 交付的反向用例与默认门控。每项发现给出受影响入口、最小合成夹具与严重度，并标出需由总指挥处理的共享模块。提交 NP-16 前按最终候选复跑涉及修复的门禁。
+
+见 [开工安排](../handoffs/G4_Launch_Plan.md) 和 [G3 第二批复验](../reviews/G3-wave2-verification.md)。
+
 ## 目标与开工条件
 
 验证从协议输入、持久化、插件、身份控制到 Web 的安全和资源边界，给出可重复的发布证据。
@@ -43,7 +49,7 @@
 2. 按当前可用数据完成本域模块。遇到缺接口，先用冻结的 stub，给 owner 附用例的变更提议。真实模式无法验证时保留 gate，提交可审查的降级或限制证据。
 3. T15/T17/T18，跨平台 host / Windows 读路径，第三方插件、传统客户端和安全回归。发现高危就冻结该 feature gate。
 4. 运行适用的包测试及 `pnpm typecheck`，检查 `git diff --check` 与文件范围。进入 G2/G3/G4 前按 [全量门禁](../12_Test_Strategy.md) 执行。未跑的检查和原因写在报告中。
-5. 审查报告、可复跑 benchmark 基线与日志、风险初始和结束判定、按领域列修复列表。。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
+5. 审查报告、可复跑 benchmark 基线与日志、风险初始和结束判定、按领域列修复列表。提交便于审查的最小 commit，用固定 SHA 交付。集成分支和其他 Worktree 由各自 owner 维护。
 
 **合并和回滚**　经 [独立审查](../reviews/README.md) 后按 [依赖图](../10_Task_Dependency_Graph.md) 合入。失败 feature gate 保持关闭，回退测量脚本可单提交撤销。
 
