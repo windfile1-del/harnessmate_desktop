@@ -6,9 +6,11 @@ import type {
   NativeAgentId,
   NativeCommandSubmitRequest,
   NativeControlRequest,
+  NativeFeedSyncState,
   NativeRuntimeProjection,
   NativeTimelinePageResponse,
   NativeWorkflowResourcePageResponse,
+  RuntimeBinding,
   WorkId,
   WorkflowId,
 } from '../../../../lib/native-client';
@@ -56,6 +58,7 @@ export const DEFAULT_WORKBENCH_ROUTE: WorkbenchRouteState = {
 export interface NativeWorkbenchViewProps {
   session: Session;
   projection: NativeRuntimeProjection | null;
+  syncState?: NativeFeedSyncState | null;
   capabilities: readonly CapabilityDescriptor[];
   pendingApprovals: readonly ApprovalRequest[];
   route: WorkbenchRouteState;
@@ -68,10 +71,15 @@ export interface NativeWorkbenchViewProps {
     req: ResolveApprovalRequest,
   ) => Promise<{ conflict?: boolean; resolvedBy?: string | null }>;
   onSubmitCommand?: (
-    req: Omit<NativeCommandSubmitRequest, 'bindingGeneration' | 'catalogRevision' | 'idempotencyKey'>,
+    req: Omit<NativeCommandSubmitRequest, 'bindingGeneration' | 'catalogRevision' | 'idempotencyKey'> & {
+      expectedBinding?: RuntimeBinding;
+      expectedCapabilitiesRevision?: number;
+    },
   ) => Promise<void>;
   onDispatchControl?: (
-    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'>,
+    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'> & {
+      expectedBinding?: RuntimeBinding;
+    },
   ) => Promise<void>;
   loadTimeline?: (
     scope: { kind: 'activity' | 'agent'; id: string },

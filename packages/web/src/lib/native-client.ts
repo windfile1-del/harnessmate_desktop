@@ -408,8 +408,10 @@ export interface NativeTimelineEntry {
   diff?: string;
   status?: WorkState | ActivityStatus;
   evidence?: EvidenceDto;
-  /** When present and identical to the previous entry's key, consecutive text deltas coalesce cleanly. */
+  /** When present and identical to the previous entry's key (same actor & kind), consecutive text deltas coalesce cleanly. */
   deltaCoalesceKey?: string;
+  /** Tracks all original entryIds merged into this entry so duplicate re-delivery never appends twice. */
+  mergedEntryIds?: readonly string[];
 }
 
 export interface NativeTimelinePageResponse {
@@ -494,6 +496,7 @@ export type NativeErrorCode =
   | 'UNSUPPORTED_ACTION'
   | 'FORBIDDEN'
   | 'ENDPOINT_UNAVAILABLE'
+  | 'INVALID_RESPONSE'
   | 'NETWORK_ERROR'
   | 'UNKNOWN_ERROR';
 
@@ -593,7 +596,143 @@ export interface NativeRuntimeTransport {
   ): Promise<NativeRequestResolveResponse>;
 }
 
-async function nativeFetch<T>(path: string, init?: RequestInit): Promise<T> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isRuntimeBinding(value: unknown): value is RuntimeBinding {
+  return (
+    isRecord(value) &&
+    typeof value.runtimeId === 'string' &&
+    typeof value.sessionId === 'string' &&
+    typeof value.instanceId === 'string' &&
+    typeof value.generation === 'string'
+  );
+}
+
+function assertSnapshotResponse(data: unknown): NativeSnapshotResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    !isRecord(data.projection) ||
+    data.projection.schemaVersion !== 1 ||
+    !isRuntimeBinding(data.projection.binding) ||
+    typeof data.projection.asOfSeq !== 'number' ||
+    !Array.isArray(data.projection.activities) ||
+    !Array.isArray(data.projection.work) ||
+    !Array.isArray(data.projection.agents) ||
+    !Array.isArray(data.projection.relations) ||
+    !Array.isArray(data.projection.workflows) ||
+    !Array.isArray(data.projection.requestIds)
+  ) {
+    throw new NativeClientError('Invalid native snapshot response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeSnapshotResponse;
+}
+
+function assertCapabilitiesResponse(data: unknown): NativeCapabilitiesResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    typeof data.capabilitiesRevision !== 'number' ||
+    !Array.isArray(data.descriptors)
+  ) {
+    throw new NativeClientError(
+      'Invalid native capabilities response shape',
+      502,
+      'INVALID_RESPONSE',
+    );
+  }
+  return data as unknown as NativeCapabilitiesResponse;
+}
+
+function assertEventsPageResponse(data: unknown): NativeEventsPageResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    !isRuntimeBinding(data.binding) ||
+    typeof data.asOfSeq !== 'number' ||
+    !Array.isArray(data.events) ||
+    typeof data.hasMore !== 'boolean'
+  ) {
+    throw new NativeClientError('Invalid native events page response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeEventsPageResponse;
+}
+
+function assertTimelinePageResponse(data: unknown): NativeTimelinePageResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    (data.scopeKind !== 'activity' && data.scopeKind !== 'agent') ||
+    typeof data.scopeId !== 'string' ||
+    !Array.isArray(data.items) ||
+    typeof data.hasMore !== 'boolean'
+  ) {
+    throw new NativeClientError('Invalid native timeline response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeTimelinePageResponse;
+}
+
+function assertWorkflowResourcePageResponse(data: unknown): NativeWorkflowResourcePageResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    typeof data.workflowId !== 'string' ||
+    typeof data.resource !== 'string' ||
+    !Array.isArray(data.items) ||
+    typeof data.hasMore !== 'boolean'
+  ) {
+    throw new NativeClientError(
+      'Invalid native workflow resource response shape',
+      502,
+      'INVALID_RESPONSE',
+    );
+  }
+  return data as unknown as NativeWorkflowResourcePageResponse;
+}
+
+function assertCommandSubmitResponse(data: unknown): NativeCommandSubmitResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    (data.status !== 'accepted' && data.status !== 'completed')
+  ) {
+    throw new NativeClientError('Invalid native command response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeCommandSubmitResponse;
+}
+
+function assertControlResponse(data: unknown): NativeControlResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    typeof data.receiptId !== 'string' ||
+    (data.state !== 'requested' && data.state !== 'confirmed' && data.state !== 'unknown')
+  ) {
+    throw new NativeClientError('Invalid native control response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeControlResponse;
+}
+
+function assertRequestResolveResponse(data: unknown): NativeRequestResolveResponse {
+  if (
+    !isRecord(data) ||
+    data.schemaVersion !== 1 ||
+    typeof data.approvalId !== 'string' ||
+    typeof data.receiptId !== 'string' ||
+    typeof data.receiptState !== 'string'
+  ) {
+    throw new NativeClientError('Invalid native request resolve response shape', 502, 'INVALID_RESPONSE');
+  }
+  return data as unknown as NativeRequestResolveResponse;
+}
+
+async function nativeFetch<T>(
+  path: string,
+  validate: (data: unknown) => T,
+  init?: RequestInit,
+): Promise<T> {
   const url = `${getDaemonBaseUrl()}${path}`;
   const headers = new Headers(init?.headers);
   if (init?.body != null && !headers.has('Content-Type')) {
@@ -615,7 +754,7 @@ async function nativeFetch<T>(path: string, init?: RequestInit): Promise<T> {
       const errMsg = obj && 'error' in obj ? String(obj.error) : `HTTP ${res.status}`;
       throw classifyNativeError(new ApiHttpError(errMsg, res.status, obj));
     }
-    return data as T;
+    return validate(data);
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err;
     throw classifyNativeError(err);
@@ -628,15 +767,15 @@ export function createHttpNativeTransport(): NativeRuntimeTransport {
   return {
     mode: 'http',
     getSnapshot: (sessionId, signal) =>
-      nativeFetch<NativeSnapshotResponse>(`${base(sessionId)}/snapshot`, { signal }),
+      nativeFetch(`${base(sessionId)}/snapshot`, assertSnapshotResponse, { signal }),
 
     getCapabilities: (sessionId, signal) =>
-      nativeFetch<NativeCapabilitiesResponse>(`${base(sessionId)}/capabilities`, { signal }),
+      nativeFetch(`${base(sessionId)}/capabilities`, assertCapabilitiesResponse, { signal }),
 
     getEvents: (sessionId, { afterSeq, limit = 200, cursor }, signal) => {
       const qs = new URLSearchParams({ after: String(afterSeq), limit: String(limit) });
       if (cursor) qs.set('cursor', cursor);
-      return nativeFetch<NativeEventsPageResponse>(`${base(sessionId)}/events?${qs.toString()}`, {
+      return nativeFetch(`${base(sessionId)}/events?${qs.toString()}`, assertEventsPageResponse, {
         signal,
       });
     },
@@ -646,8 +785,9 @@ export function createHttpNativeTransport(): NativeRuntimeTransport {
       if (params?.pageToken) qs.set('pageToken', params.pageToken);
       if (params?.limit) qs.set('limit', String(params.limit));
       const suffix = qs.toString() ? `?${qs.toString()}` : '';
-      return nativeFetch<NativeTimelinePageResponse>(
+      return nativeFetch(
         `${base(sessionId)}/activity/${encodeURIComponent(activityId)}/timeline${suffix}`,
+        assertTimelinePageResponse,
         { signal },
       );
     },
@@ -657,8 +797,9 @@ export function createHttpNativeTransport(): NativeRuntimeTransport {
       if (params?.pageToken) qs.set('pageToken', params.pageToken);
       if (params?.limit) qs.set('limit', String(params.limit));
       const suffix = qs.toString() ? `?${qs.toString()}` : '';
-      return nativeFetch<NativeTimelinePageResponse>(
+      return nativeFetch(
         `${base(sessionId)}/agents/${encodeURIComponent(agentId)}/timeline${suffix}`,
+        assertTimelinePageResponse,
         { signal },
       );
     },
@@ -668,29 +809,31 @@ export function createHttpNativeTransport(): NativeRuntimeTransport {
       if (params?.pageToken) qs.set('pageToken', params.pageToken);
       if (params?.limit) qs.set('limit', String(params.limit));
       const suffix = qs.toString() ? `?${qs.toString()}` : '';
-      return nativeFetch<NativeWorkflowResourcePageResponse>(
+      return nativeFetch(
         `${base(sessionId)}/workflows/${encodeURIComponent(workflowId)}/${encodeURIComponent(resource)}${suffix}`,
+        assertWorkflowResourcePageResponse,
         { signal },
       );
     },
 
     submitCommand: (sessionId, req, signal) =>
-      nativeFetch<NativeCommandSubmitResponse>(`${base(sessionId)}/commands`, {
+      nativeFetch(`${base(sessionId)}/commands`, assertCommandSubmitResponse, {
         method: 'POST',
         body: JSON.stringify(req),
         signal,
       }),
 
     dispatchControl: (sessionId, req, signal) =>
-      nativeFetch<NativeControlResponse>(`${base(sessionId)}/control`, {
+      nativeFetch(`${base(sessionId)}/control`, assertControlResponse, {
         method: 'POST',
         body: JSON.stringify(req),
         signal,
       }),
 
     resolveNativeRequest: (sessionId, approvalId, req, signal) =>
-      nativeFetch<NativeRequestResolveResponse>(
+      nativeFetch(
         `${base(sessionId)}/requests/${encodeURIComponent(approvalId)}/resolve`,
+        assertRequestResolveResponse,
         {
           method: 'POST',
           body: JSON.stringify(req),
@@ -730,24 +873,33 @@ export interface NativeApplyOutcome {
   droppedStaleGenerationCount: number;
   droppedDuplicateSeqCount: number;
   seqGapDetected: { expectedSeq: number; receivedSeq: number } | null;
+  /** Valid current-generation events with seq >= receivedSeq preserved for replay after gap repair. */
+  unappliedAfterGap: NativeCanonicalEvent[];
+  /** Present when an in-order frame announces a binding generation change requiring authoritative resync. */
+  generationTransitionDetected: RuntimeBinding | null;
   capabilitiesChangedRevision: number | null;
   updatedCapabilities?: CapabilityDescriptor[];
 }
 
+export interface ApplyNativeBatchOptions {
+  retiredGenerations?: ReadonlySet<string>;
+}
+
 /**
  * Applies a single or batched set of `NativeCanonicalEvent` frames idempotently
- * using `runtimeId + generation + seq` fencing.
+ * using strict `runtimeId + generation + seq` fencing.
  *
  * Rules:
- * - Events from a mismatched `runtimeId` or `generation` are dropped (unless `native.runtime.changed`
- *   delivers an explicit binding generation advancement).
+ * - Events from ANY mismatched `runtimeId` or `generation` are strictly rejected (never allowing
+ *   an old-binding `native.runtime.changed` frame to roll back the projection).
  * - Duplicate/older `seq <= asOfSeq` events are ignored idempotently.
- * - A `seq > asOfSeq + 1` gap halts live application and signals `seqGapDetected` so the
- *   feed controller can fetch missing pages or resync from snapshot.
+ * - A `seq > asOfSeq + 1` gap halts live application, preserves the suffix in `unappliedAfterGap`,
+ *   and signals `seqGapDetected` so the controller can catch up and replay without dropping frames.
  */
 export function applyNativeEventBatch(
   current: NativeRuntimeProjection,
   rawEvents: readonly NativeCanonicalEvent[],
+  options?: ApplyNativeBatchOptions,
 ): NativeApplyOutcome {
   if (rawEvents.length === 0) {
     return {
@@ -756,6 +908,8 @@ export function applyNativeEventBatch(
       droppedStaleGenerationCount: 0,
       droppedDuplicateSeqCount: 0,
       seqGapDetected: null,
+      unappliedAfterGap: [],
+      generationTransitionDetected: null,
       capabilitiesChangedRevision: null,
     };
   }
@@ -767,35 +921,59 @@ export function applyNativeEventBatch(
   let droppedStaleGenerationCount = 0;
   let droppedDuplicateSeqCount = 0;
   let seqGapDetected: { expectedSeq: number; receivedSeq: number } | null = null;
+  const unappliedAfterGap: NativeCanonicalEvent[] = [];
+  let generationTransitionDetected: RuntimeBinding | null = null;
   let capabilitiesChangedRevision: number | null = null;
   let updatedCapabilities: CapabilityDescriptor[] | undefined;
 
-  for (const event of ordered) {
-    if (event.runtimeId !== next.binding.runtimeId) {
+  for (let i = 0; i < ordered.length; i += 1) {
+    const event = ordered[i]!;
+    if (
+      event.runtimeId !== next.binding.runtimeId ||
+      event.generation !== next.binding.generation
+    ) {
       droppedStaleGenerationCount += 1;
       continue;
     }
 
-    const isGenerationAdvance =
+    if (event.seq <= next.asOfSeq) {
+      droppedDuplicateSeqCount += 1;
+      continue;
+    }
+
+    if (event.seq > next.asOfSeq + 1) {
+      seqGapDetected = { expectedSeq: next.asOfSeq + 1, receivedSeq: event.seq };
+      for (let j = i; j < ordered.length; j += 1) {
+        const trailing = ordered[j]!;
+        if (
+          trailing.runtimeId === next.binding.runtimeId &&
+          trailing.generation === next.binding.generation &&
+          trailing.seq > next.asOfSeq
+        ) {
+          unappliedAfterGap.push(trailing);
+        } else if (
+          trailing.runtimeId !== next.binding.runtimeId ||
+          trailing.generation !== next.binding.generation
+        ) {
+          droppedStaleGenerationCount += 1;
+        }
+      }
+      break;
+    }
+
+    if (
       event.type === 'native.runtime.changed' &&
       event.payload.binding &&
-      event.payload.binding.runtimeId === next.binding.runtimeId &&
-      event.payload.binding.generation !== next.binding.generation;
-
-    if (event.generation !== next.binding.generation && !isGenerationAdvance) {
-      droppedStaleGenerationCount += 1;
-      continue;
-    }
-
-    if (!isGenerationAdvance) {
-      if (event.seq <= next.asOfSeq) {
-        droppedDuplicateSeqCount += 1;
+      (event.payload.binding.runtimeId !== next.binding.runtimeId ||
+        event.payload.binding.generation !== next.binding.generation)
+    ) {
+      if (options?.retiredGenerations?.has(event.payload.binding.generation)) {
+        droppedStaleGenerationCount += 1;
         continue;
       }
-      if (event.seq > next.asOfSeq + 1) {
-        seqGapDetected = { expectedSeq: next.asOfSeq + 1, receivedSeq: event.seq };
-        break;
-      }
+      // Signal authoritative resync on binding transition instead of mutating generation in-place
+      generationTransitionDetected = event.payload.binding;
+      break;
     }
 
     appliedCount += 1;
@@ -804,7 +982,6 @@ export function applyNativeEventBatch(
       case 'native.runtime.changed': {
         next = {
           ...next,
-          binding: event.payload.binding ?? next.binding,
           asOfSeq: event.seq,
           status: event.payload.status,
           leaseReasons: event.payload.leaseReasons ?? next.leaseReasons,
@@ -920,41 +1097,60 @@ export function applyNativeEventBatch(
     droppedStaleGenerationCount,
     droppedDuplicateSeqCount,
     seqGapDetected,
+    unappliedAfterGap,
+    generationTransitionDetected,
     capabilitiesChangedRevision,
     updatedCapabilities,
   };
 }
 
 /**
- * Coalesces consecutive text deltas that share an explicit `deltaCoalesceKey`
- * without ever deduplicating distinct full text chunks by string equality.
+ * Coalesces consecutive text deltas that share an explicit `deltaCoalesceKey`, `kind`, and actor
+ * identity (`actorKind` + `actorId`) while preserving every merged `entryId` so re-delivered
+ * deltas are never duplicated and distinct actors never cross-merge.
  */
 export function coalesceTimelineEntries(
   existing: readonly NativeTimelineEntry[],
   incoming: readonly NativeTimelineEntry[],
 ): NativeTimelineEntry[] {
   if (incoming.length === 0) return existing.slice();
-  const seenIds = new Set(existing.map((e) => e.entryId));
+  const seenIds = new Set<string>();
+  for (const entry of existing) {
+    seenIds.add(entry.entryId);
+    if (entry.mergedEntryIds) {
+      for (const mergedId of entry.mergedEntryIds) seenIds.add(mergedId);
+    }
+  }
   const merged = existing.slice();
 
   for (const item of incoming) {
-    if (seenIds.has(item.entryId)) continue;
+    const itemIds = item.mergedEntryIds?.length ? item.mergedEntryIds : [item.entryId];
+    if (seenIds.has(item.entryId) || itemIds.every((id) => seenIds.has(id))) continue;
     seenIds.add(item.entryId);
+    for (const id of itemIds) seenIds.add(id);
 
     const prev = merged.at(-1);
+    const sameActor =
+      prev !== undefined &&
+      prev.actorKind === item.actorKind &&
+      (prev.actorId ?? '') === (item.actorId ?? '');
+
     if (
       prev &&
+      sameActor &&
       item.deltaCoalesceKey &&
       prev.deltaCoalesceKey === item.deltaCoalesceKey &&
       prev.kind === item.kind &&
       typeof prev.text === 'string' &&
       typeof item.text === 'string'
     ) {
+      const priorMerged = prev.mergedEntryIds ?? [prev.entryId];
       merged[merged.length - 1] = {
         ...prev,
         seq: Math.max(prev.seq, item.seq),
         timestamp: Math.max(prev.timestamp, item.timestamp),
         text: prev.text + item.text,
+        mergedEntryIds: [...priorMerged, ...itemIds],
       };
     } else {
       merged.push(item);
@@ -967,9 +1163,18 @@ export function coalesceTimelineEntries(
 // ── Snapshot + Cursor Feed Controller (03b Core Engine) ─────────────────
 
 export interface NativeFeedSyncState {
-  phase: 'idle' | 'hydrating' | 'live' | 'catching_up' | 'resyncing' | 'unavailable' | 'error';
+  phase:
+    | 'idle'
+    | 'hydrating'
+    | 'live'
+    | 'catching_up'
+    | 'resyncing'
+    | 'incomplete'
+    | 'unavailable'
+    | 'error';
   resyncCount: number;
   droppedStaleEvents: number;
+  incompleteReason?: string | null;
   lastError?: string | null;
   lastSyncedAt: number | null;
 }
@@ -979,6 +1184,8 @@ export interface NativeFeedControllerOptions {
   transport: NativeRuntimeTransport;
   batchWindowMs?: number;
   pageLimit?: number;
+  maxPages?: number;
+  maxResyncAttempts?: number;
   onUpdate: (update: {
     projection: NativeRuntimeProjection | null;
     capabilities: CapabilityDescriptor[];
@@ -986,10 +1193,13 @@ export interface NativeFeedControllerOptions {
   }) => void;
 }
 
+const MAX_QUEUED_EVENTS = 5_000;
+const MAX_PENDING_GAP_EVENTS = 2_000;
+
 /**
  * Manages snapshot hydration, paginated catch-up (`GET /events?after=...`),
- * `410 RESYNC_REQUIRED` recovery, seq-gap repair, generation fencing, and
- * frame-batched live event flushing for a single session.
+ * `410 RESYNC_REQUIRED` recovery, seq-gap suffix preservation & replay, monotonic
+ * generation fencing, request-epoch ordering, and frame-batched live flushing.
  */
 export class NativeFeedController {
   private projection: NativeRuntimeProjection | null = null;
@@ -998,14 +1208,20 @@ export class NativeFeedController {
     phase: 'idle',
     resyncCount: 0,
     droppedStaleEvents: 0,
+    incompleteReason: null,
     lastError: null,
     lastSyncedAt: null,
   };
   private queuedEvents: NativeCanonicalEvent[] = [];
+  private pendingAfterGap = new Map<number, NativeCanonicalEvent>();
+  private gapTargetSeq: number | null = null;
+  private retiredGenerations = new Set<string>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private abortController: AbortController | null = null;
   private disposed = false;
   private catchingUp = false;
+  private requestEpoch = 0;
+  private resyncAttemptsInCycle = 0;
 
   constructor(private readonly options: NativeFeedControllerOptions) {}
 
@@ -1021,27 +1237,66 @@ export class NativeFeedController {
     };
   }
 
-  async hydrate(): Promise<void> {
+  async hydrate(isResync = false): Promise<void> {
     if (this.disposed) return;
+    if (!isResync) {
+      this.resyncAttemptsInCycle = 0;
+    }
     this.abortInFlight();
+    const epoch = ++this.requestEpoch;
     const controller = new AbortController();
     this.abortController = controller;
-    this.updateSync({ phase: this.projection ? 'resyncing' : 'hydrating', lastError: null });
+    this.updateSync({
+      phase: this.projection ? 'resyncing' : 'hydrating',
+      incompleteReason: null,
+      lastError: null,
+    });
 
     try {
       const [snapRes, capRes] = await Promise.all([
         this.options.transport.getSnapshot(this.options.sessionId, controller.signal),
         this.options.transport.getCapabilities(this.options.sessionId, controller.signal),
       ]);
-      if (this.disposed || controller.signal.aborted) return;
+      if (this.disposed || controller.signal.aborted || epoch !== this.requestEpoch) return;
+
+      const incomingBinding = snapRes.projection.binding;
+      if (
+        this.projection &&
+        (this.projection.binding.runtimeId !== incomingBinding.runtimeId ||
+          this.projection.binding.generation !== incomingBinding.generation)
+      ) {
+        // Retire old generation and clear gap state belonging to the previous binding
+        if (this.retiredGenerations.has(incomingBinding.generation)) {
+          this.updateSync({
+            phase: 'incomplete',
+            incompleteReason: 'stale_snapshot_generation',
+            lastError: '服务端返回了已退役的旧绑定快照，请重试同步。',
+          });
+          return;
+        }
+        this.retiredGenerations.add(this.projection.binding.generation);
+        this.pendingAfterGap.clear();
+        this.gapTargetSeq = null;
+      }
 
       this.projection = snapRes.projection;
       this.capabilities = capRes.descriptors;
-      this.updateSync({ phase: 'catching_up', lastSyncedAt: Date.now(), lastError: null });
+      this.updateSync({
+        phase: 'catching_up',
+        lastSyncedAt: Date.now(),
+        incompleteReason: null,
+        lastError: null,
+      });
 
-      await this.catchUp(controller.signal);
+      await this.catchUp(controller.signal, epoch);
     } catch (err) {
-      if (this.disposed || (err instanceof DOMException && err.name === 'AbortError')) return;
+      if (
+        this.disposed ||
+        epoch !== this.requestEpoch ||
+        (err instanceof DOMException && err.name === 'AbortError')
+      ) {
+        return;
+      }
       const typed = classifyNativeError(err);
       this.updateSync({
         phase: typed.code === 'ENDPOINT_UNAVAILABLE' ? 'unavailable' : 'error',
@@ -1050,16 +1305,24 @@ export class NativeFeedController {
     }
   }
 
-  async catchUp(externalSignal?: AbortSignal): Promise<void> {
+  async catchUp(externalSignal?: AbortSignal, expectedEpoch?: number): Promise<void> {
     if (this.disposed || !this.projection || this.catchingUp) return;
     this.catchingUp = true;
+    const epoch = expectedEpoch ?? this.requestEpoch;
     const signal = externalSignal ?? this.abortController?.signal;
+    const maxPages = this.options.maxPages ?? 50;
+    const maxResyncAttempts = this.options.maxResyncAttempts ?? 2;
 
     try {
       let cursor: string | null = null;
-      const maxPages = 50;
+      let hitPageLimit = false;
+      let pageGapDetected = false;
+      let generationChanged = false;
+
       for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
-        if (this.disposed || signal?.aborted || !this.projection) return;
+        if (this.disposed || signal?.aborted || epoch !== this.requestEpoch || !this.projection) {
+          return;
+        }
         const page = await this.options.transport.getEvents(
           this.options.sessionId,
           {
@@ -1069,24 +1332,31 @@ export class NativeFeedController {
           },
           signal,
         );
-        if (this.disposed || signal?.aborted || !this.projection) return;
+        if (this.disposed || signal?.aborted || epoch !== this.requestEpoch || !this.projection) {
+          return;
+        }
 
-        // If backend binding generation changed during catch-up, full snapshot resync is required
+        // If backend binding generation changed during catch-up, require full snapshot resync
         if (
           page.binding.runtimeId !== this.projection.binding.runtimeId ||
           page.binding.generation !== this.projection.binding.generation
         ) {
-          this.catchingUp = false;
-          this.syncState = {
-            ...this.syncState,
-            resyncCount: this.syncState.resyncCount + 1,
-          };
-          await this.hydrate();
-          return;
+          if (this.retiredGenerations.has(page.binding.generation)) {
+            this.syncState = {
+              ...this.syncState,
+              droppedStaleEvents: this.syncState.droppedStaleEvents + Math.max(1, page.events.length),
+            };
+            pageGapDetected = true;
+            break;
+          }
+          generationChanged = true;
+          break;
         }
 
         if (page.events.length > 0) {
-          const outcome = applyNativeEventBatch(this.projection, page.events);
+          const outcome = applyNativeEventBatch(this.projection, page.events, {
+            retiredGenerations: this.retiredGenerations,
+          });
           this.projection = outcome.projection;
           if (outcome.updatedCapabilities) {
             this.capabilities = outcome.updatedCapabilities;
@@ -1101,23 +1371,110 @@ export class NativeFeedController {
           if (outcome.capabilitiesChangedRevision !== null && !outcome.updatedCapabilities) {
             void this.refreshCapabilities();
           }
+          if (outcome.generationTransitionDetected) {
+            generationChanged = true;
+            break;
+          }
+          if (outcome.seqGapDetected) {
+            this.retainAfterGap(outcome.unappliedAfterGap);
+            pageGapDetected = true;
+            break;
+          }
         }
 
         cursor = page.nextCursor;
         if (!page.hasMore || page.events.length === 0) break;
+        if (pageIndex === maxPages - 1 && page.hasMore) {
+          hitPageLimit = true;
+        }
       }
 
-      this.updateSync({ phase: 'live', lastSyncedAt: Date.now(), lastError: null });
+      if (this.disposed || signal?.aborted || epoch !== this.requestEpoch || !this.projection) {
+        return;
+      }
+
+      if (generationChanged) {
+        this.catchingUp = false;
+        if (this.resyncAttemptsInCycle < maxResyncAttempts) {
+          this.resyncAttemptsInCycle += 1;
+          this.syncState = { ...this.syncState, resyncCount: this.syncState.resyncCount + 1 };
+          await this.hydrate(true);
+        } else {
+          this.updateSync({
+            phase: 'incomplete',
+            incompleteReason: 'generation_resync_exhausted',
+            lastError: '绑定代次多次变更，超过自动重同步上限，请手动刷新。',
+          });
+        }
+        return;
+      }
+
+      // Replay any buffered post-gap suffix events now that the prefix may have filled in
+      this.replayPendingAfterGap();
+
+      const hasUnresolvedGap =
+        pageGapDetected ||
+        this.pendingAfterGap.size > 0 ||
+        (this.gapTargetSeq !== null && this.projection.asOfSeq < this.gapTargetSeq);
+
+      if (hasUnresolvedGap) {
+        this.catchingUp = false;
+        if (this.resyncAttemptsInCycle < maxResyncAttempts) {
+          this.resyncAttemptsInCycle += 1;
+          this.syncState = { ...this.syncState, resyncCount: this.syncState.resyncCount + 1 };
+          await this.hydrate(true);
+        } else {
+          this.updateSync({
+            phase: 'incomplete',
+            incompleteReason: pageGapDetected ? 'seq_gap_unresolved' : 'gap_catchup_empty',
+            lastError: `事件补缺未完成（当前水位 #${this.projection.asOfSeq}），请点击重试同步。`,
+          });
+        }
+        return;
+      }
+
+      if (hitPageLimit) {
+        this.updateSync({
+          phase: 'incomplete',
+          incompleteReason: 'page_limit_reached',
+          lastError: `事件分页达到单次上限（${maxPages} 页），数据未完成同步，请点击重试继续拉取。`,
+        });
+        return;
+      }
+
+      this.gapTargetSeq = null;
+      this.resyncAttemptsInCycle = 0;
+      this.updateSync({
+        phase: 'live',
+        incompleteReason: null,
+        lastSyncedAt: Date.now(),
+        lastError: null,
+      });
     } catch (err) {
-      if (this.disposed || (err instanceof DOMException && err.name === 'AbortError')) return;
+      if (
+        this.disposed ||
+        epoch !== this.requestEpoch ||
+        (err instanceof DOMException && err.name === 'AbortError')
+      ) {
+        return;
+      }
       const typed = classifyNativeError(err);
       if (typed.code === 'RESYNC_REQUIRED') {
         this.catchingUp = false;
-        this.syncState = {
-          ...this.syncState,
-          resyncCount: this.syncState.resyncCount + 1,
-        };
-        await this.hydrate();
+        if (this.resyncAttemptsInCycle < maxResyncAttempts) {
+          this.resyncAttemptsInCycle += 1;
+          this.syncState = {
+            ...this.syncState,
+            resyncCount: this.syncState.resyncCount + 1,
+          };
+          await this.hydrate(true);
+        } else {
+          this.updateSync({
+            phase: 'incomplete',
+            incompleteReason: 'resync_limit_reached',
+            lastError: '游标连续过期，超过自动重同步上限，请点击重试。',
+          });
+        }
         return;
       }
       this.updateSync({
@@ -1127,15 +1484,28 @@ export class NativeFeedController {
     } finally {
       this.catchingUp = false;
     }
+
+    // Drain any events queued before or during hydration/catch-up once live
+    if (
+      !this.disposed &&
+      epoch === this.requestEpoch &&
+      this.syncState.phase === 'live' &&
+      this.queuedEvents.length > 0
+    ) {
+      this.flushNow();
+    }
   }
 
   /**
-   * Pushes live events from WS/subscription into a micro-batched queue.
-   * Use `flushNow()` in deterministic tests or immediate drain paths.
+   * Pushes live events from WS/subscription into a bounded micro-batched queue.
+   * Events arriving before initial hydration completes are retained and drained after hydrate().
    */
   enqueueLiveEvents(events: readonly NativeCanonicalEvent[]): void {
     if (this.disposed || events.length === 0) return;
     this.queuedEvents.push(...events);
+    if (this.queuedEvents.length > MAX_QUEUED_EVENTS) {
+      this.queuedEvents = this.queuedEvents.slice(-MAX_QUEUED_EVENTS);
+    }
     const windowMs = this.options.batchWindowMs ?? 16;
     if (windowMs <= 0) {
       this.flushNow();
@@ -1155,11 +1525,14 @@ export class NativeFeedController {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    if (this.queuedEvents.length === 0 || !this.projection) return;
+    // Keep queued events buffered until initial snapshot & active catch-up complete
+    if (this.queuedEvents.length === 0 || !this.projection || this.catchingUp) return;
     const batch = this.queuedEvents;
     this.queuedEvents = [];
 
-    const outcome = applyNativeEventBatch(this.projection, batch);
+    const outcome = applyNativeEventBatch(this.projection, batch, {
+      retiredGenerations: this.retiredGenerations,
+    });
     this.projection = outcome.projection;
     if (outcome.updatedCapabilities) {
       this.capabilities = outcome.updatedCapabilities;
@@ -1172,6 +1545,15 @@ export class NativeFeedController {
       };
     }
 
+    if (outcome.generationTransitionDetected) {
+      this.retiredGenerations.add(this.projection.binding.generation);
+      this.pendingAfterGap.clear();
+      this.gapTargetSeq = null;
+      this.syncState = { ...this.syncState, resyncCount: this.syncState.resyncCount + 1 };
+      void this.hydrate(true);
+      return;
+    }
+
     if (outcome.appliedCount > 0 || outcome.droppedStaleGenerationCount > 0) {
       this.emit();
     }
@@ -1181,19 +1563,24 @@ export class NativeFeedController {
     }
 
     if (outcome.seqGapDetected) {
-      this.updateSync({ phase: 'catching_up' });
+      this.retainAfterGap(outcome.unappliedAfterGap);
+      this.updateSync({ phase: 'catching_up', incompleteReason: null });
       void this.catchUp();
     }
   }
 
   async refreshCapabilities(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || !this.projection) return;
+    const epoch = this.requestEpoch;
+    const bindingKey = `${this.projection.binding.runtimeId}:${this.projection.binding.generation}`;
     try {
       const capRes = await this.options.transport.getCapabilities(
         this.options.sessionId,
         this.abortController?.signal,
       );
-      if (this.disposed) return;
+      if (this.disposed || epoch !== this.requestEpoch || !this.projection) return;
+      const currentKey = `${this.projection.binding.runtimeId}:${this.projection.binding.generation}`;
+      if (currentKey !== bindingKey) return;
       this.capabilities = capRes.descriptors;
       this.emit();
     } catch {
@@ -1203,12 +1590,46 @@ export class NativeFeedController {
 
   dispose(): void {
     this.disposed = true;
+    this.requestEpoch += 1;
     this.abortInFlight();
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
     this.queuedEvents = [];
+    this.pendingAfterGap.clear();
+    this.gapTargetSeq = null;
+  }
+
+  private retainAfterGap(events: readonly NativeCanonicalEvent[]): void {
+    for (const ev of events) {
+      this.pendingAfterGap.set(ev.seq, ev);
+      this.gapTargetSeq =
+        this.gapTargetSeq === null ? ev.seq : Math.max(this.gapTargetSeq, ev.seq);
+    }
+    if (this.pendingAfterGap.size > MAX_PENDING_GAP_EVENTS) {
+      const sortedKeys = [...this.pendingAfterGap.keys()].sort((a, b) => a - b);
+      const excess = sortedKeys.length - MAX_PENDING_GAP_EVENTS;
+      for (let i = 0; i < excess; i += 1) {
+        this.pendingAfterGap.delete(sortedKeys[i]!);
+      }
+    }
+  }
+
+  private replayPendingAfterGap(): void {
+    if (!this.projection || this.pendingAfterGap.size === 0) return;
+    const pending = [...this.pendingAfterGap.values()].sort((a, b) => a.seq - b.seq);
+    this.pendingAfterGap.clear();
+    const outcome = applyNativeEventBatch(this.projection, pending, {
+      retiredGenerations: this.retiredGenerations,
+    });
+    this.projection = outcome.projection;
+    if (outcome.updatedCapabilities) {
+      this.capabilities = outcome.updatedCapabilities;
+    }
+    if (outcome.unappliedAfterGap.length > 0) {
+      this.retainAfterGap(outcome.unappliedAfterGap);
+    }
   }
 
   private abortInFlight(): void {

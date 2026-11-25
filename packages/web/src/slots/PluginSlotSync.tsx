@@ -23,7 +23,6 @@ import {
   AgyWorkbenchShell,
   DEFAULT_WORKBENCH_ROUTE,
 } from '../components/agy/native/shared';
-import { defaultNativeTransport } from '../lib/native-client';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
@@ -269,6 +268,19 @@ function AgyNativeInspectorAdapter({ session }: { session: Session }) {
   const hydrate = useAppStore((state) => state.hydrateNativeRuntime);
   const resolveRuntimeRequest = useAppStore((state) => state.resolveRuntimeRequest);
   const dispatchControl = useAppStore((state) => state.dispatchNativeControl);
+  const loadNativeTimeline = useAppStore((state) => state.loadNativeTimeline);
+  const loadNativeWorkflowResource = useAppStore((state) => state.loadNativeWorkflowResource);
+
+  const stableLoadTimeline = useMemo(
+    () => (scope: { kind: 'activity' | 'agent'; id: string }, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeTimeline(session.id, scope, pageToken, signal),
+    [session.id, loadNativeTimeline],
+  );
+  const stableLoadWorkflowResource = useMemo(
+    () => (workflowId: import('../lib/native-client').WorkflowId, resource: string, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeWorkflowResource(session.id, workflowId, resource, pageToken, signal),
+    [session.id, loadNativeWorkflowResource],
+  );
 
   if (session.harnessKind !== 'agy') {
     return (
@@ -287,6 +299,7 @@ function AgyNativeInspectorAdapter({ session }: { session: Session }) {
       <AgyWorkbenchShell
         session={session}
         projection={slice?.projection ?? null}
+        syncState={slice?.syncState ?? null}
         capabilities={slice?.capabilities ?? []}
         pendingApprovals={sessionPending}
         route={slice?.route ?? { ...DEFAULT_WORKBENCH_ROUTE, surface: 'runtime' }}
@@ -296,11 +309,8 @@ function AgyNativeInspectorAdapter({ session }: { session: Session }) {
         onRefresh={() => void hydrate(session.id)}
         onResolveRequest={resolveRuntimeRequest}
         onDispatchControl={(req) => dispatchControl(session.id, req)}
-        loadTimeline={(scope, pageToken, signal) =>
-          scope.kind === 'activity'
-            ? defaultNativeTransport.getActivityTimeline(session.id, scope.id, { pageToken }, signal)
-            : defaultNativeTransport.getAgentTimeline(session.id, scope.id, { pageToken }, signal)
-        }
+        loadTimeline={stableLoadTimeline}
+        loadWorkflowResource={stableLoadWorkflowResource}
       />
     </div>
   );

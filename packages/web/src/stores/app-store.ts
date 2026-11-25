@@ -74,13 +74,19 @@ import {
   applyNativeEventBatch,
   createNativeIdempotencyKey,
   defaultNativeTransport,
+  type ActivityId,
   type CapabilityDescriptor,
+  type NativeAgentId,
   type NativeCanonicalEvent,
   type NativeCommandSubmitRequest,
   type NativeControlRequest,
   type NativeFeedSyncState,
   type NativeRuntimeProjection,
   type NativeRuntimeTransport,
+  type NativeTimelinePageResponse,
+  type NativeWorkflowResourcePageResponse,
+  type RuntimeBinding,
+  type WorkflowId,
 } from '../lib/native-client';
 import { isTriageEnabled, mergeTriageState, type TriageStateBySession } from '../lib/triage';
 
@@ -88,6 +94,7 @@ export interface NativeCommandSubmissionState {
   phase: 'idle' | 'submitting' | 'sent_awaiting_evidence' | 'confirmed' | 'conflict' | 'failed';
   message?: string;
   idempotencyKey?: string;
+  intentSignature?: string;
   updatedAt: number;
 }
 
@@ -390,12 +397,30 @@ interface AppState {
     sessionId: string,
     req: Omit<NativeCommandSubmitRequest, 'bindingGeneration' | 'catalogRevision' | 'idempotencyKey'> & {
       idempotencyKey?: string;
+      expectedBinding?: RuntimeBinding;
+      expectedCapabilitiesRevision?: number;
     },
   ) => Promise<boolean>;
   dispatchNativeControl: (
     sessionId: string,
-    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'> & { idempotencyKey?: string },
+    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'> & {
+      idempotencyKey?: string;
+      expectedBinding?: RuntimeBinding;
+    },
   ) => Promise<void>;
+  loadNativeTimeline: (
+    sessionId: string,
+    scope: { kind: 'activity' | 'agent'; id: string },
+    pageToken?: string | null,
+    signal?: AbortSignal,
+  ) => Promise<NativeTimelinePageResponse>;
+  loadNativeWorkflowResource: (
+    sessionId: string,
+    workflowId: WorkflowId,
+    resource: string,
+    pageToken?: string | null,
+    signal?: AbortSignal,
+  ) => Promise<NativeWorkflowResourcePageResponse>;
   clearNativeSessionState: (sessionId: string) => void;
 }
 
@@ -403,7 +428,58 @@ let wsClient: DaemonWsClient | null = null;
 const commandOutputRefCounts = new Map<string, number>();
 const terminalOutputRefCounts = new Map<string, number>();
 const nativeFeedControllers = new Map<string, NativeFeedController>();
+const nativeScopeEpochBySession = new Map<string, number>();
+const inFlightCommandKeyByIntent = new Map<string, string>();
+let nativeGlobalScopeEpoch = 0;
 let activeNativeTransport: NativeRuntimeTransport = defaultNativeTransport;
+let nativeKeyCounter = 0;
+
+function getNativeScopeEpoch(sessionId: string): number {
+  return nativeScopeEpochBySession.get(sessionId) ?? 0;
+}
+
+function bumpNativeScopeEpoch(sessionId: string): number {
+  const next = getNativeScopeEpoch(sessionId) + 1;
+  nativeScopeEpochBySession.set(sessionId, next);
+  for (const intentKey of [...inFlightCommandKeyByIntent.keys()]) {
+    if (intentKey.startsWith(`${sessionId}|`)) {
+      inFlightCommandKeyByIntent.delete(intentKey);
+    }
+  }
+  return next;
+}
+
+function canonicalizeArgs(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalizeArgs).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalizeArgs(v)}`).join(',')}}`;
+}
+
+function buildNativeCommandIntentSignature(params: {
+  sessionId: string;
+  instanceId: string;
+  runtimeId: string;
+  generation: string;
+  catalogRevision: number;
+  capabilityId: string;
+  actionKey: string;
+  args: Record<string, unknown>;
+}): string {
+  return [
+    params.sessionId,
+    params.instanceId,
+    params.runtimeId,
+    params.generation,
+    String(params.catalogRevision),
+    params.capabilityId,
+    params.actionKey,
+    canonicalizeArgs(params.args),
+  ].join('|');
+}
 
 function disposeNativeFeedController(sessionId: string): void {
   const controller = nativeFeedControllers.get(sessionId);
@@ -804,6 +880,7 @@ export const useAppStore = create<AppState>((set, get) => {
                   for (const sess of state.sessions) {
                     if (sess.harnessId === frame.state.instanceId) {
                       disposeNativeFeedController(sess.id);
+                      bumpNativeScopeEpoch(sess.id);
                       delete nextNative[sess.id];
                     }
                   }
@@ -1372,6 +1449,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const prevSessionId = get().selectedSessionId;
       if (prevSessionId && prevSessionId !== sessionId) {
         disposeNativeFeedController(prevSessionId);
+        bumpNativeScopeEpoch(prevSessionId);
       }
       set({ selectedSessionId: sessionId, focusedTurn: null });
       if (!sessionId) return;
@@ -1487,6 +1565,7 @@ export const useAppStore = create<AppState>((set, get) => {
     deleteSession: async (id) => {
       await daemonApi.deleteSession(id);
       disposeNativeFeedController(id);
+      bumpNativeScopeEpoch(id);
       set((state) => {
         const nextSessions = state.sessions.filter((s) => s.id !== id);
         const nextNative = { ...state.nativeRuntimeBySession };
@@ -2053,8 +2132,14 @@ export const useAppStore = create<AppState>((set, get) => {
         // ignore storage errors
       }
       if (!enabled) {
+        nativeGlobalScopeEpoch += 1;
+        inFlightCommandKeyByIntent.clear();
         for (const sid of [...nativeFeedControllers.keys()]) {
           disposeNativeFeedController(sid);
+          bumpNativeScopeEpoch(sid);
+        }
+        for (const sid of Object.keys(get().nativeRuntimeBySession)) {
+          bumpNativeScopeEpoch(sid);
         }
       }
       set({ agyNativeWorkbenchEnabled: enabled });
@@ -2066,11 +2151,27 @@ export const useAppStore = create<AppState>((set, get) => {
 
     hydrateNativeRuntime: async (sessionId) => {
       if (!get().agyNativeWorkbenchEnabled) return;
+      const globalEpoch = nativeGlobalScopeEpoch;
+      const scopeEpoch = getNativeScopeEpoch(sessionId);
+      const sessionSnapshot = get().sessions.find((s) => s.id === sessionId);
+      const expectedInstanceId = sessionSnapshot?.harnessId;
       disposeNativeFeedController(sessionId);
       const controller = new NativeFeedController({
         sessionId,
         transport: activeNativeTransport,
         onUpdate: ({ projection, capabilities, syncState }) => {
+          const cur = get();
+          if (
+            !cur.agyNativeWorkbenchEnabled ||
+            nativeGlobalScopeEpoch !== globalEpoch ||
+            getNativeScopeEpoch(sessionId) !== scopeEpoch
+          ) {
+            return;
+          }
+          if (expectedInstanceId) {
+            const liveSession = cur.sessions.find((s) => s.id === sessionId);
+            if (!liveSession || liveSession.harnessId !== expectedInstanceId) return;
+          }
           set((state) => {
             const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
             return {
@@ -2092,7 +2193,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     applyNativeEvents: (sessionId, events) => {
-      if (events.length === 0) return;
+      if (events.length === 0 || !get().agyNativeWorkbenchEnabled) return;
       const controller = nativeFeedControllers.get(sessionId);
       if (controller) {
         controller.enqueueLiveEvents(events);
@@ -2135,6 +2236,7 @@ export const useAppStore = create<AppState>((set, get) => {
                 phase: 'live',
                 resyncCount: 0,
                 droppedStaleEvents: 0,
+                incompleteReason: null,
                 lastError: null,
                 lastSyncedAt: Date.now(),
               },
@@ -2173,9 +2275,11 @@ export const useAppStore = create<AppState>((set, get) => {
       }),
 
     submitNativeCommand: async (sessionId, req) => {
+      if (!get().agyNativeWorkbenchEnabled) return false;
       const slice = get().nativeRuntimeBySession[sessionId];
       const projection = slice?.projection;
-      if (!projection) {
+      const session = get().sessions.find((s) => s.id === sessionId);
+      if (!projection || !session) {
         get().pushToast({
           kind: 'warning',
           title: '原生运行时尚未就绪',
@@ -2183,15 +2287,86 @@ export const useAppStore = create<AppState>((set, get) => {
         });
         return false;
       }
-      // Reuse pending idempotency key on repeated click while submitting
+
+      const binding = req.expectedBinding ?? projection.binding;
+      const catalogRevision = req.expectedCapabilitiesRevision ?? projection.capabilitiesRevision;
+
+      // Reject if rendered binding or revision is already stale against live projection
+      if (
+        binding.runtimeId !== projection.binding.runtimeId ||
+        binding.generation !== projection.binding.generation ||
+        binding.instanceId !== session.harnessId ||
+        projection.status === 'disconnected'
+      ) {
+        set((state) => {
+          const cur = state.nativeRuntimeBySession[sessionId];
+          if (!cur) return state;
+          return {
+            nativeRuntimeBySession: {
+              ...state.nativeRuntimeBySession,
+              [sessionId]: {
+                ...cur,
+                commandSubmission: {
+                  phase: 'conflict',
+                  message: '当前绑定已变更或断开，已保留草稿，请刷新后再提交。',
+                  updatedAt: Date.now(),
+                },
+              },
+            },
+          };
+        });
+        return false;
+      }
+
+      const capturedScope = {
+        globalEpoch: nativeGlobalScopeEpoch,
+        scopeEpoch: getNativeScopeEpoch(sessionId),
+        instanceId: session.harnessId,
+        runtimeId: binding.runtimeId,
+        generation: binding.generation,
+      };
+
+      const intentSignature = buildNativeCommandIntentSignature({
+        sessionId,
+        instanceId: session.harnessId,
+        runtimeId: binding.runtimeId,
+        generation: binding.generation,
+        catalogRevision,
+        capabilityId: req.capabilityId,
+        actionKey: req.actionKey,
+        args: req.args,
+      });
+
+      // Only reuse idempotency key for an identical in-flight intent (never across different prompts/args)
+      const existingKey = inFlightCommandKeyByIntent.get(intentSignature);
       const key =
         req.idempotencyKey ??
-        (slice.commandSubmission?.phase === 'submitting' && slice.commandSubmission.idempotencyKey
-          ? slice.commandSubmission.idempotencyKey
-          : createNativeIdempotencyKey(req.capabilityId, req.actionKey));
+        existingKey ??
+        createNativeIdempotencyKey(
+          req.capabilityId,
+          req.actionKey,
+          `${Date.now().toString(36)}_${(++nativeKeyCounter).toString(36)}`,
+        );
+      inFlightCommandKeyByIntent.set(intentSignature, key);
+
+      const isScopeStillValid = () => {
+        const cur = get();
+        if (!cur.agyNativeWorkbenchEnabled) return false;
+        if (nativeGlobalScopeEpoch !== capturedScope.globalEpoch) return false;
+        if (getNativeScopeEpoch(sessionId) !== capturedScope.scopeEpoch) return false;
+        const curSession = cur.sessions.find((s) => s.id === sessionId);
+        if (!curSession || curSession.harnessId !== capturedScope.instanceId) return false;
+        const curSlice = cur.nativeRuntimeBySession[sessionId];
+        if (!curSlice?.projection) return false;
+        return (
+          curSlice.projection.binding.runtimeId === capturedScope.runtimeId &&
+          curSlice.projection.binding.generation === capturedScope.generation
+        );
+      };
 
       set((state) => {
-        const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+        const prev = state.nativeRuntimeBySession[sessionId];
+        if (!prev) return state;
         return {
           nativeRuntimeBySession: {
             ...state.nativeRuntimeBySession,
@@ -2201,6 +2376,7 @@ export const useAppStore = create<AppState>((set, get) => {
                 phase: 'submitting',
                 message: '正在发起原生命令…',
                 idempotencyKey: key,
+                intentSignature,
                 updatedAt: Date.now(),
               },
             },
@@ -2210,15 +2386,22 @@ export const useAppStore = create<AppState>((set, get) => {
 
       try {
         const res = await activeNativeTransport.submitCommand(sessionId, {
-          bindingGeneration: projection.binding.generation,
-          catalogRevision: projection.capabilitiesRevision,
+          bindingGeneration: binding.generation,
+          catalogRevision,
           capabilityId: req.capabilityId,
           actionKey: req.actionKey,
           args: req.args,
           idempotencyKey: key,
         });
+        if (inFlightCommandKeyByIntent.get(intentSignature) === key) {
+          inFlightCommandKeyByIntent.delete(intentSignature);
+        }
+        // Ignore late receipt if session was cleared, switched, logged out, or gate disabled
+        if (!isScopeStillValid()) return false;
+
         set((state) => {
-          const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+          const prev = state.nativeRuntimeBySession[sessionId];
+          if (!prev) return state;
           return {
             nativeRuntimeBySession: {
               ...state.nativeRuntimeBySession,
@@ -2230,6 +2413,7 @@ export const useAppStore = create<AppState>((set, get) => {
                     ? '已收到原生模式确认'
                     : '已发送，等待原生确认',
                   idempotencyKey: key,
+                  intentSignature,
                   updatedAt: Date.now(),
                 },
               },
@@ -2238,9 +2422,15 @@ export const useAppStore = create<AppState>((set, get) => {
         });
         return true;
       } catch (err) {
+        if (inFlightCommandKeyByIntent.get(intentSignature) === key) {
+          inFlightCommandKeyByIntent.delete(intentSignature);
+        }
+        if (!isScopeStillValid()) return false;
+
         const isConflict = err instanceof NativeClientError && err.status === 409;
         set((state) => {
-          const prev = state.nativeRuntimeBySession[sessionId] ?? createEmptyNativeSlice();
+          const prev = state.nativeRuntimeBySession[sessionId];
+          if (!prev) return state;
           return {
             nativeRuntimeBySession: {
               ...state.nativeRuntimeBySession,
@@ -2254,13 +2444,14 @@ export const useAppStore = create<AppState>((set, get) => {
                       ? err.message
                       : String(err),
                   idempotencyKey: key,
+                  intentSignature,
                   updatedAt: Date.now(),
                 },
               },
             },
           };
         });
-        if (isConflict) {
+        if (isConflict && isScopeStillValid()) {
           void get().hydrateNativeRuntime(sessionId);
         }
         return false;
@@ -2268,14 +2459,29 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     dispatchNativeControl: async (sessionId, req) => {
+      if (!get().agyNativeWorkbenchEnabled) {
+        throw new Error('AGY 原生工作台门控已关闭');
+      }
       const projection = get().nativeRuntimeBySession[sessionId]?.projection;
       if (!projection) {
         throw new Error('原生运行时未连接，无法执行控制操作');
       }
+      const binding = req.expectedBinding ?? projection.binding;
+      if (
+        binding.runtimeId !== projection.binding.runtimeId ||
+        binding.generation !== projection.binding.generation
+      ) {
+        throw new NativeClientError('绑定代次已过期，拒绝发送旧目标控制命令', 409, 'STALE_BINDING');
+      }
       const key =
-        req.idempotencyKey ?? createNativeIdempotencyKey(`ctrl_${req.target.type}`, req.action);
+        req.idempotencyKey ??
+        createNativeIdempotencyKey(
+          `ctrl_${req.target.type}`,
+          `${req.target.id}_${req.action}`,
+          `${Date.now().toString(36)}_${(++nativeKeyCounter).toString(36)}`,
+        );
       await activeNativeTransport.dispatchControl(sessionId, {
-        generation: projection.binding.generation,
+        generation: binding.generation,
         target: req.target,
         action: req.action,
         expectedRevision: req.expectedRevision,
@@ -2283,8 +2489,33 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
+    loadNativeTimeline: (sessionId, scope, pageToken, signal) =>
+      scope.kind === 'activity'
+        ? activeNativeTransport.getActivityTimeline(
+            sessionId,
+            scope.id as ActivityId,
+            { pageToken },
+            signal,
+          )
+        : activeNativeTransport.getAgentTimeline(
+            sessionId,
+            scope.id as NativeAgentId,
+            { pageToken },
+            signal,
+          ),
+
+    loadNativeWorkflowResource: (sessionId, workflowId, resource, pageToken, signal) =>
+      activeNativeTransport.getWorkflowResource(
+        sessionId,
+        workflowId,
+        resource,
+        { pageToken },
+        signal,
+      ),
+
     clearNativeSessionState: (sessionId) => {
       disposeNativeFeedController(sessionId);
+      bumpNativeScopeEpoch(sessionId);
       set((state) => {
         if (!state.nativeRuntimeBySession[sessionId]) return state;
         const next = { ...state.nativeRuntimeBySession };

@@ -91,7 +91,7 @@ import {
   NativeActivityLink,
   resolveAgyModeOptions,
 } from './agy/native/shared';
-import { defaultNativeTransport } from '../lib/native-client';
+import type { WorkflowId } from '../lib/native-client';
 import {
   ComposerPendingRequestBar,
   GlobalAttentionStrip,
@@ -223,6 +223,8 @@ export function ChatStage() {
     hydrateNativeRuntime,
     submitNativeCommand,
     dispatchNativeControl,
+    loadNativeTimeline,
+    loadNativeWorkflowResource,
   } = useAppStore(useShallow((state) => ({
     sessions: state.sessions,
     pendingApprovals: state.pendingApprovals,
@@ -278,6 +280,8 @@ export function ChatStage() {
     hydrateNativeRuntime: state.hydrateNativeRuntime,
     submitNativeCommand: state.submitNativeCommand,
     dispatchNativeControl: state.dispatchNativeControl,
+    loadNativeTimeline: state.loadNativeTimeline,
+    loadNativeWorkflowResource: state.loadNativeWorkflowResource,
   })));
 
   const session = useMemo(
@@ -309,6 +313,7 @@ export function ChatStage() {
     session && session.harnessKind === 'agy' && agyNativeWorkbenchEnabled,
   );
   const nativeProjection = nativeWorkbenchActive ? (selectedNativeRuntime?.projection ?? null) : null;
+  const nativeSyncState = nativeWorkbenchActive ? (selectedNativeRuntime?.syncState ?? null) : null;
   const nativeCapabilities = nativeWorkbenchActive ? (selectedNativeRuntime?.capabilities ?? []) : [];
   const nativeRoute = nativeWorkbenchActive
     ? (selectedNativeRuntime?.route ?? DEFAULT_WORKBENCH_ROUTE)
@@ -328,11 +333,30 @@ export function ChatStage() {
   }, [nativeWorkbenchActive, session, agyAuthStates, nativeProjection, nativeCapabilities]);
   const activeNativeMode = nativeModeOptions.find((m) => m.id === nativeSelectedModeId) ?? null;
 
+  const stableLoadNativeTimeline = useCallback(
+    (scope: { kind: 'activity' | 'agent'; id: string }, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeTimeline(selectedSessionId ?? '', scope, pageToken, signal),
+    [selectedSessionId, loadNativeTimeline],
+  );
+  const stableLoadNativeWorkflowResource = useCallback(
+    (workflowId: WorkflowId, resource: string, pageToken?: string | null, signal?: AbortSignal) =>
+      loadNativeWorkflowResource(selectedSessionId ?? '', workflowId, resource, pageToken, signal),
+    [selectedSessionId, loadNativeWorkflowResource],
+  );
+
+  // Only isolate legacy placeholder turns (`turn_bg`/`turn_unknown`) when a healthy live native projection replaces them
+  const canIsolateNativePlaceholders = Boolean(
+    nativeWorkbenchActive &&
+      nativeProjection &&
+      nativeSyncState?.phase === 'live' &&
+      nativeProjection.activities.length > 0,
+  );
+
   const project = useMemo(() => createSessionEventProjector(), [selectedSessionId]);
   const baseTimeline = project(
     visibleEvents,
     session ? { id: session.harnessId, kind: session.harnessKind } : undefined,
-    { isolateNativePlaceholders: nativeWorkbenchActive },
+    { isolateNativePlaceholders: canIsolateNativePlaceholders },
   );
   const timeline = useMemo(
     () =>
@@ -723,14 +747,32 @@ export function ChatStage() {
         return;
       }
       setSending(true);
+      const sentAttIds = attachments.map((a) => a.id);
+      const sentChipIds = pendingTerminalChips.map((c) => c.id);
       try {
         const ok = await submitNativeCommand(session.id, {
           capabilityId: activeNativeMode.capabilityId,
           actionKey: activeNativeMode.id,
-          args: { prompt: trimmed },
+          expectedBinding: nativeProjection?.binding,
+          expectedCapabilitiesRevision: nativeProjection?.capabilitiesRevision,
+          args: {
+            prompt: trimmed,
+            ...(sentAttIds.length > 0 ? { attachmentIds: sentAttIds } : {}),
+            ...(sentChipIds.length > 0 ? { terminalContextIds: sentChipIds } : {}),
+          },
         });
-        if (ok && useAppStore.getState().draftTextBySession[session.id] === inputText) {
-          clearDraft(session.id);
+        if (ok) {
+          const curState = useAppStore.getState();
+          if (curState.draftTextBySession[session.id] === inputText) {
+            setDraftText(session.id, '');
+          }
+          // Only remove attachments/chips that were actually part of this submission; preserve mid-flight additions
+          for (const attId of sentAttIds) {
+            removeDraftAttachment(session.id, attId);
+          }
+          for (const chipId of sentChipIds) {
+            removePendingTerminalChip(session.id, chipId);
+          }
         }
       } finally {
         setSending(false);
@@ -888,44 +930,36 @@ export function ChatStage() {
     (isNarrowViewport || nativeRoute.layout === 'split');
   const isNarrowSheetOpen = showSplitOrSheetWorkbench && isNarrowViewport;
 
+  const sharedWorkbenchProps = {
+    session,
+    projection: nativeProjection,
+    syncState: nativeSyncState,
+    capabilities: nativeCapabilities,
+    pendingApprovals: sessionPendingRequests,
+    route: nativeRoute,
+    returnFocusToRef: workbenchTriggerRef,
+    onNavigate: (patch: Parameters<typeof setNativeWorkbenchRoute>[1]) =>
+      setNativeWorkbenchRoute(session.id, patch),
+    onBackToChat: () => {
+      pendingWorkbenchFocusRestoreRef.current = true;
+      setNativeWorkbenchRoute(session.id, { surface: 'chat' });
+    },
+    onRefresh: () => void hydrateNativeRuntime(session.id),
+    onResolveRequest: resolveRuntimeRequest,
+    onSubmitCommand: async (req: Parameters<typeof submitNativeCommand>[1]) => {
+      await submitNativeCommand(session.id, req);
+    },
+    onDispatchControl: (req: Parameters<typeof dispatchNativeControl>[1]) =>
+      dispatchNativeControl(session.id, req),
+    loadTimeline: stableLoadNativeTimeline,
+    loadWorkflowResource: stableLoadNativeWorkflowResource,
+  };
+
   return (
     <div className="flex h-full min-w-0 flex-1 overflow-hidden">
       {showFullWorkbench ? (
         <div className="flex h-full min-w-0 flex-1 overflow-hidden">
-          <AgyWorkbenchShell
-            session={session}
-            projection={nativeProjection}
-            capabilities={nativeCapabilities}
-            pendingApprovals={sessionPendingRequests}
-            route={nativeRoute}
-            isNarrowViewport={false}
-            returnFocusToRef={workbenchTriggerRef}
-            onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
-            onBackToChat={() => {
-              pendingWorkbenchFocusRestoreRef.current = true;
-              setNativeWorkbenchRoute(session.id, { surface: 'chat' });
-            }}
-            onRefresh={() => void hydrateNativeRuntime(session.id)}
-            onResolveRequest={resolveRuntimeRequest}
-            onSubmitCommand={async (req) => {
-              await submitNativeCommand(session.id, req);
-            }}
-            onDispatchControl={(req) => dispatchNativeControl(session.id, req)}
-            loadTimeline={(scope, pageToken, signal) =>
-              scope.kind === 'activity'
-                ? defaultNativeTransport.getActivityTimeline(session.id, scope.id, { pageToken }, signal)
-                : defaultNativeTransport.getAgentTimeline(session.id, scope.id, { pageToken }, signal)
-            }
-            loadWorkflowResource={(workflowId, resource, pageToken, signal) =>
-              defaultNativeTransport.getWorkflowResource(
-                session.id,
-                workflowId,
-                resource,
-                { pageToken },
-                signal,
-              )
-            }
-          />
+          <AgyWorkbenchShell {...sharedWorkbenchProps} isNarrowViewport={false} />
         </div>
       ) : (
       <div
@@ -1340,6 +1374,27 @@ export function ChatStage() {
                     );
                   })}
                 </div>
+              )}
+
+              {timeline.detachedNativeEvents && timeline.detachedNativeEvents.length > 0 && (
+                <details
+                  data-testid="detached-native-fallback"
+                  className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2 text-[11.5px] text-[var(--text-secondary)]"
+                >
+                  <summary className="cursor-pointer font-medium text-[var(--text-primary)]">
+                    已隔离的旧版原生占位事件（{timeline.detachedNativeEvents.length} 条 · 点击可只读回看）
+                  </summary>
+                  <div className="mt-2 max-h-40 space-y-1 overflow-y-auto font-mono-code text-[10.5px]">
+                    {timeline.detachedNativeEvents.map((ev) => (
+                      <div key={ev.seq} className="truncate text-[var(--text-muted)]">
+                        #{ev.seq} [{ev.turnId ?? 'null'}] {ev.type}:{' '}
+                        {typeof ev.payload.text === 'string'
+                          ? ev.payload.text
+                          : JSON.stringify(ev.payload).slice(0, 120)}
+                      </div>
+                    ))}
+                  </div>
+                </details>
               )}
 
               {timeline.items.length === 0 ? (
@@ -1912,40 +1967,7 @@ export function ChatStage() {
               : 'h-full w-[440px] max-w-[48vw] shrink-0 overflow-hidden'
           }
         >
-          <AgyWorkbenchShell
-            session={session}
-            projection={nativeProjection}
-            capabilities={nativeCapabilities}
-            pendingApprovals={sessionPendingRequests}
-            route={nativeRoute}
-            isNarrowViewport={isNarrowViewport}
-            returnFocusToRef={workbenchTriggerRef}
-            onNavigate={(patch) => setNativeWorkbenchRoute(session.id, patch)}
-            onBackToChat={() => {
-              pendingWorkbenchFocusRestoreRef.current = true;
-              setNativeWorkbenchRoute(session.id, { surface: 'chat' });
-            }}
-            onRefresh={() => void hydrateNativeRuntime(session.id)}
-            onResolveRequest={resolveRuntimeRequest}
-            onSubmitCommand={async (req) => {
-              await submitNativeCommand(session.id, req);
-            }}
-            onDispatchControl={(req) => dispatchNativeControl(session.id, req)}
-            loadTimeline={(scope, pageToken, signal) =>
-              scope.kind === 'activity'
-                ? defaultNativeTransport.getActivityTimeline(session.id, scope.id, { pageToken }, signal)
-                : defaultNativeTransport.getAgentTimeline(session.id, scope.id, { pageToken }, signal)
-            }
-            loadWorkflowResource={(workflowId, resource, pageToken, signal) =>
-              defaultNativeTransport.getWorkflowResource(
-                session.id,
-                workflowId,
-                resource,
-                { pageToken },
-                signal,
-              )
-            }
-          />
+          <AgyWorkbenchShell {...sharedWorkbenchProps} isNarrowViewport={isNarrowViewport} />
         </div>
       )}
 

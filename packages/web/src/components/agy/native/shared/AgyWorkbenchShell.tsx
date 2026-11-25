@@ -14,12 +14,13 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type {
-  CapabilityDescriptor,
-  NativeAgentId,
-  NativeTimelineEntry,
-  NativeWork,
-  NativeWorkflow,
+import {
+  coalesceTimelineEntries,
+  type CapabilityDescriptor,
+  type NativeAgentId,
+  type NativeTimelineEntry,
+  type NativeWork,
+  type NativeWorkflow,
 } from '../../../../lib/native-client';
 import { CapabilityUnavailable } from './CapabilityUnavailable';
 import { EntityStatusBadge } from './EntityStatusBadge';
@@ -58,8 +59,140 @@ function findCap(
   return undefined;
 }
 
+interface ScopedTimelineState {
+  scopeKey: string;
+  entries: NativeTimelineEntry[];
+  loading: boolean;
+  nextPageToken: string | null;
+  sourceUnavailable: boolean;
+  sourceUnavailableReason?: string;
+}
+
+/**
+ * Binding- and scope-isolated timeline loader shared by Runtime Center & Subagent Manager.
+ * - Immediately resets entries when runtime/generation/entity changes (no stale entries under new header).
+ * - Cancels BOTH initial fetch and any in-flight `loadMore` fetch on scope change or unmount.
+ * - Guards async resolution with `activeScopeKeyRef` and coalesces paginated deltas safely.
+ */
+function useScopedNativeTimeline(
+  scope: { kind: 'activity' | 'agent'; id: string } | null,
+  bindingKey: string | null,
+  loadTimeline?: NativeWorkbenchViewProps['loadTimeline'],
+) {
+  const scopeKey = scope && bindingKey ? `${bindingKey}:${scope.kind}:${scope.id}` : '';
+  const activeScopeKeyRef = useRef(scopeKey);
+  activeScopeKeyRef.current = scopeKey;
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
+
+  const [state, setState] = useState<ScopedTimelineState>({
+    scopeKey,
+    entries: [],
+    loading: false,
+    nextPageToken: null,
+    sourceUnavailable: false,
+  });
+
+  useEffect(() => {
+    loadMoreAbortRef.current?.abort();
+    loadMoreAbortRef.current = null;
+
+    if (!scope || !bindingKey || !loadTimeline) {
+      setState({
+        scopeKey,
+        entries: [],
+        loading: false,
+        nextPageToken: null,
+        sourceUnavailable: false,
+      });
+      return;
+    }
+
+    const requestScopeKey = scopeKey;
+    const controller = new AbortController();
+    // Immediately clear stale entries from previous scope while loading new scope
+    setState({
+      scopeKey: requestScopeKey,
+      entries: [],
+      loading: true,
+      nextPageToken: null,
+      sourceUnavailable: false,
+    });
+
+    void loadTimeline(scope, null, controller.signal)
+      .then((page) => {
+        if (controller.signal.aborted || activeScopeKeyRef.current !== requestScopeKey) return;
+        setState({
+          scopeKey: requestScopeKey,
+          entries: coalesceTimelineEntries([], page.items),
+          loading: false,
+          nextPageToken: page.nextPageToken,
+          sourceUnavailable: Boolean(page.sourceUnavailableReason),
+          sourceUnavailableReason: page.sourceUnavailableReason,
+        });
+      })
+      .catch(() => {
+        if (controller.signal.aborted || activeScopeKeyRef.current !== requestScopeKey) return;
+        setState({
+          scopeKey: requestScopeKey,
+          entries: [],
+          loading: false,
+          nextPageToken: null,
+          sourceUnavailable: true,
+        });
+      });
+
+    return () => {
+      controller.abort();
+      loadMoreAbortRef.current?.abort();
+      loadMoreAbortRef.current = null;
+    };
+  }, [scope?.kind, scope?.id, bindingKey, scopeKey, loadTimeline]);
+
+  const loadMore = useCallback(() => {
+    if (!scope || !bindingKey || !loadTimeline) return;
+    if (state.scopeKey !== scopeKey || !state.nextPageToken || state.loading) return;
+    const requestScopeKey = scopeKey;
+    const token = state.nextPageToken;
+    loadMoreAbortRef.current?.abort();
+    const controller = new AbortController();
+    loadMoreAbortRef.current = controller;
+
+    setState((prev) => (prev.scopeKey === requestScopeKey ? { ...prev, loading: true } : prev));
+
+    void loadTimeline(scope, token, controller.signal)
+      .then((page) => {
+        if (controller.signal.aborted || activeScopeKeyRef.current !== requestScopeKey) return;
+        setState((prev) => {
+          if (prev.scopeKey !== requestScopeKey) return prev;
+          return {
+            ...prev,
+            entries: coalesceTimelineEntries(prev.entries, page.items),
+            nextPageToken: page.nextPageToken,
+            loading: false,
+          };
+        });
+      })
+      .catch(() => {
+        if (controller.signal.aborted || activeScopeKeyRef.current !== requestScopeKey) return;
+        setState((prev) => (prev.scopeKey === requestScopeKey ? { ...prev, loading: false } : prev));
+      });
+  }, [scope, bindingKey, loadTimeline, state.scopeKey, state.nextPageToken, state.loading, scopeKey]);
+
+  // Never render entries belonging to an older scope during render transition
+  const matchesCurrentScope = state.scopeKey === scopeKey;
+  return {
+    entries: matchesCurrentScope ? state.entries : [],
+    loading: matchesCurrentScope ? state.loading : Boolean(scope && bindingKey && loadTimeline),
+    hasMore: matchesCurrentScope && Boolean(state.nextPageToken),
+    sourceUnavailable: matchesCurrentScope && state.sourceUnavailable,
+    sourceUnavailableReason: matchesCurrentScope ? state.sourceUnavailableReason : undefined,
+    loadMore: matchesCurrentScope && state.nextPageToken ? loadMore : undefined,
+  };
+}
+
 function DefaultRuntimeCenterView({
   projection,
+  syncState,
   capabilities,
   pendingApprovals,
   route,
@@ -70,10 +203,6 @@ function DefaultRuntimeCenterView({
   loadTimeline,
 }: NativeWorkbenchViewProps) {
   const [filterKind, setFilterKind] = useState<'all' | NativeWork['kind']>('all');
-  const [timelineEntries, setTimelineEntries] = useState<NativeTimelineEntry[]>([]);
-  const [timelineLoading, setTimelineLoading] = useState(false);
-  const [timelineSourceMissing, setTimelineSourceMissing] = useState(false);
-  const [nextPageToken, setNextPageToken] = useState<string | null>(null);
 
   const activities = projection?.activities ?? [];
   const workItems = projection?.work ?? [];
@@ -87,32 +216,14 @@ function DefaultRuntimeCenterView({
     filteredWork.find((w) => w.id === route.selectedWorkId) ?? filteredWork[0] ?? null;
 
   const runtimeCap = findCap(capabilities, ['AGY-R10', 'AGY-W11', 'AGY-R04']);
-
-  useEffect(() => {
-    if (!selectedActivity || !loadTimeline) {
-      setTimelineEntries([]);
-      setNextPageToken(null);
-      setTimelineSourceMissing(false);
-      return;
-    }
-    const controller = new AbortController();
-    setTimelineLoading(true);
-    setTimelineSourceMissing(false);
-    void loadTimeline({ kind: 'activity', id: selectedActivity.id }, null, controller.signal)
-      .then((page) => {
-        if (controller.signal.aborted) return;
-        setTimelineEntries(page.items);
-        setNextPageToken(page.nextPageToken);
-        setTimelineSourceMissing(Boolean(page.sourceUnavailableReason));
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setTimelineSourceMissing(true);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setTimelineLoading(false);
-      });
-    return () => controller.abort();
-  }, [selectedActivity?.id, loadTimeline]);
+  const bindingKey = projection
+    ? `${projection.binding.runtimeId}:${projection.binding.generation}`
+    : null;
+  const activityScope = useMemo(
+    () => (selectedActivity ? { kind: 'activity' as const, id: selectedActivity.id } : null),
+    [selectedActivity?.id],
+  );
+  const timeline = useScopedNativeTimeline(activityScope, bindingKey, loadTimeline);
 
   if (!projection) {
     return (
@@ -159,6 +270,19 @@ function DefaultRuntimeCenterView({
           </span>
         </SummaryStat>
       </div>
+
+      {syncState?.phase === 'incomplete' && (
+        <CapabilityUnavailable
+          title="数据未完成同步"
+          gate="unknown"
+          capabilityId="AGY-S03"
+          reason={
+            syncState.lastError ??
+            '事件补缺未完成或触达分页上限，当前展示可能落后于实时状态，请点击刷新重试。'
+          }
+          onRefresh={onRefresh}
+        />
+      )}
 
       {projection.status !== 'attached' && (
         <CapabilityUnavailable
@@ -293,6 +417,7 @@ function DefaultRuntimeCenterView({
               target={{ type: 'work', id: selectedWork.id }}
               targetLabel={selectedWork.observedLabel ?? selectedWork.id}
               expectedRevision={selectedWork.revision}
+              binding={projection.binding}
               capability={runtimeCap}
               onDispatchControl={onDispatchControl}
             />
@@ -340,27 +465,18 @@ function DefaultRuntimeCenterView({
           </div>
         )}
         <NativeTimeline
-          entries={timelineEntries}
+          entries={timeline.entries}
           scopeLabel={selectedActivity ? `活动 ${selectedActivity.id}` : '活动时间线'}
-          loading={timelineLoading}
-          hasMore={Boolean(nextPageToken)}
-          sourceNotProvided={timelineSourceMissing}
+          loading={timeline.loading}
+          hasMore={timeline.hasMore}
+          sourceNotProvided={timeline.sourceUnavailable}
           sourceUnavailableReason={
-            timelineSourceMissing ? '当前连接未暴露活动级分页时间线，请在主聊天或官方 /tasks 查看。' : undefined
-          }
-          onLoadMore={
-            selectedActivity && loadTimeline && nextPageToken
-              ? () => {
-                  setTimelineLoading(true);
-                  void loadTimeline({ kind: 'activity', id: selectedActivity.id }, nextPageToken)
-                    .then((page) => {
-                      setTimelineEntries((prev) => [...prev, ...page.items]);
-                      setNextPageToken(page.nextPageToken);
-                    })
-                    .finally(() => setTimelineLoading(false));
-                }
+            timeline.sourceUnavailable
+              ? (timeline.sourceUnavailableReason ??
+                '当前连接未暴露活动级分页时间线，请在主聊天或官方 /tasks 查看。')
               : undefined
           }
+          onLoadMore={timeline.loadMore}
         />
       </section>
     </div>
@@ -380,9 +496,6 @@ function DefaultSubagentManagerView({
   loadTimeline,
 }: NativeWorkbenchViewProps) {
   const [roleFilter, setRoleFilter] = useState('');
-  const [timelineEntries, setTimelineEntries] = useState<NativeTimelineEntry[]>([]);
-  const [timelineLoading, setTimelineLoading] = useState(false);
-  const [sourceUnavailable, setSourceUnavailable] = useState(false);
 
   const agents = projection?.agents ?? [];
   const relations = projection?.relations ?? [];
@@ -399,31 +512,14 @@ function DefaultSubagentManagerView({
   const selectedAgent =
     agents.find((a) => a.id === route.selectedAgentId) ?? filteredAgents[0] ?? null;
   const childCap = findCap(capabilities, ['AGY-W02', 'AGY-W01']);
-
-  // Switching across children cancels the previous in-flight timeline fetch cleanly
-  useEffect(() => {
-    if (!selectedAgent || !loadTimeline) {
-      setTimelineEntries([]);
-      setSourceUnavailable(false);
-      return;
-    }
-    const controller = new AbortController();
-    setTimelineLoading(true);
-    setSourceUnavailable(false);
-    void loadTimeline({ kind: 'agent', id: selectedAgent.id }, null, controller.signal)
-      .then((page) => {
-        if (controller.signal.aborted) return;
-        setTimelineEntries(page.items);
-        setSourceUnavailable(Boolean(page.sourceUnavailableReason));
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setSourceUnavailable(true);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setTimelineLoading(false);
-      });
-    return () => controller.abort();
-  }, [selectedAgent?.id, loadTimeline]);
+  const bindingKey = projection
+    ? `${projection.binding.runtimeId}:${projection.binding.generation}`
+    : null;
+  const agentScope = useMemo(
+    () => (selectedAgent ? { kind: 'agent' as const, id: selectedAgent.id } : null),
+    [selectedAgent?.id],
+  );
+  const timeline = useScopedNativeTimeline(agentScope, bindingKey, loadTimeline);
 
   if (!projection) {
     return (
@@ -555,16 +651,22 @@ function DefaultSubagentManagerView({
             target={{ type: 'agent', id: selectedAgent.id }}
             targetLabel={selectedAgent.id}
             expectedRevision={selectedAgent.revision}
+            binding={projection.binding}
             capability={selectedAgent.lineage === 'confirmed' ? childCap : null}
             onDispatchControl={onDispatchControl}
           />
 
           <NativeTimeline
-            entries={timelineEntries}
+            entries={timeline.entries}
             scopeLabel={`子 Agent ${selectedAgent.id} 轨迹`}
-            loading={timelineLoading}
-            sourceNotProvided={sourceUnavailable}
-            sourceUnavailableReason="该子 Agent 暂无已验证的独立轨迹源；不会回退到父会话历史以免错标。"
+            loading={timeline.loading}
+            hasMore={timeline.hasMore}
+            onLoadMore={timeline.loadMore}
+            sourceNotProvided={timeline.sourceUnavailable}
+            sourceUnavailableReason={
+              timeline.sourceUnavailableReason ??
+              '该子 Agent 暂无已验证的独立轨迹源；不会回退到父会话历史以免错标。'
+            }
           />
         </div>
       )}

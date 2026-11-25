@@ -605,4 +605,83 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
       ),
     ).toBe(false);
   });
+
+  it('R1/R3 UI regressions: surfaces incomplete sync banner, keeps legacy turn_bg visible when projection is absent, and provides detached fallback viewer when isolated', () => {
+    const live = createLiveReactiveFixture(baseAgySession.id);
+
+    // 1. Incomplete sync banner shown in Runtime Center when syncState.phase === 'incomplete'
+    const incompleteHtml = renderToStaticMarkup(
+      <AgyWorkbenchShell
+        session={baseAgySession}
+        projection={live.projection}
+        syncState={{
+          phase: 'incomplete',
+          resyncCount: 2,
+          droppedStaleEvents: 0,
+          incompleteReason: 'seq_gap_unresolved',
+          lastError: '事件补缺未完成，请点击重试同步。',
+          lastSyncedAt: 1000,
+        }}
+        capabilities={live.capabilities}
+        pendingApprovals={[]}
+        route={{ ...DEFAULT_WORKBENCH_ROUTE, surface: 'runtime' }}
+        isNarrowViewport={false}
+        onNavigate={() => {}}
+        onBackToChat={() => {}}
+        onRefresh={() => {}}
+        onResolveRequest={async () => ({ conflict: false })}
+      />,
+    );
+    expect(incompleteHtml).toContain('数据未完成同步');
+    expect(incompleteHtml).toContain('事件补缺未完成，请点击重试同步。');
+
+    // 2. When gate is ON but native projection is absent, legacy turn_bg events MUST remain visible (not hidden)
+    const legacyBgEvents = [
+      {
+        sessionId: baseAgySession.id,
+        seq: 1,
+        type: 'message.user' as const,
+        turnId: 'turn_1',
+        createdAt: 1000,
+        payload: { text: 'Start job' },
+      },
+      {
+        sessionId: baseAgySession.id,
+        seq: 2,
+        type: 'message.assistant.completed' as const,
+        turnId: 'turn_bg',
+        createdAt: 2000,
+        payload: { text: 'Legacy background output preserved' },
+      },
+    ];
+    useAppStore.setState({
+      agyNativeWorkbenchEnabled: true,
+      harnesses: [baseAgyHarness],
+      sessions: [baseAgySession],
+      selectedSessionId: baseAgySession.id,
+      eventsBySession: { [baseAgySession.id]: legacyBgEvents },
+      nativeRuntimeBySession: {},
+    });
+    const noProjHtml = renderToStaticMarkup(
+      <SlotRegistryProvider>
+        <SlotSessionProvider session={baseAgySession}>
+          <ChatStage />
+        </SlotSessionProvider>
+      </SlotRegistryProvider>,
+    );
+    expect(noProjHtml).toContain('Legacy background output preserved');
+    expect(noProjHtml).not.toContain('detached-native-fallback');
+
+    // 3. When live native projection IS active, turn_bg is isolated AND accessible via detached-native-fallback
+    useAppStore.getState().ingestNativeProjectionFixture(baseAgySession.id, live.projection, live.capabilities);
+    const withLiveProjHtml = renderToStaticMarkup(
+      <SlotRegistryProvider>
+        <SlotSessionProvider session={baseAgySession}>
+          <ChatStage />
+        </SlotSessionProvider>
+      </SlotRegistryProvider>,
+    );
+    expect(withLiveProjHtml).toContain('data-testid="detached-native-fallback"');
+    expect(withLiveProjHtml).toContain('已隔离的旧版原生占位事件（1 条');
+  });
 });

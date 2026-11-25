@@ -3,6 +3,7 @@ import { useState } from 'react';
 import type {
   CapabilityDescriptor,
   NativeControlRequest,
+  RuntimeBinding,
 } from '../../../../lib/native-client';
 import { EntityStatusBadge } from './EntityStatusBadge';
 
@@ -10,10 +11,13 @@ export interface NativeControlMenuProps {
   target: NativeControlRequest['target'];
   targetLabel: string;
   expectedRevision?: number;
+  binding?: RuntimeBinding;
   capability?: CapabilityDescriptor | null;
   disabled?: boolean;
   onDispatchControl?: (
-    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'>,
+    req: Omit<NativeControlRequest, 'generation' | 'idempotencyKey'> & {
+      expectedBinding?: RuntimeBinding;
+    },
   ) => Promise<void>;
 }
 
@@ -27,6 +31,7 @@ export function NativeControlMenu({
   target,
   targetLabel,
   expectedRevision,
+  binding,
   capability,
   disabled = false,
   onDispatchControl,
@@ -50,6 +55,7 @@ export function NativeControlMenu({
         target,
         action: actionKey,
         expectedRevision,
+        expectedBinding: binding,
       });
     } catch (err) {
       setReceiptMessage(null);
