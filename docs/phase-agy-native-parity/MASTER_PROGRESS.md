@@ -13,7 +13,8 @@
 | 共享接口 | [v0.1 设计提案](08_Shared_Contracts.md)。等待 NP-02 提交 G1 契约。NP-01 tap 与诊断编号待复验 |
 | G0 基线门禁 | 185 项及插件契约、类型检查、构建通过。集成与原预置任务 Worktree 安装锁定依赖并构建，集成分支的 7 项 AGY 定向测试通过 |
 | NP-01 集成评审 | `np01_protocol_observatory @ dd190a9` 已收件并审查。独立全量复跑通过 198 项，定向运行有一次 T03 失败。脱敏输出、事件归因与 U01 边界存在阻塞。详见 [独立评审](reviews/NP-01-review-dd190a9.md) |
-| 当前合并与冲突 | 集成还在 G0 开工点，新增记录为评审文档。NP-01 等待修复。无需解决 Git 文件冲突 |
+| NP-03 集成评审 | `np03_agy_workbench @ fb91c9c` 已收件。Web 62 项和类型检查通过。03a 窄屏焦点待修，03b stub 在补缺、代次和操作作用域存在阻塞，实际接入等待 NP-02 G1。详见 [独立评审](reviews/NP-03-review-fb91c9c.md) |
+| 当前合并与冲突 | 集成源码仍为 G0，两份工作包评审已入档。NP-01 和 NP-03 等待修复。 |
 | 真实能力验收 | U01 已选 Gemini 3.8 Flash，等待专用 Profile 官方登录和安全工具复验。真实后台 wake、child、付费模式、App/CLI/HM 同场景及 L5 等待有效证据 |
 
 ## 任务看板
@@ -22,8 +23,9 @@
 | --- | --- |
 | 已完成 | NP-00 研究、矩阵、源码审计、协议证据、架构与前端、共享契约设计、17 项任务/提示词、Git 与验收规划 |
 | 评审退回 | NP-01，原交付分支追加修复并提交新 HEAD。R1–R5 见 [独立评审](reviews/NP-01-review-dd190a9.md) |
-| 正在执行 | NP-02 共享契约、NP-03a 前端骨架。观察到实际 Worktree 有进行中的本地变更，等待各自正式交付 |
-| 等待检查点 | NP-03b、NP-04 至 NP-17，见 [DAG](10_Task_Dependency_Graph.md) |
+| 评审退回 | NP-03a / NP-03b stub，在原交付分支追加修复。见 [独立评审](reviews/NP-03-review-fb91c9c.md) |
+| 正在执行 | NP-02 共享契约，等待正式交付 |
+| 等待检查点 | NP-03b 真实接线与 NP-04 至 NP-17，见 [DAG](10_Task_Dependency_Graph.md) |
 | 等待测试账号及工具复验 | [U01 登录与范围](handoffs/G0_Test_Profile.md)。运行 NP-01 的账号测试需通过脱敏与专用 Profile 边界复验 |
 
 ## 当前协调
@@ -32,6 +34,6 @@
 | --- | --- | --- |
 | NP-01 | `np01_protocol_observatory` · `D:/AppDataCache/.gemini/antigravity/worktrees/harnessmate_desktop/np01_protocol_observatory` | [独立评审](reviews/NP-01-review-dd190a9.md)，录制、夹具及 evidence 范围内修复 |
 | NP-02 | `np02_shared_contracts_persistence` · `D:/AppDataCache/.gemini/antigravity/worktrees/harnessmate_desktop/np02_shared_contracts_persistence` | [共享契约](prompts/NP-02-contracts.md)，继续接缝和隔离测试，录制真实接线待 G1 |
-| NP-03a | `np03_agy_workbench` · `D:/AppDataCache/.gemini/antigravity/worktrees/harnessmate_desktop/np03_agy_workbench` | [前端骨架](prompts/NP-03-frontend.md)，继续夹具验证，诊断编号等 G1 契约 |
+| NP-03 | `np03_agy_workbench` · `D:/AppDataCache/.gemini/antigravity/worktrees/harnessmate_desktop/np03_agy_workbench` | [独立评审](reviews/NP-03-review-fb91c9c.md)。03a 复验窄版交互，03b 修复 stub 并在 G1 对接冻结契约。 |
 
 后续工作包由已审查检查点启动。公共 ADR 和试验范围见 [决策](15_Decision_Log.md)，架构仍以 ACP v1 默认、独立原生活动与用户 turn、依证据开放控制、共享核心单 owner 为准。独立交付放在 `handoffs/`，独立审核放在 `reviews/`。总指挥负责本页、矩阵等级和检查点。换手时查阅 [接手说明](handoffs/README.md) · [总计划](00_Master_Plan.md) · [工作包索引](11_Parallel_Development_Plan.md)。
