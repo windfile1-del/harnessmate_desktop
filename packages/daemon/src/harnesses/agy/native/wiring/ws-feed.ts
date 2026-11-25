@@ -13,39 +13,75 @@ import {
   isLocalBrowserRequest,
   type RemoteAuthService,
 } from '../../../../server/auth.js';
+import { encodeNativeCursor } from './persistence.js';
 import type { AgyNativeRuntimeRegistry } from './registry.js';
 
 export interface NativeWsFeedGatewayDeps {
   readonly auth: RemoteAuthService;
   readonly sessionManager: SessionManager;
   readonly nativeRegistry: AgyNativeRuntimeRegistry;
+  readonly maxReplayEvents?: number;
+  readonly maxLiveBuffer?: number;
+  readonly maxBufferedBytes?: number;
 }
 
 const NATIVE_WS_PATH_RE = /^\/api\/v1\/sessions\/([^/]+)\/native\/ws$/;
+const DEFAULT_MAX_REPLAY_EVENTS = 10_000;
+const DEFAULT_REPLAY_PAGE_SIZE = 500;
+const DEFAULT_MAX_LIVE_BUFFER = 2048;
+const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /**
  * Dedicated versioned WebSocket namespace (`/api/v1/sessions/:id/native/ws`) for the AGY native
- * canonical event feed. Keeps existing `/api/v1/ws` frames 100% untouched for legacy clients while
- * reusing the exact same authentication, cursor validation, and gap-free replay+live semantics.
+ * canonical event feed.
+ *
+ * R3 guarantees:
+ * - Complete bounded multi-page replay before emitting `native_replay_complete` (or explicit `native_resync_required` if backlog exceeds bound).
+ * - Runtime and generation changes immediately emit `native_resync_required` instead of silent drops.
+ * - Bounded live buffer & slow-consumer protection emitting `native_resync_required`.
+ * - Controlled HTTP upgrade errors for malformed paths and non-AGY sessions (matching REST scope).
  */
 export class NativeWsFeedGateway {
   private readonly wss: WebSocketServer;
+  private readonly maxReplayEvents: number;
+  private readonly maxLiveBuffer: number;
+  private readonly maxBufferedBytes: number;
 
   constructor(private readonly deps: NativeWsFeedGatewayDeps) {
     this.wss = new WebSocketServer({ noServer: true });
+    this.maxReplayEvents = deps.maxReplayEvents ?? DEFAULT_MAX_REPLAY_EVENTS;
+    this.maxLiveBuffer = deps.maxLiveBuffer ?? DEFAULT_MAX_LIVE_BUFFER;
+    this.maxBufferedBytes = deps.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
   }
 
   canHandlePath(requestUrl: string | undefined): boolean {
-    const url = new URL(requestUrl ?? '/', 'http://localhost');
-    return NATIVE_WS_PATH_RE.test(url.pathname);
+    try {
+      const url = new URL(requestUrl ?? '/', 'http://localhost');
+      return NATIVE_WS_PATH_RE.test(url.pathname);
+    } catch {
+      return false;
+    }
   }
 
   handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): boolean {
-    const url = new URL(request.url ?? '/', 'http://localhost');
+    let url: URL;
+    try {
+      url = new URL(request.url ?? '/', 'http://localhost');
+    } catch {
+      return false;
+    }
     const match = NATIVE_WS_PATH_RE.exec(url.pathname);
     if (!match) return false;
 
-    const sessionId = decodeURIComponent(match[1]!);
+    let sessionId: string;
+    try {
+      sessionId = decodeURIComponent(match[1]!);
+    } catch {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return true;
+    }
+
     const authHeader = request.headers.authorization;
     const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
     const queryToken = url.searchParams.get('token') ?? undefined;
@@ -71,6 +107,11 @@ export class NativeWsFeedGateway {
       socket.destroy();
       return true;
     }
+    if (session.harnessKind !== 'agy') {
+      socket.write('HTTP/1.1 422 Unprocessable Entity\r\n\r\n');
+      socket.destroy();
+      return true;
+    }
 
     this.wss.handleUpgrade(request, socket, head, (ws) => {
       this.handleConnection(ws, session.id, session.harnessId);
@@ -88,9 +129,11 @@ export class NativeWsFeedGateway {
   private handleConnection(ws: WebSocket, sessionId: string, instanceId: string): void {
     let activeUnsub: (() => void) | null = null;
     const schemaStatus = this.deps.nativeRegistry.getSchemaStatus();
-    const binding = schemaStatus.compatible
-      ? this.deps.nativeRegistry.getActiveBinding(sessionId, instanceId)
-      : null;
+    const enabled = this.deps.nativeRegistry.isEnabled();
+    const binding =
+      schemaStatus.compatible && enabled
+        ? this.deps.nativeRegistry.getActiveBinding(sessionId, instanceId)
+        : null;
 
     this.send(ws, {
       op: 'native_hello',
@@ -99,7 +142,7 @@ export class NativeWsFeedGateway {
       sessionId,
       runtimeId: binding?.runtimeId ?? null,
       generation: binding?.generation ?? null,
-      enabled: this.deps.nativeRegistry.isEnabled(),
+      enabled,
     });
 
     if (!schemaStatus.compatible) {
@@ -164,28 +207,48 @@ export class NativeWsFeedGateway {
           }
 
           let replaying = true;
+          let bufferOverflowed = false;
           const liveBuffer: NativeCanonicalEvent[] = [];
           let activeRuntimeId: string | null = null;
           let activeGeneration: string | null = null;
           let maxSentSeq = frame.afterSeq;
 
+          const abortWithResync = (
+            reason: string,
+            latestSeq: number,
+            currentGeneration: NativeCanonicalEvent['generation'] | null,
+          ) => {
+            activeUnsub?.();
+            activeUnsub = null;
+            this.send(ws, {
+              op: 'native_resync_required',
+              schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+              code: 'RESYNC_REQUIRED',
+              reason,
+              latestSeq,
+              currentGeneration,
+            });
+          };
+
           activeUnsub = this.deps.nativeRegistry.subscribeSession(sessionId, (event) => {
             if (replaying) {
+              if (liveBuffer.length >= this.maxLiveBuffer) {
+                bufferOverflowed = true;
+                return;
+              }
               liveBuffer.push(event);
               return;
             }
-            if (activeRuntimeId && event.runtimeId !== activeRuntimeId) return;
+            if (ws.bufferedAmount > this.maxBufferedBytes) {
+              abortWithResync('slow_consumer_overflow', event.seq, event.generation);
+              return;
+            }
+            if (activeRuntimeId && event.runtimeId !== activeRuntimeId) {
+              abortWithResync('runtime_changed', event.seq, event.generation);
+              return;
+            }
             if (activeGeneration && event.generation !== activeGeneration) {
-              this.send(ws, {
-                op: 'native_resync_required',
-                schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-                code: 'RESYNC_REQUIRED',
-                reason: 'generation_changed',
-                latestSeq: event.seq,
-                currentGeneration: event.generation,
-              });
-              activeUnsub?.();
-              activeUnsub = null;
+              abortWithResync('generation_changed', event.seq, event.generation);
               return;
             }
             if (event.seq > maxSentSeq) {
@@ -198,31 +261,92 @@ export class NativeWsFeedGateway {
             }
           });
 
-          const replay = this.deps.nativeRegistry.readEventsForSession(sessionId, instanceId, {
-            afterSeq: frame.afterSeq,
-            limit: 500,
-            cursor: frame.cursor,
-            expectedGeneration: frame.generation,
-          });
+          // Complete multi-page bounded replay loop before ever sending `native_replay_complete`
+          let nextAfterSeq = frame.afterSeq;
+          let cursorForFirstPage = frame.cursor;
+          let expectedGeneration = frame.generation;
+          let totalReplayed = 0;
+          let finalRuntimeId: NativeCanonicalEvent['runtimeId'] | null = null;
+          let finalGeneration: NativeCanonicalEvent['generation'] | null = null;
+          let finalCursor = '';
 
-          if (replay.resyncRequired) {
-            activeUnsub?.();
-            activeUnsub = null;
-            this.send(ws, {
-              op: 'native_resync_required',
-              schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-              code: 'RESYNC_REQUIRED',
-              reason: replay.reason,
-              latestSeq: replay.latestSeq,
-              currentGeneration: replay.currentGeneration,
+          while (true) {
+            const page = this.deps.nativeRegistry.readEventsForSession(sessionId, instanceId, {
+              afterSeq: nextAfterSeq,
+              limit: DEFAULT_REPLAY_PAGE_SIZE,
+              cursor: cursorForFirstPage,
+              expectedGeneration,
             });
+            cursorForFirstPage = undefined;
+
+            if (page.resyncRequired) {
+              abortWithResync(page.reason, page.latestSeq, page.currentGeneration);
+              return;
+            }
+
+            if (finalRuntimeId && (finalRuntimeId !== page.runtimeId || finalGeneration !== page.generation)) {
+              abortWithResync(
+                finalRuntimeId !== page.runtimeId ? 'runtime_changed' : 'generation_changed',
+                page.asOfSeq,
+                page.generation,
+              );
+              return;
+            }
+
+            finalRuntimeId = page.runtimeId;
+            finalGeneration = page.generation;
+            expectedGeneration = page.generation;
+            activeRuntimeId = page.runtimeId;
+            activeGeneration = page.generation;
+            finalCursor = page.nextCursor;
+
+            for (const ev of page.events) {
+              totalReplayed += 1;
+              if (totalReplayed > this.maxReplayEvents) {
+                abortWithResync('replay_backlog_exceeded', page.asOfSeq, page.generation);
+                return;
+              }
+              if (ev.seq > maxSentSeq) {
+                maxSentSeq = ev.seq;
+                this.send(ws, {
+                  op: 'native_event',
+                  schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+                  event: ev,
+                });
+              }
+            }
+
+            if (!page.hasMore) {
+              break;
+            }
+            if (page.nextSeq <= nextAfterSeq) {
+              // Defensive progress guard against non-advancing cursor
+              abortWithResync('replay_stalled', page.asOfSeq, page.generation);
+              return;
+            }
+            nextAfterSeq = page.nextSeq;
+          }
+
+          if (bufferOverflowed || ws.bufferedAmount > this.maxBufferedBytes) {
+            const latest = this.deps.nativeRegistry.getActiveBinding(sessionId, instanceId);
+            abortWithResync(
+              'slow_consumer_overflow',
+              maxSentSeq,
+              latest?.generation ?? finalGeneration,
+            );
             return;
           }
 
-          activeRuntimeId = replay.runtimeId;
-          activeGeneration = replay.generation;
-
-          for (const ev of replay.events) {
+          replaying = false;
+          for (const ev of liveBuffer) {
+            if (ev.runtimeId !== activeRuntimeId) {
+              abortWithResync('runtime_changed', ev.seq, ev.generation);
+              return;
+            }
+            if (ev.generation !== activeGeneration) {
+              abortWithResync('generation_changed', ev.seq, ev.generation);
+              return;
+            }
             if (ev.seq > maxSentSeq) {
               maxSentSeq = ev.seq;
               this.send(ws, {
@@ -233,26 +357,16 @@ export class NativeWsFeedGateway {
             }
           }
 
-          replaying = false;
-          for (const ev of liveBuffer) {
-            if (ev.runtimeId === activeRuntimeId && ev.generation === activeGeneration && ev.seq > maxSentSeq) {
-              maxSentSeq = ev.seq;
-              this.send(ws, {
-                op: 'native_event',
-                schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-                event: ev,
-              });
-            }
+          if (finalRuntimeId && finalGeneration) {
+            this.send(ws, {
+              op: 'native_replay_complete',
+              schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+              runtimeId: finalRuntimeId,
+              generation: finalGeneration,
+              lastSeq: maxSentSeq,
+              nextCursor: encodeNativeCursor(finalRuntimeId, finalGeneration, maxSentSeq) || finalCursor,
+            });
           }
-
-          this.send(ws, {
-            op: 'native_replay_complete',
-            schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-            runtimeId: replay.runtimeId,
-            generation: replay.generation,
-            lastSeq: maxSentSeq,
-            nextCursor: replay.nextCursor,
-          });
           break;
         }
       }

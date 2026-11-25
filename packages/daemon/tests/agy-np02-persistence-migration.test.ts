@@ -364,6 +364,7 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
     const b2 = nativeStore.advanceGeneration(binding.runtimeId, {
       generation: asBindingGeneration('gen_next'),
     });
+    const binding2 = { ...binding, generation: b2.generation };
     const staleRead = nativeStore.listEvents(binding.runtimeId, {
       afterSeq: 0,
       limit: 10,
@@ -375,21 +376,21 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
       expect(staleRead.currentGeneration).toBe(b2.generation);
     }
 
-    // Idempotency key + payload digest conflict
+    // Idempotency key + payload digest conflict (scoped to active binding2)
     const d1 = computePayloadDigest({ capabilityId: 'c1', args: { a: 1, b: 2 } });
     const d1Reordered = computePayloadDigest({ args: { b: 2, a: 1 }, capabilityId: 'c1' });
     const d2 = computePayloadDigest({ capabilityId: 'c1', args: { a: 99 } });
     expect(d1).toBe(d1Reordered);
 
     const cFirst = nativeStore.claimIdempotentReceipt({
-      binding,
+      binding: binding2,
       kind: 'command',
       idempotencyKey: 'idem_cmd_1',
       payloadDigest: d1,
     });
     expect(cFirst.replayed).toBe(false);
     const cReplay = nativeStore.claimIdempotentReceipt({
-      binding,
+      binding: binding2,
       kind: 'command',
       idempotencyKey: 'idem_cmd_1',
       payloadDigest: d1Reordered,
@@ -399,15 +400,15 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
 
     expect(() =>
       nativeStore.claimIdempotentReceipt({
-        binding,
+        binding: binding2,
         kind: 'command',
         idempotencyKey: 'idem_cmd_1',
         payloadDigest: d2,
       }),
     ).toThrowError(NativePersistenceError);
 
-    // Approval receipt CAS & disconnect invalidation
-    nativeStore.createPendingApprovalReceipt({ binding, approvalId: 'appr_1' });
+    // Approval receipt CAS & disconnect invalidation (scoped to active binding2)
+    nativeStore.createPendingApprovalReceipt({ binding: binding2, approvalId: 'appr_1' });
     const claimWrongGen = nativeStore.claimApprovalReceiptCas({
       approvalId: 'appr_1',
       expectedGeneration: asBindingGeneration('gen_wrong'),
@@ -416,7 +417,7 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
 
     const claim1 = nativeStore.claimApprovalReceiptCas({
       approvalId: 'appr_1',
-      expectedGeneration: binding.generation,
+      expectedGeneration: binding2.generation,
     });
     expect(claim1.claimed).toBe(true);
     expect(claim1.receipt?.state).toBe('claimed');
@@ -424,18 +425,177 @@ describe('AGY Native SQLite component migration & atomic persistence (NP-02)', (
     // Second click loses CAS race
     const claim2 = nativeStore.claimApprovalReceiptCas({
       approvalId: 'appr_1',
-      expectedGeneration: binding.generation,
+      expectedGeneration: binding2.generation,
     });
     expect(claim2.claimed).toBe(false);
 
     // Disconnect turns claimed -> delivery_unknown and pending -> connection_lost
-    nativeStore.createPendingApprovalReceipt({ binding, approvalId: 'appr_2' });
-    const inv = nativeStore.invalidateApprovalReceiptsForRuntime(binding.runtimeId, binding.generation);
+    nativeStore.createPendingApprovalReceipt({ binding: binding2, approvalId: 'appr_2' });
+    const inv = nativeStore.invalidateApprovalReceiptsForRuntime(binding2.runtimeId, binding2.generation);
     expect(inv.lostCount).toBe(1);
     expect(inv.unknownCount).toBe(1);
 
     // Ensure non-empty work ID helper is covered
     expect(asWorkId('wrk_check')).toBe('wrk_check');
+
+    store.close();
+  });
+
+  it('strictly fences writes, mutationKey replays, approvals, and capabilities across generation advances (R1 & R3)', () => {
+    const dbPath = makeTempDb('hm-np02-r1-gen-');
+    const store = openStore(dbPath);
+    const { sessionId } = seedLegacyWorkspaceAndSession(store);
+    const registry = new AgyNativeRuntimeRegistry(store, { enabled: true });
+
+    const b1 = registry.ensureRuntimeBinding({
+      sessionId,
+      instanceId: 'agy',
+      profileRef: 'agy:default',
+    });
+    const gen1Binding = {
+      runtimeId: b1.runtimeId,
+      sessionId: b1.sessionId,
+      instanceId: b1.instanceId,
+      generation: b1.generation,
+    };
+
+    const liveEv = {
+      kind: 'live_protocol' as const,
+      connectionId: 'conn_gen1',
+      ingressOrdinal: 1,
+      wireVariant: 'acp_v1',
+      observedAt: 1000,
+    };
+
+    // Commit work + capability snapshot + pending approval in gen1
+    registry.commitAndPublish(
+      gen1Binding,
+      {
+        work: [
+          {
+            id: asWorkId('wrk_gen1'),
+            kind: 'finite_command',
+            blocking: 'confirmed_blocking',
+            state: { kind: 'known', value: 'running', evidence: liveEv },
+            revision: 1,
+          },
+        ],
+        capabilitiesRevision: 2,
+        capabilityDescriptors: [
+          {
+            id: 'agy.workflow.goal',
+            snapshotRevision: 2,
+            surfaces: ['acp'],
+            advertised: true,
+            launch: 'available',
+            observe: 'available',
+            control: 'available',
+            localRead: 'not_tested',
+            actions: [],
+            evidenceRefs: ['E05'],
+            verifiedLevel: 1,
+          },
+        ],
+        status: 'attached',
+        retentionReasons: ['finite_work:wrk_gen1'],
+      },
+      {
+        type: 'native.runtime.changed',
+        turnId: null,
+        payload: { status: 'attached', retentionReasons: ['finite_work:wrk_gen1'], revision: 1 },
+        mutationKey: 'mut_gen1_1',
+      },
+    );
+    registry.persistence.createPendingApprovalReceipt({
+      binding: gen1Binding,
+      approvalId: 'appr_gen1',
+    });
+    expect(registry.getProjectionForSession(sessionId, 'agy').requestIds).toEqual(['appr_gen1']);
+
+    // Advance generation to gen2
+    const b2 = registry.advanceRuntimeGeneration(gen1Binding.runtimeId, {
+      generation: asBindingGeneration('gen_2'),
+      status: 'attached',
+    });
+    const gen2Binding = {
+      runtimeId: b2.runtimeId,
+      sessionId: b2.sessionId,
+      instanceId: b2.instanceId,
+      generation: b2.generation,
+    };
+
+    // 1. Old gen1 write MUST be rejected with STALE_BINDING and NEVER roll DB generation back to gen1!
+    expect(() =>
+      registry.commitAndPublish(
+        gen1Binding,
+        { status: 'disconnected' },
+        {
+          type: 'native.runtime.changed',
+          turnId: null,
+          payload: { status: 'disconnected', retentionReasons: [], revision: 2 },
+        },
+      ),
+    ).toThrowError(NativePersistenceError);
+
+    expect(registry.persistence.getBinding(gen1Binding.runtimeId)?.generation).toBe('gen_2');
+    expect(registry.persistence.getBinding(gen1Binding.runtimeId)?.asOfSeq).toBe(1);
+    expect(registry.getActiveBinding(sessionId, 'agy')?.generation).toBe('gen_2');
+
+    // 2. Old gen1 mutationKey replay MUST also be rejected
+    expect(() =>
+      registry.commitAndPublish(
+        gen1Binding,
+        {},
+        {
+          type: 'native.runtime.changed',
+          turnId: null,
+          payload: { status: 'attached', retentionReasons: [], revision: 1 },
+          mutationKey: 'mut_gen1_1',
+        },
+      ),
+    ).toThrowError(NativePersistenceError);
+
+    // 3. Cross-session binding write MUST be rejected
+    expect(() =>
+      registry.commitAndPublish(
+        { ...gen2Binding, sessionId: 'sess_other' },
+        {},
+        {
+          type: 'native.runtime.changed',
+          turnId: null,
+          payload: { status: 'attached', retentionReasons: [], revision: 2 },
+        },
+      ),
+    ).toThrowError(NativePersistenceError);
+
+    // 4. Old gen1 pending approval MUST NOT appear in gen2 snapshot AND CAS claim MUST fail!
+    const gen2Proj = registry.getProjectionForSession(sessionId, 'agy');
+    expect(gen2Proj.binding.generation).toBe('gen_2');
+    expect(gen2Proj.requestIds).toEqual([]);
+    // Old-gen work entity remains readable as history, explicitly demoted to stale
+    expect(gen2Proj.work).toHaveLength(1);
+    expect(gen2Proj.work[0]?.state.kind).toBe('stale');
+
+    const staleCas = registry.persistence.claimApprovalReceiptCas({
+      approvalId: 'appr_gen1',
+      expectedGeneration: gen1Binding.generation,
+    });
+    expect(staleCas.claimed).toBe(false);
+    expect(staleCas.staleGeneration).toBe(true);
+    expect(staleCas.receipt?.state).toBe('connection_lost');
+
+    // 5. Old-gen capability snapshot MUST NOT leak into gen2
+    expect(registry.persistence.readCapabilitySnapshot(gen2Binding.runtimeId)).toBeNull();
+
+    // 6. R3: REST event feed for gen2 does NOT mix gen1 events
+    const gen2EventsBefore = registry.persistence.listEvents(gen2Binding.runtimeId, {
+      afterSeq: 0,
+      limit: 50,
+    });
+    expect(gen2EventsBefore.resyncRequired).toBe(false);
+    if (!gen2EventsBefore.resyncRequired) {
+      expect(gen2EventsBefore.events).toHaveLength(0);
+    }
 
     store.close();
   });

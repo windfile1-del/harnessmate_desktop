@@ -19,6 +19,7 @@ import type {
   NativeTimelineEntryDto,
   NativeWork,
   NativeWorkflow,
+  NativeWorkflowResourceItemDto,
   NativeWorkflowResourceKind,
   PendingNativeRequest,
   ResolveNativeRequestInput,
@@ -80,6 +81,18 @@ export type TurnSettlement =
       readonly resetAt?: number | null;
     }
   | { readonly kind: 'disconnected'; readonly reason: string };
+
+/**
+ * Host settlement exit bound by SessionManager so NativeLifecyclePort (NP-04) can release
+ * a previously `held` turn exactly once when blocking native work finishes or transport closes.
+ */
+export interface NativeTurnSettlementSink {
+  settleTurn(params: {
+    readonly binding: RuntimeBinding;
+    readonly turnId: string;
+    readonly settlement: Extract<TurnSettlement, { kind: 'eligible' | 'disconnected' }>;
+  }): { readonly settled: boolean; readonly reason?: string };
+}
 
 // ── Native Ingress & Typed Observation Union ───────────────────────────
 
@@ -209,6 +222,7 @@ export interface NativeTransportObserver {
 // ── Domain Owner Ports (Implemented by NP-04..NP-15) ───────────────────
 
 export interface NativeLifecyclePort {
+  attachSettlementSink?(sink: NativeTurnSettlementSink): void;
   acceptFrame(envelope: NativeIngress): void;
   acceptNativeObservation(observation: NativeObservation): void;
   handleTransportClosed(binding: RuntimeBinding, connectionId: string, reason?: string): void;
@@ -218,8 +232,8 @@ export interface NativeLifecyclePort {
   onPromptSettled?(
     ctx: PromptContext,
     result:
-      | { ok: true; stopReason: string }
-      | { ok: false; message: string; code?: string; failureClass?: string; resetAt?: number | null },
+      | { ok: true; stopReason: string; isCurrentTurn: boolean }
+      | { ok: false; message: string; code?: string; failureClass?: string; resetAt?: number | null; isCurrentTurn: boolean },
   ): TurnSettlement;
   onCancelRequested?(binding: RuntimeBinding, target?: { type: string; id: string }): void;
   onProfileGenerationChanged?(prevBinding: RuntimeBinding | null, nextBinding: RuntimeBinding): void;
@@ -239,6 +253,7 @@ export interface NativePermissionPort {
       readonly binding: RuntimeBinding;
       readonly connectionId: string;
       readonly ingressOrdinal: number;
+      readonly channel: 'live' | 'history_replay';
       readonly wireRequestId: RpcId;
       readonly method: string;
       readonly params: Record<string, unknown>;
@@ -250,6 +265,7 @@ export interface NativePermissionPort {
   resolveNativeRequest(input: {
     readonly binding: RuntimeBinding;
     readonly approvalId: string;
+    readonly receiptId: string;
     readonly request: ResolveNativeRequestInput;
     readonly resolvedBy: 'desktop' | 'mobile';
   }): Promise<{
@@ -260,7 +276,7 @@ export interface NativePermissionPort {
   }>;
 
   onConnectionClosed(binding: RuntimeBinding, connectionId: string): void;
-  listPendingRequests?(binding: RuntimeBinding): readonly PendingNativeRequest[];
+  listPendingRequests(binding: RuntimeBinding): readonly PendingNativeRequest[];
 }
 
 export interface NativeCommandRouterPort {
@@ -285,14 +301,16 @@ export interface NativeCommandRouterPort {
 export interface NativeTimelineReaderPort {
   readTimeline(input: {
     readonly binding: RuntimeBinding;
-    readonly scopeType: 'activity' | 'agent';
+    readonly scopeKind: 'activity' | 'agent';
     readonly scopeId: string;
     readonly pageToken?: string;
     readonly limit: number;
   }): {
     readonly revision: number;
-    readonly entries: readonly NativeTimelineEntryDto[];
+    readonly items: readonly NativeTimelineEntryDto[];
     readonly nextPageToken: string | null;
+    readonly hasMore: boolean;
+    readonly sourceUnavailableReason?: string;
   };
 }
 
@@ -306,9 +324,10 @@ export interface NativeWorkflowResourceReaderPort {
   }): {
     readonly revision: number;
     readonly available: boolean;
-    readonly reasonCode?: string;
-    readonly items: readonly Record<string, unknown>[];
+    readonly sourceUnavailableReason?: string;
+    readonly items: readonly NativeWorkflowResourceItemDto[];
     readonly nextPageToken: string | null;
+    readonly hasMore: boolean;
   };
 }
 
@@ -320,6 +339,7 @@ export interface NativeRuntimeHooks {
   readonly onIncomingServerRequest?: (req: {
     readonly connectionId: string;
     readonly ingressOrdinal: number;
+    readonly channel: 'live' | 'history_replay';
     readonly wireRequestId: RpcId;
     readonly method: string;
     readonly params: Record<string, unknown>;
@@ -330,8 +350,8 @@ export interface NativeRuntimeHooks {
   readonly onPromptSettled?: (
     ctx: PromptContext,
     result:
-      | { ok: true; stopReason: string }
-      | { ok: false; message: string; code?: string; failureClass?: string; resetAt?: number | null },
+      | { ok: true; stopReason: string; isCurrentTurn: boolean }
+      | { ok: false; message: string; code?: string; failureClass?: string; resetAt?: number | null; isCurrentTurn: boolean },
   ) => TurnSettlement | null;
   readonly onTransportClosed?: (connectionId: string, reason?: string) => void;
   readonly listRetentionReasons?: () => string[];

@@ -21,17 +21,13 @@ import {
   sanitizeNativeWorkForPublic,
   sanitizeNativeWorkflowForPublic,
   type Activity,
-  type AgentIdentity,
   type BindingGeneration,
   type CapabilityDescriptor,
   type NativeAgentId,
   type NativeCanonicalEvent,
-  type NativeRelationship,
   type NativeRequestReceiptState,
   type NativeRuntimeProjection,
   type NativeRuntimeStatus,
-  type NativeWork,
-  type NativeWorkflow,
   type RuntimeBinding,
   type RuntimeId,
 } from '@harnessmate/protocol';
@@ -69,6 +65,15 @@ export interface StoredNativeReceipt {
   updatedAt: number;
 }
 
+export interface StoredNativeEntityMeta {
+  runtimeId: RuntimeId;
+  entityKind: string;
+  entityId: string;
+  generation: BindingGeneration;
+  revision: number;
+  updatedAt: number;
+}
+
 export interface DecodedNativeCursor {
   v: 1;
   runtimeId: RuntimeId;
@@ -79,8 +84,10 @@ export interface DecodedNativeCursor {
 export type NativeEventsReadResult =
   | {
       resyncRequired: false;
+      binding: RuntimeBinding;
       runtimeId: RuntimeId;
       generation: BindingGeneration;
+      asOfSeq: number;
       events: NativeCanonicalEvent[];
       nextSeq: number;
       nextCursor: string;
@@ -97,6 +104,7 @@ export class NativePersistenceError extends Error {
   constructor(
     readonly code:
       | 'NATIVE_SCHEMA_NEWER_THAN_READER'
+      | 'STALE_BINDING'
       | 'IDEMPOTENCY_CONFLICT'
       | 'RELATION_CYCLE_DETECTED'
       | 'RELATION_PARENT_CONFLICT'
@@ -304,6 +312,63 @@ export class NativeRuntimeStore {
     }
   }
 
+  private assertBindingMatchesCurrent(bindingRow: BindingRow, binding: RuntimeBinding): void {
+    if (
+      bindingRow.session_id !== binding.sessionId ||
+      bindingRow.instance_id !== binding.instanceId ||
+      bindingRow.current_generation !== binding.generation
+    ) {
+      throw new NativePersistenceError(
+        'STALE_BINDING',
+        `Binding scope/generation mismatch for runtime ${binding.runtimeId} (expected ${bindingRow.session_id}/${bindingRow.instance_id}/${bindingRow.current_generation}, got ${binding.sessionId}/${binding.instanceId}/${binding.generation})`,
+      );
+    }
+  }
+
+  private invalidateReceiptsInTx(
+    db: DatabaseSync,
+    runtimeId: string,
+    now: number,
+    generation?: string,
+  ): { lostCount: number; unknownCount: number } {
+    const lostRes = generation
+      ? db
+          .prepare(
+            `UPDATE native_runtime_receipts
+             SET state = 'connection_lost', updated_at = ?
+             WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'pending'`,
+          )
+          .run(now, runtimeId, generation)
+      : db
+          .prepare(
+            `UPDATE native_runtime_receipts
+             SET state = 'connection_lost', updated_at = ?
+             WHERE runtime_id = ? AND kind = 'approval' AND state = 'pending'`,
+          )
+          .run(now, runtimeId);
+
+    const unknownRes = generation
+      ? db
+          .prepare(
+            `UPDATE native_runtime_receipts
+             SET state = 'delivery_unknown', updated_at = ?
+             WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'claimed'`,
+          )
+          .run(now, runtimeId, generation)
+      : db
+          .prepare(
+            `UPDATE native_runtime_receipts
+             SET state = 'delivery_unknown', updated_at = ?
+             WHERE runtime_id = ? AND kind = 'approval' AND state = 'claimed'`,
+          )
+          .run(now, runtimeId);
+
+    return {
+      lostCount: Number(lostRes.changes),
+      unknownCount: Number(unknownRes.changes),
+    };
+  }
+
   ensureBinding(params: {
     sessionId: string;
     instanceId: string;
@@ -311,6 +376,7 @@ export class NativeRuntimeStore {
     sourceRef?: string;
     generation?: BindingGeneration;
     status?: NativeRuntimeStatus;
+    advanceIfExisting?: boolean;
   }): StoredNativeBinding {
     this.assertSchemaCompatible();
     const sourceRef = params.sourceRef ?? 'acp';
@@ -325,9 +391,15 @@ export class NativeRuntimeStore {
 
       if (existing) {
         if (existing.profile_ref !== params.profileRef || existing.source_ref !== sourceRef) {
-          // Immutable profile/source ref changed: allocate a new binding_revision and fresh runtimeId/generation
-          const nextRev = existing.binding_revision + 1;
+          // Immutable profile/source ref changed: invalidate prior binding receipts and allocate a fresh runtimeId/generation
           const now = Date.now();
+          this.invalidateReceiptsInTx(db, existing.runtime_id, now);
+          db.prepare(
+            `UPDATE native_runtime_bindings SET status = 'disconnected', retention_reasons_json = '[]', updated_at = ?
+             WHERE runtime_id = ?`,
+          ).run(now, existing.runtime_id);
+
+          const nextRev = existing.binding_revision + 1;
           const runtimeId = asRuntimeId(`nrt_${crypto.randomBytes(6).toString('hex')}`);
           const generation =
             params.generation ?? asBindingGeneration(`gen_${crypto.randomBytes(5).toString('hex')}`);
@@ -354,6 +426,26 @@ export class NativeRuntimeStore {
             .get(runtimeId) as unknown as BindingRow;
           return mapBindingRow(created);
         }
+
+        if (params.advanceIfExisting) {
+          const now = Date.now();
+          this.invalidateReceiptsInTx(db, existing.runtime_id, now, existing.current_generation);
+          const nextGen =
+            params.generation ?? asBindingGeneration(`gen_${crypto.randomBytes(5).toString('hex')}`);
+          db.prepare(
+            `UPDATE native_runtime_bindings
+             SET current_generation = ?,
+                 status = COALESCE(?, status),
+                 retention_reasons_json = '[]',
+                 updated_at = ?
+             WHERE runtime_id = ?`,
+          ).run(nextGen, params.status ?? null, now, existing.runtime_id);
+          const updated = db
+            .prepare('SELECT * FROM native_runtime_bindings WHERE runtime_id = ?')
+            .get(existing.runtime_id) as unknown as BindingRow;
+          return mapBindingRow(updated);
+        }
+
         return mapBindingRow(existing);
       }
 
@@ -427,12 +519,18 @@ export class NativeRuntimeStore {
       if (!existing) {
         throw new NativePersistenceError('BINDING_NOT_FOUND', `Native runtime binding not found: ${runtimeId}`);
       }
+      const now = Date.now();
+      // Fence and invalidate any in-flight/pending approvals from the outgoing generation
+      this.invalidateReceiptsInTx(db, runtimeId, now, existing.current_generation);
+
       const nextGen =
         opts?.generation ?? asBindingGeneration(`gen_${crypto.randomBytes(5).toString('hex')}`);
-      const now = Date.now();
       db.prepare(
         `UPDATE native_runtime_bindings
-         SET current_generation = ?, status = COALESCE(?, status), updated_at = ?
+         SET current_generation = ?,
+             status = COALESCE(?, status),
+             retention_reasons_json = '[]',
+             updated_at = ?
          WHERE runtime_id = ?`,
       ).run(nextGen, opts?.status ?? null, now, runtimeId);
       const updated = db
@@ -442,15 +540,49 @@ export class NativeRuntimeStore {
     });
   }
 
+  getEntityMeta(
+    runtimeId: RuntimeId,
+    entityKind: 'activity' | 'work' | 'agent' | 'workflow' | 'capability_snapshot',
+    entityId: string,
+  ): StoredNativeEntityMeta | null {
+    this.assertSchemaCompatible();
+    const row = this.store
+      .getDatabaseSync()
+      .prepare(
+        `SELECT runtime_id, entity_kind, entity_id, generation, revision, updated_at
+         FROM native_runtime_entities
+         WHERE runtime_id = ? AND entity_kind = ? AND entity_id = ?`,
+      )
+      .get(runtimeId, entityKind, entityId) as
+      | {
+          runtime_id: string;
+          entity_kind: string;
+          entity_id: string;
+          generation: string;
+          revision: number;
+          updated_at: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      runtimeId: asRuntimeId(row.runtime_id),
+      entityKind: row.entity_kind,
+      entityId: row.entity_id,
+      generation: asBindingGeneration(row.generation),
+      revision: row.revision,
+      updatedAt: row.updated_at,
+    };
+  }
+
   /**
    * Atomically applies snapshot mutations (entities, aliases, acyclic single-parent relations,
    * binding status/cursor) AND appends the durable NativeCanonicalEvent inside a single
    * BEGIN IMMEDIATE transaction.
    *
-   * If `eventDraft.mutationKey` already exists for this runtime, returns the existing event
-   * without duplicating writes or advancing seq.
-   *
-   * Callers MUST only publish the returned event to live subscribers AFTER this method commits.
+   * Strict R1 isolation:
+   * - Verifies runtimeId + sessionId + instanceId + current_generation BEFORE mutationKey or writes.
+   * - Never overwrites current_generation (generation advancement is exclusive to `advanceGeneration` / `ensureBinding`).
+   * - Rejects stale-generation or cross-binding writes and mutationKey replays with `STALE_BINDING`.
    */
   commitSnapshotAndEvent(
     binding: RuntimeBinding,
@@ -470,6 +602,9 @@ export class NativeRuntimeStore {
         );
       }
 
+      // Strict generation & binding scope fence (runs BEFORE mutationKey check!)
+      this.assertBindingMatchesCurrent(bindingRow, binding);
+
       if (eventDraft.mutationKey) {
         const existingEventRow = db
           .prepare(
@@ -477,6 +612,12 @@ export class NativeRuntimeStore {
           )
           .get(binding.runtimeId, eventDraft.mutationKey) as unknown as NativeEventRow | undefined;
         if (existingEventRow) {
+          if (existingEventRow.generation !== binding.generation) {
+            throw new NativePersistenceError(
+              'STALE_BINDING',
+              `Mutation key "${eventDraft.mutationKey}" belongs to a different generation`,
+            );
+          }
           return {
             deduplicated: true,
             event: mapEventRow(existingEventRow),
@@ -487,7 +628,7 @@ export class NativeRuntimeStore {
 
       const now = eventDraft.createdAt ?? Date.now();
 
-      // 1. Upsert activities
+      // 1. Upsert entities
       const upsertEntity = db.prepare(
         `INSERT INTO native_runtime_entities (
           runtime_id, entity_kind, entity_id, schema_version, revision, generation,
@@ -504,12 +645,18 @@ export class NativeRuntimeStore {
 
       for (const act of mutation.activities ?? []) {
         const parsed = ActivitySchema.parse(act);
+        const existingAct = db
+          .prepare(
+            `SELECT revision FROM native_runtime_entities
+             WHERE runtime_id = ? AND entity_kind = 'activity' AND entity_id = ?`,
+          )
+          .get(binding.runtimeId, parsed.id) as { revision?: number } | undefined;
         upsertEntity.run(
           binding.runtimeId,
           'activity',
           parsed.id,
           AGY_NATIVE_CONTRACT_VERSION,
-          1,
+          (existingAct?.revision ?? 0) + 1,
           binding.generation,
           binding.sessionId,
           parsed.agentId ?? parsed.workId ?? null,
@@ -611,7 +758,7 @@ export class NativeRuntimeStore {
         );
       }
 
-      // 3. Upsert / revoke relations enforcing single-parent and acyclicity invariants
+      // 3. Upsert / revoke relations enforcing single-parent and acyclicity invariants within current generation
       for (const rel of mutation.relationsUpsert ?? []) {
         const parsed = NativeRelationshipSchema.parse(rel);
         if (parsed.parentAgentId === parsed.childAgentId) {
@@ -620,19 +767,26 @@ export class NativeRuntimeStore {
             `Agent ${parsed.childAgentId} cannot be its own parent`,
           );
         }
-        this.assertNoAncestorCycle(db, binding.runtimeId, parsed.parentAgentId, parsed.childAgentId);
+        this.assertNoAncestorCycle(
+          db,
+          binding.runtimeId,
+          binding.generation,
+          parsed.parentAgentId,
+          parsed.childAgentId,
+        );
 
         const existingRel = db
           .prepare(
-            `SELECT parent_agent_id, revoked_at FROM native_runtime_relations
+            `SELECT parent_agent_id, generation, revoked_at FROM native_runtime_relations
              WHERE runtime_id = ? AND child_agent_id = ?`,
           )
           .get(binding.runtimeId, parsed.childAgentId) as
-          | { parent_agent_id: string; revoked_at: number | null }
+          | { parent_agent_id: string; generation: string; revoked_at: number | null }
           | undefined;
 
         if (
           existingRel &&
+          existingRel.generation === binding.generation &&
           existingRel.revoked_at === null &&
           existingRel.parent_agent_id !== parsed.parentAgentId
         ) {
@@ -671,8 +825,8 @@ export class NativeRuntimeStore {
         db.prepare(
           `UPDATE native_runtime_relations
            SET revoked_at = ?, updated_at = ?
-           WHERE runtime_id = ? AND child_agent_id = ?`,
-        ).run(rev.revokedAt, now, binding.runtimeId, rev.childAgentId);
+           WHERE runtime_id = ? AND child_agent_id = ? AND generation = ?`,
+        ).run(rev.revokedAt, now, binding.runtimeId, rev.childAgentId, binding.generation);
       }
 
       // 4. Allocate next monotonic seq and persist durable event
@@ -708,7 +862,7 @@ export class NativeRuntimeStore {
         event.createdAt,
       );
 
-      // 5. Advance binding cursor and metadata in the same transaction
+      // 5. Advance binding cursor and metadata in the same transaction (NEVER mutating current_generation!)
       const nextStatus = mutation.status ?? (bindingRow.status as NativeRuntimeStatus);
       const nextRetention = mutation.retentionReasons
         ? JSON.stringify([...mutation.retentionReasons])
@@ -720,21 +874,20 @@ export class NativeRuntimeStore {
 
       db.prepare(
         `UPDATE native_runtime_bindings
-         SET current_generation = ?,
-             status = ?,
+         SET status = ?,
              as_of_seq = ?,
              capabilities_revision = ?,
              retention_reasons_json = ?,
              updated_at = ?
-         WHERE runtime_id = ?`,
+         WHERE runtime_id = ? AND current_generation = ?`,
       ).run(
-        binding.generation,
         nextStatus,
         nextSeq,
         nextCapRev,
         nextRetention,
         now,
         binding.runtimeId,
+        binding.generation,
       );
 
       opts?.beforeCommitHookForTest?.(db);
@@ -754,6 +907,7 @@ export class NativeRuntimeStore {
   private assertNoAncestorCycle(
     db: DatabaseSync,
     runtimeId: RuntimeId,
+    generation: BindingGeneration,
     parentAgentId: NativeAgentId,
     childAgentId: NativeAgentId,
   ): void {
@@ -761,7 +915,7 @@ export class NativeRuntimeStore {
     const visited = new Set<string>([childAgentId]);
     const stmt = db.prepare(
       `SELECT parent_agent_id FROM native_runtime_relations
-       WHERE runtime_id = ? AND child_agent_id = ? AND revoked_at IS NULL`,
+       WHERE runtime_id = ? AND child_agent_id = ? AND generation = ? AND revoked_at IS NULL`,
     );
     while (cursor) {
       if (visited.has(cursor)) {
@@ -771,7 +925,7 @@ export class NativeRuntimeStore {
         );
       }
       visited.add(cursor);
-      const row = stmt.get(runtimeId, cursor) as { parent_agent_id?: string } | undefined;
+      const row = stmt.get(runtimeId, cursor, generation) as { parent_agent_id?: string } | undefined;
       cursor = row?.parent_agent_id ?? null;
     }
   }
@@ -801,28 +955,39 @@ export class NativeRuntimeStore {
     for (const row of entityRows) {
       const parsedJson = safeJsonParse<unknown>(row.payload_json, null);
       if (!parsedJson) continue;
+      // Entities from prior generations remain readable for history, explicitly demoted to stale
+      const staleReason =
+        row.generation !== binding.generation ? 'prior_generation_snapshot' : undefined;
+
       if (row.entity_kind === 'activity') {
         const res = ActivitySchema.safeParse(parsedJson);
-        if (res.success) activities.push(res.data);
+        if (res.success) {
+          activities.push(
+            staleReason && !['finished', 'failed', 'cancelled'].includes(res.data.state)
+              ? { ...res.data, state: 'reconciling' }
+              : res.data,
+          );
+        }
       } else if (row.entity_kind === 'work') {
         const res = NativeWorkSchema.safeParse(parsedJson);
-        if (res.success) work.push(sanitizeNativeWorkForPublic(res.data, nowMs));
+        if (res.success) work.push(sanitizeNativeWorkForPublic(res.data, nowMs, staleReason));
       } else if (row.entity_kind === 'agent') {
         const res = AgentIdentitySchema.safeParse(parsedJson);
-        if (res.success) agents.push(sanitizeAgentIdentityForPublic(res.data, nowMs));
+        if (res.success) agents.push(sanitizeAgentIdentityForPublic(res.data, nowMs, staleReason));
       } else if (row.entity_kind === 'workflow') {
         const res = NativeWorkflowSchema.safeParse(parsedJson);
-        if (res.success) workflows.push(sanitizeNativeWorkflowForPublic(res.data, nowMs));
+        if (res.success) workflows.push(sanitizeNativeWorkflowForPublic(res.data, nowMs, staleReason));
       }
     }
 
+    // Active relations strictly belong to the current generation
     const relRows = db
       .prepare(
         `SELECT * FROM native_runtime_relations
-         WHERE runtime_id = ? AND revoked_at IS NULL
+         WHERE runtime_id = ? AND generation = ? AND revoked_at IS NULL
          ORDER BY updated_at ASC`,
       )
-      .all(runtimeId) as unknown as RelationRow[];
+      .all(runtimeId, binding.generation) as unknown as RelationRow[];
 
     const relations = [];
     for (const row of relRows) {
@@ -838,13 +1003,14 @@ export class NativeRuntimeStore {
       }
     }
 
+    // Pending approval requestIds are strictly scoped to the CURRENT generation
     const pendingReceiptRows = db
       .prepare(
         `SELECT approval_id FROM native_runtime_receipts
-         WHERE runtime_id = ? AND kind = 'approval' AND state = 'pending' AND approval_id IS NOT NULL
+         WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'pending' AND approval_id IS NOT NULL
          ORDER BY created_at ASC`,
       )
-      .all(runtimeId) as unknown as Array<{ approval_id: string }>;
+      .all(runtimeId, binding.generation) as unknown as Array<{ approval_id: string }>;
 
     const requestIds = pendingReceiptRows.map((r) => r.approval_id);
 
@@ -877,12 +1043,20 @@ export class NativeRuntimeStore {
   } | null {
     this.assertSchemaCompatible();
     const db = this.store.getDatabaseSync();
+    const bindingRow = db
+      .prepare('SELECT current_generation FROM native_runtime_bindings WHERE runtime_id = ?')
+      .get(runtimeId) as { current_generation?: string } | undefined;
+    if (!bindingRow?.current_generation) return null;
+
+    // Only expose capability snapshot that was recorded for the CURRENT generation
     const row = db
       .prepare(
         `SELECT revision, payload_json FROM native_runtime_entities
-         WHERE runtime_id = ? AND entity_kind = 'capability_snapshot' AND entity_id = 'default'`,
+         WHERE runtime_id = ? AND entity_kind = 'capability_snapshot' AND entity_id = 'default' AND generation = ?`,
       )
-      .get(runtimeId) as { revision?: number; payload_json?: string } | undefined;
+      .get(runtimeId, bindingRow.current_generation) as
+      | { revision?: number; payload_json?: string }
+      | undefined;
     if (!row?.payload_json) return null;
     const raw = safeJsonParse<unknown[]>(row.payload_json, []);
     const descriptors: CapabilityDescriptor[] = [];
@@ -961,10 +1135,12 @@ export class NativeRuntimeStore {
       };
     }
 
-    // Detect pruned event log gap when caller asks for an older sequence than oldest retained row
+    // Detect pruned event log gap within current generation
     const minRow = db
-      .prepare('SELECT MIN(seq) AS min_seq FROM native_runtime_events WHERE runtime_id = ?')
-      .get(runtimeId) as { min_seq: number | null } | undefined;
+      .prepare(
+        'SELECT MIN(seq) AS min_seq FROM native_runtime_events WHERE runtime_id = ? AND generation = ?',
+      )
+      .get(runtimeId, currentGeneration) as { min_seq: number | null } | undefined;
     if (
       minRow?.min_seq !== null &&
       minRow?.min_seq !== undefined &&
@@ -980,14 +1156,15 @@ export class NativeRuntimeStore {
     }
 
     const cappedLimit = Math.min(Math.max(1, opts.limit), 500);
+    // Strictly scope returned feed events to current generation (never mix prior-gen events into live feed)
     const rows = db
       .prepare(
         `SELECT * FROM native_runtime_events
-         WHERE runtime_id = ? AND seq > ?
+         WHERE runtime_id = ? AND generation = ? AND seq > ?
          ORDER BY seq ASC
          LIMIT ?`,
       )
-      .all(runtimeId, effectiveAfterSeq, cappedLimit + 1) as unknown as NativeEventRow[];
+      .all(runtimeId, currentGeneration, effectiveAfterSeq, cappedLimit + 1) as unknown as NativeEventRow[];
 
     const hasMore = rows.length > cappedLimit;
     const sliced = hasMore ? rows.slice(0, cappedLimit) : rows;
@@ -996,8 +1173,15 @@ export class NativeRuntimeStore {
 
     return {
       resyncRequired: false,
+      binding: {
+        runtimeId,
+        sessionId: bindingRow.session_id,
+        instanceId: bindingRow.instance_id,
+        generation: currentGeneration,
+      },
       runtimeId,
       generation: currentGeneration,
+      asOfSeq: bindingRow.as_of_seq,
       events,
       nextSeq,
       nextCursor: encodeNativeCursor(runtimeId, currentGeneration, nextSeq),
@@ -1007,8 +1191,10 @@ export class NativeRuntimeStore {
 
   /**
    * Idempotency key + payload digest check for POST /commands and POST /control.
-   * Same key + same digest -> returns existing receipt (`replayed: true`).
-   * Same key + different digest -> throws `IDEMPOTENCY_CONFLICT`.
+   * - Validates active binding & generation inside the same BEGIN IMMEDIATE transaction.
+   * - Only `replayed === false` may execute the underlying port!
+   * - Same key + same digest -> returns `{ replayed: true, receipt }` (caller inspects state: completed vs claimed/in_flight vs delivery_unknown).
+   * - Same key + different digest -> throws `IDEMPOTENCY_CONFLICT`.
    */
   claimIdempotentReceipt(params: {
     binding: RuntimeBinding;
@@ -1018,6 +1204,17 @@ export class NativeRuntimeStore {
   }): { replayed: boolean; receipt: StoredNativeReceipt } {
     this.assertSchemaCompatible();
     return this.store.runInImmediateTransaction((db) => {
+      const bindingRow = db
+        .prepare('SELECT * FROM native_runtime_bindings WHERE runtime_id = ?')
+        .get(params.binding.runtimeId) as unknown as BindingRow | undefined;
+      if (!bindingRow) {
+        throw new NativePersistenceError(
+          'BINDING_NOT_FOUND',
+          `Native runtime binding not found: ${params.binding.runtimeId}`,
+        );
+      }
+      this.assertBindingMatchesCurrent(bindingRow, params.binding);
+
       const existing = db
         .prepare(
           `SELECT * FROM native_runtime_receipts
@@ -1087,6 +1284,17 @@ export class NativeRuntimeStore {
   }): StoredNativeReceipt {
     this.assertSchemaCompatible();
     return this.store.runInImmediateTransaction((db) => {
+      const bindingRow = db
+        .prepare('SELECT * FROM native_runtime_bindings WHERE runtime_id = ?')
+        .get(params.binding.runtimeId) as unknown as BindingRow | undefined;
+      if (!bindingRow) {
+        throw new NativePersistenceError(
+          'BINDING_NOT_FOUND',
+          `Native runtime binding not found: ${params.binding.runtimeId}`,
+        );
+      }
+      this.assertBindingMatchesCurrent(bindingRow, params.binding);
+
       const existing = db
         .prepare(
           `SELECT * FROM native_runtime_receipts
@@ -1118,14 +1326,29 @@ export class NativeRuntimeStore {
     });
   }
 
+  getApprovalReceiptByApprovalId(approvalId: string): StoredNativeReceipt | null {
+    this.assertSchemaCompatible();
+    const row = this.store
+      .getDatabaseSync()
+      .prepare(
+        `SELECT * FROM native_runtime_receipts
+         WHERE kind = 'approval' AND approval_id = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(approvalId) as unknown as ReceiptRow | undefined;
+    return row ? mapReceiptRow(row) : null;
+  }
+
   /**
-   * Database CAS claim preventing double-click vs auto-expiry races on native approvals.
+   * Database CAS claim preventing double-click vs auto-expiry vs generation-advance races.
+   * Verifies BOTH receipt.generation AND current native_runtime_bindings.current_generation!
    */
   claimApprovalReceiptCas(params: {
     approvalId: string;
     expectedGeneration: BindingGeneration;
+    expectedSessionId?: string;
     idempotencyKey?: string;
-  }): { claimed: boolean; receipt: StoredNativeReceipt | null } {
+  }): { claimed: boolean; receipt: StoredNativeReceipt | null; staleGeneration?: boolean } {
     this.assertSchemaCompatible();
     return this.store.runInImmediateTransaction((db) => {
       const existing = db
@@ -1137,11 +1360,41 @@ export class NativeRuntimeStore {
         .get(params.approvalId) as unknown as ReceiptRow | undefined;
       if (!existing) return { claimed: false, receipt: null };
 
-      if (existing.generation !== params.expectedGeneration || existing.state !== 'pending') {
+      if (params.expectedSessionId && existing.session_id !== params.expectedSessionId) {
         return { claimed: false, receipt: mapReceiptRow(existing) };
       }
 
+      const bindingRow = db
+        .prepare('SELECT * FROM native_runtime_bindings WHERE runtime_id = ?')
+        .get(existing.runtime_id) as unknown as BindingRow | undefined;
+
       const now = Date.now();
+      if (!bindingRow || bindingRow.current_generation !== existing.generation) {
+        // Stale-generation receipt: invalidate if still pending so it can never be claimed
+        if (existing.state === 'pending') {
+          db.prepare(
+            `UPDATE native_runtime_receipts SET state = 'connection_lost', updated_at = ?
+             WHERE receipt_id = ? AND state = 'pending'`,
+          ).run(now, existing.receipt_id);
+        }
+        const refreshed = db
+          .prepare('SELECT * FROM native_runtime_receipts WHERE receipt_id = ?')
+          .get(existing.receipt_id) as unknown as ReceiptRow;
+        return { claimed: false, receipt: mapReceiptRow(refreshed), staleGeneration: true };
+      }
+
+      if (
+        existing.generation !== params.expectedGeneration ||
+        bindingRow.current_generation !== params.expectedGeneration ||
+        existing.state !== 'pending'
+      ) {
+        return {
+          claimed: false,
+          receipt: mapReceiptRow(existing),
+          staleGeneration: bindingRow.current_generation !== params.expectedGeneration,
+        };
+      }
+
       const res = db
         .prepare(
           `UPDATE native_runtime_receipts
@@ -1212,45 +1465,9 @@ export class NativeRuntimeStore {
     generation?: BindingGeneration,
   ): { lostCount: number; unknownCount: number } {
     this.assertSchemaCompatible();
-    return this.store.runInImmediateTransaction((db) => {
-      const now = Date.now();
-      const lostRes = generation
-        ? db
-            .prepare(
-              `UPDATE native_runtime_receipts
-               SET state = 'connection_lost', updated_at = ?
-               WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'pending'`,
-            )
-            .run(now, runtimeId, generation)
-        : db
-            .prepare(
-              `UPDATE native_runtime_receipts
-               SET state = 'connection_lost', updated_at = ?
-               WHERE runtime_id = ? AND kind = 'approval' AND state = 'pending'`,
-            )
-            .run(now, runtimeId);
-
-      const unknownRes = generation
-        ? db
-            .prepare(
-              `UPDATE native_runtime_receipts
-               SET state = 'delivery_unknown', updated_at = ?
-               WHERE runtime_id = ? AND generation = ? AND kind = 'approval' AND state = 'claimed'`,
-            )
-            .run(now, runtimeId, generation)
-        : db
-            .prepare(
-              `UPDATE native_runtime_receipts
-               SET state = 'delivery_unknown', updated_at = ?
-               WHERE runtime_id = ? AND kind = 'approval' AND state = 'claimed'`,
-            )
-            .run(now, runtimeId);
-
-      return {
-        lostCount: Number(lostRes.changes),
-        unknownCount: Number(unknownRes.changes),
-      };
-    });
+    return this.store.runInImmediateTransaction((db) =>
+      this.invalidateReceiptsInTx(db, runtimeId, Date.now(), generation),
+    );
   }
 
   markAttachedBindingsReconcilingOnStartup(): number {
@@ -1261,7 +1478,7 @@ export class NativeRuntimeStore {
       const changed = db
         .prepare(
           `UPDATE native_runtime_bindings
-           SET status = 'reconciling', updated_at = ?
+           SET status = 'reconciling', retention_reasons_json = '[]', updated_at = ?
            WHERE status = 'attached'`,
         )
         .run(now).changes;

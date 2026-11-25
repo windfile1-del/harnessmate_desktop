@@ -206,6 +206,8 @@ export interface AdapterSessionHandle {
   listRetentionReasons?(): string[];
   /** Optional transport connection identifier for native runtime correlation. */
   getConnectionId?(): string | null;
+  /** Optional hook called by SessionManager when a held native turn is released for single settlement. */
+  releaseHeldTurn?(turnId: string): void;
   dispose(): Promise<void>;
   onEvent(listener: (event: NormalizedAdapterEvent) => void): () => void;
 }

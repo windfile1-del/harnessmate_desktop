@@ -5,10 +5,13 @@ import {
   AGY_NATIVE_MIGRATION_COMPONENT,
   AGY_NATIVE_MIGRATION_VERSION,
   NativeCanonicalEventSchema,
-  NativeCaptureMetadataSchema,
+  NativeCaptureRecordV1Schema,
   NativeCommandRequestSchema,
   NativeControlRequestSchema,
   NativeRuntimeProjectionSchema,
+  NativeSnapshotResponseSchema,
+  NativeTimelineResponseSchema,
+  NativeWorkflowResourceResponseSchema,
   NativeWsClientFrameSchema,
   NativeWsServerFrameSchema,
   ResolveNativeRequestInputSchema,
@@ -49,7 +52,6 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
     expect(() => asRuntimeId('../escape')).toThrow();
     expect(() => asWorkId('')).toThrow();
 
-    // RpcId preserves string vs number types
     const numId = RpcIdSchema.parse(42);
     const strId = RpcIdSchema.parse('42');
     expect(typeof numId).toBe('number');
@@ -101,6 +103,10 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
     const workDto = sanitizeNativeWorkForPublic(work);
     expect(JSON.stringify(workDto)).not.toContain('conn_secret_internal_123');
 
+    // Prior-generation demotion produces stale DTO
+    const priorGenWorkDto = sanitizeNativeWorkForPublic(work, 1_764_000_000_000, 'prior_generation_snapshot');
+    expect(priorGenWorkDto.state.kind).toBe('stale');
+
     const agentDto = sanitizeAgentIdentityForPublic({
       id: asNativeAgentId('agt_1'),
       foreground: { kind: 'known', value: 'running', evidence: liveEvidence },
@@ -137,8 +143,14 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
     expect(JSON.stringify(wfDto)).not.toContain('conn_secret_internal_123');
   });
 
-  it('strictly validates permission resolution, command/control inputs, and WS/capture schemas', () => {
+  it('strictly validates permission resolution, command/control, timeline, workflow resource allowlist, and WS schemas', () => {
     const gen = asBindingGeneration('gen_1');
+    const binding = {
+      runtimeId: asRuntimeId('nrt_1'),
+      sessionId: 'sess_1',
+      instanceId: 'agy',
+      generation: gen,
+    };
 
     expect(
       ResolveNativeRequestInputSchema.safeParse({
@@ -148,15 +160,9 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
       }).success,
     ).toBe(true);
 
-    // Reject missing optionId on selected
     expect(
-      ResolveNativeRequestInputSchema.safeParse({
-        generation: gen,
-        outcome: 'selected',
-      }).success,
+      ResolveNativeRequestInputSchema.safeParse({ generation: gen, outcome: 'selected' }).success,
     ).toBe(false);
-
-    // Reject mixing optionId + formPayload
     expect(
       ResolveNativeRequestInputSchema.safeParse({
         generation: gen,
@@ -165,8 +171,6 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
         formPayload: { answer: 'yes' },
       }).success,
     ).toBe(false);
-
-    // Reject empty formPayload on form_submitted
     expect(
       ResolveNativeRequestInputSchema.safeParse({
         generation: gen,
@@ -174,8 +178,6 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
         formPayload: {},
       }).success,
     ).toBe(false);
-
-    // Reject optionId on cancelled
     expect(
       ResolveNativeRequestInputSchema.safeParse({
         generation: gen,
@@ -184,7 +186,6 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
       }).success,
     ).toBe(false);
 
-    // Reject unknown fields (strict)
     expect(
       NativeCommandRequestSchema.safeParse({
         bindingGeneration: gen,
@@ -203,6 +204,58 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
         action: 'cancel',
         expectedRevision: 2,
         idempotencyKey: 'ctrl_1',
+      }).success,
+    ).toBe(true);
+
+    // R4: Workflow resource DTO allowlist accepts typed items and REJECTS arbitrary debug / host path fields
+    expect(
+      NativeWorkflowResourceResponseSchema.safeParse({
+        schemaVersion: 1,
+        binding,
+        workflowId: asWorkflowId('wf_1'),
+        resource: 'board',
+        revision: 1,
+        available: true,
+        items: [
+          {
+            kind: 'board_post',
+            postId: 'post_1',
+            summary: 'Coordinator update',
+            truncated: false,
+            createdAt: 1000,
+            evidence: { sourceKind: 'live_protocol', freshness: 'live', observedAt: 1000 },
+          },
+        ],
+        nextPageToken: null,
+        hasMore: false,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      NativeWorkflowResourceResponseSchema.safeParse({
+        schemaVersion: 1,
+        binding,
+        workflowId: asWorkflowId('wf_1'),
+        resource: 'board',
+        revision: 1,
+        available: true,
+        items: [{ debugPath: 'C:\\Users\\secret\\token.json', rawPayload: { secret: true } }],
+        nextPageToken: null,
+        hasMore: false,
+      }).success,
+    ).toBe(false);
+
+    // R6: NP-03 aligned timeline & snapshot envelopes
+    expect(
+      NativeTimelineResponseSchema.safeParse({
+        schemaVersion: 1,
+        binding,
+        scopeKind: 'activity',
+        scopeId: 'act_1',
+        revision: 1,
+        items: [],
+        nextPageToken: null,
+        hasMore: false,
       }).success,
     ).toBe(true);
 
@@ -242,35 +295,187 @@ describe('AGY Native v1 shared contracts (NP-02)', () => {
         currentGeneration: 'gen_2',
       }).success,
     ).toBe(true);
-
-    expect(
-      NativeCaptureMetadataSchema.safeParse({
-        schemaVersion: 1,
-        captureId: 'cap_01',
-        scenario: 'T02',
-        platform: 'win32',
-        cliVersion: '1.5.16',
-        protocol: 'acp_v1',
-        accountCategory: 'personal_test',
-        source: 'synthetic',
-        observedAt: 1_764_000_000_000,
-        producer: 'np01-observatory',
-        seq: 1,
-        monotonicMs: 12.5,
-        direction: 'in',
-        messageKind: 'notification',
-      }).success,
-    ).toBe(true);
   });
 
-  it('produces valid Known Empty, NP-03 sample fixture, and honest default capabilities', () => {
+  it('validates all NP-01 capture-v1 Windows sanitized record shapes and rejects malformed records (R6)', () => {
+    const np01WindowsCleanV1Samples = [
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: null,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595202371,
+        producer: 'observatory_cli',
+        seq: 1,
+        monotonicMs: 4.15,
+        layer: 'raw',
+        direction: 'lifecycle',
+        messageKind: 'capture_meta',
+        provenance: {
+          origin: 'live_windows_agy_clean_unauthenticated',
+          migratedFrom: null,
+          timingSynthetic: false,
+          notes: 'Captured via NP-01 observatory CLI v0.2 with allowlist reconstruction',
+        },
+        correlation: {
+          connectionId: 'conn-1',
+          ingressOrdinal: 0,
+          channel: 'live',
+          diagnosticCode: 'AGY-DIAG-v1:cap-20261125082642-c74e32:clean_v1:conn-1:gen-0:live:0:s1:raw:capture_start',
+        },
+        shape: { profileSource: 'ephemeral', requestedProtocol: 1 },
+      },
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: null,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595204037,
+        producer: 'observatory_cli',
+        seq: 2,
+        monotonicMs: 1670.56,
+        layer: 'raw',
+        direction: 'lifecycle',
+        messageKind: 'cli_catalog',
+        correlation: { connectionId: 'conn-1', ingressOrdinal: 0, channel: 'live' },
+        shape: { command: 'models', exitCode: 1 },
+      },
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: 1,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595206891,
+        producer: 'observatory_cli',
+        seq: 5,
+        monotonicMs: 4521.43,
+        layer: 'raw',
+        direction: 'inbound',
+        messageKind: 'rpc_response',
+        latencyMs: 730.3,
+        correlation: {
+          connectionId: 'conn-1',
+          ingressOrdinal: 1,
+          channel: 'live',
+          rpcIdAlias: 'rpc-1',
+          rpcIdType: 'number',
+        },
+        shape: { jsonrpc: '2.0', protocolVersion: 1 },
+      },
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: 1,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595207146,
+        producer: 'observatory_cli',
+        seq: 7,
+        monotonicMs: 4776.14,
+        layer: 'raw',
+        direction: 'inbound',
+        messageKind: 'rpc_error',
+        latencyMs: 250.65,
+        correlation: {
+          connectionId: 'conn-1',
+          ingressOrdinal: 2,
+          channel: 'live',
+          rpcIdAlias: 'rpc-2',
+          rpcIdType: 'number',
+        },
+        shape: { error: { code: -32000, authenticationRequired: true } },
+      },
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: 1,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595208688,
+        producer: 'observatory_cli',
+        seq: 8,
+        monotonicMs: 6321.57,
+        layer: 'raw',
+        direction: 'lifecycle',
+        messageKind: 'process_exit',
+        correlation: { connectionId: 'conn-1', ingressOrdinal: 0, channel: 'live' },
+        shape: { exitCode: 0, signal: null },
+      },
+      {
+        schemaVersion: 1,
+        captureId: 'cap-20261125082642-c74e32',
+        scenario: 'clean_v1',
+        platform: 'win32',
+        cliVersion: '1.5.17',
+        protocol: 1,
+        accountCategory: 'none',
+        source: 'live_raw',
+        observedAt: 1795595208690,
+        producer: 'observatory_cli',
+        seq: 9,
+        monotonicMs: 6323.19,
+        layer: 'raw',
+        direction: 'lifecycle',
+        messageKind: 'capture_end',
+        correlation: { connectionId: 'conn-1', ingressOrdinal: 0, channel: 'live' },
+        shape: { outcome: 'expected_auth_required', negotiatedProtocol: 1 },
+      },
+    ];
+
+    for (const rec of np01WindowsCleanV1Samples) {
+      expect(NativeCaptureRecordV1Schema.safeParse(rec).success).toBe(true);
+    }
+
+    // Strict schema rejects shape as string, extra provenance key, and numeric correlation.generation
+    expect(
+      NativeCaptureRecordV1Schema.safeParse({ ...np01WindowsCleanV1Samples[0], shape: 'bad' }).success,
+    ).toBe(false);
+    expect(
+      NativeCaptureRecordV1Schema.safeParse({
+        ...np01WindowsCleanV1Samples[0],
+        provenance: { ...np01WindowsCleanV1Samples[0]!.provenance, extraLeak: 'nope' },
+      }).success,
+    ).toBe(false);
+    expect(
+      NativeCaptureRecordV1Schema.safeParse({
+        ...np01WindowsCleanV1Samples[0],
+        correlation: { ...np01WindowsCleanV1Samples[0]!.correlation, generation: 123 },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('produces valid Known Empty, NP-03 sample fixture, wrapped snapshot, and honest default capabilities', () => {
     const empty = createKnownEmptyNativeProjection({
       sessionId: 'sess_empty',
       instanceId: 'agy',
     });
     expect(NativeRuntimeProjectionSchema.parse(empty).enabled).toBe(false);
-    expect(empty.activities).toEqual([]);
-    expect(empty.asOfSeq).toBe(0);
+    expect(
+      NativeSnapshotResponseSchema.parse({
+        schemaVersion: 1,
+        contractRevision: AGY_NATIVE_CONTRACT_REVISION,
+        enabled: false,
+        projection: empty,
+      }).projection.asOfSeq,
+    ).toBe(0);
 
     const sample = createSampleNativeProjectionFixture();
     expect(NativeRuntimeProjectionSchema.parse(sample).enabled).toBe(true);

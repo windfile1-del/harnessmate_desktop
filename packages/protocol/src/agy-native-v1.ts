@@ -230,12 +230,22 @@ export type PublicObserved<T> =
 export function sanitizeObservedForPublic<T>(
   observed: Observed<T>,
   nowMs = Date.now(),
+  forceStaleReason?: string,
 ): PublicObserved<T> {
   if (observed.kind === 'known') {
+    const pubEv = toPublicEvidenceDto(observed.evidence, nowMs);
+    if (forceStaleReason) {
+      return {
+        kind: 'stale',
+        last: observed.value,
+        evidence: { ...pubEv, freshness: 'stale' },
+        reasonCode: forceStaleReason,
+      };
+    }
     return {
       kind: 'known',
       value: observed.value,
-      evidence: toPublicEvidenceDto(observed.evidence, nowMs),
+      evidence: pubEv,
     };
   }
   if (observed.kind === 'stale') {
@@ -349,6 +359,8 @@ export const ActivitySchema = z
     workId: WorkIdSchema.optional(),
     agentId: NativeAgentIdSchema.optional(),
     state: ActivityStatusSchema,
+    summary: z.string().max(400).optional(),
+    evidence: PublicEvidenceDtoSchema.optional(),
     updatedAt: z.number().int().nonnegative(),
   })
   .strict();
@@ -479,12 +491,14 @@ export const WorkflowDetailSchema = z.discriminatedUnion('kind', [
       coordinatorId: NativeAgentIdSchema.optional(),
       workerIds: z.array(NativeAgentIdSchema),
       board: observedSchema(SwarmBoardAvailabilitySchema),
+      objective: z.string().max(1000).optional(),
     })
     .strict(),
   z
     .object({
       kind: z.literal('boost'),
       phases: z.array(NativeStageSchema).optional(),
+      objective: z.string().max(1000).optional(),
     })
     .strict(),
   z
@@ -529,12 +543,14 @@ export const WorkflowDetailDtoSchema = z.discriminatedUnion('kind', [
       coordinatorId: NativeAgentIdSchema.optional(),
       workerIds: z.array(NativeAgentIdSchema),
       board: publicObservedSchema(SwarmBoardAvailabilitySchema),
+      objective: z.string().max(1000).optional(),
     })
     .strict(),
   z
     .object({
       kind: z.literal('boost'),
       phases: z.array(NativeStageDtoSchema).optional(),
+      objective: z.string().max(1000).optional(),
     })
     .strict(),
   z
@@ -617,6 +633,7 @@ export const CapabilityActionDescriptorSchema = z
     lane: CommandLaneSchema,
     gate: GateStateSchema,
     reasonCode: z.string().min(1).max(128).optional(),
+    label: z.string().min(1).max(120).optional(),
   })
   .strict();
 export type CapabilityActionDescriptor = z.infer<typeof CapabilityActionDescriptorSchema>;
@@ -681,6 +698,7 @@ export const PendingNativeRequestSchema = z
     activityId: ActivityIdSchema.optional(),
     kind: NativeRequestKindSchema,
     allowedOptionIds: z.array(z.string().min(1).max(128)),
+    allowsFreeText: z.boolean().optional(),
     deadline: z.number().int().nonnegative().optional(),
   })
   .strict();
@@ -697,8 +715,11 @@ export const NativeRequestSummaryDtoSchema = z
     targetLineage: AgentLineageSchema.default('unresolved'),
     kind: NativeRequestKindSchema,
     allowedOptionIds: z.array(z.string().min(1).max(128)),
+    allowsFreeText: z.boolean().optional(),
+    receiptId: z.string().min(1).max(128).optional(),
     receiptState: NativeRequestReceiptStateSchema,
     deadline: z.number().int().nonnegative().optional(),
+    evidence: PublicEvidenceDtoSchema.optional(),
     updatedAt: z.number().int().nonnegative(),
   })
   .strict();
@@ -875,11 +896,23 @@ export const NativeRuntimeProjectionSchema = z
   .strict();
 export type NativeRuntimeProjection = z.infer<typeof NativeRuntimeProjectionSchema>;
 
+/** Wrapped REST snapshot envelope aligned with NP-03 while preserving direct projection fields. */
+export const NativeSnapshotResponseSchema = z
+  .object({
+    schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
+    contractRevision: z.literal(AGY_NATIVE_CONTRACT_REVISION),
+    enabled: z.boolean(),
+    projection: NativeRuntimeProjectionSchema,
+  })
+  .strict();
+export type NativeSnapshotResponse = z.infer<typeof NativeSnapshotResponseSchema>;
+
 // ── Sanitization Helpers (Internal -> Public DTO) ──────────────────────
 
 export function sanitizeNativeWorkForPublic(
   work: NativeWork,
   nowMs = Date.now(),
+  forceStaleReason?: string,
 ): NativeWorkDto {
   return NativeWorkDtoSchema.parse({
     id: work.id,
@@ -888,8 +921,8 @@ export function sanitizeNativeWorkForPublic(
     ...(work.ownerAgentId ? { ownerAgentId: work.ownerAgentId } : {}),
     ...(work.workflowId ? { workflowId: work.workflowId } : {}),
     blocking: work.blocking,
-    state: sanitizeObservedForPublic(work.state, nowMs),
-    ...(work.outcome ? { outcome: sanitizeObservedForPublic(work.outcome, nowMs) } : {}),
+    state: sanitizeObservedForPublic(work.state, nowMs, forceStaleReason),
+    ...(work.outcome ? { outcome: sanitizeObservedForPublic(work.outcome, nowMs, forceStaleReason) } : {}),
     ...(work.observedLabel !== undefined ? { observedLabel: work.observedLabel } : {}),
     revision: work.revision,
   });
@@ -898,13 +931,14 @@ export function sanitizeNativeWorkForPublic(
 export function sanitizeAgentIdentityForPublic(
   agent: AgentIdentity,
   nowMs = Date.now(),
+  forceStaleReason?: string,
 ): AgentIdentityDto {
   return AgentIdentityDtoSchema.parse({
     id: agent.id,
-    ...(agent.role ? { role: sanitizeObservedForPublic(agent.role, nowMs) } : {}),
-    ...(agent.label ? { label: sanitizeObservedForPublic(agent.label, nowMs) } : {}),
-    foreground: sanitizeObservedForPublic(agent.foreground, nowMs),
-    ...(agent.status ? { status: sanitizeObservedForPublic(agent.status, nowMs) } : {}),
+    ...(agent.role ? { role: sanitizeObservedForPublic(agent.role, nowMs, forceStaleReason) } : {}),
+    ...(agent.label ? { label: sanitizeObservedForPublic(agent.label, nowMs, forceStaleReason) } : {}),
+    foreground: sanitizeObservedForPublic(agent.foreground, nowMs, forceStaleReason),
+    ...(agent.status ? { status: sanitizeObservedForPublic(agent.status, nowMs, forceStaleReason) } : {}),
     launchWorkIds: [...agent.launchWorkIds],
     lineage: agent.lineage,
     revision: agent.revision,
@@ -924,11 +958,15 @@ export function sanitizeNativeRelationshipForPublic(
   });
 }
 
-function sanitizeStageForPublic(stage: NativeStage, nowMs = Date.now()): NativeStageDto {
+function sanitizeStageForPublic(
+  stage: NativeStage,
+  nowMs = Date.now(),
+  forceStaleReason?: string,
+): NativeStageDto {
   return {
     id: stage.id,
     label: stage.label,
-    state: sanitizeObservedForPublic(stage.state, nowMs),
+    state: sanitizeObservedForPublic(stage.state, nowMs, forceStaleReason),
     ...(stage.after ? { after: [...stage.after] } : {}),
     ...(stage.agentIds ? { agentIds: [...stage.agentIds] } : {}),
   };
@@ -937,6 +975,7 @@ function sanitizeStageForPublic(stage: NativeStage, nowMs = Date.now()): NativeS
 export function sanitizeNativeWorkflowForPublic(
   workflow: NativeWorkflow,
   nowMs = Date.now(),
+  forceStaleReason?: string,
 ): NativeWorkflowDto {
   let detail: WorkflowDetailDto;
   switch (workflow.detail.kind) {
@@ -945,15 +984,17 @@ export function sanitizeNativeWorkflowForPublic(
         kind: 'swarm',
         ...(workflow.detail.coordinatorId ? { coordinatorId: workflow.detail.coordinatorId } : {}),
         workerIds: [...workflow.detail.workerIds],
-        board: sanitizeObservedForPublic(workflow.detail.board, nowMs),
+        board: sanitizeObservedForPublic(workflow.detail.board, nowMs, forceStaleReason),
+        ...(workflow.detail.objective !== undefined ? { objective: workflow.detail.objective } : {}),
       };
       break;
     case 'boost':
       detail = {
         kind: 'boost',
         ...(workflow.detail.phases
-          ? { phases: workflow.detail.phases.map((s) => sanitizeStageForPublic(s, nowMs)) }
+          ? { phases: workflow.detail.phases.map((s) => sanitizeStageForPublic(s, nowMs, forceStaleReason)) }
           : {}),
+        ...(workflow.detail.objective !== undefined ? { objective: workflow.detail.objective } : {}),
       };
       break;
     case 'teamwork':
@@ -967,7 +1008,11 @@ export function sanitizeNativeWorkflowForPublic(
           : {}),
         ...(workflow.detail.projectLabel ? { projectLabel: workflow.detail.projectLabel } : {}),
         ...(workflow.detail.milestones
-          ? { milestones: workflow.detail.milestones.map((s) => sanitizeStageForPublic(s, nowMs)) }
+          ? {
+              milestones: workflow.detail.milestones.map((s) =>
+                sanitizeStageForPublic(s, nowMs, forceStaleReason),
+              ),
+            }
           : {}),
       };
       break;
@@ -978,7 +1023,7 @@ export function sanitizeNativeWorkflowForPublic(
           ? { scriptArtifactId: workflow.detail.scriptArtifactId }
           : {}),
         ...(workflow.detail.steps
-          ? { steps: workflow.detail.steps.map((s) => sanitizeStageForPublic(s, nowMs)) }
+          ? { steps: workflow.detail.steps.map((s) => sanitizeStageForPublic(s, nowMs, forceStaleReason)) }
           : {}),
         ...(workflow.detail.resultArtifactIds
           ? { resultArtifactIds: [...workflow.detail.resultArtifactIds] }
@@ -1001,7 +1046,7 @@ export function sanitizeNativeWorkflowForPublic(
           ? { scheduleLabel: workflow.detail.scheduleLabel }
           : {}),
         ...(workflow.detail.nextAt
-          ? { nextAt: sanitizeObservedForPublic(workflow.detail.nextAt, nowMs) }
+          ? { nextAt: sanitizeObservedForPublic(workflow.detail.nextAt, nowMs, forceStaleReason) }
           : {}),
         occurrenceWorkIds: [...workflow.detail.occurrenceWorkIds],
       };
@@ -1011,7 +1056,7 @@ export function sanitizeNativeWorkflowForPublic(
   return NativeWorkflowDtoSchema.parse({
     id: workflow.id,
     originActivityId: workflow.originActivityId,
-    state: sanitizeObservedForPublic(workflow.state, nowMs),
+    state: sanitizeObservedForPublic(workflow.state, nowMs, forceStaleReason),
     detail,
     revision: workflow.revision,
   });
@@ -1032,6 +1077,7 @@ export const NativeApiErrorCodeSchema = z.enum([
   'NOT_FOUND',
   'ALREADY_RESOLVED',
   'CONNECTION_LOST',
+  'DELIVERY_UNKNOWN',
   'CONSUMER_PROVENANCE_BLOCKED',
 ]);
 export type NativeApiErrorCode = z.infer<typeof NativeApiErrorCodeSchema>;
@@ -1070,8 +1116,10 @@ export type NativeEventsQuery = z.infer<typeof NativeEventsQuerySchema>;
 export const NativeEventsResponseSchema = z
   .object({
     schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
+    binding: RuntimeBindingSchema,
     runtimeId: RuntimeIdSchema,
     generation: BindingGenerationSchema,
+    asOfSeq: z.number().int().nonnegative(),
     events: z.array(NativeCanonicalEventSchema),
     nextSeq: z.number().int().nonnegative(),
     nextCursor: z.string().min(1).max(256),
@@ -1090,10 +1138,17 @@ export const NativeTimelineEntryDtoSchema = z
   .object({
     entryId: z.string().min(1).max(128),
     seq: z.number().int().nonnegative(),
-    kind: z.enum(['text', 'thinking', 'tool', 'diff', 'request', 'status', 'artifact_ref']),
-    summary: z.string().max(4096),
+    timestamp: z.number().int().nonnegative(),
+    kind: z.enum(['assistant_text', 'thinking', 'tool', 'diff', 'request', 'status', 'artifact_ref', 'notice']),
+    actorKind: z.enum(['main', 'child', 'system', 'user']),
+    actorId: z.string().min(1).max(128).optional(),
+    actorLabel: z.string().min(1).max(160).optional(),
+    title: z.string().max(240).optional(),
+    text: z.string().max(8192).optional(),
+    diff: z.string().max(16384).optional(),
+    status: z.union([WorkStateSchema, ActivityStatusSchema]).optional(),
     truncated: z.boolean().default(false),
-    createdAt: z.number().int().nonnegative(),
+    deltaCoalesceKey: z.string().min(1).max(128).optional(),
     evidence: PublicEvidenceDtoSchema,
   })
   .strict();
@@ -1102,13 +1157,14 @@ export type NativeTimelineEntryDto = z.infer<typeof NativeTimelineEntryDtoSchema
 export const NativeTimelineResponseSchema = z
   .object({
     schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
-    runtimeId: RuntimeIdSchema,
-    generation: BindingGenerationSchema,
-    scopeType: z.enum(['activity', 'agent']),
+    binding: RuntimeBindingSchema,
+    scopeKind: z.enum(['activity', 'agent']),
     scopeId: z.string().min(1).max(128),
     revision: z.number().int().nonnegative(),
-    entries: z.array(NativeTimelineEntryDtoSchema),
+    items: z.array(NativeTimelineEntryDtoSchema),
     nextPageToken: z.string().min(1).max(256).nullable(),
+    hasMore: z.boolean(),
+    sourceUnavailableReason: z.string().min(1).max(160).optional(),
   })
   .strict();
 export type NativeTimelineResponse = z.infer<typeof NativeTimelineResponseSchema>;
@@ -1116,18 +1172,71 @@ export type NativeTimelineResponse = z.infer<typeof NativeTimelineResponseSchema
 export const NativeWorkflowResourceKindSchema = z.enum(['board', 'phases', 'logs', 'artifacts']);
 export type NativeWorkflowResourceKind = z.infer<typeof NativeWorkflowResourceKindSchema>;
 
+/**
+ * Strict allowlisted public DTO union for workflow resource pagination.
+ * Explicitly disallows arbitrary nested objects, internal debug keys, and raw host paths.
+ */
+export const NativeWorkflowResourceItemDtoSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('board_post'),
+      postId: opaqueIdString,
+      threadId: opaqueIdString.optional(),
+      authorAgentId: NativeAgentIdSchema.optional(),
+      authorLabel: z.string().min(1).max(120).optional(),
+      summary: z.string().max(4000),
+      truncated: z.boolean().default(false),
+      createdAt: z.number().int().nonnegative(),
+      evidence: PublicEvidenceDtoSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('phase'),
+      stage: NativeStageDtoSchema,
+      summary: z.string().max(1000).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('log_entry'),
+      entryId: opaqueIdString,
+      seq: z.number().int().nonnegative(),
+      level: z.enum(['info', 'warn', 'error']),
+      summary: z.string().max(4000),
+      truncated: z.boolean().default(false),
+      createdAt: z.number().int().nonnegative(),
+      evidence: PublicEvidenceDtoSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('artifact_ref'),
+      artifactId: opaqueIdString,
+      title: z.string().min(1).max(200),
+      artifactKind: z.enum(['markdown', 'text', 'diff', 'script', 'json', 'media', 'unknown']),
+      ownerAgentId: NativeAgentIdSchema.optional(),
+      activityId: ActivityIdSchema.optional(),
+      revision: z.number().int().nonnegative(),
+      updatedAt: z.number().int().nonnegative(),
+      evidence: PublicEvidenceDtoSchema,
+    })
+    .strict(),
+]);
+export type NativeWorkflowResourceItemDto = z.infer<typeof NativeWorkflowResourceItemDtoSchema>;
+
 export const NativeWorkflowResourceResponseSchema = z
   .object({
     schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
-    runtimeId: RuntimeIdSchema,
-    generation: BindingGenerationSchema,
+    binding: RuntimeBindingSchema,
     workflowId: WorkflowIdSchema,
     resource: NativeWorkflowResourceKindSchema,
     revision: z.number().int().nonnegative(),
     available: z.boolean(),
-    reasonCode: z.string().min(1).max(128).optional(),
-    items: z.array(z.record(z.unknown())),
+    sourceUnavailableReason: z.string().min(1).max(160).optional(),
+    items: z.array(NativeWorkflowResourceItemDtoSchema),
     nextPageToken: z.string().min(1).max(256).nullable(),
+    hasMore: z.boolean(),
   })
   .strict();
 export type NativeWorkflowResourceResponse = z.infer<typeof NativeWorkflowResourceResponseSchema>;
@@ -1139,13 +1248,20 @@ const idempotencyKeySchema = z
   .max(128)
   .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/, 'Invalid idempotency key');
 
+export const NativeScalarValueSchema = z.union([
+  z.string().max(1000),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+]);
+
 export const NativeCommandRequestSchema = z
   .object({
     bindingGeneration: BindingGenerationSchema,
     catalogRevision: z.number().int().nonnegative(),
     capabilityId: z.string().min(1).max(64),
     actionKey: z.string().min(1).max(80),
-    args: z.record(z.unknown()).default({}),
+    args: z.record(z.string().min(1).max(64), z.union([NativeScalarValueSchema, z.array(z.string().max(256)).max(32)])).default({}),
     idempotencyKey: idempotencyKeySchema,
   })
   .strict();
@@ -1158,7 +1274,7 @@ export const NativeCommandResponseSchema = z.discriminatedUnion('kind', [
       kind: z.literal('inspect'),
       receiptId: z.string().min(1).max(128),
       output: z.string().max(65_536),
-      data: z.record(z.unknown()).optional(),
+      summaryFields: z.record(z.string().min(1).max(64), NativeScalarValueSchema).optional(),
     })
     .strict(),
   z
@@ -1168,6 +1284,7 @@ export const NativeCommandResponseSchema = z.discriminatedUnion('kind', [
       receiptId: z.string().min(1).max(128),
       activityId: ActivityIdSchema,
       turnId: z.string().min(1).max(128).optional(),
+      modeEvidenceObserved: z.boolean().optional(),
     })
     .strict(),
 ]);
@@ -1203,8 +1320,9 @@ export const NativeControlResponseSchema = z
     schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
     receiptId: z.string().min(1).max(128),
     accepted: z.boolean(),
-    state: z.enum(['requested', 'applied', 'noop']),
+    state: z.enum(['requested', 'applied', 'noop', 'unknown']),
     revision: z.number().int().nonnegative(),
+    reasonCode: z.string().min(1).max(128).optional(),
   })
   .strict();
 export type NativeControlResponse = z.infer<typeof NativeControlResponseSchema>;
@@ -1351,32 +1469,117 @@ export const NativeWsServerFrameSchema = z.discriminatedUnion('op', [
 ]);
 export type NativeWsServerFrame = z.infer<typeof NativeWsServerFrameSchema>;
 
-// ── Observatory Capture Alignment Schema (for NP-01) ───────────────────
+// ── Observatory Capture v1 Schema (Aligned 1:1 with NP-01 capture-v1.schema.json) ──
 
-export const NativeCaptureMetadataSchema = z
+const captureAliasToken = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-zA-Z0-9._:-]{1,64}$/);
+
+export const NativeCaptureProvenanceSchema = z
+  .object({
+    origin: z.string().max(128).regex(/^[a-zA-Z0-9._:/ -]{1,128}$/).optional(),
+    migratedFrom: z.string().max(128).regex(/^[a-zA-Z0-9._:/ -]{1,128}$/).nullable().optional(),
+    timingSynthetic: z.boolean().optional(),
+    notes: z.string().max(240).optional(),
+  })
+  .strict();
+export type NativeCaptureProvenance = z.infer<typeof NativeCaptureProvenanceSchema>;
+
+export const NativeCaptureCorrelationSchema = z
+  .object({
+    connectionId: z.string().min(2).max(64).regex(/^[a-zA-Z0-9._:-]{2,64}$/),
+    generation: captureAliasToken.nullable().optional(),
+    ingressOrdinal: z.number().int().nonnegative(),
+    channel: z.enum(['live', 'history_replay']),
+    rpcIdAlias: captureAliasToken.nullable().optional(),
+    rpcIdType: z.enum(['number', 'string']).nullable().optional(),
+    sessionAlias: captureAliasToken.nullable().optional(),
+    childAlias: captureAliasToken.nullable().optional(),
+    toolAlias: captureAliasToken.nullable().optional(),
+    taskAlias: captureAliasToken.nullable().optional(),
+    workflowAlias: captureAliasToken.nullable().optional(),
+    approvalAlias: captureAliasToken.nullable().optional(),
+    turnAlias: captureAliasToken.nullable().optional(),
+    activityAlias: captureAliasToken.nullable().optional(),
+    workAlias: captureAliasToken.nullable().optional(),
+    agentAlias: captureAliasToken.nullable().optional(),
+    diagnosticCode: z
+      .string()
+      .max(240)
+      .regex(/^AGY-DIAG-v1:[a-zA-Z0-9._:-]{4,220}$/)
+      .nullable()
+      .optional(),
+  })
+  .strict();
+export type NativeCaptureCorrelation = z.infer<typeof NativeCaptureCorrelationSchema>;
+
+export const NativeCaptureRecordV1Schema = z
   .object({
     schemaVersion: z.literal(AGY_NATIVE_CONTRACT_VERSION),
-    captureId: z.string().min(1).max(128),
-    scenario: z.string().min(1).max(64),
-    platform: z.string().min(1).max(64),
-    cliVersion: z.string().min(1).max(64),
-    protocol: z.string().min(1).max(32),
-    accountCategory: z.string().min(1).max(64),
-    source: z.enum(['synthetic', 'replay_with_provenance', 'live_raw', 'live_hm', 'official_comparison']),
+    captureId: z.string().min(4).max(96).regex(/^[a-zA-Z0-9._:-]{4,96}$/),
+    scenario: z.string().min(2).max(64).regex(/^[a-zA-Z0-9._:-]{2,64}$/),
+    platform: z.enum(['win32', 'darwin', 'linux', 'unknown']),
+    cliVersion: z.string().max(48).regex(/^[a-zA-Z0-9._+-]{1,48}$/).nullable(),
+    protocol: z.union([z.literal(1), z.literal(2), z.null()]),
+    accountCategory: z.enum([
+      'none',
+      'dedicated_test_personal',
+      'dedicated_test_business',
+      'synthetic',
+      'replay_sanitized',
+    ]),
+    source: z.enum([
+      'synthetic',
+      'replay_with_provenance',
+      'live_raw',
+      'live_hm',
+      'official_comparison',
+    ]),
     observedAt: z.number().int().nonnegative(),
-    producer: z.string().min(1).max(64),
-    seq: z.number().int().nonnegative(),
+    producer: z.enum([
+      'observatory_cli',
+      'daemon_tap_callback',
+      'replay_harness',
+      'migrator',
+    ]),
+    seq: z.number().int().min(1),
     monotonicMs: z.number().nonnegative(),
-    direction: z.enum(['in', 'out', 'internal']),
-    messageKind: z.string().min(1).max(64),
-    connectionAlias: z.string().min(1).max(64).optional(),
-    sessionAlias: z.string().min(1).max(64).optional(),
-    correlationId: z.string().min(1).max(128).optional(),
+    layer: z.enum(['raw', 'normalized', 'native_canonical', 'ui']),
+    direction: z.enum(['outbound', 'inbound', 'internal', 'stderr', 'lifecycle']),
+    messageKind: z.enum([
+      'capture_meta',
+      'capture_end',
+      'cli_catalog',
+      'rpc_request',
+      'rpc_response',
+      'rpc_error',
+      'rpc_notification',
+      'server_request',
+      'malformed_line',
+      'stderr_classified',
+      'process_exit',
+      'timeout',
+      'drop_overflow',
+      'adapter_normalized',
+      'native_canonical',
+      'ui_projection',
+    ]),
+    latencyMs: z.number().nonnegative().nullable().optional(),
+    provenance: NativeCaptureProvenanceSchema.optional(),
+    correlation: NativeCaptureCorrelationSchema,
+    shape: z.record(z.unknown()).optional(),
+    unknownKeys: z.array(z.string().max(64).regex(/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/)).optional(),
     truncated: z.boolean().optional(),
     droppedCount: z.number().int().nonnegative().optional(),
   })
   .strict();
-export type NativeCaptureMetadata = z.infer<typeof NativeCaptureMetadataSchema>;
+export type NativeCaptureRecordV1 = z.infer<typeof NativeCaptureRecordV1Schema>;
+
+/** Alias preserving backward compatibility with earlier candidate imports. */
+export const NativeCaptureMetadataSchema = NativeCaptureRecordV1Schema;
+export type NativeCaptureMetadata = NativeCaptureRecordV1;
 
 // ── Known Empty & Sample Fixtures (for NP-03 & Contract Tests) ─────────
 
@@ -1483,6 +1686,7 @@ export function createSampleNativeProjectionFixture(params?: {
         workId,
         agentId: rootAgentId,
         state: 'waiting_background',
+        summary: 'Waiting on synthetic finite background task',
         updatedAt: nowMs,
       },
     ],

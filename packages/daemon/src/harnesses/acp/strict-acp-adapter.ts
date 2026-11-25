@@ -979,6 +979,21 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     return this.hasActiveBackgroundWork() ? ['legacy_background_ttl'] : [];
   }
 
+  releaseHeldTurn(turnId: string): void {
+    if (this.currentTurnId !== turnId) return;
+    this.currentTurnId = null;
+    if (this.thinkingAccum) {
+      const text = this.thinkingAccum;
+      this.thinkingAccum = '';
+      this.emit({ type: 'thinking.completed', turnId, text });
+    }
+    if (this.assistantAccum) {
+      const text = this.assistantAccum;
+      this.assistantAccum = '';
+      this.emit({ type: 'message.assistant.completed', turnId, text });
+    }
+  }
+
   getConfigOptions(): AcpConfigOption[] {
     return this.configOptions;
   }
@@ -1654,31 +1669,52 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       }
     };
 
-    void runPrompt()
-      .then((res) => {
+    void runPrompt().then(
+      (res) => {
         this.hasAcpTurn = true;
         this.runtimeOpts.onAuthenticated?.();
         const stopReason = res?.stopReason ?? 'end_turn';
-        const nativeSettlement = promptContext
-          ? this.nativeHooks?.onPromptSettled?.(promptContext, { ok: true, stopReason }) ?? null
-          : null;
+        const isCurrentTurn = this.currentTurnId === capturedTurnId;
+
+        let nativeSettlement = null;
+        if (promptContext && this.nativeHooks?.onPromptSettled) {
+          try {
+            nativeSettlement = this.nativeHooks.onPromptSettled(promptContext, {
+              ok: true,
+              stopReason,
+              isCurrentTurn,
+            });
+          } catch (hookErr) {
+            this.emit({
+              type: 'diagnostic.log',
+              level: 'error',
+              stream: 'protocol',
+              message: `Native onPromptSettled hook threw: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
+            });
+            nativeSettlement = null;
+          }
+        }
 
         // Captured PromptContext guard: never allow a stale response from an earlier cancelled turn
         // to overwrite or settle a newer turn currently occupying `currentTurnId`.
-        if (this.currentTurnId !== capturedTurnId) return;
+        if (!isCurrentTurn) return;
         if (nativeSettlement?.kind === 'held') {
           return;
         }
         this.currentTurnId = null;
 
         if (this.thinkingAccum) {
-          this.emit({ type: 'thinking.completed', turnId: capturedTurnId, text: this.thinkingAccum });
+          const text = this.thinkingAccum;
+          this.thinkingAccum = '';
+          this.emit({ type: 'thinking.completed', turnId: capturedTurnId, text });
         }
         if (this.assistantAccum) {
+          const text = this.assistantAccum;
+          this.assistantAccum = '';
           this.emit({
             type: 'message.assistant.completed',
             turnId: capturedTurnId,
-            text: this.assistantAccum,
+            text,
           });
         }
 
@@ -1707,17 +1743,28 @@ export class AcpSessionHandle implements AdapterSessionHandle {
             this.emit({ type: 'turn.completed', turnId: capturedTurnId, stopReason });
           }
         }
-      })
-      .catch((err: Error) => {
+      },
+      (err: Error) => {
         const authErr = isAcpAuthRequiredError(err);
-        if (promptContext) {
-          this.nativeHooks?.onPromptSettled?.(promptContext, {
-            ok: false,
-            message: err.message,
-            ...(authErr ? { code: 'unauthenticated' } : {}),
-          });
+        const isCurrentTurn = this.currentTurnId === capturedTurnId;
+        if (promptContext && this.nativeHooks?.onPromptSettled) {
+          try {
+            this.nativeHooks.onPromptSettled(promptContext, {
+              ok: false,
+              message: err.message,
+              ...(authErr ? { code: 'unauthenticated' } : {}),
+              isCurrentTurn,
+            });
+          } catch (hookErr) {
+            this.emit({
+              type: 'diagnostic.log',
+              level: 'error',
+              stream: 'protocol',
+              message: `Native onPromptSettled error hook threw: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
+            });
+          }
         }
-        if (this.currentTurnId !== capturedTurnId) return;
+        if (!isCurrentTurn) return;
         this.currentTurnId = null;
         if (authErr) {
           this.runtimeOpts.onAuthRequired?.();
@@ -1728,7 +1775,8 @@ export class AcpSessionHandle implements AdapterSessionHandle {
           message: err.message,
           ...(authErr ? { code: 'unauthenticated' } : {}),
         });
-      });
+      },
+    );
 
     return { driverUsed };
   }
@@ -1782,18 +1830,28 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     }
     try {
       const res = await reqMeta.promise;
-      if (steerCtx) {
-        this.nativeHooks?.onPromptSettled?.(steerCtx, {
-          ok: true,
-          stopReason: res?.stopReason ?? 'end_turn',
-        });
+      if (steerCtx && this.nativeHooks?.onPromptSettled) {
+        try {
+          this.nativeHooks.onPromptSettled(steerCtx, {
+            ok: true,
+            stopReason: res?.stopReason ?? 'end_turn',
+            isCurrentTurn: this.currentTurnId === input.turnId,
+          });
+        } catch {
+          // isolate settlement hook failure
+        }
       }
     } catch (err) {
-      if (steerCtx) {
-        this.nativeHooks?.onPromptSettled?.(steerCtx, {
-          ok: false,
-          message: err instanceof Error ? err.message : String(err),
-        });
+      if (steerCtx && this.nativeHooks?.onPromptSettled) {
+        try {
+          this.nativeHooks.onPromptSettled(steerCtx, {
+            ok: false,
+            message: err instanceof Error ? err.message : String(err),
+            isCurrentTurn: this.currentTurnId === input.turnId,
+          });
+        } catch {
+          // isolate settlement hook failure
+        }
       }
       throw err;
     }
@@ -1879,13 +1937,14 @@ export class AcpSessionHandle implements AdapterSessionHandle {
     const params = (req.params ?? {}) as Record<string, unknown>;
     const connectionId = req.connectionId ?? this.rpc.connectionId;
     const ingressOrdinal = req.ingressOrdinal ?? this.rpc.currentIngressOrdinal;
+    const channel: 'live' | 'history_replay' = this.isHistoryReplayActive ? 'history_replay' : 'live';
 
     if (this.nativeHooks) {
       this.nativeHooks.onIngressFrame?.({
         binding: this.nativeHooks.binding,
         connectionId,
         ingressOrdinal,
-        channel: this.isHistoryReplayActive ? 'history_replay' : 'live',
+        channel,
         originSession: typeof params.sessionId === 'string' ? params.sessionId : undefined,
         wire: { id: req.id, method: req.method, params },
       });
@@ -1893,6 +1952,7 @@ export class AcpSessionHandle implements AdapterSessionHandle {
       const nativePermResult = this.nativeHooks.onIncomingServerRequest?.({
         connectionId,
         ingressOrdinal,
+        channel,
         wireRequestId: req.id,
         method: req.method,
         params,
@@ -1907,6 +1967,12 @@ export class AcpSessionHandle implements AdapterSessionHandle {
         }
         return;
       }
+    }
+
+    // Never turn history_replay server requests into live interactive approvals
+    if (channel === 'history_replay') {
+      this.rpc.respondError(req.id, -32601, 'Server requests are not permitted during history replay');
+      return;
     }
 
     if (req.method === 'session/request_permission') {

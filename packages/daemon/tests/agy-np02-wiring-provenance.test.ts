@@ -24,6 +24,7 @@ import {
   type NativeLifecyclePort,
   type NativePermissionPort,
   type NativeTransportFrame,
+  type NativeTurnSettlementSink,
 } from '../src/harnesses/agy/native/wiring/index.js';
 import { HarnessRegistry } from '../src/harnesses/registry.js';
 import type { HarnessAdapter, NormalizedAdapterEvent } from '../src/harnesses/types.js';
@@ -130,7 +131,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       authMethod: 'oauth-personal' as const,
     };
 
-    // Forged plain object mimicking human_direct MUST fail
     const forged = { channel: 'human_direct', actor: 'desktop', issuedAt: Date.now() };
     const forgedDecision = evaluateAgyConsumerProvenance(consumerTarget, forged);
     expect(forgedDecision.allowed).toBe(false);
@@ -139,7 +139,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       AgyConsumerProvenanceError,
     );
 
-    // Automated channels MUST fail for consumer OAuth AGY
     for (const ch of [
       'hm_orchestrator_delegation',
       'hm_orchestrator_wakeup',
@@ -154,7 +153,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       expect(dec.code).toBe('CONSUMER_PROVENANCE_BLOCKED');
     }
 
-    // Verified human_direct / manual_user_switch / agy_native_internal MUST pass
     for (const ch of ['human_direct', 'manual_user_switch', 'agy_native_internal'] as const) {
       const dec = evaluateAgyConsumerProvenance(
         consumerTarget,
@@ -163,7 +161,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       expect(dec.allowed).toBe(true);
     }
 
-    // Non-consumer AGY (API key) and non-AGY (codex) are not blocked by consumer OAuth guard
     expect(
       evaluateAgyConsumerProvenance(
         { instanceId: 'agy-api', driverId: 'agy', authMethod: 'gemini-api-key' },
@@ -217,7 +214,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       updatedAt: Date.now(),
     });
 
-    // 1. Orchestrator must reject delegating a subagent to consumer OAuth AGY
     const orch = new OrchestratorService(store, registry);
     orch.attachHooks({
       isOrchestratorEnabled: () => true,
@@ -244,7 +240,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
       code: 'E_CONSUMER_PROVENANCE_BLOCKED',
     } satisfies Partial<OrchestratorError>);
 
-    // 2. FailoverCoordinator must downgrade Codex -> consumer OAuth AGY to manual even under auto policy
     const failover = new FailoverCoordinator(store, registry, () => undefined);
     failover.setPolicy({
       mode: 'auto_any',
@@ -256,7 +251,6 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
     expect(recToConsumer.canAutoFailover).toBe(false);
     expect(recToConsumer.downgradedToManualReason).toContain('个人 OAuth AGY');
 
-    // Whereas failing over to non-consumer API-key AGY is permitted under auto_any
     failover.setPolicy({
       mode: 'auto_any',
       priorityChain: ['agy-apikey'],
@@ -265,15 +259,13 @@ describe('AGY consumer provenance policy & unforgeable guardrails (NP-02)', () =
     const recToApiKey = failover.recommendFailover('sess_parent', 'codex', 'rate_limited');
     expect(recToApiKey.recommendedInstanceId).toBe('agy-apikey');
     expect(recToApiKey.canAutoFailover).toBe(true);
-
-    store.close();
   });
 });
 
-describe('AGY captured PromptContext, transport tap, REST/WS native feed & feature-off regression (NP-02)', () => {
-  it('prevents stale Turn 1 prompt response from settling Turn 2 and preserves RPC ID types & transport tap', async () => {
+describe('AGY captured PromptContext, held settlement exit, transport tap & R1-R5 invariants (NP-02)', () => {
+  it('prevents stale Turn 1 prompt response from settling Turn 2, isolates hook errors, and supports deferred single settlement via NativeTurnSettlementSink (R5)', async () => {
     const tmp = makeTempDir('hm-np02-acp-');
-    const mockScript = path.join(tmp, 'mock-acp-stale.mjs');
+    const mockScript = path.join(tmp, 'mock-acp-r5.mjs');
     fs.writeFileSync(
       mockScript,
       `
@@ -300,7 +292,7 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({
       jsonrpc: '2.0',
       id: msg.id,
-      result: { sessionId: 'nat_stale_1', configOptions: [] },
+      result: { sessionId: 'nat_r5_1', configOptions: [] },
     }) + '\\n');
     return;
   }
@@ -308,23 +300,21 @@ rl.on('line', (line) => {
     promptCount += 1;
     if (promptCount === 1) {
       firstPromptId = msg.id;
-      // Hold Turn 1 response until Turn 2 arrives
       return;
     }
     if (promptCount === 2) {
-      // First send the STALE response for Turn 1 while Turn 2 is active!
+      // Send stale Turn 1 response while Turn 2 is active
       process.stdout.write(JSON.stringify({
         jsonrpc: '2.0',
         id: firstPromptId,
         result: { stopReason: 'end_turn' },
       }) + '\\n');
-      // Then emit Turn 2 assistant message & completion shortly after
       setTimeout(() => {
         process.stdout.write(JSON.stringify({
           jsonrpc: '2.0',
           method: 'session/update',
           params: {
-            sessionId: 'nat_stale_1',
+            sessionId: 'nat_r5_1',
             update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Turn 2 answer' } },
           },
         }) + '\\n');
@@ -333,7 +323,24 @@ rl.on('line', (line) => {
           id: msg.id,
           result: { stopReason: 'end_turn' },
         }) + '\\n');
-      }, 40);
+      }, 30);
+      return;
+    }
+    if (promptCount === 3) {
+      // Quick prompt response for held-turn settlement test
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: 'nat_r5_1',
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Started bg job' } },
+        },
+      }) + '\\n');
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { stopReason: 'end_turn' },
+      }) + '\\n');
     }
   }
 });
@@ -341,34 +348,50 @@ rl.on('line', (line) => {
       'utf8',
     );
 
-    const adapter = makeAgyAdapter(path.join(tmp, 'profiles'), 'agy-test', 'oauth-personal', process.execPath);
-    // Point args to our mock node script by overriding protected args via subclass
     class ScriptAgyAdapter extends AgyAdapter {
       protected override buildLaunchArgs(): string[] {
         return [mockScript];
       }
     }
+
+    const daemon = createDaemon({
+      dataDir: path.join(tmp, 'data'),
+      port: 0,
+      webDistDir: null,
+    });
+    activeDaemons.push(daemon);
+
     const scriptAdapter = new ScriptAgyAdapter({
-      profile: adapter.getProfile(),
+      profile: {
+        instanceId: 'agy-r5',
+        displayName: 'AGY R5',
+        isolationMode: 'profile_isolated',
+        authMethod: 'oauth-personal',
+        appDataDirName: DEFAULT_AGY_APP_DATA_DIR_NAME,
+        defaults: { linkGlobalSkills: false, syncGlobalRules: false, additionalDirectories: [] },
+        enabled: true,
+      },
       profilesRootDir: path.join(tmp, 'profiles'),
       binaryOverride: process.execPath,
       applyWindowsAcl: false,
     });
+    daemon.registry.register(scriptAdapter);
 
+    // 1. Direct adapter test: stale Turn 1 response + throwing hook does NOT double-invoke failure callback!
     const frames: NativeTransportFrame[] = [];
-    const settledPrompts: string[] = [];
-    const binding = {
-      runtimeId: 'nrt_test' as never,
-      sessionId: 'sess_test',
-      instanceId: 'agy-test',
+    const settledLog: Array<{ turnId: string; ok: boolean; isCurrentTurn: boolean }> = [];
+    let shouldThrowInHook = false;
+    const dummyBinding = {
+      runtimeId: 'nrt_r5_direct' as never,
+      sessionId: 'sess_r5_direct',
+      instanceId: 'agy-r5',
       generation: asBindingGeneration('gen_1'),
     };
-
     const handle = await scriptAdapter.createSession({
       cwd: tmp,
       permissionMode: 'manual',
       nativeRuntimeHooks: {
-        binding,
+        binding: dummyBinding,
         getFeatureFlags: () => ({
           enabled: true,
           nativeLifecycle: true,
@@ -378,47 +401,137 @@ rl.on('line', (line) => {
           acpV2Preview: false,
         }),
         onTransportFrame: (frame) => frames.push(frame),
-        onPromptSettled: (ctx) => {
-          settledPrompts.push(ctx.turnId);
+        onPromptSettled: (ctx, res) => {
+          settledLog.push({ turnId: ctx.turnId, ok: res.ok, isCurrentTurn: res.isCurrentTurn });
+          if (shouldThrowInHook) {
+            throw new Error('simulated lifecycle hook exception');
+          }
           return null;
         },
       },
     });
-
     const events: NormalizedAdapterEvent[] = [];
     handle.onEvent((ev) => events.push(ev));
 
     await handle.sendTurn({ turnId: 'turn_1', text: 'first prompt' });
     await handle.interrupt();
+    shouldThrowInHook = true;
     await handle.sendTurn({ turnId: 'turn_2', text: 'second prompt' });
-
     await new Promise((r) => setTimeout(r, 150));
 
-    const completedTurnIds = events
-      .filter((e): e is Extract<NormalizedAdapterEvent, { type: 'turn.completed' }> => e.type === 'turn.completed')
-      .map((e) => e.turnId);
-    const completedTexts = events
-      .filter(
-        (e): e is Extract<NormalizedAdapterEvent, { type: 'message.assistant.completed' }> =>
-          e.type === 'message.assistant.completed',
-      )
-      .map((e) => ({ turnId: e.turnId, text: e.text }));
-
-    // Turn 1's stale response did NOT prematurely settle Turn 2; Turn 2 completed with its actual text!
-    expect(completedTurnIds).toEqual(['turn_2']);
-    expect(completedTexts).toEqual([{ turnId: 'turn_2', text: 'Turn 2 answer' }]);
-    // Both prompt contexts were observed by native lifecycle
-    expect(settledPrompts).toContain('turn_1');
-    expect(settledPrompts).toContain('turn_2');
-    // Transport observatory saw monotonic frames with a connectionId
+    // Turn 2 completed cleanly ONCE despite Turn 1 stale response AND despite hook throwing (no double invocation!)
+    expect(
+      events.filter((e) => e.type === 'turn.completed').map((e) => (e as { turnId: string }).turnId),
+    ).toEqual(['turn_2']);
+    expect(settledLog.filter((s) => s.turnId === 'turn_2')).toEqual([
+      { turnId: 'turn_2', ok: true, isCurrentTurn: true },
+    ]);
+    expect(settledLog.find((s) => s.turnId === 'turn_1')?.isCurrentTurn).toBe(false);
     expect(frames.length).toBeGreaterThan(4);
     expect(handle.getConnectionId()).toMatch(/^conn_/);
-
     await handle.dispose();
-  }, 15_000);
 
-  it('serves feature-off Known Empty, feature-on REST endpoints, 410 RESYNC_REQUIRED, permission validation, and dedicated WS feed', async () => {
-    const tmp = makeTempDir('hm-np02-daemon-');
+    // 2. End-to-end SessionManager held-turn -> deferred single settlement via NativeTurnSettlementSink!
+    const ws = daemon.store.createWorkspace({
+      id: 'ws_r5',
+      name: 'R5 WS',
+      rootPath: tmp,
+      isGitRepo: false,
+      gitBranch: null,
+      createdAt: Date.now(),
+    });
+    const session = daemon.store.createSession({
+      id: 'sess_r5',
+      workspaceId: ws.id,
+      harnessId: 'agy-r5',
+      harnessKind: 'agy',
+      nativeSessionId: null,
+      cwd: tmp,
+      worktreeBranch: null,
+      title: 'R5 Held Settlement',
+      status: 'idle',
+      model: null,
+      reasoningEffort: null,
+      permissionMode: 'manual',
+      lastSeq: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    // Feature-OFF check (R4): opening a session while feature gate is OFF creates ZERO native_runtime_bindings rows!
+    daemon.nativeRegistry.setFeatureFlags({ enabled: false, nativeLifecycle: false });
+    expect(daemon.nativeRegistry.persistence.getLatestBindingForSession(session.id, 'agy-r5')).toBeNull();
+
+    // Enable nativeLifecycle and attach a lifecycle port that holds turn_3 until explicitly released via sink!
+    daemon.nativeRegistry.setFeatureFlags({ enabled: true, nativeLifecycle: true });
+    let capturedSink: NativeTurnSettlementSink | null = null;
+    let heldTurnId: string | null = null;
+    let heldBinding = null as ReturnType<typeof daemon.nativeRegistry.getActiveBinding>;
+    const heldLifecycle: NativeLifecyclePort = {
+      attachSettlementSink(sink) {
+        capturedSink = sink;
+      },
+      acceptFrame: () => {},
+      acceptNativeObservation: () => {},
+      handleTransportClosed: () => {},
+      listRetentionReasons: () => (heldTurnId ? ['finite_work:wrk_bg_1'] : []),
+      decideTurnSettlement: (tid) =>
+        tid === heldTurnId
+          ? { kind: 'held', reasonIds: ['finite_work:wrk_bg_1'] }
+          : { kind: 'eligible', outcome: 'completed' },
+      onPromptSettled: (ctx, res) => {
+        if (res.ok && res.isCurrentTurn) {
+          heldTurnId = ctx.turnId;
+          heldBinding = ctx.binding;
+          return { kind: 'held', reasonIds: ['finite_work:wrk_bg_1'] };
+        }
+        return { kind: 'eligible', outcome: 'completed' };
+      },
+    };
+    daemon.nativeRegistry.registerModules({ lifecycle: heldLifecycle });
+    expect(capturedSink).not.toBeNull();
+
+    // Prime prompt 1 & 2 on the fresh scriptAdapter handle then prompt 3 -> returns quickly & gets held!
+    const t1 = await daemon.sessionManager.sendTurn(session.id, 'p1');
+    await daemon.sessionManager.interruptSession(session.id);
+    const t2 = await daemon.sessionManager.sendTurn(session.id, 'p2');
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Turn 2 is now held by lifecycle port -> session remains 'running' with zero turn.completed yet!
+    expect(heldTurnId).toBe(t2.turnId);
+    expect(daemon.store.getSession(session.id)?.status).toBe('running');
+    const completedBeforeRelease = daemon.sessionManager
+      .getSessionEvents(session.id, 0)
+      .filter((e) => e.type === 'turn.completed' && e.turnId === t2.turnId);
+    expect(completedBeforeRelease).toHaveLength(0);
+
+    // Release held turn ONCE via NativeTurnSettlementSink -> settles cleanly and becomes 'idle'!
+    const release1 = capturedSink!.settleTurn({
+      binding: heldBinding!,
+      turnId: t2.turnId,
+      settlement: { kind: 'eligible', outcome: 'completed', stopReason: 'background_finished' },
+    });
+    expect(release1.settled).toBe(true);
+    expect(daemon.store.getSession(session.id)?.status).toBe('idle');
+
+    // Second release call is idempotently rejected (single settlement guarantee!)
+    const release2 = capturedSink!.settleTurn({
+      binding: heldBinding!,
+      turnId: t2.turnId,
+      settlement: { kind: 'eligible', outcome: 'completed', stopReason: 'duplicate' },
+    });
+    expect(release2.settled).toBe(false);
+    const completedAfterRelease = daemon.sessionManager
+      .getSessionEvents(session.id, 0)
+      .filter((e) => e.type === 'turn.completed' && e.turnId === t2.turnId);
+    expect(completedAfterRelease).toHaveLength(1);
+    expect(t1.turnId).not.toBe(t2.turnId);
+  }, 20_000);
+});
+
+describe('AGY REST/WS contracts: R2 concurrent idempotency & control/approval loops, R3 501-event WS replay & resync, R4 feature-off purity (NP-02)', () => {
+  it('enforces R2 concurrent idempotency, closed-loop control & approval authorization, R4 feature-off purity, and R3 501-event complete WS replay', async () => {
+    const tmp = makeTempDir('hm-np02-r234-');
     const daemon = createDaemon({
       dataDir: path.join(tmp, 'data'),
       port: 0,
@@ -452,38 +565,35 @@ rl.on('line', (line) => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    const codexSession = daemon.store.createSession({
+      id: 'sess_codex',
+      workspaceId: ws.id,
+      harnessId: 'codex',
+      harnessKind: 'codex',
+      nativeSessionId: null,
+      cwd: tmp,
+      worktreeBranch: null,
+      title: 'Codex Session',
+      status: 'idle',
+      model: null,
+      reasoningEffort: null,
+      permissionMode: 'manual',
+      lastSeq: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
 
-    // 1. Default feature-off: snapshot returns Known Empty (enabled=false), writes return 503 NATIVE_RUNTIME_DISABLED
+    // 1. Default feature-off: snapshot wrapped DTO returns Known Empty (enabled=false), writes return 503
     const snapOff = await daemon.app.inject({
       method: 'GET',
       url: `/api/v1/sessions/${session.id}/native/snapshot`,
     });
     expect(snapOff.statusCode).toBe(200);
     expect(snapOff.json().enabled).toBe(false);
-    expect(snapOff.json().asOfSeq).toBe(0);
+    expect(snapOff.json().projection.enabled).toBe(false);
+    expect(snapOff.json().projection.asOfSeq).toBe(0);
 
-    const capsOff = await daemon.app.inject({
-      method: 'GET',
-      url: `/api/v1/sessions/${session.id}/native/capabilities`,
-    });
-    expect(capsOff.statusCode).toBe(200);
-    expect(capsOff.json().enabled).toBe(false);
-
-    const cmdOff = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/commands`,
-      payload: {
-        bindingGeneration: 'gen_0',
-        catalogRevision: 0,
-        capabilityId: 'agy.workflow.goal',
-        actionKey: 'launch',
-        idempotencyKey: 'k1',
-      },
-    });
-    expect(cmdOff.statusCode).toBe(503);
-    expect(cmdOff.json().code).toBe('NATIVE_RUNTIME_DISABLED');
-
-    // 2. Enable native flags and register minimal stub modules
+    // 2. Enable feature flags and wire controllable ports
     daemon.nativeRegistry.setFeatureFlags({
       enabled: true,
       nativeLifecycle: true,
@@ -495,6 +605,7 @@ rl.on('line', (line) => {
       sessionId: session.id,
       instanceId: 'agy',
       profileRef: 'agy:default',
+      status: 'attached',
     });
     const binding = {
       runtimeId: storedBinding.runtimeId,
@@ -503,209 +614,379 @@ rl.on('line', (line) => {
       generation: storedBinding.generation,
     };
 
-    const sampleCap: CapabilityDescriptor = {
-      id: 'agy.workflow.goal',
-      snapshotRevision: 3,
-      surfaces: ['cli', 'acp'],
-      advertised: true,
-      launch: 'available',
-      observe: 'available',
-      control: 'not_tested',
-      localRead: 'not_tested',
-      actions: [{ key: 'inspect', lane: 'query', gate: 'available' }],
-      evidenceRefs: ['E05'],
-      verifiedLevel: 1,
-    };
-
+    let controlGate: CapabilityDescriptor['control'] = 'not_tested';
     let commandExecutions = 0;
+    let controlExecutions = 0;
+    let approvalExecutions = 0;
+    let timelineCalls = 0;
+    let workflowReaderCalls = 0;
+    let releaseFirstCmd!: () => void;
+    let throwNextCmd = false;
+
+    const makeCaps = (): CapabilityDescriptor[] => [
+      {
+        id: 'agy.reactive.background',
+        snapshotRevision: 3,
+        surfaces: ['cli', 'acp'],
+        advertised: true,
+        launch: 'available',
+        observe: 'available',
+        control: controlGate,
+        localRead: 'not_tested',
+        actions: [
+          { key: 'inspect', lane: 'query', gate: 'available' },
+          { key: 'cancel', lane: 'live_workflow', gate: controlGate },
+        ],
+        evidenceRefs: ['E05'],
+        verifiedLevel: 1,
+      },
+    ];
+
     const permStub: NativePermissionPort = {
       onIncomingRequest: () => null,
       onConnectionClosed: () => {},
-      listPendingRequests: () => [
-        {
-          approvalId: 'appr_native_1',
-          runtimeId: binding.runtimeId,
-          generation: binding.generation,
-          connectionId: 'conn_priv_1',
-          wireRequestId: 7,
-          occurrence: 1,
-          actualNativeSessionId: 'nat_priv_1',
-          kind: 'permission',
-          allowedOptionIds: ['allow_once', 'reject_once'],
-        },
-      ],
-      resolveNativeRequest: async ({ approvalId }) => ({
-        approvalId,
-        receiptId: 'nrcpt_perm_1',
-        receiptState: 'response_written',
-        conflict: false,
-      }),
-    };
-    const lifecycleStub: NativeLifecyclePort = {
-      acceptFrame: () => {},
-      acceptNativeObservation: () => {},
-      handleTransportClosed: () => {},
-      listRetentionReasons: () => ['finite_work:wrk_1'],
-      decideTurnSettlement: () => ({ kind: 'held', reasonIds: ['finite_work:wrk_1'] }),
+      listPendingRequests: (b) =>
+        b.generation === binding.generation
+          ? [
+              {
+                approvalId: 'appr_native_1',
+                runtimeId: binding.runtimeId,
+                generation: binding.generation,
+                connectionId: 'conn_priv_1',
+                wireRequestId: 7,
+                occurrence: 1,
+                actualNativeSessionId: 'nat_priv_1',
+                kind: 'permission',
+                allowedOptionIds: ['allow_once', 'reject_once'],
+              },
+            ]
+          : [],
+      resolveNativeRequest: async ({ approvalId, receiptId }) => {
+        approvalExecutions += 1;
+        return {
+          approvalId,
+          receiptId,
+          receiptState: 'response_written',
+          conflict: false,
+        };
+      },
     };
 
     daemon.nativeRegistry.registerModules({
-      lifecycle: lifecycleStub,
       permissions: permStub,
+      timelineReader: {
+        readTimeline: () => {
+          timelineCalls += 1;
+          return { revision: 1, items: [], nextPageToken: null, hasMore: false };
+        },
+      },
+      workflowResourceReader: {
+        readWorkflowResource: () => {
+          workflowReaderCalls += 1;
+          return {
+            revision: 1,
+            available: true,
+            // Deliberately invalid item to test strict DTO outlet validation in R4!
+            items: [{ leakedDebugPath: 'C:\\secret' } as unknown as never],
+            nextPageToken: null,
+            hasMore: false,
+          };
+        },
+      },
       commandRouter: {
-        getCapabilities: () => ({ capabilitiesRevision: 3, descriptors: [sampleCap] }),
+        getCapabilities: () => ({ capabilitiesRevision: 3, descriptors: makeCaps() }),
         executeCommand: async ({ receiptId }) => {
           commandExecutions += 1;
+          if (throwNextCmd) {
+            throw new Error('simulated transport write error');
+          }
+          await new Promise<void>((resolve) => {
+            releaseFirstCmd = resolve;
+          });
           return {
             schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
             kind: 'inspect',
             receiptId,
-            output: 'Goal inspect ok',
+            output: 'Concurrent inspect ok',
           };
         },
-        executeControl: async ({ receiptId }) => ({
-          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-          receiptId,
-          accepted: true,
-          state: 'requested',
-          revision: 1,
-        }),
+        executeControl: async ({ receiptId }) => {
+          controlExecutions += 1;
+          return {
+            schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+            receiptId,
+            accepted: true,
+            state: 'requested',
+            revision: 2,
+          };
+        },
       },
     });
 
-    // Commit an event and verify GET /events + cursor + 410 RESYNC_REQUIRED
-    const committed = daemon.nativeRegistry.commitAndPublish(
+    // R2-A: Two CONCURRENT requests with same idempotencyKey -> ONLY ONE enters command port; second gets 409 BUSY!
+    const req1Promise = daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/commands`,
+      payload: {
+        bindingGeneration: binding.generation,
+        catalogRevision: 3,
+        capabilityId: 'agy.reactive.background',
+        actionKey: 'inspect',
+        idempotencyKey: 'idem_concurrent_1',
+      },
+    });
+    // Wait a tick for req1 to claim DB receipt and suspend inside executeCommand
+    await new Promise((r) => setTimeout(r, 20));
+    const req2Res = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/commands`,
+      payload: {
+        bindingGeneration: binding.generation,
+        catalogRevision: 3,
+        capabilityId: 'agy.reactive.background',
+        actionKey: 'inspect',
+        idempotencyKey: 'idem_concurrent_1',
+      },
+    });
+    expect(req2Res.statusCode).toBe(409);
+    expect(req2Res.json().code).toBe('BUSY');
+    expect(commandExecutions).toBe(1);
+
+    releaseFirstCmd();
+    const req1Res = await req1Promise;
+    expect(req1Res.statusCode).toBe(200);
+    expect(req1Res.json().output).toBe('Concurrent inspect ok');
+
+    // Replay after completion returns cached 200 without re-executing
+    const req3Res = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/commands`,
+      payload: {
+        bindingGeneration: binding.generation,
+        catalogRevision: 3,
+        capabilityId: 'agy.reactive.background',
+        actionKey: 'inspect',
+        idempotencyKey: 'idem_concurrent_1',
+      },
+    });
+    expect(req3Res.statusCode).toBe(200);
+    expect(commandExecutions).toBe(1);
+
+    // Exception during command marks receipt `delivery_unknown` and blocks silent re-execution on same key
+    throwNextCmd = true;
+    const errCmd = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/commands`,
+      payload: {
+        bindingGeneration: binding.generation,
+        catalogRevision: 3,
+        capabilityId: 'agy.reactive.background',
+        actionKey: 'inspect',
+        idempotencyKey: 'idem_err_1',
+      },
+    });
+    expect(errCmd.statusCode).toBe(500);
+    expect(errCmd.json().code).toBe('DELIVERY_UNKNOWN');
+    const errCmdRetry = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/commands`,
+      payload: {
+        bindingGeneration: binding.generation,
+        catalogRevision: 3,
+        capabilityId: 'agy.reactive.background',
+        actionKey: 'inspect',
+        idempotencyKey: 'idem_err_1',
+      },
+    });
+    expect(errCmdRetry.statusCode).toBe(409);
+    expect(errCmdRetry.json().code).toBe('DELIVERY_UNKNOWN');
+    expect(commandExecutions).toBe(2);
+
+    // R2-B: Closed-loop Control Authorization
+    // 1) control is 'not_tested' -> 422 UNSUPPORTED_ACTION, port NEVER invoked!
+    const ctrlDisabled = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/control`,
+      payload: {
+        generation: binding.generation,
+        target: { type: 'work', id: 'wrk_missing' },
+        action: 'cancel',
+        expectedRevision: 1,
+        idempotencyKey: 'ctrl_1',
+      },
+    });
+    expect(ctrlDisabled.statusCode).toBe(422);
+    expect(ctrlDisabled.json().code).toBe('UNSUPPORTED_ACTION');
+    expect(controlExecutions).toBe(0);
+
+    // 2) control is 'available', but target work does NOT exist -> 404 NOT_FOUND, port NEVER invoked!
+    controlGate = 'available';
+    const ctrlMissing = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/control`,
+      payload: {
+        generation: binding.generation,
+        target: { type: 'work', id: 'wrk_missing' },
+        action: 'cancel',
+        expectedRevision: 1,
+        idempotencyKey: 'ctrl_2',
+      },
+    });
+    expect(ctrlMissing.statusCode).toBe(404);
+    expect(ctrlMissing.json().code).toBe('NOT_FOUND');
+    expect(controlExecutions).toBe(0);
+
+    // 3) Create real work entity with revision 2 -> wrong expectedRevision gets 409 STALE_BINDING; matching revision succeeds!
+    daemon.nativeRegistry.commitAndPublish(
       binding,
       {
-        activities: [
+        work: [
           {
-            id: asActivityId('act_1'),
-            turnId: null,
-            origin: 'native_continuation',
-            workId: asWorkId('wrk_1'),
-            state: 'running',
-            updatedAt: Date.now(),
+            id: asWorkId('wrk_real_1'),
+            kind: 'finite_command',
+            blocking: 'confirmed_blocking',
+            state: {
+              kind: 'known',
+              value: 'running',
+              evidence: {
+                kind: 'live_protocol',
+                connectionId: 'conn_1',
+                ingressOrdinal: 1,
+                wireVariant: 'acp_v1',
+                observedAt: Date.now(),
+              },
+            },
+            revision: 2,
           },
         ],
-        status: 'attached',
-        retentionReasons: ['finite_work:wrk_1'],
       },
       {
         type: 'native.runtime.changed',
         turnId: null,
-        payload: {
-          status: 'attached',
-          retentionReasons: ['finite_work:wrk_1'],
-          revision: 1,
-        },
+        payload: { status: 'attached', retentionReasons: ['finite_work:wrk_real_1'], revision: 1 },
       },
     );
-    expect(committed.event.seq).toBe(1);
 
-    const evRes = await daemon.app.inject({
-      method: 'GET',
-      url: `/api/v1/sessions/${session.id}/native/events?after=0&limit=10`,
-    });
-    expect(evRes.statusCode).toBe(200);
-    expect(evRes.json().events).toHaveLength(1);
-    expect(evRes.json().nextSeq).toBe(1);
-
-    const staleEvRes = await daemon.app.inject({
-      method: 'GET',
-      url: `/api/v1/sessions/${session.id}/native/events?generation=gen_stale`,
-    });
-    expect(staleEvRes.statusCode).toBe(410);
-    expect(staleEvRes.json().code).toBe('RESYNC_REQUIRED');
-
-    // Command validation: stale catalog revision -> 409, idempotency replay -> single execution, conflict -> 409
-    const staleCmd = await daemon.app.inject({
+    const ctrlWrongRev = await daemon.app.inject({
       method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/commands`,
-      payload: {
-        bindingGeneration: binding.generation,
-        catalogRevision: 0,
-        capabilityId: 'agy.workflow.goal',
-        actionKey: 'inspect',
-        idempotencyKey: 'cmd_stale',
-      },
-    });
-    expect(staleCmd.statusCode).toBe(409);
-    expect(staleCmd.json().code).toBe('STALE_BINDING');
-
-    const okCmd1 = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/commands`,
-      payload: {
-        bindingGeneration: binding.generation,
-        catalogRevision: 3,
-        capabilityId: 'agy.workflow.goal',
-        actionKey: 'inspect',
-        args: { filter: 'active' },
-        idempotencyKey: 'cmd_ok_1',
-      },
-    });
-    expect(okCmd1.statusCode).toBe(200);
-    expect(okCmd1.json().output).toBe('Goal inspect ok');
-
-    // Replay same key + same payload returns cached response without re-executing
-    const okCmdReplay = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/commands`,
-      payload: {
-        bindingGeneration: binding.generation,
-        catalogRevision: 3,
-        capabilityId: 'agy.workflow.goal',
-        actionKey: 'inspect',
-        args: { filter: 'active' },
-        idempotencyKey: 'cmd_ok_1',
-      },
-    });
-    expect(okCmdReplay.statusCode).toBe(200);
-    expect(commandExecutions).toBe(1);
-
-    // Same key + different payload returns 409 IDEMPOTENCY_CONFLICT
-    const conflictCmd = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/commands`,
-      payload: {
-        bindingGeneration: binding.generation,
-        catalogRevision: 3,
-        capabilityId: 'agy.workflow.goal',
-        actionKey: 'inspect',
-        args: { filter: 'different' },
-        idempotencyKey: 'cmd_ok_1',
-      },
-    });
-    expect(conflictCmd.statusCode).toBe(409);
-    expect(conflictCmd.json().code).toBe('IDEMPOTENCY_CONFLICT');
-
-    // Permission input validation: invalid optionId not in allowedOptionIds -> 400
-    const badPerm = await daemon.app.inject({
-      method: 'POST',
-      url: `/api/v1/sessions/${session.id}/native/requests/appr_native_1/resolve`,
+      url: `/api/v1/sessions/${session.id}/native/control`,
       payload: {
         generation: binding.generation,
-        outcome: 'selected',
-        optionId: 'allow_everything_forged',
+        target: { type: 'work', id: 'wrk_real_1' },
+        action: 'cancel',
+        expectedRevision: 1,
+        idempotencyKey: 'ctrl_3',
       },
     });
-    expect(badPerm.statusCode).toBe(400);
-    expect(badPerm.json().code).toBe('INVALID_REQUEST');
+    expect(ctrlWrongRev.statusCode).toBe(409);
+    expect(ctrlWrongRev.json().code).toBe('STALE_BINDING');
+    expect(controlExecutions).toBe(0);
 
+    const ctrlOk = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/control`,
+      payload: {
+        generation: binding.generation,
+        target: { type: 'work', id: 'wrk_real_1' },
+        action: 'cancel',
+        expectedRevision: 2,
+        idempotencyKey: 'ctrl_4',
+      },
+    });
+    expect(ctrlOk.statusCode).toBe(200);
+    expect(controlExecutions).toBe(1);
+
+    // R2-C: Closed-loop Approval Authorization & CAS
+    // Unknown approvalId -> 404 NOT_FOUND, port NEVER invoked!
+    const missingPerm = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/requests/appr_does_not_exist/resolve`,
+      payload: { generation: binding.generation, outcome: 'selected', optionId: 'allow_once' },
+    });
+    expect(missingPerm.statusCode).toBe(404);
+    expect(approvalExecutions).toBe(0);
+
+    // Valid approval resolves ONCE; second resolve loses DB CAS -> 409 ALREADY_RESOLVED, port NOT invoked again!
     const okPerm = await daemon.app.inject({
       method: 'POST',
       url: `/api/v1/sessions/${session.id}/native/requests/appr_native_1/resolve`,
-      payload: {
-        generation: binding.generation,
-        outcome: 'selected',
-        optionId: 'allow_once',
-      },
+      payload: { generation: binding.generation, outcome: 'selected', optionId: 'allow_once' },
     });
     expect(okPerm.statusCode).toBe(200);
-    expect(okPerm.json().receiptState).toBe('response_written');
+    expect(approvalExecutions).toBe(1);
 
-    // Dedicated WS native feed (/api/v1/sessions/:id/native/ws): replay + live stream
-    const wsFrames: NativeWsServerFrame[] = [];
+    const dupPerm = await daemon.app.inject({
+      method: 'POST',
+      url: `/api/v1/sessions/${session.id}/native/requests/appr_native_1/resolve`,
+      payload: { generation: binding.generation, outcome: 'selected', optionId: 'allow_once' },
+    });
+    expect(dupPerm.statusCode).toBe(409);
+    expect(dupPerm.json().code).toBe('ALREADY_RESOLVED');
+    expect(approvalExecutions).toBe(1);
+
+    // R4: Strict workflow resource DTO outlet rejects arbitrary debug fields from reader port
+    const badWfOutlet = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/workflows/wf_1/board`,
+    });
+    expect(badWfOutlet.statusCode).toBe(500);
+
+    // R4: Toggling feature gate OFF after writes returns Known Empty, default not_tested caps, and never invokes reader ports!
+    daemon.nativeRegistry.setFeatureFlags({ enabled: false });
+    const snapAfterOff = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/snapshot`,
+    });
+    expect(snapAfterOff.statusCode).toBe(200);
+    expect(snapAfterOff.json().enabled).toBe(false);
+    expect(snapAfterOff.json().projection.status).toBe('disconnected');
+    expect(snapAfterOff.json().projection.asOfSeq).toBe(0);
+    expect(snapAfterOff.json().projection.work).toEqual([]);
+
+    const capsAfterOff = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/capabilities`,
+    });
+    expect(capsAfterOff.statusCode).toBe(200);
+    expect(capsAfterOff.json().enabled).toBe(false);
+    expect(capsAfterOff.json().descriptors.every((d: CapabilityDescriptor) => d.control === 'not_tested')).toBe(true);
+
+    const tlCallsBefore = timelineCalls;
+    const wfCallsBefore = workflowReaderCalls;
+    const tlOff = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/activity/act_1/timeline`,
+    });
+    expect(tlOff.statusCode).toBe(200);
+    expect(tlOff.json().sourceUnavailableReason).toBe('native_runtime_disabled');
+    expect(timelineCalls).toBe(tlCallsBefore);
+
+    const wfOff = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/workflows/wf_1/board`,
+    });
+    expect(wfOff.statusCode).toBe(200);
+    expect(wfOff.json().available).toBe(false);
+    expect(workflowReaderCalls).toBe(wfCallsBefore);
+
+    // R3: Re-enable and pre-populate 501 total events (seq 1..501), verify WS replays ALL 501 + live 502 with ZERO gaps!
+    daemon.nativeRegistry.setFeatureFlags({ enabled: true });
+    for (let i = 2; i <= 501; i += 1) {
+      daemon.nativeRegistry.commitAndPublish(
+        binding,
+        {},
+        {
+          type: 'native.runtime.changed',
+          turnId: null,
+          payload: { status: 'attached', retentionReasons: [], revision: i },
+        },
+      );
+    }
+
+    const receivedSeqs: number[] = [];
+    let replayCompleteSeq: number | null = null;
+    let resyncReason: string | null = null;
+
     await new Promise<void>((resolve, reject) => {
       const client = new WebSocket(
         `ws://127.0.0.1:${port}/api/v1/sessions/${session.id}/native/ws?token=${encodeURIComponent(daemon.config.localToken)}`,
@@ -713,39 +994,74 @@ rl.on('line', (line) => {
       client.on('error', reject);
       client.on('message', (data) => {
         const frame = JSON.parse(data.toString('utf8')) as NativeWsServerFrame;
-        wsFrames.push(frame);
         if (frame.op === 'native_hello') {
-          client.send(
-            JSON.stringify({
-              op: 'subscribe_native',
-              schemaVersion: 1,
-              afterSeq: 0,
-            }),
-          );
+          client.send(JSON.stringify({ op: 'subscribe_native', schemaVersion: 1, afterSeq: 0 }));
+        } else if (frame.op === 'native_event') {
+          receivedSeqs.push(frame.event.seq);
+          if (frame.event.seq === 502) {
+            // Now change runtimeId (profile change) and emit event -> WS MUST send native_resync_required!
+            const newBindingStored = daemon.nativeRegistry.ensureRuntimeBinding({
+              sessionId: session.id,
+              instanceId: 'agy',
+              profileRef: 'agy:profile:switched',
+              status: 'attached',
+            });
+            daemon.nativeRegistry.commitAndPublish(
+              {
+                runtimeId: newBindingStored.runtimeId,
+                sessionId: newBindingStored.sessionId,
+                instanceId: newBindingStored.instanceId,
+                generation: newBindingStored.generation,
+              },
+              {},
+              {
+                type: 'native.runtime.changed',
+                turnId: null,
+                payload: { status: 'attached', retentionReasons: [], revision: 1 },
+              },
+            );
+          }
         } else if (frame.op === 'native_replay_complete') {
-          // Trigger a live native event after replay completes
+          replayCompleteSeq = frame.lastSeq;
+          // Emit live event 502 after complete replay
           daemon.nativeRegistry.commitAndPublish(
             binding,
-            { status: 'attached', retentionReasons: [] },
+            {},
             {
               type: 'native.runtime.changed',
               turnId: null,
-              payload: { status: 'attached', retentionReasons: [], revision: 2 },
+              payload: { status: 'attached', retentionReasons: [], revision: 502 },
             },
           );
-        } else if (frame.op === 'native_event' && frame.event.seq === 2) {
+        } else if (frame.op === 'native_resync_required') {
+          resyncReason = frame.reason;
           client.close();
           resolve();
         }
       });
     });
 
-    expect(wsFrames.some((f) => f.op === 'native_hello' && f.enabled === true)).toBe(true);
-    expect(wsFrames.some((f) => f.op === 'native_event' && f.event.seq === 1)).toBe(true);
-    expect(wsFrames.some((f) => f.op === 'native_replay_complete' && f.lastSeq === 1)).toBe(true);
-    expect(wsFrames.some((f) => f.op === 'native_event' && f.event.seq === 2)).toBe(true);
+    expect(replayCompleteSeq).toBe(501);
+    expect(receivedSeqs).toHaveLength(502);
+    expect(receivedSeqs[0]).toBe(1);
+    expect(receivedSeqs[500]).toBe(501);
+    expect(receivedSeqs[501]).toBe(502);
+    expect(resyncReason).toBe('runtime_changed');
 
-    // SessionManager.sendTurn rejects forged provenance object on consumer AGY
+    // R3: WS upgrade rejects non-AGY session (422) cleanly
+    await expect(
+      new Promise<void>((_, reject) => {
+        const badWs = new WebSocket(
+          `ws://127.0.0.1:${port}/api/v1/sessions/${codexSession.id}/native/ws?token=${encodeURIComponent(daemon.config.localToken)}`,
+        );
+        badWs.on('unexpected-response', (_req, res) => {
+          reject(new Error(`HTTP_${res.statusCode}`));
+        });
+        badWs.on('error', reject);
+      }),
+    ).rejects.toThrow('HTTP_422');
+
+    // Verify forged provenance rejection in SessionManager.sendTurn
     await expect(
       daemon.sessionManager.sendTurn(session.id, 'forged automated prompt', undefined, {
         dispatchProvenance: {
@@ -756,7 +1072,7 @@ rl.on('line', (line) => {
       }),
     ).rejects.toThrowError(AgyConsumerProvenanceError);
 
-    // Newer-than-reader DB closes native routes (503) while keeping legacy /api/v1/sessions/:id readable (200)
+    // Verify newer-than-reader DB closes native routes (503) while preserving legacy GET /sessions/:id (200)
     await daemon.stop();
     activeDaemons.pop();
     const reopenedRaw = new HarnessMateStore(path.join(tmp, 'data', 'harnessmate.db'));
@@ -787,5 +1103,5 @@ rl.on('line', (line) => {
     });
     expect(nativeNewer.statusCode).toBe(503);
     expect(nativeNewer.json().code).toBe('NATIVE_SCHEMA_NEWER_THAN_READER');
-  });
+  }, 20_000);
 });

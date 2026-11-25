@@ -9,12 +9,14 @@ import {
   type NativeCanonicalEvent,
   type NativeCapabilitiesResponse,
   type NativeRuntimeProjection,
+  type NativeRuntimeStatus,
   type RuntimeBinding,
   type RuntimeId,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore, NativeRuntimeSchemaStatus } from '../../../../db/sqlite.js';
 import {
   NativeRuntimeStore,
+  encodeNativeCursor,
   type NativeEventsReadResult,
   type StoredNativeBinding,
 } from './persistence.js';
@@ -32,6 +34,7 @@ import {
   type NativeTimelineReaderPort,
   type NativeTransportFrame,
   type NativeTransportObserver,
+  type NativeTurnSettlementSink,
   type NativeWorkflowResourceReaderPort,
   type TurnSettlement,
 } from './types.js';
@@ -44,6 +47,7 @@ export class AgyNativeRuntimeRegistry {
   private commandRouterPort: NativeCommandRouterPort | null = null;
   private timelineReaderPort: NativeTimelineReaderPort | null = null;
   private workflowResourceReaderPort: NativeWorkflowResourceReaderPort | null = null;
+  private settlementSink: NativeTurnSettlementSink | null = null;
   private readonly transportObservers = new Map<string, NativeTransportObserver>();
   private readonly sessionSubscribers = new Map<string, Set<NativeRuntimeEventListener>>();
   private readonly runtimeSubscribers = new Map<RuntimeId, Set<NativeRuntimeEventListener>>();
@@ -82,11 +86,31 @@ export class AgyNativeRuntimeRegistry {
     return this.persistence.getSchemaStatus();
   }
 
-  // ── Module Registration (Domain Owners Plug In Here) ─────────────────
+  // ── Module Registration & Host Settlement Exit ───────────────────────
+
+  bindTurnSettlementSink(sink: NativeTurnSettlementSink): void {
+    this.settlementSink = sink;
+    try {
+      this.lifecyclePort?.attachSettlementSink?.(sink);
+    } catch {
+      // isolate lifecycle hook failures
+    }
+  }
+
+  getTurnSettlementSink(): NativeTurnSettlementSink | null {
+    return this.settlementSink;
+  }
 
   registerModules(registration: NativeRuntimeModuleRegistration): void {
     if (registration.lifecycle) {
       this.lifecyclePort = registration.lifecycle;
+      if (this.settlementSink) {
+        try {
+          this.lifecyclePort.attachSettlementSink?.(this.settlementSink);
+        } catch {
+          // isolate lifecycle hook failures
+        }
+      }
     }
     if (registration.permissions) {
       this.permissionPort = registration.permissions;
@@ -134,7 +158,7 @@ export class AgyNativeRuntimeRegistry {
     return this.workflowResourceReaderPort;
   }
 
-  // ── Binding & Generation Management ──────────────────────────────────
+  // ── Binding & Generation Management (DB Authoritative) ───────────────
 
   ensureRuntimeBinding(params: {
     sessionId: string;
@@ -142,17 +166,17 @@ export class AgyNativeRuntimeRegistry {
     profileRef: string;
     sourceRef?: string;
     advanceGeneration?: boolean;
+    status?: NativeRuntimeStatus;
   }): StoredNativeBinding {
-    let stored = this.persistence.ensureBinding({
+    const prev = this.activeBindingsBySession.get(params.sessionId) ?? null;
+    const stored = this.persistence.ensureBinding({
       sessionId: params.sessionId,
       instanceId: params.instanceId,
       profileRef: params.profileRef,
       sourceRef: params.sourceRef,
+      advanceIfExisting: params.advanceGeneration,
+      status: params.status,
     });
-    const prev = this.activeBindingsBySession.get(params.sessionId) ?? null;
-    if (params.advanceGeneration) {
-      stored = this.persistence.advanceGeneration(stored.runtimeId, { status: 'attached' });
-    }
     const nextBinding: RuntimeBinding = {
       runtimeId: stored.runtimeId,
       sessionId: stored.sessionId,
@@ -176,14 +200,50 @@ export class AgyNativeRuntimeRegistry {
     return stored;
   }
 
-  getActiveBinding(sessionId: string, instanceId?: string): RuntimeBinding | null {
-    const cached = this.activeBindingsBySession.get(sessionId);
-    if (cached && (!instanceId || cached.instanceId === instanceId)) {
-      return cached;
+  advanceRuntimeGeneration(
+    runtimeId: RuntimeId,
+    opts?: { generation?: BindingGeneration; status?: NativeRuntimeStatus },
+  ): StoredNativeBinding {
+    const prevStored = this.persistence.getBinding(runtimeId);
+    const prevBinding: RuntimeBinding | null = prevStored
+      ? {
+          runtimeId: prevStored.runtimeId,
+          sessionId: prevStored.sessionId,
+          instanceId: prevStored.instanceId,
+          generation: prevStored.generation,
+        }
+      : null;
+
+    const updated = this.persistence.advanceGeneration(runtimeId, opts);
+    const nextBinding: RuntimeBinding = {
+      runtimeId: updated.runtimeId,
+      sessionId: updated.sessionId,
+      instanceId: updated.instanceId,
+      generation: updated.generation,
+    };
+    this.activeBindingsBySession.set(updated.sessionId, nextBinding);
+
+    if (this.flags.enabled && this.flags.nativeLifecycle && prevBinding) {
+      try {
+        this.lifecyclePort?.onProfileGenerationChanged?.(prevBinding, nextBinding);
+      } catch {
+        // isolate observer failures
+      }
     }
+    return updated;
+  }
+
+  /**
+   * Authoritatively reads the latest binding for a session from SQLite and refreshes cache so
+   * cache and DB never drift across generation advances or restarts.
+   */
+  getActiveBinding(sessionId: string, instanceId?: string): RuntimeBinding | null {
     if (!this.persistence.getSchemaStatus().compatible) return null;
     const stored = this.persistence.getLatestBindingForSession(sessionId, instanceId);
-    if (!stored) return null;
+    if (!stored) {
+      this.activeBindingsBySession.delete(sessionId);
+      return null;
+    }
     const binding: RuntimeBinding = {
       runtimeId: stored.runtimeId,
       sessionId: stored.sessionId,
@@ -202,6 +262,12 @@ export class AgyNativeRuntimeRegistry {
     eventDraft: NativeEventDraft,
   ): { deduplicated: boolean; event: NativeCanonicalEvent; binding: StoredNativeBinding } {
     const committed = this.persistence.commitSnapshotAndEvent(binding, mutation, eventDraft);
+    this.activeBindingsBySession.set(committed.binding.sessionId, {
+      runtimeId: committed.binding.runtimeId,
+      sessionId: committed.binding.sessionId,
+      instanceId: committed.binding.instanceId,
+      generation: committed.binding.generation,
+    });
     if (!committed.deduplicated) {
       this.publishEvent(committed.event);
     }
@@ -263,6 +329,18 @@ export class AgyNativeRuntimeRegistry {
     }
   }
 
+  /** Lightweight observatory-only hook used when observatoryTap is enabled while native runtime is OFF. */
+  createObservatoryOnlyHooks(sessionId: string, instanceId: string): NativeRuntimeHooks {
+    const ephemeralBinding = createKnownEmptyNativeProjection({ sessionId, instanceId }).binding;
+    return {
+      binding: ephemeralBinding,
+      getFeatureFlags: () => this.flags,
+      onTransportFrame: (frame) => {
+        this.emitTransportFrame(frame, ephemeralBinding);
+      },
+    };
+  }
+
   createAdapterRuntimeHooks(binding: RuntimeBinding): NativeRuntimeHooks {
     return {
       binding,
@@ -279,13 +357,33 @@ export class AgyNativeRuntimeRegistry {
         }
       },
       onIncomingServerRequest: (req) => {
+        // Never allow history_replay frames to create or resolve live permissions
+        if (req.channel === 'history_replay') {
+          return {
+            handled: true,
+            error: {
+              code: -32601,
+              message: 'Server requests are not permitted during history replay',
+            },
+          };
+        }
         if (!this.flags.enabled || !this.flags.nativePermissions || !this.permissionPort) {
           return null;
         }
-        return this.permissionPort.onIncomingRequest({
-          binding,
-          ...req,
-        });
+        try {
+          return this.permissionPort.onIncomingRequest({
+            binding,
+            ...req,
+          });
+        } catch {
+          return {
+            handled: true,
+            error: {
+              code: -32603,
+              message: 'Native permission router encountered an internal error',
+            },
+          };
+        }
       },
       onPromptStarted: (ctx) => {
         if (!this.flags.enabled || !this.flags.nativeLifecycle) return;
@@ -299,7 +397,12 @@ export class AgyNativeRuntimeRegistry {
         if (!this.flags.enabled || !this.flags.nativeLifecycle || !this.lifecyclePort?.onPromptSettled) {
           return null;
         }
-        return this.lifecyclePort.onPromptSettled(ctx, result);
+        try {
+          return this.lifecyclePort.onPromptSettled(ctx, result);
+        } catch {
+          // Isolate settlement hook exceptions so adapter never double-invokes failure callback
+          return null;
+        }
       },
       onTransportClosed: (connectionId, reason) => {
         this.handleTransportClosed(binding, connectionId, reason);
@@ -312,25 +415,37 @@ export class AgyNativeRuntimeRegistry {
     if (!binding || !this.flags.enabled || !this.flags.nativeLifecycle || !this.lifecyclePort) {
       return null;
     }
-    return this.lifecyclePort.decideTurnSettlement(turnId, binding);
+    try {
+      return this.lifecyclePort.decideTurnSettlement(turnId, binding);
+    } catch {
+      return null;
+    }
   }
 
   listRetentionReasons(binding: RuntimeBinding | null): string[] {
     if (!binding || !this.flags.enabled || !this.flags.nativeLifecycle || !this.lifecyclePort) {
       return [];
     }
-    return this.lifecyclePort.listRetentionReasons(binding);
+    try {
+      return this.lifecyclePort.listRetentionReasons(binding);
+    } catch {
+      return [];
+    }
   }
 
   checkWarmPoolEvict(binding: RuntimeBinding | null): { allowEvict: boolean; reasons: string[] } {
     if (!binding || !this.flags.enabled || !this.flags.nativeLifecycle || !this.lifecyclePort) {
       return { allowEvict: true, reasons: [] };
     }
-    if (this.lifecyclePort.onWarmPoolEvictCheck) {
-      return this.lifecyclePort.onWarmPoolEvictCheck(binding);
+    try {
+      if (this.lifecyclePort.onWarmPoolEvictCheck) {
+        return this.lifecyclePort.onWarmPoolEvictCheck(binding);
+      }
+      const reasons = this.lifecyclePort.listRetentionReasons(binding);
+      return { allowEvict: reasons.length === 0, reasons };
+    } catch {
+      return { allowEvict: true, reasons: [] };
     }
-    const reasons = this.lifecyclePort.listRetentionReasons(binding);
-    return { allowEvict: reasons.length === 0, reasons };
   }
 
   notifyCancelRequested(
@@ -389,11 +504,13 @@ export class AgyNativeRuntimeRegistry {
     }
   }
 
-  // ── Read Models (Snapshot, Capabilities, Events) ─────────────────────
+  // ── Read Models (Strict Feature-Off Purity + Authoritative Projection) ──
 
   getProjectionForSession(sessionId: string, instanceId: string): NativeRuntimeProjection {
     const schemaStatus = this.persistence.getSchemaStatus();
-    if (!schemaStatus.compatible) {
+    // Feature-off or incompatible schema: ALWAYS return Known Empty disconnected projection
+    // (never project stale attached/live entities while gate is OFF; persisted DB rows stay intact).
+    if (!this.flags.enabled || !schemaStatus.compatible) {
       return createKnownEmptyNativeProjection({
         sessionId,
         instanceId,
@@ -406,18 +523,18 @@ export class AgyNativeRuntimeRegistry {
       return createKnownEmptyNativeProjection({
         sessionId,
         instanceId,
-        enabled: this.flags.enabled,
+        enabled: true,
         status: 'disconnected',
       });
     }
     return (
-      this.persistence.readProjection(latest.runtimeId, { enabled: this.flags.enabled }) ??
+      this.persistence.readProjection(latest.runtimeId, { enabled: true }) ??
       createKnownEmptyNativeProjection({
         sessionId,
         instanceId,
         runtimeId: latest.runtimeId,
         generation: latest.generation,
-        enabled: this.flags.enabled,
+        enabled: true,
         status: latest.status,
         capabilitiesRevision: latest.capabilitiesRevision,
       })
@@ -425,10 +542,20 @@ export class AgyNativeRuntimeRegistry {
   }
 
   getCapabilitiesForSession(sessionId: string, instanceId: string): NativeCapabilitiesResponse {
-    const latest = this.persistence.getSchemaStatus().compatible
-      ? this.persistence.getLatestBindingForSession(sessionId, instanceId)
-      : null;
+    // Feature-off: ALWAYS return honest default `not_tested` descriptors (never leak historical `available` caps!)
+    if (!this.flags.enabled || !this.persistence.getSchemaStatus().compatible) {
+      const empty = createKnownEmptyNativeProjection({ sessionId, instanceId, enabled: false });
+      return NativeCapabilitiesResponseSchema.parse({
+        schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+        contractRevision: AGY_NATIVE_CONTRACT_REVISION,
+        enabled: false,
+        binding: empty.binding,
+        capabilitiesRevision: 0,
+        descriptors: createDefaultAgyCapabilityDescriptors(0),
+      });
+    }
 
+    const latest = this.persistence.getLatestBindingForSession(sessionId, instanceId);
     const binding: RuntimeBinding = latest
       ? {
           runtimeId: latest.runtimeId,
@@ -436,14 +563,14 @@ export class AgyNativeRuntimeRegistry {
           instanceId: latest.instanceId,
           generation: latest.generation,
         }
-      : createKnownEmptyNativeProjection({ sessionId, instanceId }).binding;
+      : createKnownEmptyNativeProjection({ sessionId, instanceId, enabled: true }).binding;
 
     let capabilitiesRevision = latest?.capabilitiesRevision ?? 0;
     let descriptors: readonly CapabilityDescriptor[] = createDefaultAgyCapabilityDescriptors(
       capabilitiesRevision,
     );
 
-    if (this.flags.enabled && this.commandRouterPort) {
+    if (this.commandRouterPort) {
       const liveCaps = this.commandRouterPort.getCapabilities(binding);
       capabilitiesRevision = liveCaps.capabilitiesRevision;
       descriptors = liveCaps.descriptors;
@@ -458,7 +585,7 @@ export class AgyNativeRuntimeRegistry {
     return NativeCapabilitiesResponseSchema.parse({
       schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
       contractRevision: AGY_NATIVE_CONTRACT_REVISION,
-      enabled: this.flags.enabled,
+      enabled: true,
       binding,
       capabilitiesRevision,
       descriptors: [...descriptors],
@@ -475,9 +602,40 @@ export class AgyNativeRuntimeRegistry {
       expectedGeneration?: BindingGeneration;
     },
   ): NativeEventsReadResult {
+    if (!this.flags.enabled) {
+      const empty = createKnownEmptyNativeProjection({ sessionId, instanceId, enabled: false });
+      if (opts.cursor || (opts.expectedGeneration && opts.expectedGeneration !== empty.binding.generation)) {
+        return {
+          resyncRequired: true,
+          reason: 'native_runtime_disabled',
+          latestSeq: 0,
+          currentGeneration: empty.binding.generation,
+        };
+      }
+      if (opts.afterSeq > 0) {
+        return {
+          resyncRequired: true,
+          reason: 'cursor_ahead_of_head',
+          latestSeq: 0,
+          currentGeneration: empty.binding.generation,
+        };
+      }
+      return {
+        resyncRequired: false,
+        binding: empty.binding,
+        runtimeId: empty.binding.runtimeId,
+        generation: empty.binding.generation,
+        asOfSeq: 0,
+        events: [],
+        nextSeq: 0,
+        nextCursor: encodeNativeCursor(empty.binding.runtimeId, empty.binding.generation, 0),
+        hasMore: false,
+      };
+    }
+
     const latest = this.persistence.getLatestBindingForSession(sessionId, instanceId);
     if (!latest) {
-      const empty = createKnownEmptyNativeProjection({ sessionId, instanceId });
+      const empty = createKnownEmptyNativeProjection({ sessionId, instanceId, enabled: true });
       if (opts.cursor || (opts.expectedGeneration && opts.expectedGeneration !== empty.binding.generation)) {
         return {
           resyncRequired: true,
@@ -496,19 +654,13 @@ export class AgyNativeRuntimeRegistry {
       }
       return {
         resyncRequired: false,
+        binding: empty.binding,
         runtimeId: empty.binding.runtimeId,
         generation: empty.binding.generation,
+        asOfSeq: 0,
         events: [],
         nextSeq: 0,
-        nextCursor: Buffer.from(
-          JSON.stringify({
-            v: 1,
-            r: empty.binding.runtimeId,
-            g: empty.binding.generation,
-            s: 0,
-          }),
-          'utf8',
-        ).toString('base64url'),
+        nextCursor: encodeNativeCursor(empty.binding.runtimeId, empty.binding.generation, 0),
         hasMore: false,
       };
     }
