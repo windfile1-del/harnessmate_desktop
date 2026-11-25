@@ -38,9 +38,14 @@ export class HarnessCommandTools {
   ) {}
 
   private async resolveAgyLaunchContext(harnessId?: string): Promise<AgyLaunchContext | undefined> {
-    const adapter = this.registry?.get(harnessId ?? 'agy') ?? this.registry?.get('agy');
+    const requested = harnessId?.trim();
+    const targetId = requested || 'agy';
+    const adapter = this.registry?.get(targetId);
     if (adapter instanceof AgyAdapter) {
       return adapter.getLaunchContext();
+    }
+    if (requested && this.registry) {
+      throw new Error(`未找到 AGY Profile 实例 "${requested}"，拒绝回落到默认账号`);
     }
     return undefined;
   }
@@ -73,10 +78,13 @@ export class HarnessCommandTools {
     return data?.skills ?? [];
   }
 
+  async listAgySkillsForSession(session: Session): Promise<NativeSkill[]> {
+    return this.listAgySkills(session.cwd, session.harnessId);
+  }
+
   async runPluginCommand(session: Session, arg: string): Promise<string> {
     const kind = session.harnessKind;
     const [verb, target, ...extra] = arg.split(/\s+/);
-    const executable = await this.getBinary(kind);
     let args: string[];
     if (!arg || arg === 'list') {
       args = ['plugin', 'list', '--json'];
@@ -85,6 +93,16 @@ export class HarnessCommandTools {
     } else {
       throw new Error('用法 /plugin list 或 /plugin install <插件[@市场]>');
     }
+    if (kind === 'agy') {
+      const launchContext = await this.resolveAgyLaunchContext(session.harnessId);
+      const executable = await this.getBinary('agy', launchContext?.binaryPath);
+      const cliArgs = launchContext ? launchContext.buildCliArgs(args) : args;
+      const { env, unsetEnv } = launchContext ? launchContext.buildEnv() : { env: undefined, unsetEnv: undefined };
+      const result = await execCliQuick(executable, cliArgs, 60_000, { cwd: session.cwd, env, unsetEnv });
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || '插件命令执行失败');
+      return result.stdout.trim() || result.stderr.trim() || '插件命令完成';
+    }
+    const executable = await this.getBinary(kind);
     const result = await execCliQuick(executable, args, 60_000, { cwd: session.cwd });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || '插件命令执行失败');
     return result.stdout.trim() || result.stderr.trim() || '插件命令完成';

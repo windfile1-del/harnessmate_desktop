@@ -1,4 +1,5 @@
 import type { AgyLaunchContext } from './agy/agy-launch-context.js';
+import { LIVE_ONLY_INTERACTIVE_WORKFLOW_COMMANDS } from './agy/native/commands/descriptors.js';
 import { execCliQuick } from './process.js';
 import type { AdapterSessionConfig } from './types.js';
 
@@ -10,11 +11,41 @@ export class AgyAuthRequiredError extends Error {
   }
 }
 
+export class AgyInteractiveWorkflowFallbackError extends Error {
+  readonly code = 'UNSUPPORTED_ACTION' as const;
+  constructor(commandName: string) {
+    super(
+      `AGY 交互式原生工作流 /${commandName} 必须通过当前 live ACP 会话执行，禁止落入 final-only 辅助 CLI 进程`,
+    );
+    this.name = 'AgyInteractiveWorkflowFallbackError';
+  }
+}
+
 export interface AgyCommandExecutionOptions {
   env?: Record<string, string | undefined>;
   unsetEnv?: readonly string[];
   appDataDir?: string;
   launchContext?: AgyLaunchContext;
+  /** When native workflow live routing is enabled, also prevent /goal from using auxiliary CLI fallback. */
+  blockGoalAuxiliaryFallback?: boolean;
+}
+
+const ALLOWED_INSPECT_COMMANDS = new Set<string>(['/usage', '/skills']);
+
+export function extractSlashCommandName(rawCommand: string): string | null {
+  const match = /^\s*\/([a-z0-9][a-z0-9_-]*)/i.exec(rawCommand);
+  return match ? match[1]!.toLowerCase() : null;
+}
+
+export function isInteractiveWorkflowSlashCommand(
+  rawCommand: string,
+  opts?: { includeGoal?: boolean },
+): boolean {
+  const name = extractSlashCommandName(rawCommand);
+  if (!name) return false;
+  if (LIVE_ONLY_INTERACTIVE_WORKFLOW_COMMANDS.has(name)) return true;
+  if (opts?.includeGoal && name === 'goal') return true;
+  return false;
 }
 
 interface AgyCliResult {
@@ -44,6 +75,9 @@ export async function inspectAgyCommand(
   command: '/usage' | '/skills',
   opts?: AgyCommandExecutionOptions,
 ): Promise<unknown> {
+  if (!ALLOWED_INSPECT_COMMANDS.has(command)) {
+    throw new Error(`仅允许只读独立查询 /usage 或 /skills，已拒绝: ${String(command)}`);
+  }
   const ctx = opts?.launchContext;
   if (
     ctx &&
@@ -54,6 +88,7 @@ export async function inspectAgyCommand(
     throw new AgyAuthRequiredError('AGY 隔离账号尚未登录，请先完成官方 Google 登录');
   }
 
+  // Strictly read-only print JSON query: never passes `--conversation` and never mutates conversation history.
   const baseArgs = ['-p', command, '--output-format', 'json', '--print-timeout', '20s'];
   // Top-level `agy` rejects `--app-data-dir` / `--gemini-dir`; `AgyLaunchContext.buildCliArgs()`
   // preserves that boundary and isolates via `GEMINI_HOME` in env.
@@ -94,6 +129,15 @@ export async function runAgyCommand(
   signal: AbortSignal,
   opts?: AgyCommandExecutionOptions,
 ): Promise<AgyCliResult> {
+  const slashName = extractSlashCommandName(command);
+  if (
+    slashName &&
+    isInteractiveWorkflowSlashCommand(command, {
+      includeGoal: Boolean(opts?.blockGoalAuxiliaryFallback),
+    })
+  ) {
+    throw new AgyInteractiveWorkflowFallbackError(slashName);
+  }
   const compact = command === '/compact';
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(binary)) {
     throw new Error('AGY 原生命令需要直接配置 agy.exe');
