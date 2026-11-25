@@ -482,6 +482,11 @@ describe('TurnBlock Projection, WorkGroup & Fallback Rendering', () => {
     expect(srcDoc).toContain('Content-Security-Policy');
     expect(srcDoc).toContain("connect-src &#39;none&#39;".replace(/&#39;/g, "'"));
     expect(srcDoc).toContain('window.alert = function () {}');
+    expect(srcDoc.indexOf('Content-Security-Policy')).toBeLessThan(srcDoc.indexOf('<h1>Chart'));
+    const documentHtml = '<html lang="zh"><head><title>Chart</title></head><body class="report">Chart</body></html>';
+    const fullDoc = buildSandboxedHtmlRenderSrcDoc({ html: documentHtml, theme: 'dark', cssVars: {}, renderId: 'r_full' });
+    expect(fullDoc).toMatch(/^<!doctype html><html><head>/);
+    expect(fullDoc.endsWith(documentHtml)).toBe(true);
 
     const cardHtml = renderToStaticMarkup(
       <HtmlRenderCard renderId="r_1" title="Architecture SVG" html="<svg></svg>" />,

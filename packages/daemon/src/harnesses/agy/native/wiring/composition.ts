@@ -51,7 +51,7 @@ export function wireAgyNativeRuntime(
   const boost = new BoostWorkflowObserver();
   const teamwork = new AgyTeamworkWorkflowObserver({ featureGates: { teamworkEnabled: true } });
   const dynamic = new DynamicWorkflowObserver({ strictMode: true });
-  const tasks = new GoalScheduleTasksObserver({ strictMode: true });
+  const tasks = new GoalScheduleTasksObserver({ enabled: true });
   const workflowReaders = {
     swarm, boost, teamwork: teamwork.createResourceReader(), dynamic,
   };

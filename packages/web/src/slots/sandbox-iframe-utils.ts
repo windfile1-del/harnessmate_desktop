@@ -237,11 +237,7 @@ export function buildIframeSrcDoc(params: {
 </script>`;
 
   const injectedHead = `${cspMeta}\n${themeStyle}\n${bridgeScript}`;
-  if (/<head\b[^>]*>/i.test(params.html)) {
-    return params.html.replace(/<head\b[^>]*>/i, (match) => `${match}\n${injectedHead}`);
-  }
-  if (/<html\b[^>]*>/i.test(params.html)) {
-    return params.html.replace(/<html\b[^>]*>/i, (match) => `${match}\n<head>${injectedHead}</head>`);
-  }
-  return `<!doctype html><html><head>${injectedHead}</head><body>${params.html}</body></html>`;
+  // Keep the CSP and bridge ahead of plugin markup in the document.
+  return `<!doctype html><html><head>${injectedHead}</head>
+${params.html}`;
 }

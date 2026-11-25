@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { mintAgyDispatchProvenance } from '../src/harnesses/agy/native/wiring/provenance.js';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +32,8 @@ import { createDaemon } from '../src/server/app.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const NP01_FIXTURES_DIR = path.join(__dirname, 'fixtures', 'agy-np');
 const AGY_1514_FIXTURE_PATH = path.join(__dirname, 'fixtures', 'agy-1.5.14', 'session-full.ndjson');
+
+const dispatchProvenance = mintAgyDispatchProvenance('human_direct', 'desktop', 'AGY replay fixture');
 
 const tempDirs: string[] = [];
 const activeDaemons: Array<ReturnType<typeof createDaemon>> = [];
@@ -1363,7 +1366,7 @@ rl.on('line', (line) => {
       updatedAt: Date.now(),
     });
 
-    const turn = await daemon.sessionManager.sendTurn(session.id, 'Run parallel finite A/B + daemon D');
+    const turn = await daemon.sessionManager.sendTurn(session.id, 'Run parallel finite A/B + daemon D', undefined, { dispatchProvenance });
 
     // Wait past early prompt response (20ms) and B finish (80ms) while A is still running (finishes at 180ms)
     await new Promise((r) => setTimeout(r, 120));

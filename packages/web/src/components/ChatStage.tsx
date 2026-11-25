@@ -2236,7 +2236,7 @@ const TurnBlock = memo(function TurnBlock({
                     slotProps={{ session, turn, block, onOpenFile, onFailover }}
                     fallback={
                       <HtmlRenderCard
-                        renderId={block.renderId}
+                        renderId={block.renderId ?? block.blockId}
                         title={block.title}
                         html={block.html}
                         preferredHeightPx={block.preferredHeightPx}

@@ -124,7 +124,7 @@ import { resolveAgyProfileDirectories } from '../harnesses/agy/agy-profile-manag
 import {
   AgyNativeRuntimeRegistry,
   NativeWsFeedGateway,
-  assertAgyConsumerProvenance,
+  AgyConsumerProvenanceError,
   mintAgyDispatchProvenance,
   registerAgyNativeRoutes,
 } from '../harnesses/agy/native/wiring/index.js';
@@ -286,28 +286,17 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
     const session = store.getSession(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
-    const targetAdapter = registry.get(session.harnessId);
     try {
-      assertAgyConsumerProvenance(
-        {
-          instanceId: session.harnessId,
-          driverId: targetAdapter?.driverId ?? targetAdapter?.kind ?? session.harnessKind,
-          profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
-        },
-        mintAgyDispatchProvenance('plugin_automated', 'plugin', 'isolated-plugin-native-command'),
-      );
+      const result = await sessionManager.runHarnessCommand(sessionId, {
+        command: command as Parameters<SessionManager['runHarnessCommand']>[1]['command'],
+        args: args ?? '',
+        harnessId: session.harnessId,
+      }, mintAgyDispatchProvenance('plugin_automated', 'plugin', 'isolated-plugin-native-command'));
+      return { output: result.output, notice: result.turnId ? `已触发轮次 ${result.turnId}` : undefined };
     } catch (err) {
-      throw new PluginApiError(
-        'E_PERMISSION_DENIED',
-        err instanceof Error ? err.message : '禁止插件向个人 AGY 账号自动派发命令',
-      );
+      if (!(err instanceof AgyConsumerProvenanceError)) throw err;
+      throw new PluginApiError('E_PERMISSION_DENIED', err.message);
     }
-    const result = await sessionManager.runHarnessCommand(sessionId, {
-      command: command as Parameters<SessionManager['runHarnessCommand']>[1]['command'],
-      args: args ?? '',
-      harnessId: session.harnessId,
-    });
-    return { output: result.output, notice: result.turnId ? `已触发轮次 ${result.turnId}` : undefined };
   });
   const auth = new RemoteAuthService(store, config.localToken);
   const wsGateway = new WsGateway({
@@ -338,8 +327,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (
       urlPath === '/api/v1/health' ||
       urlPath === pluginMcpPath ||
-      urlPath === '/api/v1/pair/exchange' ||
-      urlPath.startsWith('/api/v1/attachments/')
+      urlPath === '/api/v1/pair/exchange'
     ) {
       return;
     }
@@ -1428,7 +1416,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const parsed = RunHarnessCommandRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid CLI command input' });
     try {
-      return await sessionManager.runHarnessCommand(id, parsed.data);
+      return await sessionManager.runHarnessCommand(id, parsed.data,
+        mintAgyDispatchProvenance('human_direct', 'desktop', 'POST /api/v1/sessions/:id/commands'));
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1533,7 +1522,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid failover payload' });
     }
     try {
-      return await sessionManager.failoverSession(id, parsed.data);
+      const principal = (request as unknown as { principal?: { kind: 'local' | 'device' } }).principal;
+      const provenance = principal?.kind === 'local' && isLoopbackAddress(request.socket.remoteAddress)
+        ? mintAgyDispatchProvenance('manual_user_switch', 'desktop', 'POST /api/v1/sessions/:id/failover')
+        : undefined;
+      return await sessionManager.failoverSession(id, parsed.data, provenance);
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "description": "Independent NP-17 4-state UX matrix covering actionable, read_only, no_data, and stale_request across AGY native workbench and ecosystem components.",
+  "states": {
+    "actionable": {
+      "expectButtons": ["允许本次", "本会话信任", "拒绝"],
+      "expectDataTestId": "native-request-card",
+      "expectReceiptState": "pending"
+    },
+    "read_only": {
+      "expectText": "观测连接已断开",
+      "forbidButtons": ["允许本次", "本会话信任"],
+      "artifactGateDisabledText": "nativeArtifactsEnabled",
+      "ecosystemReadOnlyText": "只读"
+    },
+    "no_data": {
+      "expectTitle": "原生运行时尚未连接",
+      "expectEmptyWorkCopy": "尚未观察到活动",
+      "expectUnloadedSettingsTitle": "AGY 原生生态与配置发现未加载"
+    },
+    "stale_request": {
+      "expectReceiptState": "connection_lost",
+      "expectText": "原连接已断开，旧审批不会自动重放",
+      "forbidButtons": ["允许本次", "本会话信任", "提交选择"],
+      "expectReconcilingText": "重连校准中"
+    }
+  }
+}

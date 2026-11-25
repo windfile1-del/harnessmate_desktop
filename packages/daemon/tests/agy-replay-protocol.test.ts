@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { mintAgyDispatchProvenance } from '../src/harnesses/agy/native/wiring/provenance.js';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +10,8 @@ import { createDaemon } from '../src/server/app.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = path.join(__dirname, 'fixtures', 'agy-1.5.14');
+
+const dispatchProvenance = mintAgyDispatchProvenance('human_direct', 'desktop', 'AGY replay fixture');
 
 const tempDirs: string[] = [];
 const activeDaemons: Array<ReturnType<typeof createDaemon>> = [];
@@ -235,7 +238,7 @@ describe('Phase AGY-6: AGY 1.5.14 Offline Protocol Replay Suite', () => {
     });
 
     // Scenario 1 + 2: Start Turn 1 (include '·' so initial title remains eligible for ACP session_info_update), confirm metadata, available commands, config_option_update
-    const t1 = await daemon.sessionManager.sendTurn(sess.id, 'TURN_1 · Init');
+    const t1 = await daemon.sessionManager.sendTurn(sess.id, 'TURN_1 · Init', undefined, { dispatchProvenance });
 
     // Verify usage_update, session_info_update, Run update_steps, subagent, bg task, & security warning approval
     await waitFor(() => {
@@ -256,7 +259,7 @@ describe('Phase AGY-6: AGY 1.5.14 Offline Protocol Replay Suite', () => {
     );
 
     // Scenario 5: Mid-turn Steering while running (no session/cancel)
-    const steered = await daemon.sessionManager.sendTurn(sess.id, 'STEER_MSG');
+    const steered = await daemon.sessionManager.sendTurn(sess.id, 'STEER_MSG', undefined, { dispatchProvenance });
     expect(steered.turnId).toBe(t1.turnId);
     await waitFor(() => daemon.sessionManager.getSession(sess.id)?.status === 'idle');
 
@@ -266,7 +269,7 @@ describe('Phase AGY-6: AGY 1.5.14 Offline Protocol Replay Suite', () => {
     expect(agyAdapter.getObservedEffortsForModel('gemini-3.1-pro-preview')).toEqual(['low', 'high', 'xhigh']);
 
     // Scenario 3: interaction_* user_question flow
-    await daemon.sessionManager.sendTurn(sess.id, 'ASK_USER');
+    await daemon.sessionManager.sendTurn(sess.id, 'ASK_USER', undefined, { dispatchProvenance });
     const qApproval = await waitFor(
       () => daemon.sessionManager.listPendingApprovals(sess.id).find((a) => a.kind === 'user_question'),
     );
@@ -279,16 +282,16 @@ describe('Phase AGY-6: AGY 1.5.14 Offline Protocol Replay Suite', () => {
     await waitFor(() => daemon.sessionManager.getSession(sess.id)?.status === 'idle');
 
     // Scenario 6: session/cancel interrupt & subsequent RECOVERY_TURN
-    await daemon.sessionManager.sendTurn(sess.id, 'CANCEL_ME');
+    await daemon.sessionManager.sendTurn(sess.id, 'CANCEL_ME', undefined, { dispatchProvenance });
     await waitFor(() => daemon.sessionManager.getSession(sess.id)?.status === 'running');
     await daemon.sessionManager.interruptSession(sess.id);
     await waitFor(() => daemon.sessionManager.getSession(sess.id)?.status === 'idle');
 
-    await daemon.sessionManager.sendTurn(sess.id, 'RECOVERY_TURN');
+    await daemon.sessionManager.sendTurn(sess.id, 'RECOVERY_TURN', undefined, { dispatchProvenance });
     await waitFor(() => daemon.sessionManager.getSession(sess.id)?.status === 'idle');
 
     // Scenario 7: QUOTA_EXHAUSTED structured failure
-    await daemon.sessionManager.sendTurn(sess.id, 'QUOTA_TURN');
+    await daemon.sessionManager.sendTurn(sess.id, 'QUOTA_TURN', undefined, { dispatchProvenance });
     await waitFor(() =>
       daemon.store.getEventsAfter(sess.id, 0, 500).some((e) => e.type === 'turn.failed'),
     );

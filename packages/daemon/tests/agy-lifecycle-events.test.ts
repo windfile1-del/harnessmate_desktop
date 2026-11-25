@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { mintAgyDispatchProvenance } from '../src/harnesses/agy/native/wiring/provenance.js';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -24,6 +25,8 @@ import {
 } from '../src/harnesses/agy/agy-turn-outcome.js';
 import type { NormalizedAdapterEvent } from '../src/harnesses/types.js';
 import { createDaemon } from '../src/server/app.js';
+
+const dispatchProvenance = mintAgyDispatchProvenance('human_direct', 'desktop', 'AGY replay fixture');
 
 const tempDirs: string[] = [];
 const activeDaemons: Array<ReturnType<typeof createDaemon>> = [];
@@ -309,7 +312,7 @@ rl.on('line', (line) => {
     });
 
     // First turn stays running while waiting for steer
-    const t1 = await daemon.sessionManager.sendTurn(sess.id, 'FIRST_TURN');
+    const t1 = await daemon.sessionManager.sendTurn(sess.id, 'FIRST_TURN', undefined, { dispatchProvenance });
     expect(agyAdapter.capabilitiesV2.supportsActiveSteering).toBe(true);
 
     // Wait deterministically until mock ACP has processed FIRST_TURN and emitted usage.updated + ext:agy.plan
@@ -321,7 +324,7 @@ rl.on('line', (line) => {
     }
 
     // Steering turn succeeds while session is running (does not emit session/cancel)
-    const steered = await daemon.sessionManager.sendTurn(sess.id, 'STEER_MSG');
+    const steered = await daemon.sessionManager.sendTurn(sess.id, 'STEER_MSG', undefined, { dispatchProvenance });
     expect(steered.turnId).toBe(t1.turnId);
 
     // Wait for completion
@@ -339,7 +342,7 @@ rl.on('line', (line) => {
     expect(rpcCalls.some((c) => c.method === 'session/cancel')).toBe(false);
 
     // Next turn triggers interaction_* question approval
-    await daemon.sessionManager.sendTurn(sess.id, 'ASK_USER');
+    await daemon.sessionManager.sendTurn(sess.id, 'ASK_USER', undefined, { dispatchProvenance });
     let pendingAppr;
     for (let i = 0; i < 160; i++) {
       pendingAppr = daemon.sessionManager.listPendingApprovals(sess.id)[0];

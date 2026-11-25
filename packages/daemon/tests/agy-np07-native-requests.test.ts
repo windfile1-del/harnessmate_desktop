@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { mintAgyDispatchProvenance } from '../src/harnesses/agy/native/wiring/provenance.js';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,6 +25,8 @@ import {
   validateElicitationFormPayload,
 } from '../src/harnesses/agy/native/requests/index.js';
 import { createDaemon } from '../src/server/app.js';
+
+const dispatchProvenance = mintAgyDispatchProvenance('human_direct', 'desktop', 'AGY replay fixture');
 
 const tempDirs: string[] = [];
 const activeDaemons: Array<ReturnType<typeof createDaemon>> = [];
@@ -1540,7 +1543,7 @@ rl.on('line', (line) => {
     const router = daemon.nativeRegistry.getPermissionPort()!;
 
     // Send a user turn so SessionManager creates the real AcpSessionHandle & binding
-    await daemon.sessionManager.sendTurn(session.id, 'Run background workflow');
+    await daemon.sessionManager.sendTurn(session.id, 'Run background workflow', undefined, { dispatchProvenance });
 
     const binding = daemon.nativeRegistry.getActiveBinding(session.id, 'agy-e2e');
     expect(binding).not.toBeNull();
@@ -1645,7 +1648,7 @@ rl.on('line', (line) => {
 
     expect(daemon.nativeRegistry.listRetentionReasons(binding).filter((item) => item.startsWith('pending_request:')))
       .toHaveLength(0);
-    const { turnId } = await daemon.sessionManager.sendTurn(session.id, 'Stop fixture');
+    const { turnId } = await daemon.sessionManager.sendTurn(session.id, 'Stop fixture', undefined, { dispatchProvenance });
     await daemon.sessionManager.interruptSession(session.id);
     expect(daemon.store.getSession(session.id)?.status).toBe('running');
     const activityState = () => daemon.nativeRegistry.getProjectionForSession(session.id, 'agy-e2e')

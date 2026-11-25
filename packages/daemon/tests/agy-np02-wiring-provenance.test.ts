@@ -30,6 +30,8 @@ import { HarnessRegistry } from '../src/harnesses/registry.js';
 import type { HarnessAdapter, NormalizedAdapterEvent } from '../src/harnesses/types.js';
 import { createDaemon } from '../src/server/app.js';
 
+const dispatchProvenance = mintAgyDispatchProvenance('human_direct', 'desktop', 'AGY replay fixture');
+
 const tempDirs: string[] = [];
 const openStores: HarnessMateStore[] = [];
 const activeDaemons: Array<ReturnType<typeof createDaemon>> = [];
@@ -492,9 +494,9 @@ rl.on('line', (line) => {
     expect(capturedSink).not.toBeNull();
 
     // Prime prompt 1 & 2 on the fresh scriptAdapter handle then prompt 3 -> returns quickly & gets held!
-    const t1 = await daemon.sessionManager.sendTurn(session.id, 'p1');
+    const t1 = await daemon.sessionManager.sendTurn(session.id, 'p1', undefined, { dispatchProvenance });
     await daemon.sessionManager.interruptSession(session.id);
-    const t2 = await daemon.sessionManager.sendTurn(session.id, 'p2');
+    const t2 = await daemon.sessionManager.sendTurn(session.id, 'p2', undefined, { dispatchProvenance });
     await new Promise((r) => setTimeout(r, 150));
 
     // Turn 2 is now held by lifecycle port -> session remains 'running' with zero turn.completed yet!
@@ -1060,6 +1062,17 @@ describe('AGY REST/WS contracts: R2 concurrent idempotency & control/approval lo
         badWs.on('error', reject);
       }),
     ).rejects.toThrow('HTTP_422');
+
+    // Reject a switch to consumer AGY before changing the current session.
+    await expect(daemon.sessionManager.failoverSession(codexSession.id, {
+      targetHarnessId: session.harnessId,
+      retryLastFailedTurn: false,
+    })).rejects.toThrowError(AgyConsumerProvenanceError);
+    expect(daemon.store.getSession(codexSession.id)?.harnessId).toBe(codexSession.harnessId);
+
+    // Internal dispatch requires proof before the runtime is touched.
+    await expect(daemon.sessionManager.sendTurn(session.id, 'no-provenance fixture'))
+      .rejects.toThrowError(AgyConsumerProvenanceError);
 
     // Verify forged provenance rejection in SessionManager.sendTurn
     await expect(

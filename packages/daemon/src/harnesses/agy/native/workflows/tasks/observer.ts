@@ -232,8 +232,8 @@ export class GoalScheduleTasksObserver implements NativeWorkflowResourceReaderPo
   private readonly diagnostics: TasksObserverDiagnostic[] = [];
 
   constructor(opts: GoalScheduleTasksObserverOptions = {}) {
-    this.enabled = opts.enabled ?? true;
-    this.strictMode = opts.strictMode ?? false;
+    this.enabled = opts.enabled ?? false;
+    this.strictMode = opts.strictMode ?? true;
     this.recoveryPort = opts.recoveryPort ?? new FrozenTasksRecoveryEvidenceStub();
     this.now = opts.now ?? (() => Date.now());
     this.limits = {

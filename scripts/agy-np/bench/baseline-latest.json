@@ -1,0 +1,540 @@
+{
+  "schemaVersion": 1,
+  "suite": "np16-t18-full-baseline",
+  "generatedAt": "2026-11-25T18:49:59.744Z",
+  "daemon": {
+    "schemaVersion": 1,
+    "suite": "np16-t18-daemon-bench",
+    "timestamp": "2026-11-25T18:49:23.417Z",
+    "environment": {
+      "nodeVersion": "v24.18.0",
+      "platform": "win32",
+      "arch": "x64",
+      "cpus": 8,
+      "cpuModel": "11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz",
+      "totalMemoryMiB": 16183,
+      "sqliteVersion": "3.53.1",
+      "git": {
+        "sha": "81393496ac1ad95afa6232111efa1b1e5c3ec792",
+        "branch": "np16_performance_security_review"
+      },
+      "tmpRoot": "D:\\AppDataCache\\np16-bench"
+    },
+    "parameters": {
+      "samples": 3,
+      "events": 10000,
+      "agents": 100,
+      "requests": 20
+    },
+    "disabledBaseline": {
+      "mode": "gates_off_baseline",
+      "defaultFlags": {
+        "enabled": false,
+        "nativeLifecycle": false,
+        "nativePermissions": false,
+        "nativeCommands": false,
+        "nativeWorkflowObservation": false,
+        "nativeTasksObservation": false,
+        "observatoryTap": false,
+        "acpV2Preview": false
+      },
+      "legacyAppendEvents": 10000,
+      "legacyThroughputOpsPerSec": 7060.1,
+      "legacyCommitLatency": {
+        "count": 10000,
+        "meanMs": 0.1414,
+        "p50Ms": 0.0906,
+        "p95Ms": 0.248,
+        "p99Ms": 0.6814,
+        "maxMs": 13.0837,
+        "totalMs": 1413.55
+      },
+      "disabledProjectionReadLatency": {
+        "count": 50,
+        "meanMs": 0.1255,
+        "p50Ms": 0.0484,
+        "p95Ms": 0.1514,
+        "p99Ms": 3.2276,
+        "maxMs": 3.2276,
+        "totalMs": 6.28
+      },
+      "dbStats": {
+        "dbFileName": "bench-off.sqlite",
+        "sqliteVersion": "3.53.1",
+        "mainBytes": 1482752,
+        "walBytes": 4144752,
+        "shmBytes": 32768,
+        "totalDiskBytes": 5660272,
+        "pageCount": 362,
+        "pageSize": 4096,
+        "freelistCount": 0,
+        "rowCounts": {
+          "sessions": 1,
+          "session_events": 10000,
+          "native_runtime_bindings": 0,
+          "native_runtime_entities": 0,
+          "native_runtime_relations": 0,
+          "native_runtime_events": 0,
+          "native_runtime_receipts": 0
+        }
+      },
+      "rssBefore": {
+        "rssBytes": 91328512,
+        "heapUsedBytes": 31505128,
+        "heapTotalBytes": 59912192,
+        "externalBytes": 3721597,
+        "rssMiB": 87.1,
+        "heapUsedMiB": 30.05
+      },
+      "rssAfter": {
+        "rssBytes": 252788736,
+        "heapUsedBytes": 40541888,
+        "heapTotalBytes": 61222912,
+        "externalBytes": 3721648,
+        "rssMiB": 241.08,
+        "heapUsedMiB": 38.66
+      }
+    },
+    "enabledRuns": [
+      {
+        "runIndex": 0,
+        "events": {
+          "count": 10000,
+          "totalMs": 6073.67,
+          "throughputPerSec": 1646.5,
+          "commitLatency": {
+            "count": 10000,
+            "meanMs": 0.6027,
+            "p50Ms": 0.3666,
+            "p95Ms": 1.2624,
+            "p99Ms": 5.6858,
+            "maxMs": 51.5784,
+            "totalMs": 6027.38
+          },
+          "paginate500": {
+            "pages": 20,
+            "totalRead": 10000,
+            "totalMs": 316.42,
+            "pageLatency": {
+              "count": 20,
+              "meanMs": 15.8171,
+              "p50Ms": 15.0132,
+              "p95Ms": 21.7329,
+              "p99Ms": 22.341,
+              "maxMs": 22.341,
+              "totalMs": 316.34
+            }
+          },
+          "wsReplay": {
+            "received": 10000,
+            "replayLastSeq": 10000,
+            "overflowResyncReason": null,
+            "elapsedMs": 824.92,
+            "throughputEventsPerSec": 12122.5
+          }
+        },
+        "agents": {
+          "agentCount": 100,
+          "updateEvents": 200,
+          "totalMs": 241.6,
+          "commitLatency": {
+            "count": 201,
+            "meanMs": 1.1907,
+            "p50Ms": 0.8912,
+            "p95Ms": 2.0237,
+            "p99Ms": 7.43,
+            "maxMs": 24.7327,
+            "totalMs": 239.34
+          },
+          "projectionRead50": {
+            "count": 50,
+            "meanMs": 17.6446,
+            "p50Ms": 16.8382,
+            "p95Ms": 27.7168,
+            "p99Ms": 32.2128,
+            "maxMs": 32.2128,
+            "totalMs": 882.23
+          },
+          "projectionJsonBytes": 84577
+        },
+        "requests": {
+          "pendingCount": 20,
+          "wireWrites": 20,
+          "casWinners": 20,
+          "casConflicts": 20,
+          "enqueueLatency": {
+            "count": 20,
+            "meanMs": 1.9415,
+            "p50Ms": 1.4875,
+            "p95Ms": 2.1802,
+            "p99Ms": 8.2311,
+            "maxMs": 8.2311,
+            "totalMs": 38.83
+          },
+          "concurrentResolveLatency": {
+            "count": 20,
+            "meanMs": 30.2361,
+            "p50Ms": 31.998,
+            "p95Ms": 48.4281,
+            "p99Ms": 52.8918,
+            "maxMs": 52.8918,
+            "totalMs": 604.72
+          }
+        },
+        "dbStats": {
+          "dbFileName": "harnessmate.db",
+          "sqliteVersion": "3.53.1",
+          "mainBytes": 5480448,
+          "walBytes": 4169472,
+          "shmBytes": 32768,
+          "totalDiskBytes": 9682688,
+          "pageCount": 1340,
+          "pageSize": 4096,
+          "freelistCount": 0,
+          "rowCounts": {
+            "sessions": 1,
+            "session_events": 0,
+            "native_runtime_bindings": 1,
+            "native_runtime_entities": 172,
+            "native_runtime_relations": 99,
+            "native_runtime_events": 10241,
+            "native_runtime_receipts": 20
+          }
+        },
+        "rssBefore": {
+          "rssBytes": 119250944,
+          "heapUsedBytes": 42994776,
+          "heapTotalBytes": 61222912,
+          "externalBytes": 3721648,
+          "rssMiB": 113.73,
+          "heapUsedMiB": 41
+        },
+        "rssAfter": {
+          "rssBytes": 181170176,
+          "heapUsedBytes": 78228976,
+          "heapTotalBytes": 113651712,
+          "externalBytes": 3958700,
+          "rssMiB": 172.78,
+          "heapUsedMiB": 74.6
+        },
+        "legacySessionLastSeqIntact": true
+      },
+      {
+        "runIndex": 1,
+        "events": {
+          "count": 10000,
+          "totalMs": 10610.28,
+          "throughputPerSec": 942.5,
+          "commitLatency": {
+            "count": 10000,
+            "meanMs": 1.0458,
+            "p50Ms": 0.765,
+            "p95Ms": 1.9433,
+            "p99Ms": 7.4402,
+            "maxMs": 63.8408,
+            "totalMs": 10458.07
+          },
+          "paginate500": {
+            "pages": 20,
+            "totalRead": 10000,
+            "totalMs": 365.88,
+            "pageLatency": {
+              "count": 20,
+              "meanMs": 18.2926,
+              "p50Ms": 17.6829,
+              "p95Ms": 23.2789,
+              "p99Ms": 42.2408,
+              "maxMs": 42.2408,
+              "totalMs": 365.85
+            }
+          },
+          "wsReplay": null
+        },
+        "agents": {
+          "agentCount": 100,
+          "updateEvents": 200,
+          "totalMs": 188.33,
+          "commitLatency": {
+            "count": 201,
+            "meanMs": 0.9321,
+            "p50Ms": 0.7314,
+            "p95Ms": 1.3679,
+            "p99Ms": 9.1221,
+            "maxMs": 16.1163,
+            "totalMs": 187.34
+          },
+          "projectionRead50": {
+            "count": 50,
+            "meanMs": 12.6058,
+            "p50Ms": 12.5355,
+            "p95Ms": 16.677,
+            "p99Ms": 20.3872,
+            "maxMs": 20.3872,
+            "totalMs": 630.29
+          },
+          "projectionJsonBytes": 84577
+        },
+        "requests": {
+          "pendingCount": 20,
+          "wireWrites": 20,
+          "casWinners": 20,
+          "casConflicts": 20,
+          "enqueueLatency": {
+            "count": 20,
+            "meanMs": 1.151,
+            "p50Ms": 1.1106,
+            "p95Ms": 1.7532,
+            "p99Ms": 1.784,
+            "maxMs": 1.784,
+            "totalMs": 23.02
+          },
+          "concurrentResolveLatency": {
+            "count": 20,
+            "meanMs": 22.6974,
+            "p50Ms": 25.4224,
+            "p95Ms": 35.9062,
+            "p99Ms": 37.3942,
+            "maxMs": 37.3942,
+            "totalMs": 453.95
+          }
+        },
+        "dbStats": {
+          "dbFileName": "harnessmate.db",
+          "sqliteVersion": "3.53.1",
+          "mainBytes": 5480448,
+          "walBytes": 4169472,
+          "shmBytes": 32768,
+          "totalDiskBytes": 9682688,
+          "pageCount": 1340,
+          "pageSize": 4096,
+          "freelistCount": 0,
+          "rowCounts": {
+            "sessions": 1,
+            "session_events": 0,
+            "native_runtime_bindings": 1,
+            "native_runtime_entities": 172,
+            "native_runtime_relations": 99,
+            "native_runtime_events": 10241,
+            "native_runtime_receipts": 20
+          }
+        },
+        "rssBefore": {
+          "rssBytes": 177893376,
+          "heapUsedBytes": 48876688,
+          "heapTotalBytes": 113651712,
+          "externalBytes": 4123014,
+          "rssMiB": 169.65,
+          "heapUsedMiB": 46.61
+        },
+        "rssAfter": {
+          "rssBytes": 190820352,
+          "heapUsedBytes": 60494432,
+          "heapTotalBytes": 120107008,
+          "externalBytes": 4024236,
+          "rssMiB": 181.98,
+          "heapUsedMiB": 57.69
+        },
+        "legacySessionLastSeqIntact": true
+      },
+      {
+        "runIndex": 2,
+        "events": {
+          "count": 10000,
+          "totalMs": 10181.59,
+          "throughputPerSec": 982.2,
+          "commitLatency": {
+            "count": 10000,
+            "meanMs": 1.0123,
+            "p50Ms": 0.7209,
+            "p95Ms": 1.9931,
+            "p99Ms": 6.6511,
+            "maxMs": 154.9258,
+            "totalMs": 10123.45
+          },
+          "paginate500": {
+            "pages": 20,
+            "totalRead": 10000,
+            "totalMs": 308.39,
+            "pageLatency": {
+              "count": 20,
+              "meanMs": 15.4183,
+              "p50Ms": 14.392,
+              "p95Ms": 17.4021,
+              "p99Ms": 47.7368,
+              "maxMs": 47.7368,
+              "totalMs": 308.37
+            }
+          },
+          "wsReplay": null
+        },
+        "agents": {
+          "agentCount": 100,
+          "updateEvents": 200,
+          "totalMs": 124.12,
+          "commitLatency": {
+            "count": 201,
+            "meanMs": 0.6141,
+            "p50Ms": 0.3968,
+            "p95Ms": 0.9864,
+            "p99Ms": 5.7094,
+            "maxMs": 11.3978,
+            "totalMs": 123.44
+          },
+          "projectionRead50": {
+            "count": 50,
+            "meanMs": 9.3764,
+            "p50Ms": 8.7628,
+            "p95Ms": 13.0877,
+            "p99Ms": 16.0652,
+            "maxMs": 16.0652,
+            "totalMs": 468.82
+          },
+          "projectionJsonBytes": 84577
+        },
+        "requests": {
+          "pendingCount": 20,
+          "wireWrites": 20,
+          "casWinners": 20,
+          "casConflicts": 20,
+          "enqueueLatency": {
+            "count": 20,
+            "meanMs": 1.4512,
+            "p50Ms": 0.8041,
+            "p95Ms": 3.7195,
+            "p99Ms": 8.3544,
+            "maxMs": 8.3544,
+            "totalMs": 29.02
+          },
+          "concurrentResolveLatency": {
+            "count": 20,
+            "meanMs": 33.8807,
+            "p50Ms": 42.7605,
+            "p95Ms": 56.06,
+            "p99Ms": 57.3433,
+            "maxMs": 57.3433,
+            "totalMs": 677.61
+          }
+        },
+        "dbStats": {
+          "dbFileName": "harnessmate.db",
+          "sqliteVersion": "3.53.1",
+          "mainBytes": 5480448,
+          "walBytes": 4169472,
+          "shmBytes": 32768,
+          "totalDiskBytes": 9682688,
+          "pageCount": 1340,
+          "pageSize": 4096,
+          "freelistCount": 0,
+          "rowCounts": {
+            "sessions": 1,
+            "session_events": 0,
+            "native_runtime_bindings": 1,
+            "native_runtime_entities": 172,
+            "native_runtime_relations": 99,
+            "native_runtime_events": 10241,
+            "native_runtime_receipts": 20
+          }
+        },
+        "rssBefore": {
+          "rssBytes": 185737216,
+          "heapUsedBytes": 63373352,
+          "heapTotalBytes": 120107008,
+          "externalBytes": 4024236,
+          "rssMiB": 177.13,
+          "heapUsedMiB": 60.44
+        },
+        "rssAfter": {
+          "rssBytes": 266944512,
+          "heapUsedBytes": 89904416,
+          "heapTotalBytes": 193769472,
+          "externalBytes": 4024236,
+          "rssMiB": 254.58,
+          "heapUsedMiB": 85.74
+        },
+        "legacySessionLastSeqIntact": true
+      }
+    ],
+    "enabledAggregates": {
+      "eventCommitP95MeanMs": 1.7329,
+      "eventThroughputMeanPerSec": 1190.4,
+      "paginateTotalMeanMs": 330.23,
+      "projectionReadP95MeanMs": 19.1605,
+      "requestCasResolveP95MeanMs": 46.7981,
+      "peakRssMiB": 254.58,
+      "dbTotalDiskBytesRun0": 9682688
+    }
+  },
+  "web": {
+    "suite": "np16-t18-web-bench",
+    "samples": 5,
+    "disabledLegacyProjectorLatency": {
+      "count": 5,
+      "meanMs": 0.6005,
+      "p50Ms": 0.3536,
+      "p95Ms": 1.73,
+      "maxMs": 1.73,
+      "totalMs": 3
+    },
+    "enabledEventBatching": {
+      "totalEvents": 10000,
+      "batchSize": 200,
+      "asOfSeqAfter": 10000,
+      "workCountAfter": 50,
+      "perBatch200Latency": {
+        "count": 50,
+        "meanMs": 0.228,
+        "p50Ms": 0.0917,
+        "p95Ms": 0.3755,
+        "maxMs": 4.7525,
+        "totalMs": 11.4
+      },
+      "full10kReduceLatency": {
+        "count": 5,
+        "meanMs": 5.9399,
+        "p50Ms": 3.2214,
+        "p95Ms": 11.4601,
+        "maxMs": 11.4601,
+        "totalMs": 29.7
+      }
+    },
+    "virtualizedTimeline": {
+      "totalEntries": 10000,
+      "renderedWindowMidScroll": 17,
+      "htmlBytesInitialViewport": 13908,
+      "renderLatency": {
+        "count": 5,
+        "meanMs": 11.567,
+        "p50Ms": 9.1659,
+        "p95Ms": 18.6163,
+        "maxMs": 18.6163,
+        "totalMs": 57.84
+      }
+    },
+    "subagent100Render": {
+      "totalAgents": 101,
+      "htmlBytes": 384698,
+      "renderLatency": {
+        "count": 5,
+        "meanMs": 145.8256,
+        "p50Ms": 62.811,
+        "p95Ms": 291.1088,
+        "maxMs": 291.1088,
+        "totalMs": 729.13
+      }
+    },
+    "requests20Render": {
+      "pendingApprovals": 20,
+      "htmlBytes": 90554,
+      "renderLatency": {
+        "count": 5,
+        "meanMs": 12.0676,
+        "p50Ms": 13.1713,
+        "p95Ms": 15.3265,
+        "maxMs": 15.3265,
+        "totalMs": 60.34
+      }
+    },
+    "rssAfterMiB": 104.27,
+    "heapUsedAfterMiB": 30.42
+  }
+}

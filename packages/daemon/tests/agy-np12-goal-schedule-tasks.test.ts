@@ -182,7 +182,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
 
   it('T09: handles one-shot schedule with ended user turn, separate WorkId vs wake ActivityId, and registry commit', async () => {
     const { daemon, binding } = await createNp12DaemonEnv();
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_022_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_022_000 });
 
     const steps = loadTasksNdjsonFixture(path.join(FIXTURES_DIR, 't09-oneshot-post-turn-wake.ndjson'));
     const replay = replayTasksNdjson(observer, binding, steps, {
@@ -238,7 +238,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       instanceId: 'agy',
       generation: asBindingGeneration('gen_1'),
     };
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_120_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_120_000 });
     const steps = loadTasksNdjsonFixture(
       path.join(FIXTURES_DIR, 't09-early-cancel-and-goal-lifecycle.ndjson'),
     );
@@ -311,7 +311,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       instanceId: 'agy',
       generation: asBindingGeneration('gen_1'),
     };
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_225_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_225_000 });
     const steps = loadTasksNdjsonFixture(
       path.join(FIXTURES_DIR, 't09-simulated-cron-multi-occurrence.ndjson'),
     );
@@ -342,7 +342,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       instanceId: 'agy',
       generation: asBindingGeneration('gen_1'),
     };
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_330_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_330_000 });
     const steps = loadTasksNdjsonFixture(
       path.join(FIXTURES_DIR, 't14-disconnect-restart-recovery.ndjson'),
     );
@@ -410,7 +410,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       instanceId: 'agy',
       generation: asBindingGeneration('gen_1'),
     };
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_400_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_400_000 });
     observer.registerBinding({
       binding,
       connectionId: 'conn_agg',
@@ -523,7 +523,7 @@ describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
       ...binding1,
       generation: asBindingGeneration('gen_2'),
     };
-    const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_500_000 });
+    const observer = new GoalScheduleTasksObserver({ enabled: true, strictMode: false, now: () => 1_764_100_500_000 });
     observer.registerBinding({
       binding: binding1,
       connectionId: 'conn_1',

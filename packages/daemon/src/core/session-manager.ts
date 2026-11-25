@@ -1218,28 +1218,32 @@ export class SessionManager {
   async failoverSession(
     sessionId: string,
     req: FailoverRequest,
+    provenance?: AgyDispatchProvenance,
   ): Promise<{ session: Session; retriedTurnId: string | null }> {
-    const current = this.store.getSession(sessionId);
-    if (!current) throw new Error(`Session not found: ${sessionId}`);
+    return this.withSessionStartup(sessionId, async () => {
+      const current = this.store.getSession(sessionId);
+      if (!current) throw new Error(`Session not found: ${sessionId}`);
+      const targetAdapter = this.registry.get(req.targetHarnessId);
+      if (!targetAdapter) throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
+      this.assertDispatchTarget(targetAdapter.id, targetAdapter.kind, provenance);
 
-    const failover = this.service<FailoverService>('failover');
-    const retry = req.retryLastFailedTurn === false ? undefined : failover.retryInput(sessionId);
+      const failover = this.service<FailoverService>('failover');
+      const retry = req.retryLastFailedTurn === false ? undefined : failover.retryInput(sessionId);
 
-    if (current.status === 'error') {
-      this.setSessionStatus(sessionId, 'idle');
-    }
+      if (current.status === 'error') this.setSessionStatus(sessionId, 'idle');
+      const { session: switched } = await this.switchHarnessInternal(sessionId, {
+        targetHarnessId: targetAdapter.id,
+        targetModel: req.targetModel,
+      });
 
-    const { session: switched } = await this.switchHarness(sessionId, {
-      targetHarnessId: req.targetHarnessId,
-      targetModel: req.targetModel,
+      if (retry) {
+        const { turnId } = await this.startTurn(sessionId, retry.text, retry.attachments, {
+          dispatchProvenance: provenance,
+        });
+        return { session: this.store.getSession(sessionId)!, retriedTurnId: turnId };
+      }
+      return { session: switched, retriedTurnId: null };
     });
-
-    if (retry) {
-      const { turnId } = await this.sendTurn(sessionId, retry.text, retry.attachments);
-      return { session: this.store.getSession(sessionId)!, retriedTurnId: turnId };
-    }
-
-    return { session: switched, retriedTurnId: null };
   }
 
   // ── Task State Ledger APIs ───────────────────────────────────────────
@@ -1474,6 +1478,7 @@ export class SessionManager {
       if (!session || !capabilities) throw new Error('会话或插件动作服务不存在');
       if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
       if (session.status === 'archived') throw new Error('会话已归档');
+      const provenance = mintAgyDispatchProvenance('plugin_automated', 'plugin', 'SessionManager.runPluginAction');
       const entry = capabilities.listActions(session).find(({ action, plugin }) =>
         action.command === req.command && (!req.pluginId || plugin.id === req.pluginId));
       if (entry) {
@@ -1483,7 +1488,7 @@ export class SessionManager {
         const unavailable = this.nativeActionReason(session, action.nativeCommand);
         if (unavailable) throw new Error(unavailable);
         if (action.args !== undefined && req.args.trim()) throw new Error(`请单独发送 /${action.command}，该动作使用插件配置的参数`);
-        return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId });
+        return this.executeHarnessCommand(sessionId, { command: action.nativeCommand, args: (action.args ?? req.args).trim(), harnessId: req.harnessId }, provenance);
       }
       const isolatedCmd = this.pluginManager.isolated?.listCommands().find(({ command, pluginId }) =>
         command === req.command && (!req.pluginId || pluginId === req.pluginId));
@@ -1492,30 +1497,34 @@ export class SessionManager {
       if (result.kind === 'message') return { output: result.text, session };
       if (result.kind === 'compose') return { output: result.text, session };
       if (result.kind === 'native') {
-        const targetAdapter = this.registry.get(session.harnessId);
-        assertAgyConsumerProvenance(
-          {
-            instanceId: session.harnessId,
-            driverId: targetAdapter?.driverId ?? targetAdapter?.kind ?? session.harnessKind,
-            profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
-          },
-          mintAgyDispatchProvenance('plugin_automated', 'plugin', 'SessionManager.runPluginAction'),
-        );
         const nativeCmd = result.command as RunHarnessCommandRequest['command'];
         const unavailable = this.nativeActionReason(session, nativeCmd);
         if (unavailable) throw new Error(unavailable);
-        return this.executeHarnessCommand(sessionId, { command: nativeCmd, args: (result.args ?? '').trim(), harnessId: req.harnessId });
+        return this.executeHarnessCommand(sessionId, { command: nativeCmd, args: (result.args ?? '').trim(), harnessId: req.harnessId }, provenance);
       }
       return { output: '', session };
     });
   }
 
-  async runHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
-    return this.withSessionStartup(sessionId, () => this.executeHarnessCommand(sessionId, req));
+  async runHarnessCommand(
+    sessionId: string, req: RunHarnessCommandRequest, provenance?: AgyDispatchProvenance,
+  ): Promise<HarnessCommandResult> {
+    return this.withSessionStartup(sessionId, () => this.executeHarnessCommand(sessionId, req, provenance));
   }
 
-  private async executeHarnessCommand(sessionId: string, req: RunHarnessCommandRequest): Promise<HarnessCommandResult> {
-      const session = this.store.getSession(sessionId);
+  private assertDispatchTarget(instanceId: string, fallbackKind: string, provenance?: AgyDispatchProvenance): void {
+    const adapter = this.registry.get(instanceId);
+    assertAgyConsumerProvenance({
+      instanceId,
+      driverId: adapter?.driverId ?? adapter?.kind ?? fallbackKind,
+      profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
+    }, provenance);
+  }
+
+  private async executeHarnessCommand(
+    sessionId: string, req: RunHarnessCommandRequest, provenance?: AgyDispatchProvenance,
+  ): Promise<HarnessCommandResult> {
+    const session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
     if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
@@ -1529,13 +1538,15 @@ export class SessionManager {
     }
     const adapter = this.registry.get(session.harnessId);
     if (!adapter) throw new Error('当前 Harness 命令服务不可用');
+    this.assertDispatchTarget(session.harnessId, session.harnessKind, provenance);
+    const turnOpts = { dispatchProvenance: provenance };
     const tools = this.service<NativeCommandsService>('native-commands').tools;
 
     const result = (output: string, turnId?: string): HarnessCommandResult => ({
       output, turnId, session: this.store.getSession(sessionId)!,
     });
     const rawCommand = async (text: string) => {
-      const { turnId } = await this.startTurn(sessionId, text, undefined, undefined, { cliCommand: text });
+      const { turnId } = await this.startTurn(sessionId, text, undefined, turnOpts, { cliCommand: text });
       return result('', turnId);
     };
     const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, false)).handle;
@@ -1557,7 +1568,7 @@ export class SessionManager {
           return result('已退出计划模式');
         }
         await this.updateSession(sessionId, { permissionMode: 'plan' });
-        const turn = args ? await this.startTurn(sessionId, args) : undefined;
+        const turn = args ? await this.startTurn(sessionId, args, undefined, turnOpts) : undefined;
         return result('已启用计划模式', turn?.turnId);
       }
       case 'compact': {
@@ -1603,7 +1614,7 @@ export class SessionManager {
         const skillArgs = words.join(' ');
         if (session.harnessKind === 'codex') {
           if (!skill.path) throw new Error('Codex 未返回技能路径');
-          const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, undefined,
+          const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, turnOpts,
             { nativeSkill: { name, path: skill.path } });
           return result('', turnId);
         }
@@ -1650,20 +1661,8 @@ export class SessionManager {
     let session = this.store.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    // Enforce unforgeable AGY consumer provenance whenever caller supplies explicit dispatchProvenance
-    if (turnOpts?.dispatchProvenance !== undefined) {
-      const targetId = turnOpts.harnessId ?? session.harnessId;
-      const targetAdapter = this.registry.get(targetId);
-      const targetDriverId = targetAdapter?.driverId ?? targetAdapter?.kind ?? session.harnessKind;
-      assertAgyConsumerProvenance(
-        {
-          instanceId: targetId,
-          driverId: targetDriverId,
-          profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
-        },
-        turnOpts.dispatchProvenance,
-      );
-    }
+    const targetId = session.status === 'running' ? session.harnessId : turnOpts?.harnessId ?? session.harnessId;
+    this.assertDispatchTarget(targetId, session.harnessKind, turnOpts?.dispatchProvenance);
 
     const expectedNativeHandle = turnOpts?.expectedNativeHandle;
     turnOpts?.verifyNativeDispatch?.();

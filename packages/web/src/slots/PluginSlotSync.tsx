@@ -379,7 +379,7 @@ export function PluginSlotSync() {
           if (block.type !== 'html_render') return null;
           return (
             <HtmlRenderCard
-              renderId={block.renderId}
+              renderId={block.renderId ?? block.blockId}
               title={block.title}
               html={block.html}
               preferredHeightPx={block.preferredHeightPx}

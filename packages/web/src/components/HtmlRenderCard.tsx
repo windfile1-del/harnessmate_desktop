@@ -80,13 +80,9 @@ export function buildSandboxedHtmlRenderSrcDoc(params: {
 </script>`;
 
   const headInject = `${cspMeta}\n${styleTag}\n${guardScript}`;
-  if (/<head\b[^>]*>/i.test(params.html)) {
-    return params.html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${headInject}`);
-  }
-  if (/<html\b[^>]*>/i.test(params.html)) {
-    return params.html.replace(/<html\b[^>]*>/i, (m) => `${m}\n<head>${headInject}</head>`);
-  }
-  return `<!doctype html><html><head>${headInject}</head><body>${params.html}</body></html>`;
+  // The browser applies the host policy before it parses supplied markup.
+  return `<!doctype html><html><head>${headInject}</head>
+${params.html}`;
 }
 
 export interface HtmlRenderCardProps {

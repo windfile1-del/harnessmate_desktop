@@ -277,6 +277,7 @@ export function SandboxedPluginFrame({
               const command = String(params?.command ?? '').trim();
               const args = typeof params?.args === 'string' ? params.args : '';
               const result = await store.runPluginAction(currentSession.id, {
+                pluginId,
                 command,
                 harnessId: currentSession.harnessId,
                 args,

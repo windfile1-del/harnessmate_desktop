@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "reviewedBaselineCommit": "81393496ac1ad95afa6232111efa1b1e5c3ec792",
+  "reviewedBaselineTag": "agy-np-g3-wave2",
+  "officialEnvironment": {
+    "windowsCliPath": "C:\\Users\\windfile\\AppData\\Local\\agy\\bin\\agy.exe",
+    "windowsCliVersion": "1.5.17",
+    "authenticodePublisher": "Google LLC (Valid)",
+    "windowsAppInstalled": "Antigravity 2.35.1",
+    "windowsIdeInstalled": "Antigravity IDE (User) 2.5.5"
+  },
+  "u01Authorization": {
+    "profileRoot": "D:\\HarnessMate\\agy-np-test-profile",
+    "recommendedModel": "gemini-3.8-flash",
+    "status": "pending_human_oauth",
+    "note": "Non-authenticated 1.5.17 ACP probes & CLI catalog checks completed cleanly; authenticated live ACP turns and interactive Windows App GUI side-by-side comparisons await U01 human OAuth login."
+  },
+  "comparisons": [
+    {
+      "id": "CMP-01",
+      "domain": "ACP Handshake & Version Negotiation",
+      "cliCommandOrSurface": "agy.exe acp (clean v1 / request v2)",
+      "officialObserved": "Verified on 1.5.17: returns agentName='Antigravity ACP Server', agentVersion='1.5.17', protocolVersion=1 (downgrades v2 request to v1), authMethods=['oauth-personal','oauth-business','gemini-api-key','agent-platform'], loadSession=true, sessionCapabilities=[additionalDirectories,close,list,load,resume].",
+      "harnessMateStatus": "Aligned (v1 + v2 fail-closed downgrade implemented & tested; v2 preview gated behind acpV2Preview=false).",
+      "verificationLevel": "live_raw",
+      "parityVerdict": "exact_match"
+    },
+    {
+      "id": "CMP-02",
+      "domain": "Auth Fail-Closed & Profile ACL Isolation",
+      "cliCommandOrSurface": "agy models / agy usage / agy acp (icacls isolated profiles)",
+      "officialObserved": "Verified on 1.5.17: session/new returns -32000 Authentication required; isolated GEMINI_HOME + icacls fast-aborts usage probe on OAuth URL prompt without mutating global keychain.",
+      "harnessMateStatus": "Aligned (Windows profile isolation verified; Windows icacls cleanup requires resetting readonly/ACL before recursive rmdir in dry-run script).",
+      "verificationLevel": "live_raw",
+      "parityVerdict": "exact_match_with_minor_cleanup_note"
+    },
+    {
+      "id": "CMP-03",
+      "domain": "CLI Subcommands & Flags Parity (1.5.17)",
+      "cliCommandOrSurface": "agy --help / acp --help / plugin --help / mcp --help / changelog",
+      "officialObserved": "Verified on 1.5.17: flags include --mode (accept-edits,auto,plan), --effort (low|medium|high|xhigh|max), --sandbox, --settings, --add-dir, --remote-agent, --remote-control, --input/output-format stream-json, --json-schema; subcommands include acp, agent(s), changelog, mcp, mic-serve, models, plugin(s), remote-control, update.",
+      "harnessMateStatus": "Aligned on ACP-exposed subsets and dual-track isolation guards; remote-control/mic-serve remain explicit official CLI/App surfaces.",
+      "verificationLevel": "live_raw",
+      "parityVerdict": "documented_boundary"
+    },
+    {
+      "id": "CMP-04",
+      "domain": "Reactive Turn Settlement & Background Wake (T01-T05)",
+      "cliCommandOrSurface": "Windows App Conversation + agy acp (1.5.15+ fix noted in changelog)",
+      "officialObserved": "1.5.15 changelog confirms agy acp holds turn completion across non-daemon background tasks/subagents while detached daemons do not block queue. Authenticated Gemini 3.8 Flash live turn pending U01.",
+      "harnessMateStatus": "Verified in synthetic E2E (Composition wires AgyReactiveRuntimeController when enabled+nativeLifecycle=true).",
+      "verificationLevel": "synthetic",
+      "parityVerdict": "pending_u01_live_confirmation"
+    },
+    {
+      "id": "CMP-05",
+      "domain": "Subagent / Workflow Requests & Structured Questions (T06-T07)",
+      "cliCommandOrSurface": "Windows App Approval Cards vs agy acp 1.5.16+ forwarding",
+      "officialObserved": "1.5.16 changelog confirms subagent/workflow permissions & questions forward to editor in default/accept-edits mode instead of 60s stall. Live forwarded ACP wire capture pending U01.",
+      "harnessMateStatus": "Domain & REST/WS routing verified; composition.ts does not yet wire dynamic.resolveRequestTarget or swarm/teamwork/dynamic settlement callbacks.",
+      "verificationLevel": "synthetic",
+      "parityVerdict": "partial_production_wiring_gap"
+    },
+    {
+      "id": "CMP-06",
+      "domain": "Mode Control, Slash Commands, Workflows & Tasks (T08-T13)",
+      "cliCommandOrSurface": "Windows App Mode Switcher / /swarm / /boost / /teamwork / /plan / /goal / /schedule",
+      "officialObserved": "Official changelog documents /swarm Overview, Orchestrator Planner/Executor same-model optimization (1.5.17), update_steps checklist (1.5.16), plan mode. Live U01 interactive traces pending.",
+      "harnessMateStatus": "Gated in composition.ts (nativeWorkflowObservation=false, nativeTasksObservation=false, workflow routing restricted to set_plan_mode). Requires post-NP-16 integration decision.",
+      "verificationLevel": "synthetic",
+      "parityVerdict": "gated_pending_live_validation"
+    },
+    {
+      "id": "CMP-07",
+      "domain": "Ecosystem, Artifacts/Review & Recovery/ACP-v2 (T14-T17)",
+      "cliCommandOrSurface": "Windows App Artifact Tab / Browser / Settings vs CLI ~/.agents/skills & ~/.gemini",
+      "officialObserved": "Official 1.5.16 changelog confirms ~/.agents/skills + ~/.gemini precedence; 1.5.15 confirms session/load -32002 fix. App embedded browser & GUI artifacts require manual Windows App 2.35.1 side-by-side walkthrough.",
+      "harnessMateStatus": "NP-13/NP-14/NP-15 domain suites pass, but production wiring (composition.ts, app.ts routes, SessionManager recovery, PluginSlotSync nativeWorkspace props) is not yet hooked up on 8139349.",
+      "verificationLevel": "synthetic",
+      "parityVerdict": "production_wiring_pending"
+    }
+  ]
+}

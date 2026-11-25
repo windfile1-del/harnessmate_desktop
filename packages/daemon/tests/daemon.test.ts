@@ -588,6 +588,20 @@ describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
       })
     ).json();
     expect(attRes.attachment.previewUrl).toContain('/api/v1/attachments/');
+    const previewUrl = attRes.attachment.previewUrl as string;
+    const preview = await fetch(`${baseUrl}${previewUrl}`);
+    expect(preview.status).toBe(200);
+    expect(Buffer.from(await preview.arrayBuffer()).toString('base64')).toBe(tinyPngBase64);
+
+    const previewWithoutRemoteAuth = await daemon.app.inject({
+      method: 'GET', url: previewUrl, remoteAddress: '192.0.2.10',
+    });
+    expect(previewWithoutRemoteAuth.statusCode).toBe(401);
+    const previewFromOtherSite = await daemon.app.inject({
+      method: 'GET', url: previewUrl, remoteAddress: '127.0.0.1',
+      headers: { host: '127.0.0.1', 'sec-fetch-site': 'cross-site' },
+    });
+    expect(previewFromOtherSite.statusCode).toBe(403);
 
     const rulesRes = await (await fetch(`${baseUrl}/api/v1/sessions/${sessionId}/rules`)).json();
     expect(rulesRes.instructions.some((i: { name: string }) => i.name === 'AGENTS.md')).toBe(true);
