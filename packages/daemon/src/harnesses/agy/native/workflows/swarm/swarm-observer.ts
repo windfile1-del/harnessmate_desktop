@@ -87,7 +87,7 @@ interface BindingGenerationSwarmState {
   readonly binding: RuntimeBinding;
   readonly profileRef: string;
   readonly sourceRef: string;
-  readonly rootNativeSessionId: string;
+  rootNativeSessionId: string;
   readonly coordinatorAgentId: NativeAgentId;
   activeConnectionId: string | null;
   swarmAdvertised: boolean | null;
@@ -314,7 +314,15 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
   } {
     const prev = this.activeByRuntime.get(config.binding.runtimeId);
     if (prev && prev.binding.generation === config.binding.generation) {
-      if (config.connectionId) {
+      if (prev.binding.sessionId === config.binding.sessionId &&
+          prev.binding.instanceId === config.binding.instanceId &&
+          prev.profileRef === config.profileRef && prev.sourceRef === config.sourceRef &&
+          config.connectionId && prev.activeConnectionId !== config.connectionId) {
+        if (prev.activeConnectionId) this.handleTransportClosed(prev.binding, prev.activeConnectionId);
+        if (prev.rootNativeSessionId !== config.rootNativeSessionId) {
+          prev.nativeWorkflowIdToId.clear();
+          prev.rootNativeSessionId = config.rootNativeSessionId;
+        }
         prev.activeConnectionId = config.connectionId;
       }
       return { coordinatorAgentId: prev.coordinatorAgentId, binding: prev.binding };
@@ -376,7 +384,7 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
     commands: readonly ObservedAcpCommand[] | null,
   ): { readonly advertised: boolean | null } {
     const state = this.getActiveBindingState(binding);
-    if (!state) return { advertised: null };
+    if (!state?.activeConnectionId) return { advertised: null };
     if (commands === null) {
       state.swarmAdvertised = null;
       return { advertised: null };
@@ -448,7 +456,9 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
     const nowMs = this.nowFn();
     const state = this.activeByRuntime.get(envelope.binding.runtimeId);
 
-    if (!state || state.binding.generation !== envelope.binding.generation) {
+    if (!state || state.binding.generation !== envelope.binding.generation ||
+        state.binding.sessionId !== envelope.binding.sessionId ||
+        state.binding.instanceId !== envelope.binding.instanceId) {
       return {
         accepted: false,
         deduplicated: false,
@@ -488,8 +498,8 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
     }
 
     if (
-      state.activeConnectionId &&
-      envelope.channel === 'live' &&
+      envelope.channel !== 'live' ||
+      !state.activeConnectionId ||
       envelope.connectionId !== state.activeConnectionId
     ) {
       const diag = this.pushDiagnostic(
@@ -555,18 +565,11 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
       };
     }
 
-    state.seenIngressOrdinals.add(ingressKey);
-    if (state.seenIngressOrdinals.size > 4096) {
-      const first = state.seenIngressOrdinals.values().next().value;
-      if (first) state.seenIngressOrdinals.delete(first);
-    }
-
     // Verify wire session scope matches active root or known confirmed worker in same binding.
-    const wireSessionId =
-      envelope.originSession ??
-      readString(params ?? {}, ['sessionId']) ??
-      state.rootNativeSessionId;
-    if (!this.isSessionInBindingScope(state, wireSessionId, update)) {
+    const wireSessionId = readString(params ?? {}, ['sessionId']);
+    if (wire?.method !== 'session/update' || !wireSessionId ||
+        (envelope.originSession && envelope.originSession !== wireSessionId) ||
+        !this.isSessionInBindingScope(state, wireSessionId)) {
       const diag = this.pushDiagnostic(
         state,
         'scope_mismatch_rejected',
@@ -582,6 +585,12 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
         diagnostic: diag,
         commits: [],
       };
+    }
+
+    state.seenIngressOrdinals.add(ingressKey);
+    if (state.seenIngressOrdinals.size > 4096) {
+      const first = state.seenIngressOrdinals.values().next().value;
+      if (first) state.seenIngressOrdinals.delete(first);
     }
 
     const evidence = buildEvidence(envelope, `acp:${updateType || 'swarm'}`, nowMs);
@@ -603,15 +612,6 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
         };
       }
       wf.seenEventIds.add(stableEventId);
-    }
-
-    if (envelope.channel === 'history_replay') {
-      this.pushDiagnostic(
-        state,
-        'history_replay_isolated',
-        `Processed Swarm frame ${updateType} as read-only history replay`,
-        nowMs,
-      );
     }
 
     // Handle tool_call / tool_call_update explicitly: NEVER fabricate workers from tool titles!
@@ -855,10 +855,13 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
   ): readonly { readonly mutation: NativeCommitMutation; readonly eventDraft: NativeEventDraft }[] {
     const state = this.activeByRuntime.get(binding.runtimeId);
     if (!state || state.binding.generation !== binding.generation) return [];
-    if (state.activeConnectionId && state.activeConnectionId !== connectionId) return [];
+    if (!state.activeConnectionId || state.activeConnectionId !== connectionId ||
+        state.binding.sessionId !== binding.sessionId || state.binding.instanceId !== binding.instanceId) return [];
 
     const nowMs = this.nowFn();
     state.activeConnectionId = null;
+    state.swarmAdvertised = null;
+    state.activeWorkflowId = null;
     const commits: Array<{ mutation: NativeCommitMutation; eventDraft: NativeEventDraft }> = [];
 
     for (const wf of state.workflows.values()) {
@@ -1182,16 +1185,14 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
   private isSessionInBindingScope(
     state: BindingGenerationSwarmState,
     wireSessionId: string,
-    update: Record<string, unknown>,
   ): boolean {
     if (wireSessionId === state.rootNativeSessionId) return true;
     // Allow updates originating from a confirmed worker's native session ID in the same binding.
     for (const wf of state.workflows.values()) {
-      if (wf.nativeWorkerIdToAgentId.has(wireSessionId)) return true;
+      const agentId = wf.nativeWorkerIdToAgentId.get(wireSessionId);
+      const evidence = agentId && wf.workers.get(agentId)?.evidence;
+      if (evidence && evidence.kind === 'live_protocol' && evidence.connectionId === state.activeConnectionId) return true;
     }
-    // Allow first worker announcement if it explicitly references our root session as parent.
-    const parentSession = readString(update, ['parentSessionId', 'coordinatorSessionId']);
-    if (parentSession && parentSession === state.rootNativeSessionId) return true;
     return false;
   }
 
@@ -1842,7 +1843,7 @@ export class AgySwarmObserver implements NativeWorkflowResourceReaderPort {
     const wfId = asWorkflowId(
       stableScopedId(
         'wfl',
-        `swarm|${state.binding.runtimeId}|${state.binding.generation}|${nativeWorkflowId ?? `auto_${state.workflows.size + 1}`}`,
+        `swarm|${state.binding.runtimeId}|${state.binding.generation}|${state.rootNativeSessionId}|${nativeWorkflowId ?? `auto_${state.workflows.size + 1}`}`,
       ),
     );
     const originActivityId = asActivityId(

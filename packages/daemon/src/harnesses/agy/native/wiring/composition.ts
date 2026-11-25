@@ -13,7 +13,15 @@ import { NativePermissionRouter } from '../requests/native-permission-router.js'
 import type { NativeRequestTargetResolution } from '../requests/types.js';
 import { AgyReactiveRuntimeController } from '../runtime/controller.js';
 import type { AgyNativeRuntimeRegistry } from './registry.js';
-import type { NativeConnectionPort } from './types.js';
+import { registerSwarmCapabilityDescriptors } from '../workflows/swarm/descriptors.js';
+import { createBoostCapabilityContribution } from '../workflows/boost/resolver.js';
+import { TEAMWORK_CAPABILITY_CONTRIBUTION } from '../workflows/teamwork/ports.js';
+import { DYNAMIC_WORKFLOW_DESCRIPTOR_CONTRIBUTION } from '../workflows/dynamic/ports.js';
+import { AgySwarmObserver } from '../workflows/swarm/swarm-observer.js';
+import { BoostWorkflowObserver } from '../workflows/boost/observer.js';
+import { AgyTeamworkWorkflowObserver } from '../workflows/teamwork/observer.js';
+import { DynamicWorkflowObserver } from '../workflows/dynamic/observer.js';
+import type { NativeConnectionPort, NativeWorkflowResourceReaderPort } from './types.js';
 
 interface AttachedConnection {
   readonly binding: RuntimeBinding;
@@ -37,6 +45,13 @@ export function wireAgyNativeRuntime(
 ): () => void {
   const lifecycle = new AgyReactiveRuntimeController({ publisher: registry });
   const child = new ChildSessionRouter();
+  const swarm = new AgySwarmObserver({ gates: { swarmEnabled: true, boardFeedEnabled: false } });
+  const boost = new BoostWorkflowObserver();
+  const teamwork = new AgyTeamworkWorkflowObserver({ featureGates: { teamworkEnabled: true } });
+  const dynamic = new DynamicWorkflowObserver({ strictMode: true });
+  const workflowReaders = {
+    swarm, boost, teamwork: teamwork.createResourceReader(), dynamic,
+  };
   const catalog = new AgyNativeCommandCatalogService(undefined, (action) =>
     action.lane !== 'live_workflow' || (action.key === 'cancel' && registry.getFeatureFlags().nativeLifecycle));
   const tools = new HarnessCommandTools(() => undefined, binaryOverrides, adapters);
@@ -45,6 +60,11 @@ export function wireAgyNativeRuntime(
   function getConnection(binding: RuntimeBinding): AttachedConnection | undefined {
     const scope = connections.get(binding.sessionId);
     return scope && sameBinding(scope.binding, binding) ? scope : undefined;
+  }
+
+  function hasCurrentBinding(binding: RuntimeBinding): boolean {
+    const active = registry.getActiveBinding(binding.sessionId, binding.instanceId);
+    return Boolean(active && sameBinding(active, binding));
   }
 
   function requireConnection(binding: RuntimeBinding): AttachedConnection {
@@ -81,12 +101,28 @@ export function wireAgyNativeRuntime(
     });
   }
 
+  let removeWorkflowDescriptors: (() => void) | undefined;
+
   function refresh(binding: RuntimeBinding, handle: AcpSessionHandle): void {
     const scope = getConnection(binding);
     if (!scope || scope.handle !== handle) return;
     const adapter = adapters.get(binding.instanceId);
     const profile = adapter instanceof AgyAdapter ? adapter.getProfile() : null;
     const signals = handle.getNativeSessionSignals();
+    if (registry.getFeatureFlags().nativeWorkflowObservation) {
+      if (!removeWorkflowDescriptors) {
+        const dispose = [
+          registerSwarmCapabilityDescriptors(catalog, swarm.getGates()),
+          catalog.registerWorkflowDescriptor(createBoostCapabilityContribution()),
+          catalog.registerWorkflowDescriptor(TEAMWORK_CAPABILITY_CONTRIBUTION),
+          catalog.registerWorkflowDescriptor(DYNAMIC_WORKFLOW_DESCRIPTOR_CONTRIBUTION),
+        ];
+        removeWorkflowDescriptors = () => dispose.forEach((unregister) => unregister());
+      }
+    } else if (removeWorkflowDescriptors) {
+      removeWorkflowDescriptors();
+      removeWorkflowDescriptors = undefined;
+    }
     updateCatalog(binding, {
       ...signals,
       effectivePermissionMode: signals.effectiveEnforcement === 'native'
@@ -101,17 +137,34 @@ export function wireAgyNativeRuntime(
     });
   }
 
+  const workflowBindings = new Map<string, RuntimeBinding>();
+
   const connection: NativeConnectionPort = {
     attach(binding, handle) {
       const rootNativeSessionId = handle.nativeSessionId;
       const connectionId = handle.getConnectionId();
       const stored = registry.persistence.getBinding(binding.runtimeId);
-      if (!rootNativeSessionId || !connectionId || !stored || !sameBinding(stored, binding)) return;
+      if (!rootNativeSessionId || !connectionId || !stored || !sameBinding(stored, binding) ||
+          !hasCurrentBinding(binding)) return;
       const scope = {
         binding, connectionId, rootNativeSessionId, handle,
         profileRef: stored.profileRef, sourceRef: stored.sourceRef,
       };
+      const previous = connections.get(binding.sessionId);
+      if (previous?.handle === handle && sameBinding(previous.binding, binding)) return;
+      if (previous) registry.handleTransportClosed(previous.binding, previous.connectionId, 'connection_replaced');
       connections.set(binding.sessionId, scope);
+      if (registry.getFeatureFlags().nativeWorkflowObservation) {
+        swarm.registerBinding(scope);
+        boost.registerBinding(scope);
+        const priorWorkflowBinding = workflowBindings.get(binding.sessionId);
+        if (priorWorkflowBinding && !sameBinding(priorWorkflowBinding, binding)) {
+          teamwork.handleGenerationChanged(priorWorkflowBinding, binding);
+        }
+        workflowBindings.set(binding.sessionId, binding);
+        teamwork.handleReconnect(binding, connectionId, previous ? 'resume' : 'fresh', rootNativeSessionId);
+        dynamic.registerRootSession(binding, rootNativeSessionId, connectionId);
+      }
       if (registry.getFeatureFlags().nativeLifecycle || registry.getFeatureFlags().nativePermissions) {
         const { rootAgentId } = child.registerBinding(scope);
         const root = child.getStateSnapshot(binding)?.agents.find((agent) => agent.id === rootAgentId);
@@ -127,19 +180,48 @@ export function wireAgyNativeRuntime(
     refresh,
     ingest(envelope) {
       const scope = getConnection(envelope.binding);
-      if (!scope || scope.connectionId !== envelope.connectionId || envelope.channel !== 'live') return false;
-      if (!registry.getFeatureFlags().nativeLifecycle) return false;
+      if (envelope.channel !== 'live') return false;
+      if ((scope && scope.connectionId !== envelope.connectionId) || !registry.isActiveBinding(envelope.binding)) return true;
+      if (!scope) return false;
+      const flags = registry.getFeatureFlags();
       const method = (envelope.wire as { method?: unknown } | null)?.method;
       if (method !== 'session/update') return false;
+      if (flags.nativeWorkflowObservation) {
+        const swarmResult = swarm.acceptFrame(envelope, scope);
+        swarm.commitToRegistry(registry, scope.binding, swarmResult.commits);
+        boost.commitToRegistry(registry, scope.binding, boost.acceptFrame(envelope).commits);
+        if (teamwork.acceptIngressFrame(envelope).accepted &&
+            teamwork.getWorkflowEntity(scope.binding)?.state.kind !== 'unknown') {
+          teamwork.commitToRegistry(registry, scope.binding);
+        }
+        dynamic.commitToRegistry(registry, scope.binding, dynamic.acceptFrame(envelope).commits);
+      }
+      if (!flags.nativeLifecycle) return false;
       const result = child.acceptFrame(envelope, scope);
       child.commitToRegistry(registry, scope.binding, result.commits);
       return result.accepted || result.buffered ||
         Boolean(envelope.originSession && envelope.originSession !== scope.rootNativeSessionId);
     },
     close(binding, connectionId) {
-      const scope = getConnection(binding);
-      if (!scope || scope.connectionId !== connectionId) return;
+      const scope = connections.get(binding.sessionId);
+      if (!scope) return true;
+      if (!sameBinding(scope.binding, binding) || scope.connectionId !== connectionId) return false;
       connections.delete(binding.sessionId);
+      const swarmClosed = swarm.handleTransportClosed(binding, connectionId);
+      const boostClosed = boost.handleTransportClosed(binding, connectionId);
+      const teamworkRevision = teamwork.getWorkflowEntity(binding)?.revision;
+      teamwork.handleTransportClosed(binding, connectionId);
+      const dynamicClosed = dynamic.handleTransportClosed(binding, connectionId);
+      if (!hasCurrentBinding(binding)) {
+        child.handleTransportClosed(binding, connectionId);
+        return true;
+      }
+      swarm.commitToRegistry(registry, binding, swarmClosed);
+      boost.commitToRegistry(registry, binding, boostClosed);
+      const teamworkClosed = teamwork.getWorkflowEntity(binding);
+      if (teamworkClosed && teamworkClosed.state.kind !== 'unknown' &&
+          teamworkClosed.revision !== teamworkRevision) teamwork.commitToRegistry(registry, binding);
+      for (const batch of dynamicClosed) dynamic.commitToRegistry(registry, binding, batch);
       const before = child.getStateSnapshot(binding);
       child.handleTransportClosed(binding, connectionId);
       const after = child.getStateSnapshot(binding);
@@ -163,6 +245,7 @@ export function wireAgyNativeRuntime(
         });
       }
       updateCatalog(binding, { hasLiveConnection: false, profileVerified: false, advertisedCommands: [] });
+      return true;
     },
   };
 
@@ -293,8 +376,23 @@ export function wireAgyNativeRuntime(
     },
   });
 
+  const workflowResourceReader: NativeWorkflowResourceReaderPort = {
+    readWorkflowResource(input) {
+      const projection = registry.getProjectionForSession(input.binding.sessionId, input.binding.instanceId);
+      const workflow = sameBinding(projection.binding, input.binding)
+        ? projection.workflows.find((item) => item.id === input.workflowId)
+        : undefined;
+      const kind = workflow?.detail.kind;
+      if (kind === 'swarm' || kind === 'boost' || kind === 'teamwork' || kind === 'dynamic') {
+        return workflowReaders[kind].readWorkflowResource(input);
+      }
+      return { revision: projection.asOfSeq, available: false, items: [], nextPageToken: null,
+        hasMore: false, sourceUnavailableReason: 'workflow_resource_not_available' };
+    },
+  };
+
   registry.registerModules({
-    connection, lifecycle, permissions, commandRouter,
+    connection, lifecycle, permissions, commandRouter, workflowResourceReader,
     timelineReader: { readTimeline: (input) => input.scopeKind === 'agent'
       ? child.readTimeline(input) : lifecycle.readTimeline(input) },
   });
@@ -302,6 +400,8 @@ export function wireAgyNativeRuntime(
   return () => {
     permissions.dispose();
     lifecycle.dispose();
+    removeWorkflowDescriptors?.();
     connections.clear();
+    workflowBindings.clear();
   };
 }

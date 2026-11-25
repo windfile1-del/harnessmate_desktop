@@ -40,6 +40,8 @@ export interface AgyNativeFeatureFlags {
   readonly nativePermissions: boolean;
   /** Enable NativeCommandRouterPort & /native/commands + /native/control writes. Default: false. */
   readonly nativeCommands: boolean;
+  /** Opt-in observation of workflow updates on the attached ACP session. */
+  readonly nativeWorkflowObservation: boolean;
   /** Enable transport observatory frame tapping. Default: false. */
   readonly observatoryTap: boolean;
   /** ACP v2 Preview protocol negotiation gate. MUST remain false until verified live support exists. */
@@ -51,6 +53,7 @@ export const DEFAULT_AGY_NATIVE_FEATURE_FLAGS: Readonly<AgyNativeFeatureFlags> =
   nativeLifecycle: false,
   nativePermissions: false,
   nativeCommands: false,
+  nativeWorkflowObservation: false,
   observatoryTap: false,
   acpV2Preview: false,
 });
@@ -392,7 +395,8 @@ export interface NativeConnectionPort {
   attach(binding: RuntimeBinding, handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle): void;
   refresh(binding: RuntimeBinding, handle: import('../../../acp/strict-acp-adapter.js').AcpSessionHandle): void;
   ingest(envelope: NativeIngress): boolean;
-  close(binding: RuntimeBinding, connectionId: string): void;
+  /** False for a retired connection while a replacement is attached. */
+  close(binding: RuntimeBinding, connectionId: string): boolean;
 }
 
 export interface NativeCommitMutation {

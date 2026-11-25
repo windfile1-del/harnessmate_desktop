@@ -119,7 +119,7 @@ interface BindingScopeState {
   readonly workflowIdByNativeId: Map<string, WorkflowId>;
   readonly workflowIdByToolCallId: Map<string, WorkflowId>;
   rootNativeSessionId?: string;
-  transportClosed: boolean;
+  connectionId: string | null;
 }
 
 export interface DynamicWorkflowObserverOptions {
@@ -325,7 +325,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
   }
 
   private scopeKey(binding: RuntimeBinding): string {
-    return `${binding.runtimeId}::${binding.generation}`;
+    return JSON.stringify([binding.runtimeId, binding.sessionId, binding.instanceId, binding.generation]);
   }
 
   private getOrCreateScope(binding: RuntimeBinding): BindingScopeState {
@@ -338,16 +338,44 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
         workflowsById: new Map<WorkflowId, InternalWorkflowState>(),
         workflowIdByNativeId: new Map<string, WorkflowId>(),
         workflowIdByToolCallId: new Map<string, WorkflowId>(),
-        transportClosed: false,
+        connectionId: null,
       };
       this.scopesByKey.set(key, scope);
     }
     return scope;
   }
 
-  registerRootSession(binding: RuntimeBinding, rootNativeSessionId: string): void {
+  registerRootSession(binding: RuntimeBinding, rootNativeSessionId: string, connectionId: string): void {
+    if (!connectionId || !rootNativeSessionId) return;
+    for (const prior of this.scopesByKey.values()) {
+      if (prior.binding.runtimeId === binding.runtimeId && prior.connectionId &&
+          (this.scopeKey(prior.binding) !== this.scopeKey(binding) || prior.connectionId !== connectionId)) {
+        this.handleTransportClosed(prior.binding, prior.connectionId, 'binding_replaced');
+      }
+    }
     const scope = this.getOrCreateScope(binding);
+    if (scope.connectionId === connectionId) return;
     scope.rootNativeSessionId = rootNativeSessionId;
+    scope.connectionId = connectionId;
+    scope.workflowIdByToolCallId.clear();
+    scope.seenIngressKeys.clear();
+  }
+
+  private getLiveScope(binding: RuntimeBinding, connectionId: string): BindingScopeState | undefined {
+    const scope = this.scopesByKey.get(this.scopeKey(binding));
+    return scope?.connectionId && scope.connectionId === connectionId ? scope : undefined;
+  }
+
+  private getConfirmedRequestWorkflow(
+    scope: BindingScopeState,
+    toolCallId?: string,
+    workflowNativeId?: string,
+  ): InternalWorkflowState | undefined {
+    const workflowId = toolCallId && scope.workflowIdByToolCallId.get(toolCallId);
+    if (!workflowId || (workflowNativeId && scope.workflowIdByNativeId.get(workflowNativeId) !== workflowId)) {
+      return undefined;
+    }
+    return scope.workflowsById.get(workflowId);
   }
 
   /**
@@ -384,90 +412,42 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
     context?: {
       readonly originActivityId?: ActivityId;
       readonly turnId?: string | null;
-      readonly rootNativeSessionId?: string;
       readonly nowMs?: number;
     },
   ): DynamicWorkflowIngestResult {
-    if (!this.enabled) {
-      return {
-        accepted: false,
-        deduplicated: false,
-        ignoredDisabled: true,
-        workflowIds: [],
-        workIds: [],
-        commits: {
-          workflows: [],
-          work: [],
-          aliases: [],
-          eventDrafts: [],
-          mutationKeyBase: `dynwf_disabled_${envelope.ingressOrdinal}`,
-        },
-      };
-    }
-
-    const scope = this.getOrCreateScope(envelope.binding);
-    if (context?.rootNativeSessionId) {
-      scope.rootNativeSessionId = context.rootNativeSessionId;
+    const ignored = (reason: string, deduplicated = false): DynamicWorkflowIngestResult => ({
+      accepted: false,
+      deduplicated,
+      ignoredDisabled: !this.enabled,
+      workflowIds: [],
+      workIds: [],
+      commits: {
+        workflows: [], work: [], aliases: [], eventDrafts: [],
+        mutationKeyBase: `dynwf_${reason}_${envelope.ingressOrdinal}`,
+      },
+    });
+    if (!this.enabled || envelope.channel !== 'live') return ignored('isolated');
+    const scope = this.getLiveScope(envelope.binding, envelope.connectionId);
+    const wire = envelope.wire as { params?: { sessionId?: unknown } } | null;
+    if (!scope || wire?.params?.sessionId !== scope.rootNativeSessionId ||
+        (envelope.originSession && envelope.originSession !== scope.rootNativeSessionId)) {
+      return ignored('scope_mismatch');
     }
 
     const dedupKey = `${envelope.connectionId}::${envelope.ingressOrdinal}`;
-    if (scope.seenIngressKeys.has(dedupKey)) {
-      return {
-        accepted: false,
-        deduplicated: true,
-        ignoredDisabled: false,
-        workflowIds: [],
-        workIds: [],
-        commits: {
-          workflows: [],
-          work: [],
-          aliases: [],
-          eventDrafts: [],
-          mutationKeyBase: `dynwf_dedup_${envelope.ingressOrdinal}`,
-        },
-      };
-    }
+    if (scope.seenIngressKeys.has(dedupKey)) return ignored('dedup', true);
 
     const decoded = decodeDynamicWorkflowIngress(envelope, { strictMode: this.strictMode });
-    if (decoded.kind === 'not_dynamic_workflow') {
-      return {
-        accepted: false,
-        deduplicated: false,
-        ignoredDisabled: false,
-        workflowIds: [],
-        workIds: [],
-        commits: {
-          workflows: [],
-          work: [],
-          aliases: [],
-          eventDrafts: [],
-          mutationKeyBase: `dynwf_skip_${envelope.ingressOrdinal}`,
-        },
-      };
-    }
+    if (decoded.kind === 'not_dynamic_workflow') return ignored('skip');
 
     scope.seenIngressKeys.add(dedupKey);
     const nowMs = context?.nowMs ?? this.now();
     const evidence = makeEvidenceFromEnvelope(envelope, nowMs);
     const pubEvidence = toPublicEvidenceDto(evidence, nowMs);
-    const isHistoryReplay = envelope.channel === 'history_replay';
 
     if (decoded.kind === 'dynamic_workflow_request') {
-      const wfNativeId =
-        decoded.workflowNativeId ??
-        decoded.toolCallId ??
-        `req_${String(decoded.wireRequestId)}`;
-      const wf = this.ensureWorkflowRecord({
-        scope,
-        workflowNativeId: wfNativeId,
-        toolCallId: decoded.toolCallId,
-        title: decoded.summary,
-        originActivityId: context?.originActivityId,
-        turnId: context?.turnId ?? null,
-        nowMs,
-        evidence,
-        isHistoryReplay,
-      });
+      const wf = this.getConfirmedRequestWorkflow(scope, decoded.toolCallId, decoded.workflowNativeId);
+      if (!wf) return ignored('unconfirmed_request_workflow');
 
       if (decoded.scriptText) {
         this.attachApprovedScript(wf, decoded.scriptText, evidence, nowMs);
@@ -478,16 +458,10 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
       if (decoded.isScriptApproval && wf.scriptApprovalState === 'unknown') {
         wf.scriptApprovalState = 'pending';
       }
-      if (!isHistoryReplay) {
-        wf.lifecyclePhase = decoded.isScriptApproval
-          ? 'awaiting_script_approval'
-          : 'awaiting_step_action';
-        wf.state = {
-          kind: 'known',
-          value: 'requires_action',
-          evidence,
-        };
-      }
+      wf.lifecyclePhase = decoded.isScriptApproval
+        ? 'awaiting_script_approval'
+        : 'awaiting_step_action';
+      wf.state = { kind: 'known', value: 'requires_action', evidence };
       wf.revision += 1;
       wf.updatedAt = nowMs;
       this.appendTimelineEntry(wf, {
@@ -525,6 +499,10 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
     }
 
     // `dynamic_tool_patch`
+    const byTool = scope.workflowIdByToolCallId.get(decoded.toolCallId);
+    const byNativeId = scope.workflowIdByNativeId.get(decoded.workflowNativeId);
+    if (byTool && byNativeId && byTool !== byNativeId) return ignored('workflow_scope_conflict');
+
     const wf = this.ensureWorkflowRecord({
       scope,
       workflowNativeId: decoded.workflowNativeId,
@@ -535,7 +513,6 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
       turnId: context?.turnId ?? null,
       nowMs,
       evidence,
-      isHistoryReplay,
     });
 
     const isNewWorkflow = wf.revision === 0;
@@ -678,6 +655,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
    */
   onWorkflowRequestObserved(input: {
     readonly binding: RuntimeBinding;
+    readonly connectionId: string;
     readonly workflowId: WorkflowId;
     readonly approvalId: string;
     readonly isScriptApproval: boolean;
@@ -686,7 +664,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
     readonly nowMs?: number;
   }): void {
     if (!this.enabled) return;
-    const scope = this.scopesByKey.get(this.scopeKey(input.binding));
+    const scope = this.getLiveScope(input.binding, input.connectionId);
     const wf = scope?.workflowsById.get(input.workflowId);
     if (!wf) return;
 
@@ -716,6 +694,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
    */
   onWorkflowRequestResolved(input: {
     readonly binding: RuntimeBinding;
+    readonly connectionId: string;
     readonly workflowId: WorkflowId;
     readonly approvalId: string;
     readonly receiptState: NativeRequestReceiptState;
@@ -724,13 +703,14 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
     readonly nowMs?: number;
   }): NativeWorkflow | null {
     if (!this.enabled) return null;
-    const scope = this.scopesByKey.get(this.scopeKey(input.binding));
+    const scope = this.getLiveScope(input.binding, input.connectionId);
     const wf = scope?.workflowsById.get(input.workflowId);
     if (!wf) return null;
 
     const nowMs = input.nowMs ?? this.now();
     const existing = wf.requestsByApprovalId.get(input.approvalId);
-    const isScriptApproval = existing?.isScriptApproval || wf.scriptApprovalId === input.approvalId;
+    if (!existing || (existing.receiptState !== 'pending' && existing.receiptState !== 'claimed')) return null;
+    const isScriptApproval = existing.isScriptApproval;
     const isRejected =
       input.isRejectedDecision === true ||
       input.receiptState === 'cancelled' ||
@@ -738,18 +718,8 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
       (input.selectedOptionId !== undefined &&
         /^(reject|deny|decline)/i.test(input.selectedOptionId));
 
-    if (existing) {
-      existing.receiptState = input.receiptState;
-      existing.updatedAt = nowMs;
-    } else {
-      wf.requestsByApprovalId.set(input.approvalId, {
-        approvalId: input.approvalId,
-        isScriptApproval,
-        isInteractionQuestion: false,
-        receiptState: input.receiptState,
-        updatedAt: nowMs,
-      });
-    }
+    existing.receiptState = input.receiptState;
+    existing.updatedAt = nowMs;
 
     const hostEvidence: Evidence = {
       kind: 'host_observation',
@@ -833,30 +803,14 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
   resolveRequestTarget(
     input: NativeRequestTargetResolverInput,
   ): NativeRequestTargetResolution | null {
-    const scope = this.scopesByKey.get(this.scopeKey(input.binding));
-    if (!scope) return null;
-
-    let wf: InternalWorkflowState | undefined;
-    if (input.workflowIdHint) {
-      const mappedId = scope.workflowIdByNativeId.get(input.workflowIdHint);
-      if (mappedId) {
-        wf = scope.workflowsById.get(mappedId);
-      } else {
-        wf = scope.workflowsById.get(input.workflowIdHint as WorkflowId);
-      }
-    }
-    if (!wf && input.toolCallId) {
-      const mappedId = scope.workflowIdByToolCallId.get(input.toolCallId);
-      if (mappedId) wf = scope.workflowsById.get(mappedId);
-    }
+    if (!this.enabled) return null;
+    const scope = this.getLiveScope(input.binding, input.connectionId);
+    if (!scope || input.actualNativeSessionId !== scope.rootNativeSessionId ||
+        (input.rootNativeSessionId && input.rootNativeSessionId !== scope.rootNativeSessionId)) return null;
+    const wf = this.getConfirmedRequestWorkflow(scope, input.toolCallId, input.workflowIdHint);
     if (!wf) return null;
 
-    const rootSession = input.rootNativeSessionId ?? scope.rootNativeSessionId ?? null;
-    const forwardedToParentSession =
-      Boolean(rootSession && input.actualNativeSessionId === rootSession) &&
-      (Boolean(input.childSessionHint) ||
-        Boolean(input.toolCallId?.startsWith('interaction_')) ||
-        Boolean(input.workflowIdHint));
+    const forwardedToParentSession = Boolean(input.childSessionHint);
 
     return {
       scope: 'confirmed_workflow',
@@ -880,7 +834,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
   listRetentionReasons(binding: RuntimeBinding): string[] {
     if (!this.enabled) return [];
     const scope = this.scopesByKey.get(this.scopeKey(binding));
-    if (!scope || scope.transportClosed) return [];
+    if (!scope?.connectionId) return [];
 
     const reasons: string[] = [];
     for (const wf of scope.workflowsById.values()) {
@@ -912,12 +866,12 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
 
   handleTransportClosed(
     binding: RuntimeBinding,
-    _connectionId: string,
+    connectionId: string,
     reason = 'transport_closed',
-  ): NativeWorkflow[] {
-    const scope = this.scopesByKey.get(this.scopeKey(binding));
+  ): DynamicWorkflowCommitBatch[] {
+    const scope = this.getLiveScope(binding, connectionId);
     if (!scope) return [];
-    scope.transportClosed = true;
+    scope.connectionId = null;
 
     const nowMs = this.now();
     const hostEvidence: Evidence = {
@@ -925,12 +879,19 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
       observedAt: nowMs,
       reasonCode: reason,
     };
-    const updated: NativeWorkflow[] = [];
+    const updated: DynamicWorkflowCommitBatch[] = [];
 
     for (const wf of scope.workflowsById.values()) {
+      for (const req of wf.requestsByApprovalId.values()) {
+        if (req.receiptState === 'pending' || req.receiptState === 'claimed') {
+          req.receiptState = req.receiptState === 'pending' ? 'connection_lost' : 'delivery_unknown';
+          req.updatedAt = nowMs;
+        }
+      }
       const currentState = wf.state.kind === 'known' ? wf.state.value : undefined;
-      if (currentState && isTerminalWorkState(currentState)) continue;
+      if (wf.state.kind === 'stale' || (currentState && isTerminalWorkState(currentState))) continue;
 
+      const changedWork: NativeWork[] = [];
       wf.state = {
         kind: 'stale',
         ...(currentState ? { last: currentState } : {}),
@@ -953,7 +914,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
       for (const [stepId, work] of wf.workByStepId.entries()) {
         const wVal = work.state.kind === 'known' ? work.state.value : undefined;
         if (wVal && isTerminalWorkState(wVal)) continue;
-        wf.workByStepId.set(stepId, {
+        const staleWork: NativeWork = {
           ...work,
           state: {
             kind: 'stale',
@@ -962,18 +923,16 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
             reasonCode: reason,
           },
           revision: work.revision + 1,
-        });
-      }
-      for (const req of wf.requestsByApprovalId.values()) {
-        if (req.receiptState === 'pending') {
-          req.receiptState = 'connection_lost';
-          req.updatedAt = nowMs;
-        }
+        };
+        changedWork.push(staleWork);
+        wf.workByStepId.set(stepId, staleWork);
       }
       wf.lifecyclePhase = 'stale';
       wf.revision += 1;
       wf.updatedAt = nowMs;
-      updated.push(this.buildNativeWorkflowEntity(wf));
+      updated.push(this.buildCommitBatch(
+        wf, changedWork, [], `dynamic_closed:${connectionId}:${wf.workflowId}`,
+      ));
     }
 
     return updated;
@@ -981,17 +940,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
 
   handleGenerationChanged(prevBinding: RuntimeBinding, _nextBinding: RuntimeBinding): void {
     const scope = this.scopesByKey.get(this.scopeKey(prevBinding));
-    if (!scope) return;
-    scope.transportClosed = true;
-    const nowMs = this.now();
-    for (const wf of scope.workflowsById.values()) {
-      for (const req of wf.requestsByApprovalId.values()) {
-        if (req.receiptState === 'pending') {
-          req.receiptState = 'connection_lost';
-          req.updatedAt = nowMs;
-        }
-      }
-    }
+    if (scope?.connectionId) this.handleTransportClosed(prevBinding, scope.connectionId, 'generation_changed');
   }
 
   /**
@@ -1240,7 +1189,6 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
     readonly turnId: string | null;
     readonly nowMs: number;
     readonly evidence: Evidence;
-    readonly isHistoryReplay: boolean;
   }): InternalWorkflowState {
     const { scope } = params;
     let workflowId =
@@ -1249,8 +1197,8 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
 
     if (!workflowId) {
       workflowId = asWorkflowId(toSafeOpaqueId('wf_dyn', params.workflowNativeId));
-      scope.workflowIdByNativeId.set(params.workflowNativeId, workflowId);
     }
+    scope.workflowIdByNativeId.set(params.workflowNativeId, workflowId);
     if (params.toolCallId) {
       scope.workflowIdByToolCallId.set(params.toolCallId, workflowId);
     }
@@ -1291,7 +1239,7 @@ export class DynamicWorkflowObserver implements NativeWorkflowResourceReaderPort
         confirmedChildAgentsByStep: new Map(),
         revision: 0,
         updatedAt: params.nowMs,
-        isHistoricalReplay: params.isHistoryReplay,
+        isHistoricalReplay: false,
       };
       scope.workflowsById.set(workflowId, wf);
     } else if (params.toolCallId) {

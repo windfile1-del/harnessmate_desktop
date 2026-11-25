@@ -43,14 +43,16 @@ export function replayDynamicWorkflowNdjson(
   observer: DynamicWorkflowObserver,
   binding: RuntimeBinding,
   entries: readonly DynamicWorkflowNdjsonEntry[],
-  opts?: {
-    readonly rootNativeSessionId?: string;
+  opts: {
+    readonly rootNativeSessionId: string;
+    readonly connectionId: string;
     readonly defaultActivityId?: ActivityId;
   },
 ): DynamicWorkflowReplayReport {
   let scenarioMeta: DynamicWorkflowNdjsonEntry | null = null;
   const results: DynamicWorkflowIngestResult[] = [];
   let seq = 0;
+  observer.registerRootSession(binding, opts.rootNativeSessionId, opts.connectionId);
 
   for (const entry of entries) {
     if (entry.kind === 'scenario_meta') {
@@ -63,7 +65,7 @@ export function replayDynamicWorkflowNdjson(
     seq += 1;
     const envelope: NativeIngress = {
       binding,
-      connectionId: entry.connectionId ?? 'conn_replay_np11',
+      connectionId: entry.connectionId ?? opts.connectionId,
       ingressOrdinal: entry.ingressOrdinal ?? seq,
       channel: entry.channel ?? 'live',
       ...(entry.originSession ? { originSession: entry.originSession } : {}),
@@ -72,9 +74,8 @@ export function replayDynamicWorkflowNdjson(
     const res = observer.acceptFrame(envelope, {
       originActivityId: entry.originActivityId
         ? asActivityId(entry.originActivityId)
-        : opts?.defaultActivityId,
+        : opts.defaultActivityId,
       turnId: entry.turnId ?? null,
-      rootNativeSessionId: opts?.rootNativeSessionId,
       nowMs: entry.nowMs,
     });
     results.push(res);

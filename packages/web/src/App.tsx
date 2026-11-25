@@ -3,6 +3,10 @@ import { X } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
 import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
 import { registerSubagentManagerView } from './components/agy/native/child/register';
+import { registerSwarmStudioView } from './components/agy/native/swarm/register';
+import { registerBoostStudioView } from './components/agy/native/boost/register';
+import { registerTeamworkStudioView } from './components/agy/native/teamwork/register';
+import { registerDynamicWorkflowStudioView } from './components/agy/native/workflow';
 import { ChatStage } from './components/ChatStage';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
@@ -81,12 +85,15 @@ export function App() {
 
   useEffect(() => {
     if (!agyNativeWorkbenchEnabled) return;
-    const unregisterRuntime = registerAgyNativeRuntimeView();
-    const unregisterSubagents = registerSubagentManagerView();
-    return () => {
-      unregisterSubagents();
-      unregisterRuntime();
-    };
+    const unregister = [
+      registerAgyNativeRuntimeView(),
+      registerSubagentManagerView(),
+      registerSwarmStudioView(),
+      registerBoostStudioView(),
+      registerTeamworkStudioView(),
+      registerDynamicWorkflowStudioView(),
+    ];
+    return () => unregister.reverse().forEach((dispose) => dispose());
   }, [agyNativeWorkbenchEnabled]);
 
   useEffect(() => {

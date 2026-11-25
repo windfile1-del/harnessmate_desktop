@@ -237,6 +237,12 @@ export class AgyNativeRuntimeRegistry {
     return updated;
   }
 
+  isActiveBinding(binding: RuntimeBinding): boolean {
+    const active = this.activeBindingsBySession.get(binding.sessionId);
+    return active?.runtimeId === binding.runtimeId &&
+      active.instanceId === binding.instanceId && active.generation === binding.generation;
+  }
+
   /**
    * Authoritatively reads the latest binding for a session from SQLite and refreshes cache so
    * cache and DB never drift across generation advances or restarts.
@@ -511,7 +517,7 @@ export class AgyNativeRuntimeRegistry {
   ): void {
     if (!binding) return;
     try {
-      this.connectionPort?.close(binding, connectionId);
+      if (this.connectionPort?.close(binding, connectionId) === false) return;
     } catch {
       // Continue disconnect cleanup even if a projection observer fails.
     }

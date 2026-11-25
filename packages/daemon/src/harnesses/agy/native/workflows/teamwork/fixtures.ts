@@ -46,6 +46,8 @@ export interface TeamworkReplayScenario {
   readonly provenanceOrigin: string;
   readonly description: string;
   readonly binding: RuntimeBinding;
+  readonly connectionId: string;
+  readonly rootNativeSessionId: string;
   readonly workspaceContext: TeamworkWorkspaceContext;
   readonly steps: readonly TeamworkReplayStep[];
 }
@@ -80,6 +82,8 @@ export function createT12RejectedScenario(): TeamworkReplayScenario {
     description:
       'Synthetic T12 replay: scoping question idempotency + Prompt Artifact formal rejection guarantees zero project/role/milestone creation.',
     binding,
+    connectionId: connId,
+    rootNativeSessionId: 'native-sess-t12-rej',
     workspaceContext: {
       hmWorkspaceId: 'ws_hm_repo_1',
       hmWorkspaceLabel: 'harnessmate_desktop',
@@ -266,6 +270,8 @@ export function createT12ApprovedMilestone1Scenario(): TeamworkReplayScenario {
     description:
       'Synthetic T12 replay: formal Prompt Artifact approval unlocks native project scope, confirmed Sentinel/Orchestrator/Auditor roles, Milestone 1, and Audit gate.',
     binding,
+    connectionId: connId,
+    rootNativeSessionId: 'native-sess-t12-app',
     workspaceContext: {
       hmWorkspaceId: 'ws_hm_repo_1',
       hmWorkspaceLabel: 'harnessmate_desktop',
@@ -621,6 +627,8 @@ export function replayTeamworkScenario(
   scenario: TeamworkReplayScenario,
 ): RuntimeBinding {
   let activeBinding = scenario.binding;
+  let connectionId = scenario.connectionId;
+  observer.handleReconnect(activeBinding, connectionId, 'fresh', scenario.rootNativeSessionId);
   observer.setWorkspaceContext(activeBinding, scenario.workspaceContext);
 
   for (const step of scenario.steps) {
@@ -634,6 +642,7 @@ export function replayTeamworkScenario(
         if (step.receipt) {
           observer.acceptRequestReceipt({
             binding: activeBinding,
+            connectionId,
             ...step.receipt,
           });
         }
@@ -668,10 +677,9 @@ export function replayTeamworkScenario(
         }
         break;
       case 'reconnect':
+        connectionId = step.connectionId ?? 'conn_reconnected';
         observer.handleReconnect(
-          activeBinding,
-          step.connectionId ?? 'conn_reconnected',
-          step.reconnectMode ?? 'resume',
+          activeBinding, connectionId, step.reconnectMode ?? 'resume', scenario.rootNativeSessionId,
         );
         break;
     }

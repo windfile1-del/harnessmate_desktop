@@ -552,9 +552,19 @@ describe('NP-09 BoostWorkflowObserver T11 lifecycle, phases, unknown labels, dup
       originActivityId: pack.originActivityId,
       workflowId: pack.workflowId,
       objective: 'Test server denial',
+      launchRpcId: 9001,
     });
 
-    const denied = observer.acceptFrame(pack.frames.serverDenied, {
+    const denialFrame = pack.frames.serverDenied;
+    for (const id of [9002, '9001']) {
+      const wire = { ...(denialFrame.wire as object), id };
+      expect(observer.acceptFrame({ ...denialFrame, wire }).accepted).toBe(false);
+    }
+    expect(observer.getServerDenial(pack.binding)).toBeNull();
+    expect(observer.getWorkflowState(pack.binding, pack.workflowId)?.workflow.state)
+      .toMatchObject({ kind: 'known', value: 'running' });
+
+    const denied = observer.acceptFrame(denialFrame, {
       observedAt: 1_700_000_030_000,
     });
     expect(denied.accepted).toBe(true);
@@ -664,5 +674,21 @@ describe('NP-09 BoostWorkflowObserver T11 lifecycle, phases, unknown labels, dup
     expect(snap2.workflow?.state.kind).toBe('stale');
     expect(snap2.stop.state).toBe('unknown');
     expect(snap2.stop.reasonCode).toBe('stop_confirmation_lost_on_disconnect');
+    const retiredCancel = {
+      ...pack.frames.nativeCancelConfirmed,
+      binding: binding2, connectionId: 'conn_np09_2', originSession: 'agy_sess_boost_002',
+      wire: {
+        method: 'session/update', params: { sessionId: 'agy_sess_boost_002',
+          update: { sessionUpdate: 'boost_cancel_confirmed', status: 'cancelled' },
+        },
+      },
+    };
+    expect(observer.acceptFrame(retiredCancel).accepted).toBe(false);
+    observer.registerBinding({ binding: binding2, connectionId: 'conn_np09_3',
+      rootNativeSessionId: 'agy_sess_boost_002' });
+    expect(observer.acceptFrame(retiredCancel).accepted).toBe(false);
+    expect(observer.handleTransportClosed(binding2, 'conn_np09_2')).toEqual([]);
+    expect(observer.getWorkflowState(binding2, snap2.workflow!.id)?.workflow.state.kind).toBe('stale');
+
   });
 });

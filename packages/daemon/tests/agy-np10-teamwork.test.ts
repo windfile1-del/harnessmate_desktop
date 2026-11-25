@@ -88,6 +88,21 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
       now: () => ++clock,
     });
     const binding = createTeamworkTestBinding('cmd_disc');
+    observer.handleReconnect(binding, 'conn_1', 'fresh', 'nat_tw_cmd');
+    const launchInput = {
+      binding, rawCommand: '/teamwork scope', goalText: 'scope', connectionId: 'conn_1',
+    };
+    expect(observer.recordLaunchAttempt(launchInput).accepted).toBe(false);
+    const advertisement = {
+      binding, connectionId: 'conn_1', ingressOrdinal: 1,
+      wire: { method: 'session/update', params: {
+        sessionId: 'nat_tw_cmd', update: {
+          sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'teamwork' }],
+        },
+      } },
+    };
+    expect(observer.acceptIngressFrame({ ...advertisement, channel: 'history_replay' }).accepted).toBe(false);
+    expect(observer.recordLaunchAttempt(launchInput).accepted).toBe(false);
 
     // Legacy /teamwork-preview advertised alone must NOT be treated as verified /teamwork
     const legacyState = observer.recordCommandCatalogObservation(binding, ['plan', 'teamwork-preview'], {
@@ -168,6 +183,7 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
     // Duplicate late pending receipt must NOT regress response_written back to pending
     const lateDup = observer.acceptRequestReceipt({
       binding,
+      connectionId: scenario.connectionId,
       stage: 'scoping',
       dedupKey: 'tw-scope-target-platform',
       request: {
@@ -217,6 +233,7 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
     });
     const binding = createTeamworkTestBinding('anti_forgery');
     const connId = 'conn_forge_1';
+    observer.handleReconnect(binding, connId, 'fresh', 'native-sess-forge');
 
     observer.acceptIngressFrame({
       binding,
@@ -522,6 +539,10 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
     expect(staleProj.workflowState.kind).toBe('stale');
     expect(staleProj.milestones![0]!.stage.state.kind).toBe('stale');
 
+    const advertised = scenario.steps.find((step) => step.envelope)!.envelope!;
+    expect(observer.acceptIngressFrame(advertised).accepted).toBe(false);
+    expect(observer.getPublicProjection(gen1)?.commandDiscovery).toBe('not_observed');
+
     // Advance generation
     const gen2 = { ...gen1, generation: asBindingGeneration('gen_2') };
     observer.handleGenerationChanged(gen1, gen2);
@@ -550,7 +571,7 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
     expect(fenced.reasonCode).toBe('stale_generation_or_connection');
 
     // Reconnect enters reconciling without replaying approvals
-    observer.handleReconnect(gen2, 'conn_t12_app_2', 'resume');
+    observer.handleReconnect(gen2, 'conn_t12_app_2', 'resume', scenario.rootNativeSessionId);
     expect(observer.getPublicProjection(gen2)!.phase).toBe('reconciling');
 
     // history_replay approval decision MUST be blocked
@@ -642,6 +663,7 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
       now: () => ++clock,
     });
     const binding = createTeamworkTestBinding('np14_gate');
+    observer.handleReconnect(binding, 'conn_np14', 'fresh', 'native-sess-np14');
 
     observer.acceptIngressFrame({
       binding,
@@ -656,12 +678,30 @@ describe('NP-10 Teamwork Observer, T12 Replay & Safety Boundaries', () => {
             sessionUpdate: 'teamwork_update',
             event: 'prompt_artifact',
             artifactId: 'art_np14_prompt',
+            approvalRequestId: 'appr_np14_prompt',
             title: 'Prompt',
             requiresApproval: true,
           },
         },
       },
     });
+
+    const writtenReceipt = {
+      binding, connectionId: 'conn_np14', stage: 'prompt_artifact_approval' as const,
+      artifactId: 'art_np14_prompt', decisionHint: 'approve' as const,
+      request: {
+        approvalId: 'appr_np14_prompt', runtimeId: binding.runtimeId, generation: binding.generation,
+        targetLineage: 'confirmed' as const, kind: 'permission' as const,
+        allowedOptionIds: ['allow_once'], receiptId: 'receipt-test',
+        receiptState: 'response_written' as const, updatedAt: clock,
+      },
+    };
+    expect(observer.acceptRequestReceipt({ ...writtenReceipt, connectionId: 'retired' }).applied).toBe(false);
+    expect(observer.acceptRequestReceipt({ ...writtenReceipt, artifactId: 'another-artifact' }).applied).toBe(false);
+    expect(observer.acceptRequestReceipt({ ...writtenReceipt,
+      request: { ...writtenReceipt.request, approvalId: 'another-request' },
+    }).applied).toBe(false);
+    expect(observer.getPublicProjection(binding)?.approvalGate).toBe('upstream_limited_manual_app');
 
     // With reviewControlEnabled: false, native submit is blocked even though NP-14 port supports it
     const blockedSubmit = await observer.submitNativePromptArtifactDecision({

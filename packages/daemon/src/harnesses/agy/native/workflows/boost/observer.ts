@@ -81,8 +81,8 @@ export interface BoostIngestionResult {
 
 interface MutableBoostSession {
   readonly binding: RuntimeBinding;
-  readonly connectionId: string;
-  readonly rootNativeSessionId: string;
+  connectionId: string | null;
+  rootNativeSessionId: string;
   activeWorkflowId: WorkflowId | null;
   readonly workflows: Map<WorkflowId, MutableBoostWorkflow>;
   readonly seenDedupeKeys: Set<string>;
@@ -98,6 +98,8 @@ interface MutableBoostWorkflow {
   state: Observed<WorkState>;
   launchConfirmed: boolean;
   launchEvidence: Evidence;
+  launchRpcId?: number | string;
+  nativeWorkflowId?: string;
   stagesById: Map<string, BoostStageRecord>;
   stageOrder: string[];
   rolesByKey: Map<string, BoostRoleObservation>;
@@ -112,7 +114,7 @@ interface MutableBoostWorkflow {
 }
 
 function bindingSlotKey(binding: RuntimeBinding): string {
-  return `${binding.runtimeId}::${binding.generation}`;
+  return JSON.stringify([binding.runtimeId, binding.sessionId, binding.instanceId, binding.generation]);
 }
 
 function sameBinding(a: RuntimeBinding, b: RuntimeBinding): boolean {
@@ -257,9 +259,26 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
     readonly connectionId: string;
     readonly rootNativeSessionId: string;
   }): void {
+    if (!config.connectionId || !config.rootNativeSessionId) return;
+    for (const prior of this.sessions.values()) {
+      if (prior.binding.runtimeId === config.binding.runtimeId && prior.connectionId &&
+          !sameBinding(prior.binding, config.binding)) {
+        this.handleTransportClosed(prior.binding, prior.connectionId);
+      }
+    }
     const key = bindingSlotKey(config.binding);
     const existing = this.sessions.get(key);
-    if (existing && existing.connectionId === config.connectionId) {
+    if (existing) {
+      if (!sameBinding(existing.binding, config.binding)) return;
+      if (existing.connectionId === config.connectionId) return;
+      if (existing.connectionId) this.handleTransportClosed(existing.binding, existing.connectionId);
+      existing.connectionId = config.connectionId;
+      existing.rootNativeSessionId = config.rootNativeSessionId;
+      existing.activeWorkflowId = null;
+      existing.lastServerDenial = null;
+      existing.confirmedAgents.clear();
+      existing.seenDedupeKeys.clear();
+      existing.seenDedupeQueue.length = 0;
       return;
     }
     this.sessions.set(key, {
@@ -281,7 +300,7 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
    */
   syncConfirmedAgent(binding: RuntimeBinding, agent: AgentIdentity): void {
     const session = this.sessions.get(bindingSlotKey(binding));
-    if (!session) return;
+    if (!session?.connectionId || !sameBinding(session.binding, binding)) return;
     if (agent.lineage === 'confirmed') {
       session.confirmedAgents.set(agent.id, agent);
     } else {
@@ -299,15 +318,17 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
     readonly originActivityId: ActivityId;
     readonly objective?: string;
     readonly workflowId?: WorkflowId;
+    readonly launchRpcId?: number | string;
+    readonly nativeWorkflowId?: string;
     readonly ingressOrdinal?: number;
     readonly observedAt?: number;
     readonly wireVariant?: string;
   }): BoostIngestionResult {
     const session = this.sessions.get(bindingSlotKey(input.binding));
-    if (!session) {
+    if (!session || !sameBinding(session.binding, input.binding)) {
       return { accepted: false, deduplicated: false, commits: [] };
     }
-    if (session.connectionId !== input.connectionId) {
+    if (!session.connectionId || session.connectionId !== input.connectionId) {
       const diag = this.pushDiagnostic({
         code: 'wrong_connection_rejected',
         observedAt: input.observedAt ?? Date.now(),
@@ -351,6 +372,8 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
       state: { kind: 'known', value: 'running', evidence },
       launchConfirmed: true,
       launchEvidence: evidence,
+      launchRpcId: input.launchRpcId,
+      nativeWorkflowId: input.nativeWorkflowId,
       stagesById: new Map(),
       stageOrder: [],
       rolesByKey: new Map(),
@@ -418,7 +441,7 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
       return { accepted: false, deduplicated: false, commits: [], diagnostic: diag };
     }
 
-    if (session.connectionId !== envelope.connectionId) {
+    if (!session.connectionId || session.connectionId !== envelope.connectionId) {
       const diag = this.pushDiagnostic({
         code: 'wrong_connection_rejected',
         observedAt,
@@ -453,37 +476,37 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
       observedAt,
     };
 
-    // 1. Check for server denial (error response or explicit denied update)
-    const denial = detectBoostServerDenial(wire, evidence, observedAt);
-    if (denial) {
-      return this.recordServerDenial({
-        binding: envelope.binding,
-        connectionId: envelope.connectionId,
-        denial,
-        dedupeToken: `ordinal:${envelope.ingressOrdinal}:denial:${denial.code}`,
-        observedAt,
-      });
-    }
-
-    // Only inspect session/update notifications (or explicit boost workflow notifications)
-    const method = typeof wire.method === 'string' ? wire.method : '';
-    if (method !== 'session/update') {
-      return { accepted: false, deduplicated: false, commits: [] };
-    }
-
-    const params = isObject(wire.params) ? wire.params : null;
-    const update = params && isObject(params.update) ? params.update : params;
-    if (!update) {
-      return { accepted: false, deduplicated: false, commits: [] };
-    }
-
-    const updateKind = String(update.sessionUpdate ?? update.type ?? '');
-    const meta = isObject(update._meta) ? update._meta : isObject(params?._meta) ? (params!._meta as Record<string, unknown>) : null;
-    const boostMeta = meta && isObject(meta.boost) ? meta.boost : isObject(update.boost) ? update.boost : null;
-
     const activeWf = session.activeWorkflowId
       ? session.workflows.get(session.activeWorkflowId) ?? null
       : null;
+    const params = isObject(wire.params) ? wire.params : null;
+    const update = params && isObject(params.update) ? params.update : params;
+    const isRootUpdate = wire.method === 'session/update' &&
+      (params?.sessionId ?? envelope.originSession) === session.rootNativeSessionId &&
+      (!envelope.originSession || envelope.originSession === session.rootNativeSessionId);
+    const nativeWorkflowId = update && extractString(update, ['workflowId', 'nativeWorkflowId']);
+    const matchesLaunchRpc = activeWf?.launchRpcId !== undefined && wire.method === undefined &&
+      wire.id === activeWf.launchRpcId;
+    const matchesWorkflow = isRootUpdate && activeWf?.nativeWorkflowId !== undefined &&
+      nativeWorkflowId === activeWf.nativeWorkflowId;
+    if (matchesLaunchRpc || matchesWorkflow) {
+      const denial = detectBoostServerDenial(wire, evidence, observedAt);
+      if (denial) {
+        return this.recordServerDenial({
+          binding: envelope.binding,
+          connectionId: envelope.connectionId,
+          denial,
+          dedupeToken: `ordinal:${envelope.ingressOrdinal}:denial:${denial.code}`,
+          observedAt,
+        });
+      }
+    }
+    if (!update || !isRootUpdate || (activeWf?.nativeWorkflowId && nativeWorkflowId && !matchesWorkflow)) {
+      return { accepted: false, deduplicated: false, commits: [] };
+    }
+    const updateKind = String(update.sessionUpdate ?? update.type ?? '');
+    const meta = isObject(update._meta) ? update._meta : isObject(params?._meta) ? (params!._meta as Record<string, unknown>) : null;
+    const boostMeta = meta && isObject(meta.boost) ? meta.boost : isObject(update.boost) ? update.boost : null;
 
     // 2. Guard against model-spontaneous Boost:
     // Without a confirmed user `/boost` launch, NEVER fabricate a Boost workflow from text/ordinary tools.
@@ -826,7 +849,7 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
    * Records a server denial (entitlement, quota, plan required, policy, or permission denied)
    * against the active Boost workflow (if any) and binding.
    */
-  recordServerDenial(input: {
+  private recordServerDenial(input: {
     readonly binding: RuntimeBinding;
     readonly connectionId: string;
     readonly denial: BoostServerDenialRecord;
@@ -835,7 +858,8 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
   }): BoostIngestionResult {
     const observedAt = input.observedAt ?? Date.now();
     const session = this.sessions.get(bindingSlotKey(input.binding));
-    if (!session || session.connectionId !== input.connectionId) {
+    if (!session?.connectionId || session.connectionId !== input.connectionId ||
+        !sameBinding(session.binding, input.binding)) {
       return { accepted: false, deduplicated: false, commits: [] };
     }
 
@@ -918,7 +942,7 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
     const activeWf = session?.activeWorkflowId
       ? session.workflows.get(session.activeWorkflowId) ?? null
       : null;
-    if (!session || !activeWf) {
+    if (!session?.connectionId || !activeWf) {
       return { accepted: false, deduplicated: false, commits: [] };
     }
 
@@ -980,13 +1004,17 @@ export class BoostWorkflowObserver implements NativeWorkflowResourceReaderPort {
     const observedAt = opts?.observedAt ?? Date.now();
     const reasonCode = opts?.reasonCode ?? 'transport_closed_before_terminal';
     const session = this.sessions.get(bindingSlotKey(binding));
-    if (!session || session.connectionId !== connectionId) {
+    if (!session?.connectionId || session.connectionId !== connectionId ||
+        !sameBinding(session.binding, binding)) {
       return [];
     }
+    session.connectionId = null;
+    session.lastServerDenial = null;
 
     const commits: BoostCommitBatch[] = [];
     for (const wf of session.workflows.values()) {
-      const currentState = wf.state.kind === 'known' ? wf.state.value : wf.state.kind === 'stale' ? wf.state.last : undefined;
+      if (wf.state.kind === 'stale') continue;
+      const currentState = wf.state.kind === 'known' ? wf.state.value : undefined;
       const isTerminal =
         currentState === 'finished' || currentState === 'failed' || currentState === 'cancelled';
       if (isTerminal) continue;

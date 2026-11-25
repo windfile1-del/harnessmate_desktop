@@ -107,6 +107,7 @@ export interface TeamworkLaunchAttemptResult {
 
 export interface TeamworkRequestReceiptInput {
   readonly binding: RuntimeBinding;
+  readonly connectionId: string;
   readonly request: NativeRequestSummaryDto;
   readonly stage: 'scoping' | 'prompt_artifact_approval';
   readonly promptSummary?: string;
@@ -236,6 +237,7 @@ interface InternalEventTrace {
 interface InternalTeamworkBindingState {
   binding: RuntimeBinding;
   activeConnectionId: string | null;
+  rootNativeSessionId: string | null;
   workflowId: WorkflowId;
   originActivityId: ActivityId;
   scopingActivityId?: ActivityId;
@@ -351,7 +353,6 @@ export class AgyTeamworkWorkflowObserver {
     opts?: {
       readonly originActivityId?: ActivityId;
       readonly scopingActivityId?: ActivityId;
-      readonly connectionId?: string;
       readonly workspaceContext?: TeamworkWorkspaceContext;
     },
   ): InternalTeamworkBindingState {
@@ -370,9 +371,6 @@ export class AgyTeamworkWorkflowObserver {
       if (opts?.scopingActivityId && !existing.scopingActivityId) {
         existing.scopingActivityId = opts.scopingActivityId;
       }
-      if (opts?.connectionId && !existing.activeConnectionId) {
-        existing.activeConnectionId = opts.connectionId;
-      }
       return existing;
     }
 
@@ -382,7 +380,8 @@ export class AgyTeamworkWorkflowObserver {
 
     const created: InternalTeamworkBindingState = {
       binding,
-      activeConnectionId: opts?.connectionId ?? null,
+      activeConnectionId: null,
+      rootNativeSessionId: null,
       workflowId,
       originActivityId,
       ...(opts?.scopingActivityId ? { scopingActivityId: opts.scopingActivityId } : {}),
@@ -424,7 +423,8 @@ export class AgyTeamworkWorkflowObserver {
   }
 
   private getStateForBinding(binding: RuntimeBinding): InternalTeamworkBindingState | null {
-    return this.statesBySlot.get(bindingSlotKey(binding)) ?? null;
+    const state = this.statesBySlot.get(bindingSlotKey(binding));
+    return state?.binding.generation === binding.generation ? state : null;
   }
 
   private isGenerationCurrent(
@@ -433,10 +433,7 @@ export class AgyTeamworkWorkflowObserver {
     connectionId?: string,
   ): boolean {
     if (state.binding.generation !== binding.generation) return false;
-    if (connectionId && state.activeConnectionId && state.activeConnectionId !== connectionId) {
-      return false;
-    }
-    return true;
+    return connectionId === undefined || state.activeConnectionId === connectionId;
   }
 
   private appendTrace(
@@ -461,6 +458,8 @@ export class AgyTeamworkWorkflowObserver {
    * from HarnessMate's session workspace.
    */
   setWorkspaceContext(binding: RuntimeBinding, workspaceContext: TeamworkWorkspaceContext): void {
+    const existing = this.statesBySlot.get(bindingSlotKey(binding));
+    if (existing && !this.isGenerationCurrent(existing, binding)) return;
     this.ensureState(binding, { workspaceContext });
   }
 
@@ -473,9 +472,11 @@ export class AgyTeamworkWorkflowObserver {
     advertisedCommands: readonly string[],
     evidence: Evidence,
   ): TeamworkCommandDiscoveryState {
-    const state = this.ensureState(binding);
-    if (!this.isGenerationCurrent(state, binding)) return state.commandDiscovery;
-    if (!this.gates.teamworkEnabled) return state.commandDiscovery;
+    const state = this.getStateForBinding(binding);
+    if (!state || evidence.kind !== 'live_protocol' || !state.activeConnectionId ||
+        state.activeConnectionId !== evidence.connectionId || !this.gates.teamworkEnabled) {
+      return state?.commandDiscovery ?? 'not_observed';
+    }
 
     const normalized = advertisedCommands.map((c) => c.trim().replace(/^\/+/, '').toLowerCase());
     const hasCanonical = normalized.includes('teamwork');
@@ -509,12 +510,7 @@ export class AgyTeamworkWorkflowObserver {
    * Rejects legacy `/teamwork-preview` rather than assuming it works.
    */
   recordLaunchAttempt(input: TeamworkLaunchAttemptInput): TeamworkLaunchAttemptResult {
-    const state = this.ensureState(input.binding, {
-      originActivityId: input.originActivityId,
-      scopingActivityId: input.scopingActivityId,
-      connectionId: input.connectionId,
-      workspaceContext: input.workspaceContext,
-    });
+    const state = this.getStateForBinding(input.binding);
     const ts = this.now();
     const hostEvidence: Evidence = {
       kind: 'host_observation',
@@ -523,12 +519,6 @@ export class AgyTeamworkWorkflowObserver {
     };
 
     if (!this.gates.teamworkEnabled) {
-      this.appendTrace(state, {
-        eventKind: 'launch_blocked',
-        summary: 'Teamwork 功能门控已关闭，已阻断发起并保持历史只读',
-        reasonCode: 'teamwork_feature_disabled',
-        evidence: hostEvidence,
-      });
       return {
         accepted: false,
         code: 'TEAMWORK_DISABLED',
@@ -537,14 +527,6 @@ export class AgyTeamworkWorkflowObserver {
     }
 
     if (isLegacyTeamworkPreviewCommand(input.rawCommand)) {
-      state.commandDiscovery = 'legacy_preview_unverified';
-      this.bumpRevision(state);
-      this.appendTrace(state, {
-        eventKind: 'launch_blocked',
-        summary: '拒绝旧命令名 /teamwork-preview：不假定 preview 命令可用',
-        reasonCode: 'legacy_teamwork_preview_rejected',
-        evidence: hostEvidence,
-      });
       return {
         accepted: false,
         code: 'LEGACY_PREVIEW_COMMAND_REJECTED',
@@ -561,13 +543,8 @@ export class AgyTeamworkWorkflowObserver {
       };
     }
 
-    if (state.commandDiscovery === 'not_advertised') {
-      this.appendTrace(state, {
-        eventKind: 'launch_blocked',
-        summary: '当前会话未广告 /teamwork，阻断发起',
-        reasonCode: 'teamwork_not_advertised',
-        evidence: hostEvidence,
-      });
+    if (!state?.activeConnectionId || state.activeConnectionId !== input.connectionId ||
+        state.commandDiscovery !== 'advertised') {
       return {
         accepted: false,
         code: 'COMMAND_NOT_ADVERTISED',
@@ -575,6 +552,8 @@ export class AgyTeamworkWorkflowObserver {
       };
     }
 
+    this.ensureState(input.binding, { workspaceContext: input.workspaceContext });
+    if (input.originActivityId) state.originActivityId = input.originActivityId;
     state.phase = 'launch_pending_evidence';
     state.workflowState = {
       kind: 'known',
@@ -611,26 +590,22 @@ export class AgyTeamworkWorkflowObserver {
    * - Post-rejection guard (rejected gate blocks project/role/milestone creation)
    */
   acceptIngressFrame(envelope: NativeIngress): { readonly accepted: boolean; readonly reasonCode: string } {
-    const state = this.ensureState(envelope.binding, { connectionId: envelope.connectionId });
-    const ts = this.now();
-
     if (!this.gates.teamworkEnabled) {
       return { accepted: false, reasonCode: 'teamwork_feature_disabled_readonly' };
     }
-
-    if (!this.isGenerationCurrent(state, envelope.binding, envelope.connectionId)) {
-      this.appendTrace(state, {
-        eventKind: 'generation_fenced',
-        summary: '已拦截来自旧代次或旧连接的 Teamwork 入站帧',
-        reasonCode: 'stale_generation_or_connection',
-        evidence: {
-          kind: 'host_observation',
-          observedAt: ts,
-          reasonCode: 'stale_generation_or_connection',
-        },
-      });
+    if (envelope.channel !== 'live') {
+      return { accepted: false, reasonCode: 'history_replay_isolated' };
+    }
+    const state = this.getStateForBinding(envelope.binding);
+    if (!state?.activeConnectionId || state.activeConnectionId !== envelope.connectionId) {
       return { accepted: false, reasonCode: 'stale_generation_or_connection' };
     }
+    const wire = envelope.wire as { method?: unknown; params?: { sessionId?: unknown } } | null;
+    if (!wire || wire.params?.sessionId !== state.rootNativeSessionId ||
+        (envelope.originSession && envelope.originSession !== state.rootNativeSessionId)) {
+      return { accepted: false, reasonCode: 'unconfirmed_teamwork_session' };
+    }
+    const ts = this.now();
 
     const signals = decodeTeamworkIngressSignals(envelope);
     if (signals.length === 0) {
@@ -644,17 +619,6 @@ export class AgyTeamworkWorkflowObserver {
       if (signal.kind === 'command_catalog') {
         this.recordCommandCatalogObservation(envelope.binding, signal.advertisedCommands, evidence);
         appliedCount += 1;
-        continue;
-      }
-
-      // History replay MUST NEVER mutate live approval gates or create active project actions
-      if (envelope.channel === 'history_replay' && signal.kind === 'prompt_gate_decision') {
-        this.appendTrace(state, {
-          eventKind: 'approval_forgery_blocked',
-          summary: '已拦截 history_replay 通道中的批准决定帧，禁止重放审批状态',
-          reasonCode: 'history_replay_approval_blocked',
-          evidence,
-        });
         continue;
       }
 
@@ -686,6 +650,9 @@ export class AgyTeamworkWorkflowObserver {
           break;
         }
         case 'prompt_gate_decision': {
+          if (!this.matchesPromptReview(state, signal.artifactId, signal.approvalRequestId)) {
+            continue;
+          }
           this.applyPromptGateDecisionInternal(state, {
             decision: signal.decision,
             artifactId: signal.artifactId,
@@ -801,23 +768,16 @@ export class AgyTeamworkWorkflowObserver {
     readonly deduplicated: boolean;
     readonly reasonCode: string;
   } {
-    const state = this.ensureState(input.binding);
+    const state = this.getStateForBinding(input.binding);
     const ts = this.now();
-
     if (!this.gates.teamworkEnabled) {
-      return {
-        applied: false,
-        deduplicated: false,
-        reasonCode: 'teamwork_feature_disabled_readonly',
-      };
+      return { applied: false, deduplicated: false, reasonCode: 'teamwork_feature_disabled_readonly' };
     }
-
-    if (!this.isGenerationCurrent(state, input.binding)) {
-      return {
-        applied: false,
-        deduplicated: false,
-        reasonCode: 'stale_generation',
-      };
+    if (!state?.activeConnectionId || state.activeConnectionId !== input.connectionId ||
+        input.request.runtimeId !== input.binding.runtimeId ||
+        input.request.generation !== input.binding.generation ||
+        input.request.targetLineage !== 'confirmed') {
+      return { applied: false, deduplicated: false, reasonCode: 'unconfirmed_request_scope' };
     }
 
     const evidence: Evidence = input.evidence ?? {
@@ -895,21 +855,17 @@ export class AgyTeamworkWorkflowObserver {
       };
     }
 
-    // stage === 'prompt_artifact_approval'
-    const artifactId = input.artifactId ?? state.promptArtifact?.artifactId ?? 'art_teamwork_prompt';
-    if (!state.promptArtifact) {
-      this.recordPromptArtifactInternal(state, {
-        artifactId,
-        title: 'Teamwork Prompt Artifact',
-        requiresApproval: true,
-        approvalRequestId: input.request.approvalId,
-        evidence,
-        ts,
-      });
+    const promptArt = state.promptArtifact;
+    if (!promptArt || input.request.kind !== 'permission' ||
+        !this.matchesPromptReview(state, input.artifactId, input.request.approvalId)) {
+      return { applied: false, deduplicated: false, reasonCode: 'prompt_review_scope_mismatch' };
     }
-
-    const promptArt = state.promptArtifact!;
-    promptArt.approvalRequestId = input.request.approvalId;
+    if (promptArt.approvalReceiptState && isTerminalReceipt(promptArt.approvalReceiptState)) {
+      return { applied: false, deduplicated: true, reasonCode: 'prompt_review_already_settled' };
+    }
+    if (input.request.receiptState === 'response_written' && !input.request.receiptId) {
+      return { applied: false, deduplicated: false, reasonCode: 'missing_prompt_review_receipt' };
+    }
     if (input.request.receiptId) promptArt.approvalReceiptId = input.request.receiptId;
     promptArt.approvalReceiptState = input.request.receiptState;
     promptArt.updatedAt = ts;
@@ -959,14 +915,8 @@ export class AgyTeamworkWorkflowObserver {
     }
 
     if (input.request.receiptState === 'response_written') {
-      const decision =
-        input.decisionHint === 'reject' ||
-        input.selectedOptionId?.startsWith('reject') ||
-        input.selectedOptionId === 'decline'
-          ? 'rejected'
-          : input.decisionHint === 'approve' || input.selectedOptionId?.startsWith('allow')
-            ? 'approved'
-            : null;
+      const decision = input.decisionHint === 'reject' ? 'rejected'
+        : input.decisionHint === 'approve' ? 'approved' : null;
 
       if (decision) {
         this.applyPromptGateDecisionInternal(state, {
@@ -1141,10 +1091,12 @@ export class AgyTeamworkWorkflowObserver {
       };
     }
 
-    const cap = this.artifactReviewPort.getReviewCapability(
-      input.binding,
-      state.promptArtifact.artifactId,
-    );
+    const { artifactId, approvalRequestId, revision } = state.promptArtifact;
+    const connectionId = state.activeConnectionId;
+    if (!this.matchesPromptReview(state, artifactId, approvalRequestId)) {
+      return { accepted: false, state: 'conflict', reasonCode: 'prompt_review_scope_mismatch' };
+    }
+    const cap = this.artifactReviewPort.getReviewCapability(input.binding, artifactId);
     if (!cap.canApproveViaNativeProtocol || !this.artifactReviewPort.submitNativeArtifactApproval) {
       return {
         accepted: false,
@@ -1155,14 +1107,19 @@ export class AgyTeamworkWorkflowObserver {
 
     const result = await this.artifactReviewPort.submitNativeArtifactApproval({
       binding: input.binding,
-      artifactId: state.promptArtifact.artifactId,
+      artifactId,
       decision: input.decision,
-      requestId: state.promptArtifact.approvalRequestId,
+      requestId: approvalRequestId,
       idempotencyKey: input.idempotencyKey,
     });
 
-    if (result.accepted) {
+    if (result.accepted && result.state === 'response_written' && result.receiptId &&
+        state.activeConnectionId === connectionId && state.promptArtifact?.revision === revision &&
+        this.isGenerationCurrent(state, input.binding) &&
+        this.matchesPromptReview(state, artifactId, approvalRequestId)) {
       const ts = this.now();
+      state.promptArtifact.approvalReceiptId = result.receiptId;
+      state.promptArtifact.approvalReceiptState = 'response_written';
       this.applyPromptGateDecisionInternal(state, {
         decision: input.decision === 'approve' ? 'approved' : 'rejected',
         artifactId: state.promptArtifact.artifactId,
@@ -1259,7 +1216,7 @@ export class AgyTeamworkWorkflowObserver {
   handleTransportClosed(binding: RuntimeBinding, connectionId: string, reason = 'transport_disconnected'): void {
     const state = this.getStateForBinding(binding);
     if (!state) return;
-    if (state.activeConnectionId && state.activeConnectionId !== connectionId) return;
+    if (!state.activeConnectionId || state.activeConnectionId !== connectionId) return;
 
     const ts = this.now();
     const hostEvidence: Evidence = {
@@ -1316,6 +1273,7 @@ export class AgyTeamworkWorkflowObserver {
     }
 
     state.activeConnectionId = null;
+    state.commandDiscovery = 'not_observed';
     this.bumpRevision(state);
     this.appendTrace(state, {
       eventKind: 'transport_disconnected',
@@ -1330,12 +1288,15 @@ export class AgyTeamworkWorkflowObserver {
    */
   handleGenerationChanged(prevBinding: RuntimeBinding, nextBinding: RuntimeBinding): void {
     const state = this.getStateForBinding(prevBinding);
-    if (!state) return;
+    if (!state || bindingSlotKey(prevBinding) !== bindingSlotKey(nextBinding)) return;
 
     const ts = this.now();
-    this.handleTransportClosed(prevBinding, state.activeConnectionId ?? 'prev', 'generation_changed');
+    if (state.activeConnectionId) {
+      this.handleTransportClosed(prevBinding, state.activeConnectionId, 'generation_changed');
+    }
     state.binding = nextBinding;
     state.activeConnectionId = null;
+    state.commandDiscovery = 'not_observed';
     this.bumpRevision(state);
     this.appendTrace(state, {
       eventKind: 'generation_fenced',
@@ -1356,11 +1317,16 @@ export class AgyTeamworkWorkflowObserver {
     binding: RuntimeBinding,
     connectionId: string,
     mode: 'resume' | 'load' | 'fresh',
+    rootNativeSessionId: string,
   ): void {
-    const state = this.ensureState(binding, { connectionId });
+    if (!connectionId || !rootNativeSessionId) return;
+    const state = this.ensureState(binding);
+    if (!this.isGenerationCurrent(state, binding) || state.activeConnectionId === connectionId) return;
+    if (state.activeConnectionId) this.handleTransportClosed(binding, state.activeConnectionId);
     const ts = this.now();
-    state.binding = binding;
     state.activeConnectionId = connectionId;
+    state.rootNativeSessionId = rootNativeSessionId;
+    state.commandDiscovery = 'not_observed';
 
     if (state.phase === 'stale' || state.workflowState.kind === 'stale') {
       state.phase = 'reconciling';
@@ -1564,6 +1530,20 @@ export class AgyTeamworkWorkflowObserver {
       reasonCode: state.promptArtifact.reasonCode,
       evidence: params.evidence,
     });
+  }
+
+  private matchesPromptReview(
+    state: InternalTeamworkBindingState,
+    artifactId: string | undefined,
+    requestId: string | undefined,
+  ): boolean {
+    const artifact = state.promptArtifact;
+    return Boolean(artifact && artifactId && requestId &&
+      artifact.artifactId === artifactId && artifact.approvalRequestId === requestId &&
+      artifact.evidence.kind === 'live_protocol' &&
+      artifact.evidence.connectionId === state.activeConnectionId &&
+      (artifact.reviewGate === 'awaiting_native_approval' ||
+        artifact.reviewGate === 'upstream_limited_manual_app'));
   }
 
   private applyPromptGateDecisionInternal(

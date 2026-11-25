@@ -2,8 +2,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
+import { WebSocket } from 'ws';
+import type { AcpSessionHandle } from '../src/harnesses/acp/strict-acp-adapter.js';
+import type { NativeIngress } from '../src/harnesses/agy/native/wiring/types.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  NativeSnapshotResponseSchema,
   NativeWorkflowDtoSchema,
   NativeWorkflowResourceResponseSchema,
   NativeWorkflowSchema,
@@ -15,6 +20,7 @@ import {
   asWorkflowId,
   sanitizeNativeWorkflowForPublic,
   type NativeCanonicalEvent,
+  type NativeWsServerFrame,
   type RuntimeBinding,
 } from '@harnessmate/protocol';
 import {
@@ -131,13 +137,13 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
   it('replays T13 parallel vs serial non-mutating workflows, validates strict dynamic schemas, holds/releases retention, and publishes to registry', async () => {
     const { daemon, binding } = await createNp11TestEnv();
     const observer = new DynamicWorkflowObserver();
-    observer.registerRootSession(binding, 'nat_root_t13');
 
     const entries = loadDynamicWorkflowNdjsonFixture(
       path.join(FIXTURES_DIR, 't13-parallel-serial-comparison.ndjson'),
     );
     const replay = replayDynamicWorkflowNdjson(observer, binding, entries, {
       rootNativeSessionId: 'nat_root_t13',
+      connectionId: entries[1]!.connectionId!,
     });
 
     expect(replay.scenarioMeta?.scenarioId).toBe('T13-PARALLEL-SERIAL');
@@ -146,9 +152,9 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     // Retention is held while parallel steps are running (before completion frame #4)
     // Re-check intermediate retention using a second isolated observer up to frame 2
     const midObserver = new DynamicWorkflowObserver();
-    midObserver.registerRootSession(binding, 'nat_root_t13');
     replayDynamicWorkflowNdjson(midObserver, binding, entries.slice(0, 3), {
       rootNativeSessionId: 'nat_root_t13',
+      connectionId: entries[1]!.connectionId!,
     });
     const midRetention = midObserver.listRetentionReasons(binding);
     expect(midRetention.some((r) => r.startsWith('dynamic_workflow_step:'))).toBe(true);
@@ -218,7 +224,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
   it('handles denied scripts, node failure with partial results, missing edges (no Python inference), and partial omitted-field patches', async () => {
     const { daemon, binding } = await createNp11TestEnv();
     const observer = new DynamicWorkflowObserver();
-    observer.registerRootSession(binding, 'nat_root_t13_2');
+    observer.registerRootSession(binding, 'nat_root_t13_2', 'conn_t13_2');
 
     const router = new NativePermissionRouter(daemon.nativeRegistry, {
       targetResolver: {
@@ -253,7 +259,6 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
       {
         originActivityId: asActivityId('act_t13_denied'),
         turnId: 'turn_t13_denied',
-        rootNativeSessionId: 'nat_root_t13_2',
         nowMs: entries[1]!.nowMs,
       },
     );
@@ -277,7 +282,6 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
       {
         originActivityId: asActivityId('act_t13_denied'),
         turnId: 'turn_t13_denied',
-        rootNativeSessionId: 'nat_root_t13_2',
         nowMs: entries[2]!.nowMs,
       },
     );
@@ -305,6 +309,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     const approvalId = pending[0]!.approvalId;
     observer.onWorkflowRequestObserved({
       binding,
+      connectionId: 'conn_t13_2',
       workflowId: deniedWfId,
       approvalId,
       isScriptApproval: true,
@@ -331,6 +336,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
 
     const cancelledWf = observer.onWorkflowRequestResolved({
       binding,
+      connectionId: 'conn_t13_2',
       workflowId: deniedWfId,
       approvalId,
       receiptState: outcome.receiptState,
@@ -350,6 +356,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     // Now replay remaining frames (partial failure + missing `after` edges + omitted status patch)
     replayDynamicWorkflowNdjson(observer, binding, entries.slice(3), {
       rootNativeSessionId: 'nat_root_t13_2',
+      connectionId: 'conn_t13_2',
     });
 
     const partialWfId = asWorkflowId('wf_dyn_dyn_partial_02');
@@ -377,7 +384,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
       permissionMode: 'accept_edits',
     });
     const observer = new DynamicWorkflowObserver();
-    observer.registerRootSession(binding, 'nat_root_1516');
+    observer.registerRootSession(binding, 'nat_root_1516', 'conn_1516');
 
     const router = new NativePermissionRouter(daemon.nativeRegistry, {
       targetResolver: {
@@ -410,10 +417,36 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
         originSession: entry.originSession,
         wire: entry.frame,
       };
+      const request = entry.frame as {
+        id?: string | number;
+        params?: { toolCall?: { toolCallId: string } };
+      };
+      if (request.id !== undefined) {
+        const toolCallId = request.params!.toolCall!.toolCallId;
+        const target = {
+          binding, connectionId: envelope.connectionId, actualNativeSessionId: 'nat_root_1516',
+          wireRequestId: request.id, toolCallId, workflowIdHint: 'dyn_1516_01', rawParams: {},
+        };
+        expect(observer.resolveRequestTarget(target)).toBeNull();
+        // Synthetic preceding native update provides the independent tool-to-workflow mapping.
+        expect(observer.acceptFrame({
+          ...envelope,
+          ingressOrdinal: envelope.ingressOrdinal + 10,
+          wire: { method: 'session/update', params: {
+            sessionId: 'nat_root_1516', update: {
+              sessionUpdate: 'tool_call_update', toolCallId, status: 'requires_action',
+              _meta: { workflowId: 'dyn_1516_01', workflowKind: 'dynamic', stepId: toolCallId },
+            },
+          } },
+        }).accepted).toBe(true);
+        expect(observer.resolveRequestTarget({ ...target, connectionId: 'retired' })).toBeNull();
+        expect(observer.resolveRequestTarget({ ...target, actualNativeSessionId: 'other' })).toBeNull();
+        expect(observer.resolveRequestTarget({ ...target, workflowIdHint: 'different-workflow' })).toBeNull();
+        expect(observer.resolveRequestTarget({ ...target, toolCallId: undefined })).toBeNull();
+      }
       const ingest = observer.acceptFrame(envelope, {
         originActivityId: asActivityId(entry.originActivityId!),
         turnId: entry.turnId ?? null,
-        rootNativeSessionId: 'nat_root_1516',
         nowMs: entry.nowMs,
       });
 
@@ -527,6 +560,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     const artifactStub = new FrozenDynamicWorkflowArtifactReaderStub();
     const observer = new DynamicWorkflowObserver({ artifactReader: artifactStub });
     const wfId = asWorkflowId('wf_dyn_dyn_big_01');
+    observer.registerRootSession(binding, 'nat_root_big', 'conn_big');
 
     // Ingest trigger + large JSON array + multiple logs
     observer.acceptFrame(
@@ -684,7 +718,7 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     expect(observer.listRetentionReasons(binding).length).toBeGreaterThan(0);
     const staleWfs = observer.handleTransportClosed(binding, 'conn_big', 'process_exited');
     expect(staleWfs).toHaveLength(1);
-    expect(staleWfs[0]!.state.kind).toBe('stale');
+    expect(staleWfs[0]!.workflows[0]!.state.kind).toBe('stale');
     expect(observer.listRetentionReasons(binding)).toEqual([]);
 
     // Link confirmed child agent works cleanly when passed confirmed ID
@@ -745,7 +779,8 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
         },
       },
     });
-    expect(rep.accepted).toBe(true);
+    expect(rep.accepted).toBe(false);
+    expect(replayObs.listObservedWorkflowSnapshots(binding)).toEqual([]);
     expect(replayObs.listRetentionReasons(binding)).toEqual([]);
 
     const strictUnknown = decodeDynamicWorkflowIngress(
@@ -776,5 +811,97 @@ describe('NP-11 Dynamic Workflows Observer, Artifacts, and 1.5.16 Question Forwa
     );
     expect(DYNAMIC_WORKFLOW_DESCRIPTOR_CONTRIBUTION.capabilityId).toBe('AGY-W08');
     expect(DYNAMIC_WORKFLOW_DESCRIPTOR_CONTRIBUTION.launchGateOverride).toBe('not_tested');
+  });
+});
+
+
+describe('G3 integrated workflow observation', () => {
+  it.each([false, true])('gates workflow ingestion and feeds REST / WS through daemon startup (enabled=%s)', async (enabled) => {
+    const { daemon, session, binding } = await createNp11TestEnv();
+    expect(daemon.nativeRegistry.getFeatureFlags().nativeWorkflowObservation).toBe(false);
+    daemon.nativeRegistry.setFeatureFlags({ nativeWorkflowObservation: enabled });
+    const hooks = daemon.nativeRegistry.createAdapterRuntimeHooks(binding);
+    const attach = (connectionId: string) => hooks.onSessionReady?.({
+      nativeSessionId: 'nat_root_t13',
+      getConnectionId: () => connectionId,
+      getNativeSessionSignals: () => ({ advertisedCommands: [] }),
+    } as unknown as AcpSessionHandle);
+    attach('conn_t13_1');
+
+    const url = `/api/v1/sessions/${session.id}/native`;
+    const readSnapshot = async () => {
+      const reply = await daemon.app.inject({ method: 'GET', url: `${url}/snapshot` });
+      expect(reply.statusCode).toBe(200);
+      return NativeSnapshotResponseSchema.parse(reply.json()).projection;
+    };
+    const entries = loadDynamicWorkflowNdjsonFixture(path.join(FIXTURES_DIR, 't13-parallel-serial-comparison.ndjson'));
+    const trigger: NativeIngress = {
+      binding, connectionId: 'conn_t13_1', ingressOrdinal: 2, channel: 'live',
+      originSession: 'nat_root_t13', wire: entries[2]!.frame,
+    };
+    const workUpdate = { ...trigger, ingressOrdinal: 3, wire: entries[3]!.frame };
+    hooks.onIngressFrame?.({ ...trigger, channel: 'history_replay' });
+    expect((await readSnapshot()).workflows).toEqual([]);
+
+    if (!enabled) {
+      hooks.onIngressFrame?.(trigger);
+      expect((await readSnapshot()).workflows).toEqual([]);
+      return;
+    }
+
+    hooks.onIngressFrame?.(trigger);
+    const projection = await readSnapshot();
+    const workflow = projection.workflows[0]!;
+    expect(workflow?.detail.kind).toBe('dynamic');
+
+    const { port } = await daemon.start();
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}${url}/ws?token=${encodeURIComponent(daemon.config.localToken)}`,
+    );
+    try {
+      const observed = await new Promise<NativeCanonicalEvent>((resolve, reject) => {
+        socket.once('error', reject);
+        socket.once('close', () => reject(new Error('Native feed closed before workflow event')));
+        socket.on('message', (data) => {
+          const frame = JSON.parse(data.toString()) as NativeWsServerFrame;
+          if (frame.op === 'native_hello') {
+            socket.send(JSON.stringify({
+              op: 'subscribe_native', schemaVersion: 1, afterSeq: projection.asOfSeq,
+            }));
+          } else if (frame.op === 'native_replay_complete') {
+            hooks.onIngressFrame?.(workUpdate);
+          } else if (frame.op === 'native_event' && frame.event.type === 'native.workflow.changed') {
+            resolve(frame.event);
+          } else if (frame.op === 'native_error' || frame.op === 'native_resync_required') {
+            reject(new Error(`Unexpected native feed response: ${frame.op} ${frame.code}`));
+          }
+        });
+      });
+      expect(observed.payload).toMatchObject({ workflow: { id: workflow.id } });
+      expect(observed.seq).toBeGreaterThan(projection.asOfSeq);
+
+      const phases = await daemon.app.inject({ method: 'GET', url: `${url}/workflows/${workflow.id}/phases` });
+      expect(NativeWorkflowResourceResponseSchema.parse(phases.json())).toMatchObject({ available: true });
+      const missing = await daemon.app.inject({ method: 'GET', url: `${url}/workflows/wf_missing/phases` });
+      expect(missing.json()).toMatchObject({ available: false, items: [] });
+      const board = await daemon.app.inject({ method: 'GET', url: `${url}/workflows/${workflow.id}/board` });
+      expect(board.json()).toMatchObject({ available: false });
+
+      attach('conn_replacement');
+      const stale = await readSnapshot();
+      expect(stale.workflows[0]!.state.kind).toBe('stale');
+      hooks.onIngressFrame?.({ ...workUpdate, ingressOrdinal: 3 });
+      daemon.nativeRegistry.handleTransportClosed(binding, 'conn_t13_1');
+      expect((await readSnapshot()).workflows).toEqual(stale.workflows);
+
+      hooks.onIngressFrame?.({ ...trigger, connectionId: 'conn_replacement', ingressOrdinal: 1 });
+      expect((await readSnapshot()).workflows[0]!.state).toMatchObject({ kind: 'known', value: 'running' });
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        const closed = once(socket, 'close');
+        socket.terminate();
+        await closed;
+      }
+    }
   });
 });

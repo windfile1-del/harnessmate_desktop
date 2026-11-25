@@ -643,12 +643,41 @@ describe('NP-08 Swarm Observer, Shared Board & Gate Rollback [synthetic]', () =>
       expect(serialized).not.toContain(fixture.workerNativeId);
       expect(serialized).not.toContain(fixture.rootNativeSessionId);
 
+      const running = fixture.frames[7]!;
+      const historyFrame = { ...running, channel: 'history_replay' as const, ingressOrdinal: 900 };
+      expect(observer.acceptFrame(historyFrame).accepted).toBe(false);
+      expect(observer.getStateSnapshot(binding)!.workflows[0]!.workflow.revision).toBe(wfDto.revision);
+      const mismatch = observer.acceptFrame({ ...running, ingressOrdinal: 900, originSession: 'unrelated' });
+      expect(mismatch.accepted).toBe(false);
+      expect(observer.acceptFrame({ ...running, ingressOrdinal: 900 }).deduplicated).toBe(false);
+
       // Transport close demotes active workflow/workers to stale while preserving coordinator logs
       const closeCommits = observer.handleTransportClosed(binding, 'conn_t10_a');
       expect(closeCommits.length).toBeGreaterThan(0);
       observer.commitToRegistry(registry, binding, closeCommits);
       const projAfterClose = registry.getProjectionForSession(binding.sessionId, binding.instanceId);
       expect(projAfterClose.workflows[0]!.state.kind).toBe('stale');
+      const late = { ...running, ingressOrdinal: 901, wire: {
+        method: 'session/update', params: {
+          sessionId: fixture.rootNativeSessionId, update: {
+            sessionUpdate: 'swarm_coordinator_update', eventId: 'evt_swarm_reconnect',
+            swarmId: fixture.swarmNativeId, status: 'running',
+          },
+        },
+      } };
+      expect(observer.acceptFrame(late).accepted).toBe(false);
+      expect(observer.getStateSnapshot(binding)!.workflows[0]!.workflow.state.kind).toBe('stale');
+      observer.registerBinding({
+        binding,
+        rootNativeSessionId: fixture.rootNativeSessionId,
+        profileRef: 'profile_sql',
+        sourceRef: 'acp',
+        connectionId: 'conn_swarm_new',
+      });
+      expect(observer.handleTransportClosed(binding, 'conn_t10_a')).toEqual([]);
+      expect(observer.acceptFrame(late).accepted).toBe(false);
+      expect(observer.acceptFrame({ ...late, connectionId: 'conn_swarm_new' }).accepted).toBe(true);
+
 
       // NP-06 catalog descriptor contribution & advertisement/revocation
       const catalog = new AgyNativeCommandCatalogService();
