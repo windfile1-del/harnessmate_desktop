@@ -13,7 +13,7 @@
 
 ## 工作内容与前端
 
-保留 NP-00 探针的默认无身份路径。补一键 live 录制、dry-run、格式迁移和 JSON schema。让同一 alias 能贯穿 raw/normalized/native canonical/UI。包括 stderr 分类、进程退出、drop/overflow、延时和未知字段，明确 synthetic/replay/live provenance。入站与出站默认以字段 allowlist 重建，保留固定测试值的加盐关联，仅读可授权测试场景。现有 1.5.14 fixture 原状保存。具备单账户授权时先做 T01/T02。
+保留 NP-00 探针的默认无身份路径。补一键 live 录制、dry-run、格式迁移和 JSON schema。让同一 alias 能贯穿 raw/normalized/native canonical/UI。包括 stderr 分类、进程退出、drop/overflow、延时和未知字段，明确 synthetic/replay/live provenance。入站与出站默认以字段 allowlist 重建，保留固定测试值的加盐关联，仅读可授权测试场景。现有 1.5.14 fixture 原状保存。专用 Profile 已准备，U01 确认使用 Gemini 3.8 Flash。用户完成官方登录后，先做一次能力发现和一次 20 秒复现，见 [本机运行步骤](../handoffs/G0_Test_Profile.md)。
 
 无新增产品页面。需要可比较的四层简表与支持复制安全诊断编号的输入格式给 NP-03。
 

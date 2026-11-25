@@ -41,7 +41,7 @@ flowchart LR
 
 | 检查点 | 入场 / 验收 / 合并 |
 | --- | --- |
-| G0 基线 | 用户选择建集成分支，NP-00 文档进入该分支并固定 commit。首批 NP-01 / NP-02 / NP-03a 三个 Worktree 可并行 |
+| G0 基线 | 2026-11-25 已建立集成分支和规划提交。从同一 G0 快照准备 NP-01 / NP-02 / NP-03a 的三个独立 Worktree，均可开工。见 [进度](MASTER_PROGRESS.md) |
 | G1 契约冻结 | NP-01 CLI/fixture 与 evidence format 可用，NP-02 schema/接入缝/迁移 skeleton 经过独立审查。NP-03a 用合成状态走通窄屏、键盘与空态。NP-02 先提供 API mock contract；实际 transport recorder 接线由 NP-02 review 后合入 |
 | G2 基础运行时 | 并行的 NP-04/05/06/07 各跑本模块测试，NP-03b 连接版本化快照和通用壳。联合场景为单次真实 wake→child 或工具→审批→Stop/完成→主/后台 UI 对照。没有授权录制时可合入关闭的功能，生产标记保持 Not Tested |
 | G3 模式与恢复 | NP-08/09/10/11/12/14/15 各对照实录；NP-13 可于 NP-06 契约完成后提前并行，COMMIT 并入 G3。Teamwork 与 Artifact review、Schedule 与 Recovery 分别联测。各证据缺口给已验证降级或明确结案 |

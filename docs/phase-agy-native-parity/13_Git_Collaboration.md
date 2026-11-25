@@ -2,7 +2,7 @@
 
 ## 审计和分支起点
 
-下列命令是 G0 初始化记录，在现有专项 Worktree 上不需要重复运行。当前 `main` 与其他既存 Worktree 保持原状。用户批准启动开发后，先冻结新的远端 SHA 若与 [基线](01_Baseline.md) 不同，复核 diff 和影响。建议集成分支 `codex/agy-np-integration`，Worktree 根 `D:\HarnessMate\agy-np-worktrees`。每个 package 的独立 branch 见 [任务索引](11_Parallel_Development_Plan.md)。任一 branch 可由 Codex 的 Worktree 创建入口或有权限的 shell 按计划执行，开始前确认没有已存在的同名 branch/路径。
+下列命令是 G0 初始化记录，在现有专项 Worktree 上不需要重复运行。当前 `main` 与其他既存 Worktree 保持原状。用户批准启动开发后，先冻结新的远端 SHA 若与 [基线](01_Baseline.md) 不同，复核 diff 和影响。集成分支 `codex/agy-np-integration` 已建立，Worktree 根为 `D:\HarnessMate\agy-np-worktrees`。具体分支状态见 [MASTER_PROGRESS](MASTER_PROGRESS.md)。每个 package 的独立 branch 见 [任务索引](11_Parallel_Development_Plan.md)。任一 branch 可由 Codex 的 Worktree 创建入口或有权限的 shell 按计划执行，开始前确认没有已存在的同名 branch/路径。
 
 下列 PowerShell 示例说明首次启动步骤。必须先让 NP-00 文档进入集成分支的 plan commit，后续 Worktree 才能直接读取全部提示词和共享文档。只复制新增专项文件，检查 staging 内容后提交。
 
