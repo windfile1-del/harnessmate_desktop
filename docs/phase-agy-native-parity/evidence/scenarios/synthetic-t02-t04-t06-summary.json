@@ -1,0 +1,1406 @@
+{
+  "schemaVersion": 1,
+  "toolVersion": "0.2.0",
+  "captureId": "baseline-four-layer-t02-t04-t06",
+  "scenario": "T02_T04_T06_baseline_four_layer",
+  "source": "synthetic",
+  "cliVersion": "1.5.16-synthetic-peer",
+  "requestedProtocol": 1,
+  "negotiatedProtocol": 1,
+  "protocol": 1,
+  "endReason": "four_layer_complete",
+  "promptSent": true,
+  "exitCode": null,
+  "truncatedCount": 0,
+  "totalRecords": 56,
+  "layerCounts": {
+    "raw": 17,
+    "normalized": 13,
+    "native_canonical": 13,
+    "ui": 13
+  },
+  "observedLayers": {
+    "raw": true,
+    "normalized": true,
+    "native_canonical": true,
+    "ui": true
+  },
+  "stderrCounts": {},
+  "droppedTotal": 0,
+  "anomalyCount": 3,
+  "anomalies": [
+    {
+      "rowKey": "conn-1|gen-1|live#8",
+      "status": "adapter_misattributed_placeholder",
+      "reasonCode": "placeholder_turn_slot",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg"
+    },
+    {
+      "rowKey": "conn-1|gen-1|live#9",
+      "status": "adapter_misattributed_placeholder",
+      "reasonCode": "placeholder_turn_slot",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg"
+    },
+    {
+      "rowKey": "conn-1|gen-1|live#10",
+      "status": "dropped_before_adapter",
+      "reasonCode": "server_request_cancelled_before_adapter",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response"
+    }
+  ],
+  "rows": [
+    {
+      "key": "conn-1|gen-1|live#seq-1",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 1,
+      "lastSeq": 1,
+      "monotonicMs": 1.67,
+      "aliases": {},
+      "layers": {
+        "raw": {
+          "seq": 1,
+          "monotonicMs": 1.67,
+          "direction": "lifecycle",
+          "messageKind": "capture_meta",
+          "latencyMs": null,
+          "label": "capture_meta",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s1:raw:capture_start",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 1,
+              "monotonicMs": 1.67,
+              "direction": "lifecycle",
+              "messageKind": "capture_meta",
+              "latencyMs": null,
+              "label": "capture_meta",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s1:raw:capture_start"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s1:raw:capture_start"
+    },
+    {
+      "key": "conn-1|gen-1|live#seq-2",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 2,
+      "lastSeq": 2,
+      "monotonicMs": 39.63,
+      "aliases": {
+        "rpcIdAlias": "rpc-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 2,
+          "monotonicMs": 39.63,
+          "direction": "outbound",
+          "messageKind": "rpc_request",
+          "latencyMs": null,
+          "label": "rpc_request · initialize",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s2:raw:initialize",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 2,
+              "monotonicMs": 39.63,
+              "direction": "outbound",
+              "messageKind": "rpc_request",
+              "latencyMs": null,
+              "label": "rpc_request · initialize",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s2:raw:initialize"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s2:raw:initialize"
+    },
+    {
+      "key": "conn-1|gen-1|live#1",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 1,
+      "firstSeq": 3,
+      "lastSeq": 3,
+      "monotonicMs": 240.79,
+      "aliases": {
+        "rpcIdAlias": "rpc-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 3,
+          "monotonicMs": 240.79,
+          "direction": "inbound",
+          "messageKind": "rpc_response",
+          "latencyMs": 201.16,
+          "label": "rpc_response · reply:initialize",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:1:s3:raw:rpc_response",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 3,
+              "monotonicMs": 240.79,
+              "direction": "inbound",
+              "messageKind": "rpc_response",
+              "latencyMs": 201.16,
+              "label": "rpc_response · reply:initialize",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:1:s3:raw:rpc_response"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:1:s3:raw:rpc_response"
+    },
+    {
+      "key": "conn-1|gen-1|live#seq-4",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 4,
+      "lastSeq": 4,
+      "monotonicMs": 243.17,
+      "aliases": {
+        "rpcIdAlias": "rpc-2"
+      },
+      "layers": {
+        "raw": {
+          "seq": 4,
+          "monotonicMs": 243.17,
+          "direction": "outbound",
+          "messageKind": "rpc_request",
+          "latencyMs": null,
+          "label": "rpc_request · session/new",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s4:raw:session_new",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 4,
+              "monotonicMs": 243.17,
+              "direction": "outbound",
+              "messageKind": "rpc_request",
+              "latencyMs": null,
+              "label": "rpc_request · session/new",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s4:raw:session_new"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s4:raw:session_new"
+    },
+    {
+      "key": "conn-1|gen-1|live#2",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 2,
+      "firstSeq": 5,
+      "lastSeq": 8,
+      "monotonicMs": 245.39,
+      "aliases": {
+        "rpcIdAlias": "rpc-2",
+        "sessionAlias": "sess-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 5,
+          "monotonicMs": 245.39,
+          "direction": "inbound",
+          "messageKind": "rpc_response",
+          "latencyMs": 2.22,
+          "label": "rpc_response · reply:session/new",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s5:raw:rpc_response",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 5,
+              "monotonicMs": 245.39,
+              "direction": "inbound",
+              "messageKind": "rpc_response",
+              "latencyMs": 2.22,
+              "label": "rpc_response · reply:session/new",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s5:raw:rpc_response"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 6,
+          "monotonicMs": 247.33,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · native_session_ready",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s6:normalized:native_session_ready",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 6,
+              "monotonicMs": 247.33,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · native_session_ready",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s6:normalized:native_session_ready"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 7,
+          "monotonicMs": 247.98,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s7:native_canonical:native.activity.changed",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 7,
+              "monotonicMs": 247.98,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s7:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 8,
+          "monotonicMs": 248.78,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:running",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s8:ui:running",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 8,
+              "monotonicMs": 248.78,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s8:ui:running"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:2:s8:ui:running"
+    },
+    {
+      "key": "conn-1|gen-1|live#seq-9",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 9,
+      "lastSeq": 9,
+      "monotonicMs": 249.71,
+      "aliases": {
+        "rpcIdAlias": "rpc-3",
+        "sessionAlias": "sess-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 9,
+          "monotonicMs": 249.71,
+          "direction": "outbound",
+          "messageKind": "rpc_request",
+          "latencyMs": null,
+          "label": "rpc_request · session/set_mode",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s9:raw:session_set_mode",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 9,
+              "monotonicMs": 249.71,
+              "direction": "outbound",
+              "messageKind": "rpc_request",
+              "latencyMs": null,
+              "label": "rpc_request · session/set_mode",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s9:raw:session_set_mode"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s9:raw:session_set_mode"
+    },
+    {
+      "key": "conn-1|gen-1|live#3",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 3,
+      "firstSeq": 10,
+      "lastSeq": 16,
+      "monotonicMs": 251.16,
+      "aliases": {
+        "rpcIdAlias": "rpc-3",
+        "sessionAlias": "sess-1",
+        "turnAlias": "turn-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 10,
+          "monotonicMs": 251.16,
+          "direction": "inbound",
+          "messageKind": "rpc_response",
+          "latencyMs": 1.45,
+          "label": "rpc_response · reply:session/set_mode",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s10:raw:rpc_response",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 10,
+              "monotonicMs": 251.16,
+              "direction": "inbound",
+              "messageKind": "rpc_response",
+              "latencyMs": 1.45,
+              "label": "rpc_response · reply:session/set_mode",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s10:raw:rpc_response"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 11,
+          "monotonicMs": 251.95,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · config.confirmed ; adapter_normalized · turn.started",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s14:normalized:turn.started",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 11,
+              "monotonicMs": 251.95,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · config.confirmed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s11:normalized:config.confirmed"
+            },
+            {
+              "seq": 14,
+              "monotonicMs": 252.82,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn.started",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s14:normalized:turn.started"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 12,
+          "monotonicMs": 252.14,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed ; native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s15:native_canonical:native.activity.changed",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 12,
+              "monotonicMs": 252.14,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s12:native_canonical:native.activity.changed"
+            },
+            {
+              "seq": 15,
+              "monotonicMs": 253.01,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s15:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 13,
+          "monotonicMs": 252.28,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:running ; ui_projection · ui:running",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s16:ui:running",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 13,
+              "monotonicMs": 252.28,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s13:ui:running"
+            },
+            {
+              "seq": 16,
+              "monotonicMs": 253.17,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s16:ui:running"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:3:s16:ui:running"
+    },
+    {
+      "key": "conn-1|gen-1|live#seq-17",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 17,
+      "lastSeq": 17,
+      "monotonicMs": 253.7,
+      "aliases": {
+        "rpcIdAlias": "rpc-4",
+        "sessionAlias": "sess-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 17,
+          "monotonicMs": 253.7,
+          "direction": "outbound",
+          "messageKind": "rpc_request",
+          "latencyMs": null,
+          "label": "rpc_request · session/prompt",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s17:raw:session_prompt",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 17,
+              "monotonicMs": 253.7,
+              "direction": "outbound",
+              "messageKind": "rpc_request",
+              "latencyMs": null,
+              "label": "rpc_request · session/prompt",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s17:raw:session_prompt"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s17:raw:session_prompt"
+    },
+    {
+      "key": "conn-1|gen-1|live#4",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 4,
+      "firstSeq": 18,
+      "lastSeq": 24,
+      "monotonicMs": 254.92,
+      "aliases": {
+        "sessionAlias": "sess-1",
+        "toolAlias": "tool-1",
+        "taskAlias": "task-1",
+        "turnAlias": "turn-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 18,
+          "monotonicMs": 254.92,
+          "direction": "inbound",
+          "messageKind": "rpc_notification",
+          "latencyMs": null,
+          "label": "rpc_notification · session/update · tool_call · status=in_progress",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s18:raw:tool_call",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 18,
+              "monotonicMs": 254.92,
+              "direction": "inbound",
+              "messageKind": "rpc_notification",
+              "latencyMs": null,
+              "label": "rpc_notification · session/update · tool_call · status=in_progress",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s18:raw:tool_call"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 19,
+          "monotonicMs": 257.97,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · turn_block.ext · status=running ; adapter_normalized · tool.call.started",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s22:normalized:tool.call.started",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 19,
+              "monotonicMs": 257.97,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn_block.ext · status=running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s19:normalized:turn_block.ext"
+            },
+            {
+              "seq": 22,
+              "monotonicMs": 258.45,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · tool.call.started",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s22:normalized:tool.call.started"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 20,
+          "monotonicMs": 258.14,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed ; native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s23:native_canonical:native.activity.changed",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 20,
+              "monotonicMs": 258.14,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s20:native_canonical:native.activity.changed"
+            },
+            {
+              "seq": 23,
+              "monotonicMs": 258.6,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s23:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 21,
+          "monotonicMs": 258.26,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:running ; ui_projection · ui:running",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s24:ui:running",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 21,
+              "monotonicMs": 258.26,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s21:ui:running"
+            },
+            {
+              "seq": 24,
+              "monotonicMs": 258.69,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s24:ui:running"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:4:s24:ui:running"
+    },
+    {
+      "key": "conn-1|gen-1|live#5",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 5,
+      "firstSeq": 25,
+      "lastSeq": 31,
+      "monotonicMs": 278.77,
+      "aliases": {
+        "sessionAlias": "sess-1",
+        "toolAlias": "tool-2",
+        "taskAlias": "task-2",
+        "turnAlias": "turn-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 25,
+          "monotonicMs": 278.77,
+          "direction": "inbound",
+          "messageKind": "rpc_notification",
+          "latencyMs": null,
+          "label": "rpc_notification · session/update · tool_call · status=in_progress",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s25:raw:tool_call",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 25,
+              "monotonicMs": 278.77,
+              "direction": "inbound",
+              "messageKind": "rpc_notification",
+              "latencyMs": null,
+              "label": "rpc_notification · session/update · tool_call · status=in_progress",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s25:raw:tool_call"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 26,
+          "monotonicMs": 279.72,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · turn_block.ext · status=running ; adapter_normalized · tool.call.started",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s29:normalized:tool.call.started",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 26,
+              "monotonicMs": 279.72,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn_block.ext · status=running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s26:normalized:turn_block.ext"
+            },
+            {
+              "seq": 29,
+              "monotonicMs": 280.1,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · tool.call.started",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s29:normalized:tool.call.started"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 27,
+          "monotonicMs": 279.87,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed ; native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s30:native_canonical:native.activity.changed",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 27,
+              "monotonicMs": 279.87,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s27:native_canonical:native.activity.changed"
+            },
+            {
+              "seq": 30,
+              "monotonicMs": 280.2,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s30:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 28,
+          "monotonicMs": 279.98,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:running ; ui_projection · ui:running",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s31:ui:running",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 28,
+              "monotonicMs": 279.98,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s28:ui:running"
+            },
+            {
+              "seq": 31,
+              "monotonicMs": 280.3,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s31:ui:running"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:5:s31:ui:running"
+    },
+    {
+      "key": "conn-1|gen-1|live#6",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 6,
+      "firstSeq": 32,
+      "lastSeq": 38,
+      "monotonicMs": 307.01,
+      "aliases": {
+        "sessionAlias": "sess-1",
+        "toolAlias": "tool-3",
+        "taskAlias": "task-3",
+        "turnAlias": "turn-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 32,
+          "monotonicMs": 307.01,
+          "direction": "inbound",
+          "messageKind": "rpc_notification",
+          "latencyMs": null,
+          "label": "rpc_notification · session/update · tool_call · status=in_progress",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s32:raw:tool_call",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 32,
+              "monotonicMs": 307.01,
+              "direction": "inbound",
+              "messageKind": "rpc_notification",
+              "latencyMs": null,
+              "label": "rpc_notification · session/update · tool_call · status=in_progress",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s32:raw:tool_call"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 33,
+          "monotonicMs": 307.56,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · turn_block.ext · status=running ; adapter_normalized · tool.call.started",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s36:normalized:tool.call.started",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 33,
+              "monotonicMs": 307.56,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn_block.ext · status=running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s33:normalized:turn_block.ext"
+            },
+            {
+              "seq": 36,
+              "monotonicMs": 307.92,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · tool.call.started",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s36:normalized:tool.call.started"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 34,
+          "monotonicMs": 307.69,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed ; native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s37:native_canonical:native.activity.changed",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 34,
+              "monotonicMs": 307.69,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s34:native_canonical:native.activity.changed"
+            },
+            {
+              "seq": 37,
+              "monotonicMs": 308.06,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s37:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 35,
+          "monotonicMs": 307.8,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:running ; ui_projection · ui:running",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s38:ui:running",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 35,
+              "monotonicMs": 307.8,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s35:ui:running"
+            },
+            {
+              "seq": 38,
+              "monotonicMs": 308.16,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:running",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s38:ui:running"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:6:s38:ui:running"
+    },
+    {
+      "key": "conn-1|gen-1|live#7",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 7,
+      "firstSeq": 39,
+      "lastSeq": 42,
+      "monotonicMs": 321.95,
+      "aliases": {
+        "rpcIdAlias": "rpc-4",
+        "sessionAlias": "sess-1",
+        "turnAlias": "turn-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 39,
+          "monotonicMs": 321.95,
+          "direction": "inbound",
+          "messageKind": "rpc_response",
+          "latencyMs": 68.25,
+          "label": "rpc_response · reply:session/prompt · stop=end_turn",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s39:raw:rpc_response",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 39,
+              "monotonicMs": 321.95,
+              "direction": "inbound",
+              "messageKind": "rpc_response",
+              "latencyMs": 68.25,
+              "label": "rpc_response · reply:session/prompt · stop=end_turn",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s39:raw:rpc_response"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 40,
+          "monotonicMs": 322.88,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · turn.completed · stop=end_turn",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s40:normalized:turn.completed",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 40,
+              "monotonicMs": 322.88,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn.completed · stop=end_turn",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s40:normalized:turn.completed"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 41,
+          "monotonicMs": 323.04,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.runtime.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s41:native_canonical:native.runtime.changed",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 41,
+              "monotonicMs": 323.04,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.runtime.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s41:native_canonical:native.runtime.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 42,
+          "monotonicMs": 323.17,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:idle_despite_bg",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s42:ui:idle_despite_bg",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 42,
+              "monotonicMs": 323.17,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:idle_despite_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s42:ui:idle_despite_bg"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "four_layer_aligned",
+      "reasonCode": "aligned",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:7:s42:ui:idle_despite_bg"
+    },
+    {
+      "key": "conn-1|gen-1|live#8",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 8,
+      "firstSeq": 43,
+      "lastSeq": 49,
+      "monotonicMs": 352.33,
+      "aliases": {
+        "sessionAlias": "sess-1",
+        "toolAlias": "tool-2",
+        "taskAlias": "task-2",
+        "turnAlias": "turn_bg"
+      },
+      "layers": {
+        "raw": {
+          "seq": 43,
+          "monotonicMs": 352.33,
+          "direction": "inbound",
+          "messageKind": "rpc_notification",
+          "latencyMs": null,
+          "label": "rpc_notification · session/update · tool_call_update · status=completed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s43:raw:tool_call_update",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 43,
+              "monotonicMs": 352.33,
+              "direction": "inbound",
+              "messageKind": "rpc_notification",
+              "latencyMs": null,
+              "label": "rpc_notification · session/update · tool_call_update · status=completed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s43:raw:tool_call_update"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 44,
+          "monotonicMs": 352.88,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · turn_block.ext · status=completed · slot=turn_bg ; adapter_normalized · tool.call.completed · status=success · slot=turn_bg",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s47:normalized:placeholder_turn_bg",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 44,
+              "monotonicMs": 352.88,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · turn_block.ext · status=completed · slot=turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s44:normalized:placeholder_turn_bg"
+            },
+            {
+              "seq": 47,
+              "monotonicMs": 353.46,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · tool.call.completed · status=success · slot=turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s47:normalized:placeholder_turn_bg"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 45,
+          "monotonicMs": 353,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed ; native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s48:native_canonical:native.activity.changed",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 45,
+              "monotonicMs": 353,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s45:native_canonical:native.activity.changed"
+            },
+            {
+              "seq": 48,
+              "monotonicMs": 353.56,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s48:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 46,
+          "monotonicMs": 353.11,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:ghost_turn_bg ; ui_projection · ui:ghost_turn_bg",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 46,
+              "monotonicMs": 353.11,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:ghost_turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s46:ui:ghost_turn_bg"
+            },
+            {
+              "seq": 49,
+              "monotonicMs": 353.63,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:ghost_turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "adapter_misattributed_placeholder",
+      "reasonCode": "placeholder_turn_slot",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg"
+    },
+    {
+      "key": "conn-1|gen-1|live#9",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 9,
+      "firstSeq": 50,
+      "lastSeq": 53,
+      "monotonicMs": 383.7,
+      "aliases": {
+        "sessionAlias": "sess-1",
+        "turnAlias": "turn_bg"
+      },
+      "layers": {
+        "raw": {
+          "seq": 50,
+          "monotonicMs": 383.7,
+          "direction": "inbound",
+          "messageKind": "rpc_notification",
+          "latencyMs": null,
+          "label": "rpc_notification · session/update · agent_message_chunk",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s50:raw:agent_message_chunk",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 50,
+              "monotonicMs": 383.7,
+              "direction": "inbound",
+              "messageKind": "rpc_notification",
+              "latencyMs": null,
+              "label": "rpc_notification · session/update · agent_message_chunk",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s50:raw:agent_message_chunk"
+            }
+          ]
+        },
+        "normalized": {
+          "seq": 51,
+          "monotonicMs": 384.34,
+          "direction": "internal",
+          "messageKind": "adapter_normalized",
+          "latencyMs": null,
+          "label": "adapter_normalized · message.assistant.delta · slot=turn_bg",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s51:normalized:placeholder_turn_bg",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 51,
+              "monotonicMs": 384.34,
+              "direction": "internal",
+              "messageKind": "adapter_normalized",
+              "latencyMs": null,
+              "label": "adapter_normalized · message.assistant.delta · slot=turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s51:normalized:placeholder_turn_bg"
+            }
+          ]
+        },
+        "native_canonical": {
+          "seq": 52,
+          "monotonicMs": 384.46,
+          "direction": "internal",
+          "messageKind": "native_canonical",
+          "latencyMs": null,
+          "label": "native_canonical · native.activity.changed",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s52:native_canonical:native.activity.changed",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 52,
+              "monotonicMs": 384.46,
+              "direction": "internal",
+              "messageKind": "native_canonical",
+              "latencyMs": null,
+              "label": "native_canonical · native.activity.changed",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s52:native_canonical:native.activity.changed"
+            }
+          ]
+        },
+        "ui": {
+          "seq": 53,
+          "monotonicMs": 384.54,
+          "direction": "internal",
+          "messageKind": "ui_projection",
+          "latencyMs": null,
+          "label": "ui_projection · ui:ghost_turn_bg",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 53,
+              "monotonicMs": 384.54,
+              "direction": "internal",
+              "messageKind": "ui_projection",
+              "latencyMs": null,
+              "label": "ui_projection · ui:ghost_turn_bg",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg"
+            }
+          ]
+        }
+      },
+      "attributionStatus": "adapter_misattributed_placeholder",
+      "reasonCode": "placeholder_turn_slot",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg"
+    },
+    {
+      "key": "conn-1|gen-1|live#10",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 10,
+      "firstSeq": 54,
+      "lastSeq": 55,
+      "monotonicMs": 399.5,
+      "aliases": {
+        "rpcIdAlias": "srvreq-1",
+        "sessionAlias": "sess-1",
+        "toolAlias": "tool-4",
+        "approvalAlias": "req-1"
+      },
+      "layers": {
+        "raw": {
+          "seq": 54,
+          "monotonicMs": 399.5,
+          "direction": "inbound",
+          "messageKind": "server_request",
+          "latencyMs": null,
+          "label": "server_request · session/request_permission ; rpc_response · outbound_reply · outcome=cancelled",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response",
+          "eventCount": 2,
+          "events": [
+            {
+              "seq": 54,
+              "monotonicMs": 399.5,
+              "direction": "inbound",
+              "messageKind": "server_request",
+              "latencyMs": null,
+              "label": "server_request · session/request_permission",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s54:raw:session_request_permission"
+            },
+            {
+              "seq": 55,
+              "monotonicMs": 401.1,
+              "direction": "outbound",
+              "messageKind": "rpc_response",
+              "latencyMs": 1.6,
+              "label": "rpc_response · outbound_reply · outcome=cancelled",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "dropped_before_adapter",
+      "reasonCode": "server_request_cancelled_before_adapter",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response"
+    },
+    {
+      "key": "conn-1|gen-1|live#seq-56",
+      "connectionId": "conn-1",
+      "generation": "gen-1",
+      "channel": "live",
+      "ingressOrdinal": 0,
+      "firstSeq": 56,
+      "lastSeq": 56,
+      "monotonicMs": 987.81,
+      "aliases": {},
+      "layers": {
+        "raw": {
+          "seq": 56,
+          "monotonicMs": 987.81,
+          "direction": "lifecycle",
+          "messageKind": "capture_end",
+          "latencyMs": null,
+          "label": "capture_end · reason=four_layer_complete",
+          "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s56:raw:four_layer_complete",
+          "eventCount": 1,
+          "events": [
+            {
+              "seq": 56,
+              "monotonicMs": 987.81,
+              "direction": "lifecycle",
+              "messageKind": "capture_end",
+              "latencyMs": null,
+              "label": "capture_end · reason=four_layer_complete",
+              "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s56:raw:four_layer_complete"
+            }
+          ]
+        },
+        "normalized": null,
+        "native_canonical": null,
+        "ui": null
+      },
+      "attributionStatus": "partial_observation",
+      "reasonCode": "partial_layers",
+      "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:0:s56:raw:four_layer_complete"
+    }
+  ],
+  "np03DiagnosticInput": {
+    "schemaVersion": 1,
+    "toolVersion": "0.2.0",
+    "copyableDiagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg",
+    "captureId": "baseline-four-layer-t02-t04-t06",
+    "scenario": "T02_T04_T06_baseline_four_layer",
+    "provenance": "synthetic",
+    "cliVersion": "1.5.16-synthetic-peer",
+    "requestedProtocol": 1,
+    "negotiatedProtocol": 1,
+    "protocol": 1,
+    "layerCoverage": {
+      "raw": 17,
+      "normalized": 13,
+      "native_canonical": 13,
+      "ui": 13
+    },
+    "anomalySummary": [
+      {
+        "rowKey": "conn-1|gen-1|live#8",
+        "status": "adapter_misattributed_placeholder",
+        "reasonCode": "placeholder_turn_slot",
+        "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:8:s49:ui:ghost_turn_bg"
+      },
+      {
+        "rowKey": "conn-1|gen-1|live#9",
+        "status": "adapter_misattributed_placeholder",
+        "reasonCode": "placeholder_turn_slot",
+        "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:9:s53:ui:ghost_turn_bg"
+      },
+      {
+        "rowKey": "conn-1|gen-1|live#10",
+        "status": "dropped_before_adapter",
+        "reasonCode": "server_request_cancelled_before_adapter",
+        "diagnosticCode": "AGY-DIAG-v1:baseline-four-layer-t02-t04-t06:T02_T04_T06_baseline_fou:conn-1:gen-1:live:10:s55:raw:rpc_response"
+      }
+    ]
+  }
+}
