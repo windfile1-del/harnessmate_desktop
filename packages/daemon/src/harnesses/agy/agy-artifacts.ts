@@ -2,9 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveManagedProfilePathSync } from './agy-profile-manager.js';
 
-const MAX_ARTIFACT_FILES = 64;
-const MAX_ARTIFACT_BYTES = 262_144;
-const ALLOWED_EXTS = new Set(['.md', '.markdown', '.diff', '.patch', '.txt', '.json']);
+export const MAX_ARTIFACT_FILES = 64;
+export const MAX_ARTIFACT_BYTES = 262_144;
+export const ALLOWED_EXTS = new Set(['.md', '.markdown', '.diff', '.patch', '.txt', '.json']);
 
 export interface AgyArtifactSummary {
   name: string;
@@ -16,6 +16,23 @@ export interface AgyArtifactSummary {
 export interface AgyArtifactContent extends AgyArtifactSummary {
   content: string;
   truncated: boolean;
+}
+
+export function isSafeArtifactSegment(segment: string): boolean {
+  if (!segment) return false;
+  if (segment.startsWith('.')) return false;
+  if (segment === '.' || segment === '..') return false;
+  if (segment.includes('/') || segment.includes('\\') || segment.includes('..')) return false;
+  if (segment.includes('\0') || segment.includes(':')) return false;
+  // Reject ASCII control characters and trailing dots/spaces (Windows path normalization/ADS guard)
+  if (/[\x00-\x1f\x7f]/.test(segment)) return false;
+  if (/[. ]$/.test(segment)) return false;
+  return true;
+}
+
+export function isAllowedArtifactExtension(fileName: string): boolean {
+  const ext = path.extname(fileName).toLowerCase();
+  return ALLOWED_EXTS.has(ext);
 }
 
 function classifyArtifactKind(fileName: string): AgyArtifactSummary['kind'] {
@@ -34,7 +51,7 @@ export function listAgySessionArtifacts(
   nativeSessionId: string,
 ): AgyArtifactSummary[] {
   const cleanSess = nativeSessionId.trim();
-  if (!cleanSess) return [];
+  if (!isSafeArtifactSegment(cleanSess)) return [];
 
   const brainDir = resolveManagedProfilePathSync(appDataPath, ['brain', cleanSess], 'directory');
   if (!brainDir) return [];
@@ -42,9 +59,8 @@ export function listAgySessionArtifacts(
   const results: AgyArtifactSummary[] = [];
   for (const entry of fs.readdirSync(brainDir.path)) {
     if (results.length >= MAX_ARTIFACT_FILES) break;
-    if (entry.startsWith('.')) continue;
-    const ext = path.extname(entry).toLowerCase();
-    if (!ALLOWED_EXTS.has(ext)) continue;
+    if (!isSafeArtifactSegment(entry)) continue;
+    if (!isAllowedArtifactExtension(entry)) continue;
 
     const safeFile = resolveManagedProfilePathSync(appDataPath, ['brain', cleanSess, entry], 'file');
     if (!safeFile) continue;
@@ -67,7 +83,8 @@ export function readAgySessionArtifact(
 ): AgyArtifactContent | null {
   const cleanSess = nativeSessionId.trim();
   const cleanFile = fileName.trim();
-  if (!cleanSess || !cleanFile || cleanFile.startsWith('.')) return null;
+  if (!isSafeArtifactSegment(cleanSess) || !isSafeArtifactSegment(cleanFile)) return null;
+  if (!isAllowedArtifactExtension(cleanFile)) return null;
 
   const safeFile = resolveManagedProfilePathSync(appDataPath, ['brain', cleanSess, cleanFile], 'file');
   if (!safeFile) return null;
@@ -75,15 +92,29 @@ export function readAgySessionArtifact(
   const bytes = Math.min(safeFile.info.size, MAX_ARTIFACT_BYTES);
   const fd = fs.openSync(safeFile.path, 'r');
   try {
+    const fdStat = fs.fstatSync(fd);
+    if (!fdStat.isFile()) return null;
+    if (
+      safeFile.info.ino !== 0 &&
+      (fdStat.dev !== safeFile.info.dev || fdStat.ino !== safeFile.info.ino)
+    ) {
+      return null;
+    }
+
     const buf = Buffer.alloc(bytes);
     const readBytes = fs.readSync(fd, buf, 0, bytes, 0);
+    const slice = buf.subarray(0, readBytes);
+    if (slice.includes(0)) {
+      return null;
+    }
+
     return {
       name: cleanFile,
       kind: classifyArtifactKind(cleanFile),
-      sizeBytes: safeFile.info.size,
-      updatedAt: safeFile.info.mtimeMs,
-      content: buf.subarray(0, readBytes).toString('utf8'),
-      truncated: safeFile.info.size > MAX_ARTIFACT_BYTES,
+      sizeBytes: fdStat.size,
+      updatedAt: fdStat.mtimeMs,
+      content: slice.toString('utf8'),
+      truncated: fdStat.size > MAX_ARTIFACT_BYTES,
     };
   } finally {
     fs.closeSync(fd);

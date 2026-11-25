@@ -2,6 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { AgyLaunchContext } from './agy-launch-context.js';
+import {
+  AgyNativeEcosystemService,
+  type AgyEcosystemCatalogSnapshot,
+  type AgyEcosystemFeatureGates,
+  type CollectEcosystemCatalogInput,
+} from './native/ecosystem/index.js';
 
 export interface AgyEcosystemSnapshot {
   instanceId: string;
@@ -113,4 +119,17 @@ export function collectAgyEcosystemSnapshot(opts: {
       harnessMateActivePluginsCount: opts.harnessMateActivePluginsCount,
     },
   };
+}
+
+/**
+ * Convenience wrapper returning the full NP-13 profile/source/workspace-scoped
+ * native ecosystem catalog snapshot (defaulting to closed gates unless explicitly enabled).
+ */
+export function collectNativeEcosystemCatalogSnapshot(
+  input: CollectEcosystemCatalogInput & {
+    readonly gates?: Partial<AgyEcosystemFeatureGates>;
+  },
+): AgyEcosystemCatalogSnapshot {
+  const service = new AgyNativeEcosystemService({ gates: input.gates });
+  return service.collectSnapshot(input);
 }

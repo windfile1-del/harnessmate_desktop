@@ -1,13 +1,24 @@
 import type { AgyAuthMethod, AgyAuthState, AgyProfileConfig, HarnessInfo } from '@harnessmate/protocol';
-import { Copy, ExternalLink, KeyRound, LogOut, Plus, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
+import { Copy, ExternalLink, KeyRound, Layers, LogOut, Plus, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { daemonApi, type AgyInstanceEntryDto } from '../../api/client';
 import { useAppStore } from '../../stores/app-store';
+import {
+  AgyNativeSettingsWorkspace,
+  type AgyEcosystemCatalogSnapshotDto,
+  type AgyOptInQueryStateDto,
+  type SettingsSectionId,
+} from './native/settings';
 
 export interface AgySettingsSlotProps {
   harness: HarnessInfo;
   onRefresh: () => void;
   initialEntries?: AgyInstanceEntryDto[];
+  ecosystemSnapshot?: AgyEcosystemCatalogSnapshotDto | null;
+  showNativeEcosystem?: boolean;
+  initialSection?: SettingsSectionId;
+  onRequestOptInQuery?: (kind: 'usage' | 'skills' | 'agents') => void;
+  latestOptInResult?: AgyOptInQueryStateDto | null;
 }
 
 const PHASE_LABELS: Record<string, { label: string; color: string; bg: string }> = {
@@ -21,9 +32,19 @@ const PHASE_LABELS: Record<string, { label: string; color: string; bg: string }>
   idle: { label: '官方默认态', color: 'var(--text-secondary)', bg: 'var(--bg-surface)' },
 };
 
-export function AgySettingsSlot({ harness, onRefresh, initialEntries }: AgySettingsSlotProps) {
+export function AgySettingsSlot({
+  harness,
+  onRefresh,
+  initialEntries,
+  ecosystemSnapshot,
+  showNativeEcosystem,
+  initialSection,
+  onRequestOptInQuery,
+  latestOptInResult,
+}: AgySettingsSlotProps) {
   const pushToast = useAppStore((s) => s.pushToast);
   const wsAuthStates = useAppStore((s) => s.agyAuthStates);
+  const agyNativeWorkbenchEnabled = useAppStore((s) => s.agyNativeWorkbenchEnabled);
   const [entries, setEntries] = useState<AgyInstanceEntryDto[]>(initialEntries ?? []);
   const [authCodeInput, setAuthCodeInput] = useState('');
   const [confirmSharedLogout, setConfirmSharedLogout] = useState(false);
@@ -32,6 +53,10 @@ export function AgySettingsSlot({ harness, onRefresh, initialEntries }: AgySetti
   const [newInstanceId, setNewInstanceId] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
   const [newAuthMethod, setNewAuthMethod] = useState<AgyAuthMethod>('oauth-personal');
+  const [ecosystemExpanded, setEcosystemExpanded] = useState(false);
+
+  const shouldRenderNativeEcosystem =
+    Boolean(showNativeEcosystem) || ecosystemSnapshot !== undefined || ecosystemExpanded;
 
   const loadInstances = useCallback(async () => {
     if (initialEntries) return;
@@ -395,6 +420,31 @@ export function AgySettingsSlot({ harness, onRefresh, initialEntries }: AgySetti
               </div>
             </div>
           )}
+        </div>
+      )}
+      {agyNativeWorkbenchEnabled && !shouldRenderNativeEcosystem && (
+        <div className="pt-1" style={{ borderTop: '1px solid var(--border-hairline)' }}>
+          <button
+            type="button"
+            data-testid="toggle-agy-native-ecosystem"
+            onClick={() => setEcosystemExpanded(true)}
+            className="inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium text-[var(--accent-indigo)] hover:underline"
+          >
+            <Layers size={12} />
+            展开原生生态与配置视图
+          </button>
+        </div>
+      )}
+
+      {shouldRenderNativeEcosystem && (
+        <div className="pt-1.5" style={{ borderTop: '1px solid var(--border-hairline)' }}>
+          <AgyNativeSettingsWorkspace
+            snapshot={ecosystemSnapshot ?? null}
+            initialSection={initialSection}
+            onRequestOptInQuery={onRequestOptInQuery}
+            latestOptInResult={latestOptInResult}
+            onRefresh={onRefresh}
+          />
         </div>
       )}
     </div>

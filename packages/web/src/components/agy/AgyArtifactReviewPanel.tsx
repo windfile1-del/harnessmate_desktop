@@ -1,5 +1,5 @@
 import type { Session } from '@harnessmate/protocol';
-import { Check, FileCheck2, MessageSquarePlus, RefreshCw, Shield, XCircle } from 'lucide-react';
+import { Check, FileCheck2, Lock, MessageSquarePlus, RefreshCw, Shield, XCircle } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   daemonApi,
@@ -8,6 +8,7 @@ import {
   type AgyEcosystemSnapshotDto,
 } from '../../api/client';
 import { useAppStore } from '../../stores/app-store';
+import { AgyArtifactReviewWorkspace, type AgyArtifactReviewWorkspaceProps } from './native/review';
 
 export interface ArtifactLineComment {
   file: string;
@@ -19,13 +20,14 @@ export function AgyArtifactReviewPanel({
   session,
   initialArtifacts,
   initialContent,
+  nativeWorkspace,
 }: {
   session: Session;
   initialArtifacts?: AgyArtifactSummaryDto[];
   initialContent?: AgyArtifactContentDto | null;
+  nativeWorkspace?: AgyArtifactReviewWorkspaceProps | null;
 }) {
   const setDraftText = useAppStore((s) => s.setDraftText);
-  const sendTurn = useAppStore((s) => s.sendTurn);
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [artifacts, setArtifacts] = useState<AgyArtifactSummaryDto[]>(initialArtifacts ?? []);
@@ -38,8 +40,14 @@ export function AgyArtifactReviewPanel({
   const [draftNote, setDraftNote] = useState('');
   const [loading, setLoading] = useState(false);
 
+  const useNativeWorkspace = Boolean(
+    session.harnessKind === 'agy' &&
+      nativeWorkspace &&
+      nativeWorkspace.featureGates.nativeArtifactsEnabled,
+  );
+
   const loadList = useCallback(async () => {
-    if (session.harnessKind !== 'agy' || initialArtifacts) return;
+    if (session.harnessKind !== 'agy' || initialArtifacts || useNativeWorkspace) return;
     setLoading(true);
     try {
       const res = await daemonApi.listAgyArtifacts(session.id);
@@ -52,14 +60,14 @@ export function AgyArtifactReviewPanel({
     } finally {
       setLoading(false);
     }
-  }, [session.id, session.harnessKind, initialArtifacts, selectedName]);
+  }, [session.id, session.harnessKind, initialArtifacts, selectedName, useNativeWorkspace]);
 
   useEffect(() => {
     void loadList();
   }, [loadList]);
 
   useEffect(() => {
-    if (!selectedName || initialContent?.name === selectedName) return;
+    if (!selectedName || initialContent?.name === selectedName || useNativeWorkspace) return;
     let active = true;
     void daemonApi
       .readAgyArtifact(session.id, selectedName)
@@ -72,7 +80,7 @@ export function AgyArtifactReviewPanel({
     return () => {
       active = false;
     };
-  }, [session.id, selectedName, initialContent]);
+  }, [session.id, selectedName, initialContent, useNativeWorkspace]);
 
   if (session.harnessKind !== 'agy') {
     return (
@@ -80,6 +88,10 @@ export function AgyArtifactReviewPanel({
         Artifact Review 仅在 AGY 会话中可用。
       </div>
     );
+  }
+
+  if (useNativeWorkspace && nativeWorkspace) {
+    return <AgyArtifactReviewWorkspace {...nativeWorkspace} />;
   }
 
   const addLineComment = () => {
@@ -92,15 +104,9 @@ export function AgyArtifactReviewPanel({
     setDraftNote('');
   };
 
-  const buildReviewMarkdown = (verdict?: 'approve' | 'request_changes') => {
-    const header =
-      verdict === 'approve'
-        ? '[AGY Artifact Review · Approve]'
-        : verdict === 'request_changes'
-          ? '[AGY Artifact Review · Request Changes]'
-          : '[AGY Artifact Review Comments]';
+  const buildReviewDraftMarkdown = () => {
     const lines = comments.map((c) => `- \`${c.file}#L${c.line}\`: ${c.comment}`);
-    return [header, ...(lines.length > 0 ? lines : ['请按上述结论继续。'])].join('\n');
+    return ['[AGY Artifact Review Comments]', ...(lines.length > 0 ? lines : ['请按上述审阅备注继续。'])].join('\n');
   };
 
   const lines = content ? content.content.split(/\r?\n/) : [];
@@ -121,9 +127,16 @@ export function AgyArtifactReviewPanel({
         </button>
       </div>
 
+      <div className="flex items-center gap-1.5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px] text-[var(--text-muted)]">
+        <Lock size={11.5} className="shrink-0" aria-hidden="true" />
+        <span>
+          只读产物预览（原生批准/拒绝受 AGY-W14 协议证据门控，不通过聊天消息伪造批准；请在官方 App 或 CLI 中完成批准）。
+        </span>
+      </div>
+
       {artifacts.length === 0 ? (
         <p className="text-[11.5px] text-[var(--text-muted)]">
-          当前 AGY 会话暂无产物文件（位于 brain/{session.nativeSessionId ?? '<id>'}/）。
+          当前 AGY 会话暂无产物文件（位于受控会话产物目录）。
         </p>
       ) : (
         <div className="flex flex-wrap gap-1.5">
@@ -163,7 +176,7 @@ export function AgyArtifactReviewPanel({
                 <button
                   type="button"
                   onClick={() => setDraftLine(lineNo)}
-                  title={`在第 ${lineNo} 行添加评论`}
+                  title={`在第 ${lineNo} 行添加草稿备注`}
                   className={`w-8 shrink-0 cursor-pointer text-right ${
                     hasComment ? 'font-bold text-[var(--accent-star)]' : 'text-[var(--text-muted)]'
                   }`}
@@ -204,7 +217,7 @@ export function AgyArtifactReviewPanel({
       {comments.length > 0 && (
         <div className="space-y-1 rounded-lg bg-[var(--bg-elevated)] p-2 text-[11px]">
           <div className="font-medium text-[var(--text-primary)]">
-            已收集 {comments.length} 条行级评论
+            已收集 {comments.length} 条行级评论草稿
           </div>
           {comments.map((c, idx) => (
             <div key={idx} className="text-[var(--text-secondary)]">
@@ -221,8 +234,8 @@ export function AgyArtifactReviewPanel({
         <button
           type="button"
           onClick={() => {
-            setDraftText(session.id, buildReviewMarkdown());
-            pushToast({ kind: 'info', title: '已将审阅意见填入输入框' });
+            setDraftText(session.id, buildReviewDraftMarkdown());
+            pushToast({ kind: 'info', title: '已将审阅意见草稿填入输入框' });
           }}
           className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
         >
@@ -231,16 +244,18 @@ export function AgyArtifactReviewPanel({
         </button>
         <button
           type="button"
-          onClick={() => void sendTurn(session.id, buildReviewMarkdown('approve'))}
-          className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-[var(--accent-emerald)] px-2.5 py-1 text-[11px] font-medium text-white"
+          disabled
+          title="未获经验证的 ACP 原生批准协议前，禁止伪造批准"
+          className="inline-flex cursor-not-allowed items-center gap-1 rounded-lg bg-[var(--accent-emerald)] px-2.5 py-1 text-[11px] font-medium text-white opacity-45"
         >
           <Check size={12} />
           批准 (Approve)
         </button>
         <button
           type="button"
-          onClick={() => void sendTurn(session.id, buildReviewMarkdown('request_changes'))}
-          className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-[var(--accent-rose)] px-2.5 py-1 text-[11px] font-medium text-white"
+          disabled
+          title="未获经验证的 ACP 原生拒绝协议前，禁止伪造拒绝"
+          className="inline-flex cursor-not-allowed items-center gap-1 rounded-lg bg-[var(--accent-rose)] px-2.5 py-1 text-[11px] font-medium text-white opacity-45"
         >
           <XCircle size={12} />
           要求修改
