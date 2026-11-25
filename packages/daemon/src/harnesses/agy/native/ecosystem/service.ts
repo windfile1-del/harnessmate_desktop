@@ -27,7 +27,7 @@ import {
   discoverSkillsWith1516Precedence,
   validateProjectRoots,
 } from './discovery.js';
-import { readSafeBoundedFile, redactPathForDto } from './path-guard.js';
+import { normalizePathForCompare, readSafeBoundedFile, redactPathForDto } from './path-guard.js';
 import {
   DEFAULT_AGY_ECOSYSTEM_FEATURE_GATES,
   type AdminPolicySnapshot,
@@ -213,10 +213,8 @@ function readProfileDeclaredAdminPolicy(
 
 function resolveAdminPolicy(
   inputPolicy: Partial<AdminPolicySnapshot> | undefined,
-  launchContext: AgyLaunchContext,
-  platform: NodeJS.Platform,
+  filePolicy: Partial<AdminPolicySnapshot>,
 ): AdminPolicySnapshot {
-  const filePolicy = readProfileDeclaredAdminPolicy(launchContext, platform);
   const disabledPlugins = Array.from(
     new Set([...(filePolicy.disabledPlugins ?? []), ...(inputPolicy?.disabledPlugins ?? [])]),
   );
@@ -332,7 +330,18 @@ export class AgyNativeEcosystemService {
       platform,
     });
 
-    const adminPolicy = resolveAdminPolicy(input.adminPolicy, input.launchContext, platform);
+    if (input.launchContext.instanceId !== input.profile.instanceId ||
+        input.launchContext.isolationMode !== input.profile.isolationMode ||
+        input.launchContext.authMethod !== input.profile.authMethod ||
+        normalizePathForCompare(input.launchContext.appDataPath, platform) !==
+          normalizePathForCompare(scopeInspection.appDataPath, platform) ||
+        normalizePathForCompare(input.launchContext.geminiDir, platform) !==
+          normalizePathForCompare(scopeInspection.geminiDir, platform)) {
+      throw new Error('AGY ecosystem launch context does not match the selected profile');
+    }
+    const gatesClosed = !this.gates.ecosystemReadEnabled;
+    const adminPolicy = resolveAdminPolicy(input.adminPolicy,
+      gatesClosed ? {} : readProfileDeclaredAdminPolicy(input.launchContext, platform));
 
     const cacheSlotKey = [
       input.profile.instanceId,
@@ -357,6 +366,11 @@ export class AgyNativeEcosystemService {
           source,
           workspaceRoot: path.resolve(input.workspaceRoot),
           additionalDirs,
+          accountDefaults: input.profile.defaults ?? null,
+          fallbackPermissionMode: input.fallbackPermissionMode ?? null,
+          platform,
+          userHome: path.resolve(userHome),
+          cwd: input.cwd ? path.resolve(input.cwd) : null,
           sessionOverrides: input.sessionOverrides ?? null,
           turnOverrides: input.turnOverrides ?? null,
           observedActual: input.observedActual ?? null,
@@ -373,7 +387,7 @@ export class AgyNativeEcosystemService {
       .slice(0, 16);
 
     const cached = this.cache.get(cacheSlotKey);
-    if (cached && cached.cacheKeyHash === cachePayloadHash) {
+    if (gatesClosed && cached && cached.cacheKeyHash === cachePayloadHash) {
       return cached.snapshot;
     }
 
@@ -407,8 +421,6 @@ export class AgyNativeEcosystemService {
       ...(m.supportedEfforts ? { supportedEfforts: m.supportedEfforts } : {}),
       allowedByPolicy: allowedModelsSet ? allowedModelsSet.has(m.id) : true,
     }));
-
-    const gatesClosed = !this.gates.ecosystemReadEnabled;
 
     const projects = validateProjectRoots({
       workspaceRoot: input.workspaceRoot,
@@ -592,10 +604,7 @@ export class AgyNativeEcosystemService {
       }),
     };
 
-    this.cache.set(cacheSlotKey, {
-      cacheKeyHash: cachePayloadHash,
-      snapshot,
-    });
+    if (gatesClosed) this.cache.set(cacheSlotKey, { cacheKeyHash: cachePayloadHash, snapshot });
     return snapshot;
   }
 

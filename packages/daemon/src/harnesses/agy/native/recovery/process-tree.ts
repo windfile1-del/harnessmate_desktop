@@ -141,6 +141,8 @@ export class AgyProcessTreeTeardownCoordinator {
       };
     }
 
+    const stillOwnsProcess = () => this.ownedByPid.get(input.pid) === owned;
+    const isProcessAlive = () => stillOwnsProcess() && input.transport.isProcessAlive(input.pid);
     const stepsExecuted: string[] = [];
     let cancelSent = false;
     let closeSent = false;
@@ -150,14 +152,14 @@ export class AgyProcessTreeTeardownCoordinator {
 
     const pollInterval = Math.max(10, this.defaults.pollIntervalMs ?? 50);
     const waitUntilExited = async (graceMs: number): Promise<boolean> => {
-      if (!input.transport.isProcessAlive(input.pid)) return true;
+      if (!isProcessAlive()) return true;
       const deadline = input.transport.now() + Math.max(0, graceMs);
-      while (input.transport.isProcessAlive(input.pid) && input.transport.now() < deadline) {
+      while (isProcessAlive() && input.transport.now() < deadline) {
         const remaining = deadline - input.transport.now();
         if (remaining <= 0) break;
         await input.transport.wait(Math.min(pollInterval, remaining));
       }
-      return !input.transport.isProcessAlive(input.pid);
+      return !isProcessAlive();
     };
 
     // Step 1: Version-gated session/cancel when active turn/work exists
@@ -170,10 +172,7 @@ export class AgyProcessTreeTeardownCoordinator {
           cancelSent = false;
         }
         if (cancelSent) {
-          const exited = await waitUntilExited(this.defaults.cancelGraceMs ?? 3_000);
-          if (exited && !input.hasActiveTurnOrWork) {
-            this.ownedByPid.delete(input.pid);
-          }
+          await waitUntilExited(this.defaults.cancelGraceMs ?? 3_000);
         }
       } else {
         stepsExecuted.push('session_cancel_skipped_compat');
@@ -181,7 +180,7 @@ export class AgyProcessTreeTeardownCoordinator {
     }
 
     // Step 2: Version- & capability-gated session/close
-    if (input.transport.isProcessAlive(input.pid) && input.nativeSessionId) {
+    if (isProcessAlive() && input.nativeSessionId) {
       if (input.compat.degradedToSafeMode) {
         closeSkippedReason = 'bad_cli_version_degraded';
         stepsExecuted.push('session_close_skipped_degraded');
@@ -208,14 +207,16 @@ export class AgyProcessTreeTeardownCoordinator {
     }
 
     // Step 3: Windows taskkill /T /F or POSIX process group kill if still alive
-    if (input.transport.isProcessAlive(input.pid)) {
+    if (isProcessAlive()) {
       stepsExecuted.push(platform === 'win32' ? 'windows_taskkill_tree' : 'posix_pgroup_kill');
       treeKillInvoked = true;
       const killRes = await input.transport.killProcessTree(input.pid, platform);
       treeKillMethod = killRes.method;
     }
 
-    const exitedCleanly = !input.transport.isProcessAlive(input.pid);
+    const ownershipChanged = !stillOwnsProcess();
+    if (ownershipChanged) stepsExecuted.push('ownership_changed');
+    const exitedCleanly = !ownershipChanged && !isProcessAlive();
     if (exitedCleanly) {
       this.ownedByPid.delete(input.pid);
     }
@@ -223,7 +224,7 @@ export class AgyProcessTreeTeardownCoordinator {
     return {
       pid: input.pid,
       platform,
-      refusedNotOwned: false,
+      refusedNotOwned: ownershipChanged,
       stepsExecuted,
       cancelSent,
       closeSent,

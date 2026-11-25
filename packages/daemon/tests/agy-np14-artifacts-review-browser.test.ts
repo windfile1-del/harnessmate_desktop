@@ -360,6 +360,51 @@ describe('NP-14 · Suite 2: Joint Teamwork Prompt Artifact Review Bridge (T12 + 
     expect(proj.milestones ?? []).toHaveLength(0);
   });
 
+  it('keeps live artifacts immutable to replay and dispatches at most one supported decision', async () => {
+    const binding = makeBinding();
+    const artifactId = 'art_np14_race';
+    const connectionId = 'conn_np14_race';
+    const requestId = 'req_np14_race';
+    let writes = 0;
+    const service = new AgyNativeArtifactService({
+      gates: { nativeArtifactsEnabled: true, reviewControlEnabled: true },
+      reviewTransport: {
+        getWireSupportStatus: () => 'verified_live_wire',
+        async submitReviewAction() {
+          writes++;
+          return { accepted: true, state: 'response_written', reasonCode: 'written' };
+        },
+      },
+    });
+    service.attachConnection(binding, { connectionId, rootNativeSessionId: 'nat_live' });
+    const artifact = {
+      artifactId, title: 'Prompt', content: 'current', originKind: 'teamwork_prompt',
+      contentKind: 'text', evidence: {
+        kind: 'live_protocol', connectionId, ingressOrdinal: 1, wireVariant: 'acp', observedAt: 1,
+      },
+    } as const;
+    expect(service.registerObservedArtifact(binding, artifact)).toBeTruthy();
+    service.registerHistoricalSession(binding, { nativeSessionId: 'nat_old' });
+    expect(service.registerObservedArtifact(binding, {
+      ...artifact, content: 'old', evidence: { kind: 'replay', captureId: 'cap', ordinal: 1, observedAt: 2 },
+    })).toBeNull();
+    const request = {
+      binding, artifactId, connectionId, requestId, wireSupport: 'verified_live_wire', allowedDecisions: ['approve'],
+    } as const;
+    expect(service.registerPendingReviewRequest(request)).toBe(true);
+    const review = service.createTeamworkArtifactReviewPort();
+    const submit = review.submitNativeArtifactApproval!;
+    const action = { binding, artifactId, requestId };
+    const reject = await submit({ ...action, decision: 'reject', idempotencyKey: 'reject' });
+    expect(reject.reasonCode).toBe('review_decision_not_allowed');
+    const first = submit({ ...action, decision: 'approve', idempotencyKey: 'a' });
+    const duplicate = await submit({ ...action, decision: 'approve', idempotencyKey: 'b' });
+    expect(duplicate.reasonCode).toBe('review_submission_in_flight');
+    expect((await first).accepted).toBe(true);
+    expect(service.registerPendingReviewRequest(request)).toBe(false);
+    expect(writes).toBe(1);
+  });
+
   it('rejects approval completion when connection closes or artifact revision advances mid-flight (G3-03 async race guard)', async () => {
     const binding = makeBinding('gen_race', 'rt_race');
     const artifactId = 'art_race_1';

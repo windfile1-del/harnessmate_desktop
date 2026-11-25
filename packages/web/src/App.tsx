@@ -7,6 +7,7 @@ import { registerSwarmStudioView } from './components/agy/native/swarm/register'
 import { registerBoostStudioView } from './components/agy/native/boost/register';
 import { registerTeamworkStudioView } from './components/agy/native/teamwork/register';
 import { registerDynamicWorkflowStudioView } from './components/agy/native/workflow';
+import { registerNativeTasksView } from './components/agy/native/tasks/register';
 import { ChatStage } from './components/ChatStage';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
@@ -92,6 +93,7 @@ export function App() {
       registerBoostStudioView(),
       registerTeamworkStudioView(),
       registerDynamicWorkflowStudioView(),
+      registerNativeTasksView(),
     ];
     return () => unregister.reverse().forEach((dispose) => dispose());
   }, [agyNativeWorkbenchEnabled]);

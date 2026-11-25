@@ -431,7 +431,7 @@ describe('NP-13 Native Ecosystem, Custom Agents & Config Scope', () => {
       },
     });
 
-    const snapA = service.collectSnapshot({
+    const scopeA = {
       profile: profileA,
       launchContext: createAgyLaunchContext({
         instanceId: profileA.instanceId,
@@ -444,7 +444,14 @@ describe('NP-13 Native Ecosystem, Custom Agents & Config Scope', () => {
       workspaceRoot,
       userHome,
       source: 'agy_cli',
-    });
+    };
+    const snapA = service.collectSnapshot(scopeA);
+    expect(() => service.collectSnapshot({ ...scopeA, profile: profileB })).toThrow('selected profile');
+
+    writeFileEnsureDir(path.join(geminiA, 'config', 'agents', 'new-agent.md'), '---\nname: new-agent\n---\n');
+    const refreshed = service.collectSnapshot(scopeA);
+    expect(refreshed.snapshotRevision).toBeGreaterThan(snapA.snapshotRevision);
+    expect(refreshed.customAgents.items.map((a) => a.name)).toContain('new-agent');
 
     const snapB = service.collectSnapshot({
       profile: profileB,

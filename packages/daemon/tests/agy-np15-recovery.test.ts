@@ -45,10 +45,7 @@ const tempDirs: string[] = [];
 const openStores: HarnessMateStore[] = [];
 
 function makeTempDir(prefix: string): string {
-  const rootBase = fs.existsSync('D:\\HarnessMate\\np15-tmp')
-    ? 'D:\\HarnessMate\\np15-tmp'
-    : os.tmpdir();
-  const dir = fs.mkdtempSync(path.join(rootBase, prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
 }
@@ -685,6 +682,23 @@ describe('NP-15 Session Recovery & Protocol Compatibility', () => {
     expect(okGen2.accepted).toBe(true);
     expect(okGen2.invalidatedGenerations).toEqual([bindingGen1.generation]);
 
+    const scheduleObservation = {
+      scheduleNativeId: 'nightly', occurrenceId: 'first', state: 'finished',
+      source: 'live_protocol', observedAt: 1, wireVariant: 'acp-v1', ingressOrdinal: 1,
+    } as const;
+    const schedule = {
+      binding: bindingGen2, nowMs: 2, persistedOccurrences: [{
+        scheduleNativeId: 'nightly', occurrenceId: 'first', workflowId: asWorkflowId('wf_nightly'),
+        workId: asWorkId('work_first'), originGeneration: bindingGen1.generation, lastState: 'queued',
+      }],
+    } as const;
+    expect(service.reconcileScheduleOccurrences({ ...schedule, freshEvidence: [
+      { ...scheduleObservation, connectionId: 'conn_2' }, scheduleObservation,
+    ] }).occurrences[0]?.status).toBe('stale_unverified');
+    expect(service.reconcileScheduleOccurrences({ ...schedule, freshEvidence: [
+      { ...scheduleObservation, connectionId: 'conn_3' },
+    ] }).occurrences[0]?.status).toBe('fired_observed');
+
     // Simulate network disconnect & frontend cursor resync across generation boundary
     const claimedRes = registry.persistence.createPendingApprovalReceipt({
       binding: bindingGen2,
@@ -894,10 +908,11 @@ describe('NP-15 Session Recovery & Protocol Compatibility', () => {
           scheduleNativeId: 'sched_nightly',
           occurrenceId: 'occ_1',
           state: 'finished',
-          source: 'live_protocol',
+          source: 'native_snapshot',
           observedAt: now - 500,
-          connectionId: 'conn_sched_2',
-          ingressOrdinal: 7,
+          sourceId: 'schedule_data',
+          schemaVersion: '1',
+          staleAt: now + 10_000,
           nextAt: now + 3_600_000,
         },
       ],
@@ -911,7 +926,7 @@ describe('NP-15 Session Recovery & Protocol Compatibility', () => {
     expect(occ1.workId).toBe(asWorkId('wrk_occ_1_new'));
     expect(occ1.status).toBe('fired_observed');
     expect(occ1.observedState.kind).toBe('known');
-    expect(occ1.statusSource).toBe('live_protocol');
+    expect(occ1.statusSource).toBe('native_snapshot');
 
     const occ2 = reconciled.occurrences.find((o) => o.occurrenceId === 'occ_2')!;
     expect(occ2.status).toBe('stale_unverified');
@@ -1160,6 +1175,26 @@ describe('NP-15 Session Recovery & Protocol Compatibility', () => {
     });
     expect(refused.refusedNotOwned).toBe(true);
     expect(unowned.calls).toHaveLength(0);
+
+    const originalOwner = {
+      pid: 1000, binding, connectionId: 'conn_tree', cliVersion: '1.5.16',
+      platform: 'win32', spawnedAt: 1000,
+    } as const;
+    const replacement = { ...originalOwner, connectionId: 'replacement', spawnedAt: 2000 };
+    const reused = makeMockTransport('tree');
+    coordinator.registerOwnedProcess(originalOwner);
+    const interrupted = await coordinator.teardownConnection({
+      binding, connectionId: originalOwner.connectionId, pid: originalOwner.pid,
+      nativeSessionId: 'nat_tree', hasActiveTurnOrWork: true, platform: 'win32',
+      negotiated: v1Negotiated.capabilities, compat: evaluateCliVersionCompatibility('1.5.16'),
+      transport: { ...reused.transport, sendCancel: async () => {
+        coordinator.registerOwnedProcess(replacement);
+        return true;
+      } },
+    });
+    expect(interrupted.refusedNotOwned).toBe(true);
+    expect(reused.calls).toHaveLength(0);
+    expect(coordinator.getOwnedProcess(originalOwner.pid)).toBe(replacement);
 
     // 7b. 1.5.16 with clean session/close exit skips taskkill
     coordinator.registerOwnedProcess({

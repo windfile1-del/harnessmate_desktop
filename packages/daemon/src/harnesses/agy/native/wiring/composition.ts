@@ -21,6 +21,8 @@ import { AgySwarmObserver } from '../workflows/swarm/swarm-observer.js';
 import { BoostWorkflowObserver } from '../workflows/boost/observer.js';
 import { AgyTeamworkWorkflowObserver } from '../workflows/teamwork/observer.js';
 import { DynamicWorkflowObserver } from '../workflows/dynamic/observer.js';
+import { GoalScheduleTasksObserver } from '../workflows/tasks/observer.js';
+import { registerTasksCapabilityDescriptors } from '../workflows/tasks/ports.js';
 import type { NativeConnectionPort, NativeWorkflowResourceReaderPort } from './types.js';
 
 interface AttachedConnection {
@@ -49,6 +51,7 @@ export function wireAgyNativeRuntime(
   const boost = new BoostWorkflowObserver();
   const teamwork = new AgyTeamworkWorkflowObserver({ featureGates: { teamworkEnabled: true } });
   const dynamic = new DynamicWorkflowObserver({ strictMode: true });
+  const tasks = new GoalScheduleTasksObserver({ strictMode: true });
   const workflowReaders = {
     swarm, boost, teamwork: teamwork.createResourceReader(), dynamic,
   };
@@ -102,6 +105,7 @@ export function wireAgyNativeRuntime(
   }
 
   let removeWorkflowDescriptors: (() => void) | undefined;
+  let removeTasksDescriptors: (() => void) | undefined;
 
   function refresh(binding: RuntimeBinding, handle: AcpSessionHandle): void {
     const scope = getConnection(binding);
@@ -122,6 +126,13 @@ export function wireAgyNativeRuntime(
     } else if (removeWorkflowDescriptors) {
       removeWorkflowDescriptors();
       removeWorkflowDescriptors = undefined;
+    }
+    if (registry.getFeatureFlags().nativeTasksObservation) {
+      removeTasksDescriptors ??= registerTasksCapabilityDescriptors(catalog);
+      tasks.registerBinding(scope);
+    } else if (removeTasksDescriptors) {
+      removeTasksDescriptors();
+      removeTasksDescriptors = undefined;
     }
     updateCatalog(binding, {
       ...signals,
@@ -152,7 +163,11 @@ export function wireAgyNativeRuntime(
       };
       const previous = connections.get(binding.sessionId);
       if (previous?.handle === handle && sameBinding(previous.binding, binding)) return;
-      if (previous) registry.handleTransportClosed(previous.binding, previous.connectionId, 'connection_replaced');
+      if (previous) {
+        registry.handleTransportClosed(previous.binding, previous.connectionId, 'connection_replaced');
+        const tasksClosed = tasks.handleTransportClosed(previous.binding, previous.connectionId);
+        if (hasCurrentBinding(previous.binding)) tasks.commitToRegistry(registry, previous.binding, tasksClosed);
+      }
       connections.set(binding.sessionId, scope);
       if (registry.getFeatureFlags().nativeWorkflowObservation) {
         swarm.registerBinding(scope);
@@ -196,6 +211,10 @@ export function wireAgyNativeRuntime(
         }
         dynamic.commitToRegistry(registry, scope.binding, dynamic.acceptFrame(envelope).commits);
       }
+      if (flags.nativeTasksObservation) {
+        tasks.registerBinding(scope);
+        tasks.commitToRegistry(registry, scope.binding, tasks.acceptFrame(envelope).commits);
+      }
       if (!flags.nativeLifecycle) return false;
       const result = child.acceptFrame(envelope, scope);
       child.commitToRegistry(registry, scope.binding, result.commits);
@@ -212,6 +231,7 @@ export function wireAgyNativeRuntime(
       const teamworkRevision = teamwork.getWorkflowEntity(binding)?.revision;
       teamwork.handleTransportClosed(binding, connectionId);
       const dynamicClosed = dynamic.handleTransportClosed(binding, connectionId);
+      const tasksClosed = tasks.handleTransportClosed(binding, connectionId);
       if (!hasCurrentBinding(binding)) {
         child.handleTransportClosed(binding, connectionId);
         return true;
@@ -222,6 +242,7 @@ export function wireAgyNativeRuntime(
       if (teamworkClosed && teamworkClosed.state.kind !== 'unknown' &&
           teamworkClosed.revision !== teamworkRevision) teamwork.commitToRegistry(registry, binding);
       for (const batch of dynamicClosed) dynamic.commitToRegistry(registry, binding, batch);
+      tasks.commitToRegistry(registry, binding, tasksClosed);
       const before = child.getStateSnapshot(binding);
       child.handleTransportClosed(binding, connectionId);
       const after = child.getStateSnapshot(binding);
@@ -383,6 +404,7 @@ export function wireAgyNativeRuntime(
         ? projection.workflows.find((item) => item.id === input.workflowId)
         : undefined;
       const kind = workflow?.detail.kind;
+      if (kind === 'goal' || kind === 'schedule') return tasks.readWorkflowResource(input);
       if (kind === 'swarm' || kind === 'boost' || kind === 'teamwork' || kind === 'dynamic') {
         return workflowReaders[kind].readWorkflowResource(input);
       }
@@ -401,6 +423,7 @@ export function wireAgyNativeRuntime(
     permissions.dispose();
     lifecycle.dispose();
     removeWorkflowDescriptors?.();
+    removeTasksDescriptors?.();
     connections.clear();
     workflowBindings.clear();
   };

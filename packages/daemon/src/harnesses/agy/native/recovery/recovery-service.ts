@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { EvidenceSchema } from '@harnessmate/protocol';
 import type {
   BindingGeneration,
   Evidence,
@@ -667,6 +668,10 @@ export class AgyNativeRecoveryService implements NativeScheduleRecoveryPort {
       return { accepted: false, reasonCode: 'connection_replaced_same_generation' };
     }
 
+    if (current.inHistoryReplay || this.reconcilingSessions.has(envelope.binding.sessionId)) {
+      return { accepted: false, reasonCode: 'reconciling_control_gated' };
+    }
+
     const now = this.nowFn();
     current.lastSeenAt = now;
     this.lastSeenAtByRuntime.set(envelope.binding.runtimeId, now);
@@ -935,7 +940,7 @@ export class AgyNativeRecoveryService implements NativeScheduleRecoveryPort {
 
   /**
    * NP-12 NativeScheduleRecoveryPort:
-   * - Deduplicates schedule occurrences across generations via `${scheduleNativeId}::${occurrenceId}`
+   * - Deduplicates schedule occurrences across generations by the pair of native IDs
    * - Keeps independent occurrence -> workId linkage intact
    * - Applies fresh live/snapshot evidence when available, else marks `stale_unverified` honestly
    * - Never routes native schedules into HM scheduler
@@ -952,24 +957,49 @@ export class AgyNativeRecoveryService implements NativeScheduleRecoveryPort {
     readonly nextAt?: Observed<number>;
   } {
     const now = input.nowMs ?? this.nowFn();
-    const freshByKey = new Map<string, FreshScheduleOccurrenceEvidence>();
-    for (const ev of input.freshEvidence) {
-      const key = `${ev.scheduleNativeId}::${ev.occurrenceId}`;
+    const active = this.activeConnectionsBySession.get(input.binding.sessionId);
+    const canUseLiveEvidence = active && sameBinding(active.binding, input.binding) &&
+      !active.inHistoryReplay && !this.reconcilingSessions.has(input.binding.sessionId) &&
+      this.registry.isActiveBinding(input.binding);
+    const freshByKey = new Map<string, { observation: FreshScheduleOccurrenceEvidence; evidence: Evidence }>();
+    for (const observation of input.freshEvidence) {
+      if (observation.source === 'live_protocol' &&
+          (!canUseLiveEvidence || observation.connectionId !== active.connectionId)) continue;
+      const parsed = EvidenceSchema.safeParse(observation.source === 'live_protocol'
+        ? {
+            kind: 'live_protocol',
+            connectionId: observation.connectionId,
+            ingressOrdinal: observation.ingressOrdinal,
+            wireVariant: observation.wireVariant,
+            observedAt: observation.observedAt,
+          }
+        : {
+            kind: 'native_snapshot',
+            sourceId: observation.sourceId,
+            schemaVersion: observation.schemaVersion,
+            observedAt: observation.observedAt,
+            staleAt: observation.staleAt,
+          });
+      if (!parsed.success || observation.observedAt > now ||
+          (parsed.data.kind === 'native_snapshot' && now >= parsed.data.staleAt)) continue;
+      const key = JSON.stringify([observation.scheduleNativeId, observation.occurrenceId]);
       const prev = freshByKey.get(key);
-      if (!prev || ev.observedAt >= prev.observedAt) {
-        freshByKey.set(key, ev);
+      if (!prev || observation.observedAt >= prev.observation.observedAt) {
+        freshByKey.set(key, { observation, evidence: parsed.data });
       }
     }
 
     const deduped = new Map<string, PersistedScheduleOccurrenceInput>();
     let deduplicatedCount = 0;
     for (const item of input.persistedOccurrences) {
-      const key = `${item.scheduleNativeId}::${item.occurrenceId}`;
+      const key = JSON.stringify([item.scheduleNativeId, item.occurrenceId]);
       const existing = deduped.get(key);
       if (existing) {
         deduplicatedCount += 1;
-        // Prefer the newer generation or more recent observation
-        if (item.originGeneration === input.binding.generation || (item.lastObservedAt ?? 0) >= (existing.lastObservedAt ?? 0)) {
+        const itemIsCurrent = item.originGeneration === input.binding.generation;
+        const existingIsCurrent = existing.originGeneration === input.binding.generation;
+        if (itemIsCurrent !== existingIsCurrent ? itemIsCurrent :
+            (item.lastObservedAt ?? 0) >= (existing.lastObservedAt ?? 0)) {
           deduped.set(key, item);
         }
       } else {
@@ -982,57 +1012,36 @@ export class AgyNativeRecoveryService implements NativeScheduleRecoveryPort {
     let earliestNextAt: { value: number; evidence: Evidence } | undefined;
 
     for (const [dedupeKey, occ] of deduped.entries()) {
-      const fresh = freshByKey.get(dedupeKey);
+      const freshMatch = freshByKey.get(dedupeKey);
       const deduplicatedAcrossGenerations = occ.originGeneration !== input.binding.generation;
 
-      if (fresh) {
-        const evidence: Evidence =
-          fresh.source === 'live_protocol'
-            ? {
-                kind: 'live_protocol',
-                connectionId: fresh.connectionId ?? 'recovered_conn',
-                ingressOrdinal: fresh.ingressOrdinal ?? 0,
-                wireVariant: 'agy-acp-v1',
-                observedAt: fresh.observedAt,
-              }
-            : {
-                kind: 'native_snapshot',
-                sourceId: fresh.sourceId ?? 'native_schedule_snapshot',
-                schemaVersion: fresh.schemaVersion ?? '1',
-                observedAt: fresh.observedAt,
-                staleAt: fresh.staleAt ?? fresh.observedAt + this.config.snapshotStaleTtlMs,
-              };
+      if (freshMatch) {
+        const { observation: fresh, evidence } = freshMatch;
+        const status =
+          fresh.state === 'finished'
+            ? 'fired_observed'
+            : fresh.state === 'cancelled'
+              ? 'cancelled_observed'
+              : 'confirmed_active';
 
-        const isFreshSnapshotExpired =
-          evidence.kind === 'native_snapshot' && now >= evidence.staleAt;
-
-        if (!isFreshSnapshotExpired) {
-          const status =
-            fresh.state === 'finished'
-              ? 'fired_observed'
-              : fresh.state === 'cancelled'
-                ? 'cancelled_observed'
-                : 'confirmed_active';
-
-          if (fresh.nextAt !== undefined && (!earliestNextAt || fresh.nextAt < earliestNextAt.value)) {
-            earliestNextAt = { value: fresh.nextAt, evidence };
-          }
-
-          occurrences.push({
-            dedupeKey,
-            workflowId: occ.workflowId,
-            workId: occ.workId,
-            occurrenceId: occ.occurrenceId,
-            status,
-            observedState: { kind: 'known', value: fresh.state, evidence },
-            statusSource: fresh.source,
-            deduplicatedAcrossGenerations,
-            originGeneration: occ.originGeneration,
-            reconciledGeneration: input.binding.generation,
-            reasonCode: 'v1_resume_attached',
-          });
-          continue;
+        if (fresh.nextAt !== undefined && (!earliestNextAt || fresh.nextAt < earliestNextAt.value)) {
+          earliestNextAt = { value: fresh.nextAt, evidence };
         }
+
+        occurrences.push({
+          dedupeKey,
+          workflowId: occ.workflowId,
+          workId: occ.workId,
+          occurrenceId: occ.occurrenceId,
+          status,
+          observedState: { kind: 'known', value: fresh.state, evidence },
+          statusSource: fresh.source,
+          deduplicatedAcrossGenerations,
+          originGeneration: occ.originGeneration,
+          reconciledGeneration: input.binding.generation,
+          reasonCode: 'v1_resume_attached',
+        });
+        continue;
       }
 
       // Missing or expired evidence: remain strictly honest (`stale_unverified`)

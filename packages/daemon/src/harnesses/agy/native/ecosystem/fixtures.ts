@@ -18,6 +18,7 @@ export function createAuthorizedProfileEcosystemFixture(opts?: {
     instanceId: 'agy-test-profile',
     displayName: 'Personal Test Profile',
     isolationMode: 'profile_isolated',
+    geminiDir: `${profilesRootDir}/agy-test-profile`,
     authMethod: 'oauth-personal',
     appDataDirName: 'antigravity-cli',
     defaults: {

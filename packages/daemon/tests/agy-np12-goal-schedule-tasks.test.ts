@@ -15,6 +15,7 @@ import {
   type NativeWork,
   type RuntimeBinding,
 } from '@harnessmate/protocol';
+import type { AcpSessionHandle } from '../src/harnesses/acp/strict-acp-adapter.js';
 import { AgyNativeCommandCatalogService } from '../src/harnesses/agy/native/commands/catalog.js';
 import type { NativeIngress } from '../src/harnesses/agy/native/wiring/types.js';
 import {
@@ -119,6 +120,45 @@ async function createNp12DaemonEnv() {
 }
 
 describe('NP-12 Goal, Schedule & Native Tasks Observer', () => {
+  it('keeps the experimental task feed off by default and projects only current live frames when enabled', async () => {
+    const { daemon, session, binding } = await createNp12DaemonEnv();
+    const hooks = daemon.nativeRegistry.createAdapterRuntimeHooks(binding);
+    const connectionId = 'conn_integrated_np12';
+    const attach = () => hooks.onSessionReady?.({
+      nativeSessionId: 'nat_root_t09',
+      getConnectionId: () => connectionId,
+      getNativeSessionSignals: () => ({ advertisedCommands: [] }),
+    } as unknown as AcpSessionHandle);
+    attach();
+    const env: NativeIngress = {
+      binding, connectionId, ingressOrdinal: 1, channel: 'live',
+      originSession: 'nat_root_t09',
+      wire: {
+        method: 'session/update',
+        params: { sessionId: 'nat_root_t09', update: {
+          sessionUpdate: 'tool_call', toolCallId: 'schedule_tool', toolName: 'schedule', status: 'in_progress',
+          rawInput: { DurationSeconds: 20, scheduleId: 'schedule_1', timezone: 'UTC' },
+        } },
+      },
+    };
+    const projection = () => daemon.nativeRegistry.getProjectionForSession(session.id, binding.instanceId);
+    hooks.onIngressFrame?.(env);
+    expect(projection().workflows).toEqual([]);
+
+    daemon.nativeRegistry.setFeatureFlags({ nativeTasksObservation: true });
+    hooks.onIngressFrame?.({ ...env, channel: 'history_replay' });
+    hooks.onIngressFrame?.({ ...env, connectionId: 'retired' });
+    expect(projection().workflows).toEqual([]);
+    hooks.onIngressFrame?.(env);
+    const workflow = projection().workflows[0];
+    expect(workflow?.detail.kind).toBe('schedule');
+    const resource = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/sessions/${session.id}/native/workflows/${workflow?.id}/logs`,
+    });
+    expect(NativeWorkflowResourceResponseSchema.parse(resource.json())).toMatchObject({ available: true });
+  });
+
   it('T09: handles one-shot schedule with ended user turn, separate WorkId vs wake ActivityId, and registry commit', async () => {
     const { daemon, binding } = await createNp12DaemonEnv();
     const observer = new GoalScheduleTasksObserver({ now: () => 1_764_100_022_000 });

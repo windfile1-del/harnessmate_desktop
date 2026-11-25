@@ -194,6 +194,7 @@ export interface FreshScheduleOccurrenceEvidence {
   readonly staleAt?: number;
   readonly connectionId?: string;
   readonly ingressOrdinal?: number;
+  readonly wireVariant?: string;
   readonly sourceId?: string;
   readonly schemaVersion?: string;
   readonly nextAt?: number;

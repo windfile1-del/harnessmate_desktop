@@ -78,6 +78,7 @@ interface PendingReviewRequestBinding {
   readonly wireSupport: ArtifactReviewWireSupportStatus;
   readonly allowedDecisions: ReadonlySet<'approve' | 'reject' | 'comment'>;
   settled: boolean;
+  submitting?: boolean;
   decision?: 'approve' | 'reject';
   receiptId?: string;
 }
@@ -267,8 +268,9 @@ export class AgyNativeArtifactService {
       readonly sourceRef?: string;
     },
   ): void {
+    const existing = this.scopesByGenKey.get(this.genKey(binding));
+    if (existing && !existing.isHistorical) return;
     const scope = this.ensureScope(binding, true);
-    scope.isHistorical = true;
     scope.activeConnectionId = null;
     scope.rootNativeSessionId = opts.nativeSessionId;
     scope.appDataPath = opts.appDataPath ?? scope.appDataPath;
@@ -423,8 +425,12 @@ export class AgyNativeArtifactService {
     },
   ): ArtifactResourceSummaryDto | null {
     if (!isValidOpaqueArtifactId(input.artifactId)) return null;
-    const scope = this.getCurrentScope(binding) ?? this.ensureScope(binding, input.evidence.kind === 'replay');
-    if (input.evidence.kind === 'live_protocol' && scope.activeConnectionId !== input.evidence.connectionId) {
+    const replay = input.evidence.kind === 'replay';
+    const existingScope = this.scopesByGenKey.get(this.genKey(binding));
+    const currentScope = this.getCurrentScope(binding);
+    if ((existingScope && !currentScope) || (replay && currentScope && !currentScope.isHistorical)) return null;
+    const scope = currentScope ?? this.ensureScope(binding, replay);
+    if (input.evidence.kind === 'live_protocol' && (scope.isHistorical || scope.activeConnectionId !== input.evidence.connectionId)) {
       return null;
     }
 
@@ -497,7 +503,8 @@ export class AgyNativeArtifactService {
     };
 
     scope.artifactsById.set(input.artifactId, entry);
-    if (input.workflowId && (input.originKind === 'dynamic_script' || input.originKind === 'dynamic_result')) {
+    if (!isHistorical && input.workflowId &&
+        (input.originKind === 'dynamic_script' || input.originKind === 'dynamic_result')) {
       scope.approvedDynamicIds.add(`${input.workflowId}::${input.artifactId}`);
     }
 
@@ -520,6 +527,8 @@ export class AgyNativeArtifactService {
     if (!artifact || artifact.scope.isHistorical) {
       return false;
     }
+    const existing = scope.reviewRequestsByArtifactId.get(input.artifactId);
+    if (existing?.requestId === input.requestId && existing.connectionId === input.connectionId) return false;
     scope.reviewRequestsByArtifactId.set(input.artifactId, {
       binding: input.binding,
       connectionId: input.connectionId,
@@ -551,6 +560,8 @@ export class AgyNativeArtifactService {
       Boolean(scope.activeConnectionId) &&
       Boolean(req) &&
       !req?.settled &&
+      !req?.submitting &&
+      !entry.scope.isHistorical &&
       req?.artifactRevision === entry.revision &&
       req?.connectionId === scope.activeConnectionId &&
       wireSupport === 'verified_live_wire';
@@ -818,7 +829,7 @@ export class AgyNativeArtifactService {
 
         const artifact = scope.artifactsById.get(input.artifactId);
         const req = scope.reviewRequestsByArtifactId.get(input.artifactId);
-        if (!artifact || !req) {
+        if (!artifact || artifact.scope.isHistorical || !req) {
           return {
             accepted: false,
             state: 'conflict',
@@ -846,6 +857,12 @@ export class AgyNativeArtifactService {
             reasonCode: 'review_request_already_settled',
           };
         }
+        if (!req.allowedDecisions.has(input.decision)) {
+          return { accepted: false, state: 'unsupported', reasonCode: 'review_decision_not_allowed' };
+        }
+        if (req.submitting) {
+          return { accepted: false, state: 'conflict', reasonCode: 'review_submission_in_flight' };
+        }
         if (req.wireSupport !== 'verified_live_wire') {
           return {
             accepted: false,
@@ -856,15 +873,25 @@ export class AgyNativeArtifactService {
 
         const expectedConn = scope.activeConnectionId;
         const expectedRev = artifact.revision;
-        const transportResult = await this.reviewTransport.submitReviewAction({
-          binding: input.binding,
-          connectionId: expectedConn,
-          artifactId: input.artifactId,
-          artifactRevision: expectedRev,
-          requestId: req.requestId,
-          decision: input.decision,
-          idempotencyKey: input.idempotencyKey,
-        });
+        req.submitting = true;
+        let transportResult: Awaited<ReturnType<NativeArtifactReviewTransportPort['submitReviewAction']>>;
+        try {
+          transportResult = await this.reviewTransport.submitReviewAction({
+            binding: input.binding,
+            connectionId: expectedConn,
+            artifactId: input.artifactId,
+            artifactRevision: expectedRev,
+            requestId: req.requestId,
+            decision: input.decision,
+            idempotencyKey: input.idempotencyKey,
+          });
+        } catch {
+          req.settled = true;
+          return { accepted: false, state: 'conflict', reasonCode: 'review_delivery_unknown' };
+        } finally {
+          req.submitting = false;
+        }
+        if (transportResult.state === 'response_written') req.settled = true;
 
         // Async re-verification after await (G3-03 race fence)
         const currentScope = this.getCurrentScope(input.binding);
@@ -875,8 +902,8 @@ export class AgyNativeArtifactService {
           currentScope.activeConnectionId !== expectedConn ||
           !currentArtifact ||
           currentArtifact.revision !== expectedRev ||
-          !currentReq ||
-          currentReq.requestId !== input.requestId
+          currentArtifact.scope.isHistorical ||
+          currentReq !== req
         ) {
           return {
             accepted: false,

@@ -42,6 +42,8 @@ export interface AgyNativeFeatureFlags {
   readonly nativeCommands: boolean;
   /** Opt-in observation of workflow updates on the attached ACP session. */
   readonly nativeWorkflowObservation: boolean;
+  /** Experimental Goal and Schedule observation. Enable only in an isolated test or capture session. */
+  readonly nativeTasksObservation: boolean;
   /** Enable transport observatory frame tapping. Default: false. */
   readonly observatoryTap: boolean;
   /** ACP v2 Preview protocol negotiation gate. MUST remain false until verified live support exists. */
@@ -54,6 +56,7 @@ export const DEFAULT_AGY_NATIVE_FEATURE_FLAGS: Readonly<AgyNativeFeatureFlags> =
   nativePermissions: false,
   nativeCommands: false,
   nativeWorkflowObservation: false,
+  nativeTasksObservation: false,
   observatoryTap: false,
   acpV2Preview: false,
 });
