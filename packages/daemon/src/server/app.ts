@@ -121,6 +121,13 @@ import { listAgySubagentRecords, readAgySubagentDetail } from '../harnesses/agy/
 import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
 import { collectAgyEcosystemSnapshot } from '../harnesses/agy/agy-ecosystem.js';
 import { resolveAgyProfileDirectories } from '../harnesses/agy/agy-profile-manager.js';
+import {
+  AgyNativeRuntimeRegistry,
+  NativeWsFeedGateway,
+  assertAgyConsumerProvenance,
+  mintAgyDispatchProvenance,
+  registerAgyNativeRoutes,
+} from '../harnesses/agy/native/wiring/index.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
 import { PluginAuthoring } from '../plugins/plugin-authoring.js';
@@ -154,6 +161,7 @@ export interface DaemonInstance {
   pluginManager: PluginManager;
   pluginSecrets: PluginSecretStore;
   sessionManager: SessionManager;
+  nativeRegistry: AgyNativeRuntimeRegistry;
   commandOutputHub: CommandOutputHub;
   terminalWorkspace: TerminalWorkspaceService;
   outboxWorker: EffectOutboxWorker;
@@ -234,8 +242,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   let boundPort = config.port;
   const commandOutputHub = new CommandOutputHub();
   const outboxWorker = new EffectOutboxWorker(store);
+  const nativeRegistry = new AgyNativeRuntimeRegistry(store);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace);
+  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
   const agyAuthService = new AgyAuthService({
     getAdapter: (instanceId) => {
       const adapter = registry.get(instanceId);
@@ -273,6 +282,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
     const session = store.getSession(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
+    const targetAdapter = registry.get(session.harnessId);
+    try {
+      assertAgyConsumerProvenance(
+        {
+          instanceId: session.harnessId,
+          driverId: targetAdapter?.driverId ?? targetAdapter?.kind ?? session.harnessKind,
+          profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
+        },
+        mintAgyDispatchProvenance('plugin_automated', 'plugin', 'isolated-plugin-native-command'),
+      );
+    } catch (err) {
+      throw new PluginApiError(
+        'E_PERMISSION_DENIED',
+        err instanceof Error ? err.message : '禁止插件向个人 AGY 账号自动派发命令',
+      );
+    }
     const result = await sessionManager.runHarnessCommand(sessionId, {
       command: command as Parameters<SessionManager['runHarnessCommand']>[1]['command'],
       args: args ?? '',
@@ -288,6 +313,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     eventBus,
     sessionManager,
     terminalWorkspace,
+  });
+  const nativeWsGateway = new NativeWsFeedGateway({
+    auth,
+    sessionManager,
+    nativeRegistry,
   });
 
   const app = Fastify({ logger: false, bodyLimit: 24 * 1024 * 1024 });
@@ -1406,6 +1436,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid turn input' });
     }
     try {
+      const principal = (request as unknown as { principal?: { kind: 'local' | 'device' } }).principal;
+      const actor = principal?.kind === 'device' ? 'mobile' : 'desktop';
       const result = await sessionManager.sendTurn(id, parsed.data.text, parsed.data.attachments, {
         harnessId: parsed.data.harnessId,
         model: parsed.data.model,
@@ -1414,6 +1446,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         literalText: parsed.data.literalText,
         mode: parsed.data.mode,
         terminalContexts: parsed.data.terminalContexts,
+        dispatchProvenance: mintAgyDispatchProvenance('human_direct', actor, 'POST /api/v1/sessions/:id/turns'),
       });
       return reply.code(202).send(result);
     } catch (err) {
@@ -2557,6 +2590,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   }
 
   app.server.on('upgrade', (req, socket, head) => {
+    if (nativeWsGateway.handleUpgrade(req, socket, head)) {
+      return;
+    }
     wsGateway.handleUpgrade(req, socket, head);
   });
 
@@ -2683,6 +2719,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { ecosystem: snapshot };
   });
 
+  registerAgyNativeRoutes(app, {
+    sessionManager,
+    harnessRegistry: registry,
+    nativeRegistry,
+  });
+
   return {
     app,
     store,
@@ -2690,6 +2732,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     pluginManager,
     pluginSecrets,
     sessionManager,
+    nativeRegistry,
     commandOutputHub,
     terminalWorkspace,
     outboxWorker,
@@ -2707,6 +2750,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return { port: boundPort, host: boundHost };
     },
     async stop() {
+      nativeWsGateway.close();
       wsGateway.close();
       pluginAuthoring.cancel();
       pluginBuilderV2.cancel();

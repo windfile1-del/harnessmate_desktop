@@ -1,4 +1,7 @@
+import crypto from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
+import type { NativeTransportFrame } from './agy/native/wiring/types.js';
 import { ResilientJsonLineParser, killProcessTree } from './process.js';
 
 export class JsonRpcResponseError extends Error {
@@ -19,25 +22,36 @@ export interface JsonRpcServerRequest {
   id: string | number;
   method: string;
   params: unknown;
+  connectionId?: string;
+  ingressOrdinal?: number;
 }
 
 export interface JsonRpcHandlers {
-  onNotification: (method: string, params: unknown) => void;
+  onNotification: (method: string, params: unknown, meta?: { connectionId: string; ingressOrdinal: number }) => void;
   onServerRequest: (req: JsonRpcServerRequest) => void;
   onDiagnostic: (stream: 'stdout' | 'stderr' | 'protocol', message: string) => void;
   onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
   onMessageActivity?: (msg: Record<string, unknown>) => void;
+  onTransportFrame?: (frame: NativeTransportFrame) => void;
 }
 
 interface PendingRequest {
+  rpcId: string | number;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: NodeJS.Timeout;
   method: string;
 }
 
+function rpcPendingKey(id: string | number): string {
+  return `${typeof id}:${String(id)}`;
+}
+
 export class StdioJsonRpcClient {
+  readonly connectionId: string;
   private nextId = 1;
+  private ingressOrdinal = 0;
+  private egressOrdinal = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly parser: ResilientJsonLineParser;
   private disposed = false;
@@ -47,9 +61,18 @@ export class StdioJsonRpcClient {
     private readonly child: ChildProcess,
     private readonly handlers: JsonRpcHandlers,
   ) {
+    this.connectionId = `conn_${crypto.randomBytes(6).toString('hex')}`;
     this.parser = new ResilientJsonLineParser(
       (msg) => this.handleMessage(msg),
-      (noise) => this.handlers.onDiagnostic('stdout', noise),
+      (noise) => {
+        this.emitTransportFrame({
+          direction: 'in',
+          ordinal: ++this.ingressOrdinal,
+          messageKind: 'noise',
+          diagnosticText: noise,
+        });
+        this.handlers.onDiagnostic('stdout', noise);
+      },
     );
 
     child.stdin?.on('error', (err) => {
@@ -65,6 +88,12 @@ export class StdioJsonRpcClient {
       if (text) {
         for (const line of text.split(/\r?\n/)) {
           if (line.trim()) {
+            this.emitTransportFrame({
+              direction: 'in',
+              ordinal: ++this.ingressOrdinal,
+              messageKind: 'stderr',
+              diagnosticText: line.trim(),
+            });
             this.handlers.onDiagnostic('stderr', line.trim());
           }
         }
@@ -78,6 +107,13 @@ export class StdioJsonRpcClient {
 
     child.on('close', (code, signal) => {
       this.parser.flush();
+      this.emitTransportFrame({
+        direction: 'internal',
+        ordinal: ++this.ingressOrdinal,
+        messageKind: 'exit',
+        exitCode: code,
+        exitSignal: signal,
+      });
       this.rejectAllPending(new Error(`CLI process exited (code=${code}, signal=${signal})`));
       this.handlers.onExit(code, signal);
     });
@@ -87,64 +123,117 @@ export class StdioJsonRpcClient {
     return this._lastIncomingMessageAt;
   }
 
-  request<T = unknown>(method: string, params?: unknown, timeoutMs = 60_000): Promise<T> {
-    if (this.disposed) {
-      return Promise.reject(new Error(`JSON-RPC client disposed before calling ${method}`));
-    }
+  get currentIngressOrdinal(): number {
+    return this.ingressOrdinal;
+  }
+
+  requestWithMeta<T = unknown>(
+    method: string,
+    params?: unknown,
+    timeoutMs = 60_000,
+  ): { rpcId: number; requestOrdinal: number; promise: Promise<T> } {
     const id = this.nextId++;
-    const key = String(id);
-    return new Promise<T>((resolve, reject) => {
+    const requestOrdinal = ++this.egressOrdinal;
+    if (this.disposed) {
+      return {
+        rpcId: id,
+        requestOrdinal,
+        promise: Promise.reject(new Error(`JSON-RPC client disposed before calling ${method}`)),
+      };
+    }
+    const key = rpcPendingKey(id);
+    const promise = new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(key);
         reject(new Error(`JSON-RPC request "${method}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
       this.pending.set(key, {
+        rpcId: id,
         resolve: resolve as (v: unknown) => void,
         reject,
         timer,
         method,
       });
 
-      const ok = this.writeLine({
+      const wirePayload = {
         jsonrpc: '2.0',
         id,
         method,
         ...(params !== undefined ? { params } : {}),
+      };
+      this.emitTransportFrame({
+        direction: 'out',
+        ordinal: requestOrdinal,
+        messageKind: 'request',
+        rpcId: id,
+        method,
+        wire: wirePayload,
       });
+
+      const ok = this.writeLine(wirePayload);
       if (!ok) {
         clearTimeout(timer);
         this.pending.delete(key);
         reject(new Error(`Cannot send JSON-RPC request "${method}": CLI stdin is closed`));
       }
     });
+    return { rpcId: id, requestOrdinal, promise };
+  }
+
+  request<T = unknown>(method: string, params?: unknown, timeoutMs = 60_000): Promise<T> {
+    return this.requestWithMeta<T>(method, params, timeoutMs).promise;
   }
 
   notify(method: string, params?: unknown): void {
     if (this.disposed) return;
-    this.writeLine({
+    const wirePayload = {
       jsonrpc: '2.0',
       method,
       ...(params !== undefined ? { params } : {}),
+    };
+    this.emitTransportFrame({
+      direction: 'out',
+      ordinal: ++this.egressOrdinal,
+      messageKind: 'notification',
+      method,
+      wire: wirePayload,
     });
+    this.writeLine(wirePayload);
   }
 
-  respond(id: string | number, result: unknown): void {
-    if (this.disposed) return;
-    this.writeLine({
+  respond(id: string | number, result: unknown): boolean {
+    if (this.disposed) return false;
+    const wirePayload = {
       jsonrpc: '2.0',
       id,
       result,
+    };
+    this.emitTransportFrame({
+      direction: 'out',
+      ordinal: ++this.egressOrdinal,
+      messageKind: 'response',
+      rpcId: id,
+      wire: wirePayload,
     });
+    return this.writeLine(wirePayload);
   }
 
-  respondError(id: string | number, code: number, message: string): void {
-    if (this.disposed) return;
-    this.writeLine({
+  respondError(id: string | number, code: number, message: string): boolean {
+    if (this.disposed) return false;
+    const wirePayload = {
       jsonrpc: '2.0',
       id,
       error: { code, message },
+    };
+    this.emitTransportFrame({
+      direction: 'out',
+      ordinal: ++this.egressOrdinal,
+      messageKind: 'response',
+      rpcId: id,
+      wire: wirePayload,
     });
+    return this.writeLine(wirePayload);
   }
 
   async dispose(): Promise<void> {
@@ -157,6 +246,22 @@ export class StdioJsonRpcClient {
       // ignore
     }
     await killProcessTree(this.child);
+  }
+
+  private emitTransportFrame(
+    frame: Omit<NativeTransportFrame, 'connectionId' | 'monotonicMs' | 'observedAt'>,
+  ): void {
+    if (!this.handlers.onTransportFrame) return;
+    try {
+      this.handlers.onTransportFrame({
+        connectionId: this.connectionId,
+        monotonicMs: performance.now(),
+        observedAt: Date.now(),
+        ...frame,
+      });
+    } catch {
+      // observatory tap must never interfere with transport
+    }
   }
 
   private writeLine(payload: Record<string, unknown>): boolean {
@@ -179,6 +284,7 @@ export class StdioJsonRpcClient {
 
   private handleMessage(msg: Record<string, unknown>): void {
     this._lastIncomingMessageAt = Date.now();
+    const ordinal = ++this.ingressOrdinal;
     this.handlers.onMessageActivity?.(msg);
 
     const hasId = msg.id !== undefined && msg.id !== null;
@@ -186,7 +292,15 @@ export class StdioJsonRpcClient {
 
     // Response to our outgoing request
     if (hasId && !hasMethod) {
-      const key = String(msg.id);
+      const id = msg.id as string | number;
+      this.emitTransportFrame({
+        direction: 'in',
+        ordinal,
+        messageKind: 'response',
+        rpcId: id,
+        wire: msg,
+      });
+      const key = rpcPendingKey(id);
       const entry = this.pending.get(key);
       if (!entry) return;
       this.pending.delete(key);
@@ -210,17 +324,38 @@ export class StdioJsonRpcClient {
 
     // Incoming Server Request (needs response, e.g., tool permission approval)
     if (hasId && hasMethod) {
+      const id = msg.id as string | number;
+      this.emitTransportFrame({
+        direction: 'in',
+        ordinal,
+        messageKind: 'server_request',
+        rpcId: id,
+        method: msg.method as string,
+        wire: msg,
+      });
       this.handlers.onServerRequest({
-        id: msg.id as string | number,
+        id,
         method: msg.method as string,
         params: msg.params,
+        connectionId: this.connectionId,
+        ingressOrdinal: ordinal,
       });
       return;
     }
 
     // Incoming Server Notification
     if (hasMethod) {
-      this.handlers.onNotification(msg.method as string, msg.params);
+      this.emitTransportFrame({
+        direction: 'in',
+        ordinal,
+        messageKind: 'notification',
+        method: msg.method as string,
+        wire: msg,
+      });
+      this.handlers.onNotification(msg.method as string, msg.params, {
+        connectionId: this.connectionId,
+        ingressOrdinal: ordinal,
+      });
     }
   }
 

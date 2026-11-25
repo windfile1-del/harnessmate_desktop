@@ -1,0 +1,1037 @@
+import {
+  AGY_NATIVE_CONTRACT_REVISION,
+  AGY_NATIVE_CONTRACT_VERSION,
+  NativeApiErrorSchema,
+  NativeCommandRequestSchema,
+  NativeCommandResponseSchema,
+  NativeControlRequestSchema,
+  NativeControlResponseSchema,
+  NativeEventsQuerySchema,
+  NativeEventsResponseSchema,
+  NativeSnapshotResponseSchema,
+  NativeTimelineQuerySchema,
+  NativeTimelineResponseSchema,
+  NativeWorkflowResourceKindSchema,
+  NativeWorkflowResourceResponseSchema,
+  ResolveNativeRequestInputSchema,
+  ResolveNativeRequestResponseSchema,
+  asWorkflowId,
+  type CapabilityDescriptor,
+  type NativeApiErrorCode,
+  type NativeControlTargetType,
+} from '@harnessmate/protocol';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { SessionManager } from '../../../../core/session-manager.js';
+import type { HarnessRegistry } from '../../../registry.js';
+import { isLoopbackAddress } from '../../../../server/auth.js';
+import { AgyAdapter } from '../../agy-driver.js';
+import { NativePersistenceError, computePayloadDigest } from './persistence.js';
+import {
+  AgyConsumerProvenanceError,
+  assertAgyConsumerProvenance,
+  mintAgyDispatchProvenance,
+} from './provenance.js';
+import type { AgyNativeRuntimeRegistry } from './registry.js';
+
+export interface NativeRoutesDeps {
+  readonly sessionManager: SessionManager;
+  readonly harnessRegistry: HarnessRegistry;
+  readonly nativeRegistry: AgyNativeRuntimeRegistry;
+}
+
+function sendNativeError(
+  reply: FastifyReply,
+  statusCode: number,
+  code: NativeApiErrorCode,
+  message: string,
+  opts?: { retryable?: boolean; details?: Record<string, string | number | boolean | null> },
+) {
+  const body = NativeApiErrorSchema.parse({
+    schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+    code,
+    message,
+    ...(opts?.retryable !== undefined ? { retryable: opts.retryable } : {}),
+    ...(opts?.details ? { details: opts.details } : {}),
+  });
+  return reply.code(statusCode).send(body);
+}
+
+function checkSchemaGate(nativeRegistry: AgyNativeRuntimeRegistry, reply: FastifyReply): boolean {
+  const schema = nativeRegistry.getSchemaStatus();
+  if (!schema.compatible) {
+    sendNativeError(
+      reply,
+      503,
+      'NATIVE_SCHEMA_NEWER_THAN_READER',
+      'Native runtime schema in database is newer than this daemon reader; native routes are closed while legacy sessions remain readable.',
+      {
+        retryable: false,
+        details: {
+          storedVersion: schema.storedVersion,
+          supportedVersion: schema.supportedVersion,
+        },
+      },
+    );
+    return false;
+  }
+  return true;
+}
+
+function resolveAgySessionContext(
+  deps: NativeRoutesDeps,
+  sessionId: string,
+  reply: FastifyReply,
+) {
+  if (!checkSchemaGate(deps.nativeRegistry, reply)) return null;
+  const session = deps.sessionManager.getSession(sessionId);
+  if (!session) {
+    sendNativeError(reply, 404, 'NOT_FOUND', 'Session not found');
+    return null;
+  }
+  if (session.harnessKind !== 'agy') {
+    sendNativeError(
+      reply,
+      422,
+      'UNSUPPORTED_ACTION',
+      'Native AGY runtime routes are only available for AGY sessions',
+    );
+    return null;
+  }
+  const adapter = deps.harnessRegistry.get(session.harnessId);
+  return {
+    session,
+    adapter: adapter instanceof AgyAdapter ? adapter : null,
+  };
+}
+
+function requireLocalWriteBoundary(request: FastifyRequest, reply: FastifyReply): boolean {
+  if (!isLoopbackAddress(request.socket.remoteAddress)) {
+    sendNativeError(
+      reply,
+      403,
+      'FORBIDDEN',
+      'Native AGY write operations require local interactive desktop access; remote clients receive read-only allowlisted projections.',
+    );
+    return false;
+  }
+  return true;
+}
+
+function isControlAuthorizedByCatalog(
+  descriptors: readonly CapabilityDescriptor[],
+  targetType: NativeControlTargetType,
+  action: string,
+): boolean {
+  const targetMatchesDescriptor = (descId: string): boolean => {
+    switch (targetType) {
+      case 'runtime':
+      case 'activity':
+      case 'work':
+        return (
+          descId === 'agy.acp.v1' ||
+          descId.startsWith('agy.reactive') ||
+          descId.startsWith('agy.workflow.')
+        );
+      case 'agent':
+        return descId === 'agy.subagents' || descId.startsWith('agy.workflow.swarm');
+      case 'workflow':
+        return descId.startsWith('agy.workflow.');
+    }
+  };
+
+  for (const desc of descriptors) {
+    if (desc.control !== 'available') continue;
+    if (!targetMatchesDescriptor(desc.id)) continue;
+    // If the descriptor declares explicit actions, the action key must be explicitly `available`
+    if (desc.actions.length > 0) {
+      const matched = desc.actions.find((a) => a.key === action && a.gate === 'available');
+      if (matched) return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutesDeps): void {
+  // ── GET /api/v1/sessions/:id/native/snapshot ─────────────────────────
+  app.get('/api/v1/sessions/:id/native/snapshot', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const projection = deps.nativeRegistry.getProjectionForSession(
+      ctx.session.id,
+      ctx.session.harnessId,
+    );
+    return NativeSnapshotResponseSchema.parse({
+      schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+      contractRevision: AGY_NATIVE_CONTRACT_REVISION,
+      enabled: projection.enabled,
+      projection,
+    });
+  });
+
+  // ── GET /api/v1/sessions/:id/native/capabilities ─────────────────────
+  app.get('/api/v1/sessions/:id/native/capabilities', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    return deps.nativeRegistry.getCapabilitiesForSession(ctx.session.id, ctx.session.harnessId);
+  });
+
+  // ── GET /api/v1/sessions/:id/native/events ───────────────────────────
+  app.get('/api/v1/sessions/:id/native/events', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const query = NativeEventsQuerySchema.safeParse(request.query ?? {});
+    if (!query.success) {
+      return sendNativeError(
+        reply,
+        400,
+        'INVALID_REQUEST',
+        query.error.issues[0]?.message ?? 'Invalid native events query parameters',
+      );
+    }
+
+    const res = deps.nativeRegistry.readEventsForSession(ctx.session.id, ctx.session.harnessId, {
+      afterSeq: query.data.after,
+      limit: query.data.limit,
+      cursor: query.data.cursor,
+      expectedGeneration: query.data.generation,
+    });
+
+    if (res.resyncRequired) {
+      return sendNativeError(
+        reply,
+        410,
+        'RESYNC_REQUIRED',
+        `Native event cursor requires snapshot resync (${res.reason})`,
+        {
+          retryable: true,
+          details: {
+            reason: res.reason,
+            latestSeq: res.latestSeq,
+            currentGeneration: res.currentGeneration,
+          },
+        },
+      );
+    }
+
+    return NativeEventsResponseSchema.parse({
+      schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+      binding: res.binding,
+      runtimeId: res.runtimeId,
+      generation: res.generation,
+      asOfSeq: res.asOfSeq,
+      events: res.events,
+      nextSeq: res.nextSeq,
+      nextCursor: res.nextCursor,
+      hasMore: res.hasMore,
+    });
+  });
+
+  // ── GET /api/v1/sessions/:id/native/activity/:activityId/timeline ────
+  app.get('/api/v1/sessions/:id/native/activity/:activityId/timeline', async (request, reply) => {
+    const { id, activityId } = request.params as { id: string; activityId: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+    if (!query.success) {
+      return sendNativeError(
+        reply,
+        400,
+        'INVALID_REQUEST',
+        query.error.issues[0]?.message ?? 'Invalid timeline query',
+      );
+    }
+
+    const projection = deps.nativeRegistry.getProjectionForSession(
+      ctx.session.id,
+      ctx.session.harnessId,
+    );
+    const flags = deps.nativeRegistry.getFeatureFlags();
+    const reader = flags.enabled ? deps.nativeRegistry.getTimelineReaderPort() : null;
+    const page = reader
+      ? reader.readTimeline({
+          binding: projection.binding,
+          scopeKind: 'activity',
+          scopeId: activityId,
+          pageToken: query.data.pageToken,
+          limit: query.data.limit,
+        })
+      : {
+          revision: projection.asOfSeq,
+          items: [],
+          nextPageToken: null,
+          hasMore: false,
+          sourceUnavailableReason: flags.enabled
+            ? 'timeline_reader_unregistered'
+            : 'native_runtime_disabled',
+        };
+
+    return NativeTimelineResponseSchema.parse({
+      schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+      binding: projection.binding,
+      scopeKind: 'activity',
+      scopeId: activityId,
+      revision: page.revision,
+      items: [...page.items],
+      nextPageToken: page.nextPageToken,
+      hasMore: page.hasMore,
+      ...(page.sourceUnavailableReason
+        ? { sourceUnavailableReason: page.sourceUnavailableReason }
+        : {}),
+    });
+  });
+
+  // ── GET /api/v1/sessions/:id/native/agents/:agentId/timeline ─────────
+  app.get('/api/v1/sessions/:id/native/agents/:agentId/timeline', async (request, reply) => {
+    const { id, agentId } = request.params as { id: string; agentId: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+    if (!query.success) {
+      return sendNativeError(
+        reply,
+        400,
+        'INVALID_REQUEST',
+        query.error.issues[0]?.message ?? 'Invalid timeline query',
+      );
+    }
+
+    const projection = deps.nativeRegistry.getProjectionForSession(
+      ctx.session.id,
+      ctx.session.harnessId,
+    );
+    const flags = deps.nativeRegistry.getFeatureFlags();
+    const reader = flags.enabled ? deps.nativeRegistry.getTimelineReaderPort() : null;
+    const page = reader
+      ? reader.readTimeline({
+          binding: projection.binding,
+          scopeKind: 'agent',
+          scopeId: agentId,
+          pageToken: query.data.pageToken,
+          limit: query.data.limit,
+        })
+      : {
+          revision: projection.asOfSeq,
+          items: [],
+          nextPageToken: null,
+          hasMore: false,
+          sourceUnavailableReason: flags.enabled
+            ? 'timeline_reader_unregistered'
+            : 'native_runtime_disabled',
+        };
+
+    return NativeTimelineResponseSchema.parse({
+      schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+      binding: projection.binding,
+      scopeKind: 'agent',
+      scopeId: agentId,
+      revision: page.revision,
+      items: [...page.items],
+      nextPageToken: page.nextPageToken,
+      hasMore: page.hasMore,
+      ...(page.sourceUnavailableReason
+        ? { sourceUnavailableReason: page.sourceUnavailableReason }
+        : {}),
+    });
+  });
+
+  // ── GET /api/v1/sessions/:id/native/workflows/:workflowId/:resource ──
+  app.get(
+    '/api/v1/sessions/:id/native/workflows/:workflowId/:resource',
+    async (request, reply) => {
+      const { id, workflowId, resource } = request.params as {
+        id: string;
+        workflowId: string;
+        resource: string;
+      };
+      const ctx = resolveAgySessionContext(deps, id, reply);
+      if (!ctx) return;
+
+      const parsedResource = NativeWorkflowResourceKindSchema.safeParse(resource);
+      if (!parsedResource.success) {
+        return sendNativeError(
+          reply,
+          400,
+          'INVALID_REQUEST',
+          'Workflow resource must be one of: board, phases, logs, artifacts',
+        );
+      }
+
+      const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+      if (!query.success) {
+        return sendNativeError(
+          reply,
+          400,
+          'INVALID_REQUEST',
+          query.error.issues[0]?.message ?? 'Invalid workflow resource query',
+        );
+      }
+
+      const projection = deps.nativeRegistry.getProjectionForSession(
+        ctx.session.id,
+        ctx.session.harnessId,
+      );
+      const parsedWorkflowId = asWorkflowId(workflowId);
+      const flags = deps.nativeRegistry.getFeatureFlags();
+      const reader = flags.enabled ? deps.nativeRegistry.getWorkflowResourceReaderPort() : null;
+      const page = reader
+        ? reader.readWorkflowResource({
+            binding: projection.binding,
+            workflowId: parsedWorkflowId,
+            resource: parsedResource.data,
+            pageToken: query.data.pageToken,
+            limit: query.data.limit,
+          })
+        : {
+            revision: projection.asOfSeq,
+            available: false,
+            sourceUnavailableReason: flags.enabled
+              ? 'workflow_resource_not_available'
+              : 'native_runtime_disabled',
+            items: [],
+            nextPageToken: null,
+            hasMore: false,
+          };
+
+      const validated = NativeWorkflowResourceResponseSchema.safeParse({
+        schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+        binding: projection.binding,
+        workflowId: parsedWorkflowId,
+        resource: parsedResource.data,
+        revision: page.revision,
+        available: page.available,
+        ...(page.sourceUnavailableReason
+          ? { sourceUnavailableReason: page.sourceUnavailableReason }
+          : {}),
+        items: [...page.items],
+        nextPageToken: page.nextPageToken,
+        hasMore: page.hasMore,
+      });
+      if (!validated.success) {
+        return sendNativeError(
+          reply,
+          500,
+          'INVALID_REQUEST',
+          'Workflow resource reader returned payload failing public DTO allowlist validation',
+        );
+      }
+      return validated.data;
+    },
+  );
+
+  // ── POST /api/v1/sessions/:id/native/commands ────────────────────────
+  app.post('/api/v1/sessions/:id/native/commands', async (request, reply) => {
+    if (!requireLocalWriteBoundary(request, reply)) return;
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const flags = deps.nativeRegistry.getFeatureFlags();
+    if (!flags.enabled || !flags.nativeCommands) {
+      return sendNativeError(
+        reply,
+        503,
+        'NATIVE_RUNTIME_DISABLED',
+        'Native AGY command routing is currently disabled by feature gate',
+      );
+    }
+
+    const parsed = NativeCommandRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return sendNativeError(
+        reply,
+        400,
+        'INVALID_REQUEST',
+        parsed.error.issues[0]?.message ?? 'Invalid native command payload',
+      );
+    }
+
+    try {
+      assertAgyConsumerProvenance(
+        {
+          instanceId: ctx.session.harnessId,
+          driverId: ctx.session.harnessKind,
+          profile: ctx.adapter?.getProfile() ?? null,
+        },
+        mintAgyDispatchProvenance('human_direct', 'desktop', 'POST /native/commands'),
+      );
+    } catch (err) {
+      if (err instanceof AgyConsumerProvenanceError) {
+        return sendNativeError(reply, 403, 'CONSUMER_PROVENANCE_BLOCKED', err.message);
+      }
+      throw err;
+    }
+
+    const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+    if (!binding || binding.generation !== parsed.data.bindingGeneration) {
+      return sendNativeError(
+        reply,
+        409,
+        'STALE_BINDING',
+        'Binding generation does not match active runtime generation',
+        {
+          retryable: true,
+          details: { currentGeneration: binding?.generation ?? null },
+        },
+      );
+    }
+
+    const caps = deps.nativeRegistry.getCapabilitiesForSession(
+      ctx.session.id,
+      ctx.session.harnessId,
+    );
+    if (caps.capabilitiesRevision !== parsed.data.catalogRevision) {
+      return sendNativeError(
+        reply,
+        409,
+        'STALE_BINDING',
+        'Capability catalog revision is stale; refresh capabilities before retrying',
+        {
+          retryable: true,
+          details: { currentCatalogRevision: caps.capabilitiesRevision },
+        },
+      );
+    }
+
+    const router = deps.nativeRegistry.getCommandRouterPort();
+    if (!router) {
+      return sendNativeError(
+        reply,
+        422,
+        'UNSUPPORTED_ACTION',
+        'No native command router is registered for this runtime',
+      );
+    }
+
+    const descriptor = caps.descriptors.find((d) => d.id === parsed.data.capabilityId);
+    const action = descriptor?.actions.find((a) => a.key === parsed.data.actionKey);
+    if (!descriptor || !action || action.gate !== 'available') {
+      return sendNativeError(
+        reply,
+        422,
+        'UNSUPPORTED_ACTION',
+        `Action "${parsed.data.actionKey}" on capability "${parsed.data.capabilityId}" is not available`,
+        {
+          details: {
+            gate: action?.gate ?? 'unsupported',
+          },
+        },
+      );
+    }
+
+    const digest = computePayloadDigest({
+      bindingGeneration: parsed.data.bindingGeneration,
+      catalogRevision: parsed.data.catalogRevision,
+      capabilityId: parsed.data.capabilityId,
+      actionKey: parsed.data.actionKey,
+      args: parsed.data.args,
+    });
+
+    let claimed;
+    try {
+      claimed = deps.nativeRegistry.persistence.claimIdempotentReceipt({
+        binding,
+        kind: 'command',
+        idempotencyKey: parsed.data.idempotencyKey,
+        payloadDigest: digest,
+      });
+    } catch (err) {
+      if (err instanceof NativePersistenceError) {
+        if (err.code === 'IDEMPOTENCY_CONFLICT') {
+          return sendNativeError(reply, 409, 'IDEMPOTENCY_CONFLICT', err.message);
+        }
+        if (err.code === 'STALE_BINDING') {
+          return sendNativeError(reply, 409, 'STALE_BINDING', err.message, { retryable: true });
+        }
+      }
+      throw err;
+    }
+
+    // Strict R2 concurrency guard: ONLY `claimed.replayed === false` may execute the command port!
+    if (claimed.replayed) {
+      if (claimed.receipt.state === 'completed' && claimed.receipt.responseJson) {
+        const cached = NativeCommandResponseSchema.safeParse(claimed.receipt.responseJson);
+        if (cached.success) {
+          return reply.code(cached.data.kind === 'accepted' ? 202 : 200).send(cached.data);
+        }
+      }
+      if (claimed.receipt.state === 'claimed') {
+        return sendNativeError(
+          reply,
+          409,
+          'BUSY',
+          'A command with this idempotencyKey is currently in flight',
+          {
+            retryable: true,
+            details: { receiptId: claimed.receipt.receiptId, receiptState: 'claimed' },
+          },
+        );
+      }
+      return sendNativeError(
+        reply,
+        409,
+        'DELIVERY_UNKNOWN',
+        'Previous execution for this idempotencyKey did not finish cleanly; inspect runtime state before issuing a new key',
+        {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: claimed.receipt.state },
+        },
+      );
+    }
+
+    try {
+      const rawResponse = await router.executeCommand({
+        binding,
+        request: parsed.data,
+        receiptId: claimed.receipt.receiptId,
+      });
+      const validatedResponse = NativeCommandResponseSchema.parse(rawResponse);
+      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+        claimed.receipt.receiptId,
+        'completed',
+        validatedResponse,
+      );
+      return reply
+        .code(validatedResponse.kind === 'accepted' ? 202 : 200)
+        .send(validatedResponse);
+    } catch {
+      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+        claimed.receipt.receiptId,
+        'delivery_unknown',
+        { error: 'command_execution_failed' },
+      );
+      return sendNativeError(
+        reply,
+        500,
+        'DELIVERY_UNKNOWN',
+        'Command execution failed after dispatch claim; outcome is uncertain',
+        {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: 'delivery_unknown' },
+        },
+      );
+    }
+  });
+
+  // ── POST /api/v1/sessions/:id/native/control ─────────────────────────
+  app.post('/api/v1/sessions/:id/native/control', async (request, reply) => {
+    if (!requireLocalWriteBoundary(request, reply)) return;
+    const { id } = request.params as { id: string };
+    const ctx = resolveAgySessionContext(deps, id, reply);
+    if (!ctx) return;
+
+    const flags = deps.nativeRegistry.getFeatureFlags();
+    if (!flags.enabled || !flags.nativeCommands) {
+      return sendNativeError(
+        reply,
+        503,
+        'NATIVE_RUNTIME_DISABLED',
+        'Native AGY control operations are currently disabled by feature gate',
+      );
+    }
+
+    const parsed = NativeControlRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return sendNativeError(
+        reply,
+        400,
+        'INVALID_REQUEST',
+        parsed.error.issues[0]?.message ?? 'Invalid native control payload',
+      );
+    }
+
+    const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+    if (!binding || binding.generation !== parsed.data.generation) {
+      return sendNativeError(
+        reply,
+        409,
+        'STALE_BINDING',
+        'Binding generation does not match active runtime generation',
+        {
+          retryable: true,
+          details: { currentGeneration: binding?.generation ?? null },
+        },
+      );
+    }
+
+    const router = deps.nativeRegistry.getCommandRouterPort();
+    if (!router) {
+      return sendNativeError(
+        reply,
+        422,
+        'UNSUPPORTED_ACTION',
+        'No native control handler is registered for this runtime',
+      );
+    }
+
+    // R2 Closed-Loop Control Authorization:
+    // 1. Verify current capability catalog actually opens control for this target type & action
+    const caps = deps.nativeRegistry.getCapabilitiesForSession(
+      ctx.session.id,
+      ctx.session.harnessId,
+    );
+    if (!isControlAuthorizedByCatalog(caps.descriptors, parsed.data.target.type, parsed.data.action)) {
+      return sendNativeError(
+        reply,
+        422,
+        'UNSUPPORTED_ACTION',
+        `Control action "${parsed.data.action}" on target type "${parsed.data.target.type}" is not authorized by current capability descriptors`,
+      );
+    }
+
+    // 2. Verify target exists in this runtime, belongs to current generation, and matches expectedRevision
+    if (parsed.data.target.type === 'runtime') {
+      if (parsed.data.target.id !== binding.runtimeId) {
+        return sendNativeError(reply, 404, 'NOT_FOUND', 'Control target runtime does not match session binding');
+      }
+      const storedBinding = deps.nativeRegistry.persistence.getBinding(binding.runtimeId);
+      if (!storedBinding || storedBinding.asOfSeq !== parsed.data.expectedRevision) {
+        return sendNativeError(
+          reply,
+          409,
+          'STALE_BINDING',
+          'Expected runtime revision does not match current binding revision',
+          {
+            retryable: true,
+            details: { actualRevision: storedBinding?.asOfSeq ?? 0 },
+          },
+        );
+      }
+    } else {
+      const entityMeta = deps.nativeRegistry.persistence.getEntityMeta(
+        binding.runtimeId,
+        parsed.data.target.type,
+        parsed.data.target.id,
+      );
+      if (!entityMeta) {
+        return sendNativeError(
+          reply,
+          404,
+          'NOT_FOUND',
+          `Control target ${parsed.data.target.type}:${parsed.data.target.id} was not found in active runtime`,
+        );
+      }
+      if (entityMeta.generation !== binding.generation) {
+        return sendNativeError(
+          reply,
+          409,
+          'STALE_BINDING',
+          'Control target belongs to an older generation and cannot be controlled',
+          { retryable: false },
+        );
+      }
+      if (entityMeta.revision !== parsed.data.expectedRevision) {
+        return sendNativeError(
+          reply,
+          409,
+          'STALE_BINDING',
+          'Control target revision mismatch',
+          {
+            retryable: true,
+            details: { actualRevision: entityMeta.revision },
+          },
+        );
+      }
+    }
+
+    const digest = computePayloadDigest({
+      generation: parsed.data.generation,
+      target: parsed.data.target,
+      action: parsed.data.action,
+      expectedRevision: parsed.data.expectedRevision,
+    });
+
+    let claimed;
+    try {
+      claimed = deps.nativeRegistry.persistence.claimIdempotentReceipt({
+        binding,
+        kind: 'control',
+        idempotencyKey: parsed.data.idempotencyKey,
+        payloadDigest: digest,
+      });
+    } catch (err) {
+      if (err instanceof NativePersistenceError) {
+        if (err.code === 'IDEMPOTENCY_CONFLICT') {
+          return sendNativeError(reply, 409, 'IDEMPOTENCY_CONFLICT', err.message);
+        }
+        if (err.code === 'STALE_BINDING') {
+          return sendNativeError(reply, 409, 'STALE_BINDING', err.message, { retryable: true });
+        }
+      }
+      throw err;
+    }
+
+    // Strict R2 concurrency guard: ONLY sole claimer may invoke control port
+    if (claimed.replayed) {
+      if (claimed.receipt.state === 'completed' && claimed.receipt.responseJson) {
+        const cached = NativeControlResponseSchema.safeParse(claimed.receipt.responseJson);
+        if (cached.success) {
+          return reply.code(200).send(cached.data);
+        }
+      }
+      if (claimed.receipt.state === 'claimed') {
+        return sendNativeError(
+          reply,
+          409,
+          'BUSY',
+          'A control request with this idempotencyKey is currently in flight',
+          {
+            retryable: true,
+            details: { receiptId: claimed.receipt.receiptId, receiptState: 'claimed' },
+          },
+        );
+      }
+      return sendNativeError(
+        reply,
+        409,
+        'DELIVERY_UNKNOWN',
+        'Previous control execution for this idempotencyKey did not finish cleanly',
+        {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: claimed.receipt.state },
+        },
+      );
+    }
+
+    try {
+      const rawResponse = await router.executeControl({
+        binding,
+        request: parsed.data,
+        receiptId: claimed.receipt.receiptId,
+      });
+      const validatedResponse = NativeControlResponseSchema.parse(rawResponse);
+      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+        claimed.receipt.receiptId,
+        'completed',
+        validatedResponse,
+      );
+      return reply.code(200).send(validatedResponse);
+    } catch {
+      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+        claimed.receipt.receiptId,
+        'delivery_unknown',
+        { error: 'control_execution_failed' },
+      );
+      return sendNativeError(
+        reply,
+        500,
+        'DELIVERY_UNKNOWN',
+        'Control execution failed after dispatch claim; outcome is uncertain',
+        {
+          retryable: false,
+          details: { receiptId: claimed.receipt.receiptId, receiptState: 'delivery_unknown' },
+        },
+      );
+    }
+  });
+
+  // ── POST /api/v1/sessions/:id/native/requests/:approvalId/resolve ────
+  app.post(
+    '/api/v1/sessions/:id/native/requests/:approvalId/resolve',
+    async (request, reply) => {
+      if (!requireLocalWriteBoundary(request, reply)) return;
+      const { id, approvalId } = request.params as { id: string; approvalId: string };
+      const ctx = resolveAgySessionContext(deps, id, reply);
+      if (!ctx) return;
+
+      const flags = deps.nativeRegistry.getFeatureFlags();
+      if (!flags.enabled || !flags.nativePermissions) {
+        return sendNativeError(
+          reply,
+          503,
+          'NATIVE_RUNTIME_DISABLED',
+          'Native AGY request routing is currently disabled by feature gate',
+        );
+      }
+
+      const parsed = ResolveNativeRequestInputSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return sendNativeError(
+          reply,
+          400,
+          'INVALID_REQUEST',
+          parsed.error.issues[0]?.message ?? 'Invalid native request resolution payload',
+        );
+      }
+
+      const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+      if (!binding || binding.generation !== parsed.data.generation) {
+        return sendNativeError(
+          reply,
+          409,
+          'STALE_BINDING',
+          'Approval generation does not match active runtime generation',
+          {
+            retryable: false,
+            details: { currentGeneration: binding?.generation ?? null },
+          },
+        );
+      }
+
+      const permissionPort = deps.nativeRegistry.getPermissionPort();
+      if (!permissionPort) {
+        return sendNativeError(
+          reply,
+          422,
+          'UNSUPPORTED_ACTION',
+          'No native permission router is registered for this runtime',
+        );
+      }
+
+      // R2 Closed-Loop Approval Authorization: request MUST exist in live pending list for this binding & generation
+      const pendingList = permissionPort.listPendingRequests(binding);
+      const matchingPending = pendingList.find(
+        (p) =>
+          p.approvalId === approvalId &&
+          p.runtimeId === binding.runtimeId &&
+          p.generation === binding.generation,
+      );
+      if (!matchingPending) {
+        const existingReceipt =
+          deps.nativeRegistry.persistence.getApprovalReceiptByApprovalId(approvalId);
+        if (existingReceipt && existingReceipt.sessionId === ctx.session.id) {
+          return sendNativeError(
+            reply,
+            409,
+            'ALREADY_RESOLVED',
+            `Native request "${approvalId}" is no longer pending (state: ${existingReceipt.state})`,
+            {
+              retryable: false,
+              details: {
+                receiptId: existingReceipt.receiptId,
+                receiptState: existingReceipt.state,
+              },
+            },
+          );
+        }
+        return sendNativeError(
+          reply,
+          404,
+          'NOT_FOUND',
+          `Pending native request "${approvalId}" was not found for the active runtime generation`,
+        );
+      }
+
+      if (parsed.data.outcome === 'selected') {
+        if (
+          !parsed.data.optionId ||
+          !matchingPending.allowedOptionIds.includes(parsed.data.optionId)
+        ) {
+          return sendNativeError(
+            reply,
+            400,
+            'INVALID_REQUEST',
+            'Selected optionId is not in the request allowedOptionIds',
+          );
+        }
+      }
+      if (
+        parsed.data.outcome === 'form_submitted' &&
+        matchingPending.kind === 'permission' &&
+        !matchingPending.allowsFreeText
+      ) {
+        return sendNativeError(
+          reply,
+          400,
+          'INVALID_REQUEST',
+          'Free-form payload is not accepted for fixed-option permission requests',
+        );
+      }
+
+      // Ensure durable receipt exists and acquire authoritative DB CAS BEFORE calling permissionPort!
+      try {
+        deps.nativeRegistry.persistence.createPendingApprovalReceipt({
+          binding,
+          approvalId,
+        });
+      } catch (err) {
+        if (err instanceof NativePersistenceError && err.code === 'STALE_BINDING') {
+          return sendNativeError(reply, 409, 'STALE_BINDING', err.message, { retryable: false });
+        }
+        throw err;
+      }
+
+      const cas = deps.nativeRegistry.persistence.claimApprovalReceiptCas({
+        approvalId,
+        expectedGeneration: binding.generation,
+        expectedSessionId: ctx.session.id,
+        idempotencyKey: parsed.data.idempotencyKey,
+      });
+
+      if (!cas.claimed || !cas.receipt) {
+        return sendNativeError(
+          reply,
+          409,
+          cas.staleGeneration ? 'STALE_BINDING' : 'ALREADY_RESOLVED',
+          cas.staleGeneration
+            ? 'Approval generation is no longer active'
+            : `Native request "${approvalId}" was already claimed or resolved`,
+          {
+            retryable: false,
+            details: {
+              receiptId: cas.receipt?.receiptId ?? null,
+              receiptState: cas.receipt?.state ?? null,
+            },
+          },
+        );
+      }
+
+      try {
+        const outcome = await permissionPort.resolveNativeRequest({
+          binding,
+          approvalId,
+          receiptId: cas.receipt.receiptId,
+          request: parsed.data,
+          resolvedBy: 'desktop',
+        });
+
+        const finalState = outcome.receiptState;
+        deps.nativeRegistry.persistence.transitionApprovalReceiptState(
+          cas.receipt.receiptId,
+          ['claimed'],
+          finalState,
+          { outcome: parsed.data.outcome },
+        );
+
+        const body = ResolveNativeRequestResponseSchema.parse({
+          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
+          approvalId: outcome.approvalId,
+          receiptId: cas.receipt.receiptId,
+          receiptState: finalState,
+          conflict: outcome.conflict,
+        });
+
+        if (outcome.conflict) {
+          return reply.code(409).send(body);
+        }
+        return reply.code(200).send(body);
+      } catch {
+        deps.nativeRegistry.persistence.transitionApprovalReceiptState(
+          cas.receipt.receiptId,
+          ['claimed'],
+          'delivery_unknown',
+          { error: 'permission_wire_write_uncertain' },
+        );
+        return sendNativeError(
+          reply,
+          500,
+          'DELIVERY_UNKNOWN',
+          'Permission response write failed or timed out; delivery state is unknown and will not be replayed',
+          {
+            retryable: false,
+            details: { receiptId: cas.receipt.receiptId, receiptState: 'delivery_unknown' },
+          },
+        );
+      }
+    },
+  );
+}

@@ -14,6 +14,11 @@ import type {
   SubagentStatus,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
+import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
+import {
+  evaluateAgyConsumerProvenance,
+  mintAgyDispatchProvenance,
+} from '../harnesses/agy/native/wiring/provenance.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { GitService } from '../plugin-host/builtin/services.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
@@ -254,6 +259,23 @@ export class OrchestratorService {
       throw new OrchestratorError(
         'E_TARGET_INSTANCE_NOT_FOUND',
         `Target harness instance not registered: ${req.targetInstanceId}`,
+      );
+    }
+
+    // Consumer AGY provenance guard: never delegate consumer OAuth AGY as a background HM worker
+    const targetDriverId = adapter.driverId ?? adapter.kind;
+    const provenanceDecision = evaluateAgyConsumerProvenance(
+      {
+        instanceId: adapter.id,
+        driverId: targetDriverId,
+        profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
+      },
+      mintAgyDispatchProvenance('hm_orchestrator_delegation', 'system', 'orchestrator.delegate'),
+    );
+    if (!provenanceDecision.allowed) {
+      throw new OrchestratorError(
+        'E_CONSUMER_PROVENANCE_BLOCKED',
+        provenanceDecision.reason ?? 'Consumer AGY instance cannot be used as an automated orchestrator worker',
       );
     }
 
@@ -1032,6 +1054,22 @@ export class OrchestratorService {
     const parent = this.store.getSession(parentSessionId);
     if (!parent || parent.status !== 'idle') return;
     if (!this.hooks?.isOrchestratorEnabled()) {
+      this.pendingWakeupsByParent.delete(parentSessionId);
+      return;
+    }
+
+    // Consumer AGY provenance guard: do not auto-inject orchestrator wakeup turns into consumer OAuth AGY sessions
+    const parentAdapter = this.registry.get(parent.harnessId);
+    const parentDriverId = parentAdapter?.driverId ?? parentAdapter?.kind ?? parent.harnessKind;
+    const wakeupProvenance = evaluateAgyConsumerProvenance(
+      {
+        instanceId: parent.harnessId,
+        driverId: parentDriverId,
+        profile: parentAdapter instanceof AgyAdapter ? parentAdapter.getProfile() : null,
+      },
+      mintAgyDispatchProvenance('hm_orchestrator_wakeup', 'system', 'orchestrator.drainPendingWakeups'),
+    );
+    if (!wakeupProvenance.allowed) {
       this.pendingWakeupsByParent.delete(parentSessionId);
       return;
     }
