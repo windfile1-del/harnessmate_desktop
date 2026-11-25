@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harnessmate.local/schemas/agy-np/observatory-capture-v1.schema.json",
+  "title": "AGY Native Parity Observatory Capture Record v1",
+  "description": "Allowlist-reconstructed, redacted NDJSON record schema for NP-01 protocol observation, four-layer correlation, and deterministic replay.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "captureId",
+    "scenario",
+    "platform",
+    "cliVersion",
+    "protocol",
+    "accountCategory",
+    "source",
+    "observedAt",
+    "producer",
+    "seq",
+    "monotonicMs",
+    "layer",
+    "direction",
+    "messageKind",
+    "correlation"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "captureId": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9._:-]{4,96}$"
+    },
+    "scenario": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9._:-]{2,64}$"
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["win32", "darwin", "linux", "unknown"]
+    },
+    "cliVersion": {
+      "type": ["string", "null"],
+      "pattern": "^[a-zA-Z0-9._+-]{1,48}$"
+    },
+    "protocol": {
+      "type": ["integer", "null"],
+      "enum": [1, 2, null]
+    },
+    "accountCategory": {
+      "type": "string",
+      "enum": [
+        "none",
+        "dedicated_test_personal",
+        "dedicated_test_business",
+        "synthetic",
+        "replay_sanitized"
+      ]
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "synthetic",
+        "replay_with_provenance",
+        "live_raw",
+        "live_hm",
+        "official_comparison"
+      ]
+    },
+    "observedAt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "producer": {
+      "type": "string",
+      "enum": [
+        "observatory_cli",
+        "daemon_tap_callback",
+        "replay_harness",
+        "migrator"
+      ]
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "monotonicMs": {
+      "type": "number",
+      "minimum": 0
+    },
+    "layer": {
+      "type": "string",
+      "enum": ["raw", "normalized", "native_canonical", "ui"]
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["outbound", "inbound", "internal", "stderr", "lifecycle"]
+    },
+    "messageKind": {
+      "type": "string",
+      "enum": [
+        "capture_meta",
+        "capture_end",
+        "cli_catalog",
+        "rpc_request",
+        "rpc_response",
+        "rpc_error",
+        "rpc_notification",
+        "server_request",
+        "malformed_line",
+        "stderr_classified",
+        "process_exit",
+        "timeout",
+        "drop_overflow",
+        "adapter_normalized",
+        "native_canonical",
+        "ui_projection"
+      ]
+    },
+    "latencyMs": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "origin": { "type": "string", "maxLength": 128 },
+        "migratedFrom": { "type": ["string", "null"], "maxLength": 128 },
+        "timingSynthetic": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 240 }
+      }
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connectionId", "ingressOrdinal", "channel"],
+      "properties": {
+        "connectionId": { "type": "string", "pattern": "^[a-zA-Z0-9._:-]{2,64}$" },
+        "generation": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "ingressOrdinal": { "type": "integer", "minimum": 0 },
+        "channel": { "type": "string", "enum": ["live", "history_replay"] },
+        "rpcIdAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "rpcIdType": { "type": ["string", "null"], "enum": ["number", "string", null] },
+        "sessionAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "childAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "toolAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "taskAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "workflowAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "approvalAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "turnAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "activityAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "workAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "agentAlias": { "type": ["string", "null"], "pattern": "^[a-zA-Z0-9._:-]{1,64}$" },
+        "diagnosticCode": { "type": ["string", "null"], "pattern": "^AGY-DIAG-v1:[a-zA-Z0-9._:-]{4,180}$" }
+      }
+    },
+    "shape": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "unknownKeys": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-zA-Z0-9_.:-]{1,64}$"
+      }
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "droppedCount": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}
