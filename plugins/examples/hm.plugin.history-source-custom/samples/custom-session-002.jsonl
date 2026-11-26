@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"nativeSessionId":"custom-session-002","title":"自定义来源样例 · 第二会话分页校验","harnessKind":"custom","updatedAt":1795651100000,"cwd":"D:\\HarnessMate\\workspace-custom-alpha","workspaceLabel":"workspace-custom-alpha"}}
+{"role":"user","text":"这是第二条自定义来源记录，用于验证过滤与分页。","timestamp":1795651090000}
+{"role":"assistant","text":"收到，已按 history.source.v1 返回稳定 itemId 与 updatedAt。","timestamp":1795651100000}
