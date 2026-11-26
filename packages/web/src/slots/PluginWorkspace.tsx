@@ -4,6 +4,7 @@ import { useShallow } from 'zustand/react/shallow';
 import {
   HISTORY_IMPORT_CONTRACT,
   HISTORY_IMPORT_PAGE_SLOT_ID,
+  HISTORY_SOURCE_CONTRACT,
   SESSION_SEARCH_CONTRACT,
   SESSION_SEARCH_PAGE_SLOT_ID,
   getPluginInstanceId,
@@ -15,6 +16,7 @@ import {
 } from '../api/peer-contracts';
 import { formatResolutionSummary } from '../api/peer-workspace-client';
 import { HistoryImportWorkspacePage } from '../components/HistoryImportWorkspacePage';
+import { ServiceResolutionBanner } from '../components/ServiceResolutionBanner';
 import { SessionSearchWorkspacePage } from '../components/SessionSearchWorkspacePage';
 import { useAppStore } from '../stores/app-store';
 import { useSlotItems, useSlotRegistry } from './hooks';
@@ -362,19 +364,179 @@ export function PluginWorkspaceLinks() {
   );
 }
 
-function WorkspacePageContent({ page }: { page: RegisteredSlotItem<'workspace.pages'> }) {
-  return page.render({});
+function WorkspacePageContent({
+  page,
+  hostProps,
+}: {
+  page: RegisteredSlotItem<'workspace.pages'>;
+  hostProps: Record<string, unknown>;
+}) {
+  return (page.render as (props: Record<string, unknown>) => ReactNode)(hostProps);
 }
 
 export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
   const registry = useSlotRegistry();
   const pages = useSlotItems('workspace.pages');
-  const active = useAppStore((state) => state.activePluginPage);
-  const open = useAppStore((state) => state.setActivePluginPage);
-  const plugins = useAppStore((state) => state.plugins);
-  const page = pages.find((item) => pageKey(item) === active);
+  const {
+    active,
+    open,
+    plugins,
+    workspaces,
+    harnesses,
+    sessions,
+    selectedWorkspaceId,
+    selectedSessionId,
+    sessionBindingsBySession,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+    compositionEntries,
+    searchPageInitialQuery,
+    importPageInitialTab,
+    resolveService,
+    setWorkspaceBinding,
+  } = useAppStore(
+    useShallow((state) => ({
+      active: state.activePluginPage,
+      open: state.setActivePluginPage,
+      plugins: state.plugins,
+      workspaces: state.workspaces,
+      harnesses: state.harnesses,
+      sessions: state.sessions,
+      selectedWorkspaceId: state.selectedWorkspaceId,
+      selectedSessionId: state.selectedSessionId,
+      sessionBindingsBySession: state.sessionBindingsBySession,
+      workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace ?? {},
+      compositionBindings: state.compositionBindings ?? {},
+      compositionEntries: state.compositionEntries ?? [],
+      searchPageInitialQuery: state.searchPageInitialQuery,
+      importPageInitialTab: state.importPageInitialTab,
+      resolveService: state.resolveService,
+      setWorkspaceBinding: state.setWorkspaceBinding,
+    })),
+  );
 
+  const page = pages.find((item) => pageKey(item) === active);
   const parsedActive = parseWorkspacePageKey(active);
+  const activeSlotId = page?.id ?? parsedActive?.slotId ?? null;
+  const activeInstanceId = page?.pluginId ?? parsedActive?.instanceId ?? null;
+  const peerContract =
+    activeSlotId === SESSION_SEARCH_PAGE_SLOT_ID
+      ? SESSION_SEARCH_CONTRACT
+      : activeSlotId === HISTORY_IMPORT_PAGE_SLOT_ID
+        ? HISTORY_IMPORT_CONTRACT
+        : null;
+
+  const [backendResolution, setBackendResolution] = useState<ServiceResolutionV1 | null>(null);
+  useEffect(() => {
+    if (!peerContract || typeof resolveService !== 'function') {
+      setBackendResolution(null);
+      return;
+    }
+    const controller = new AbortController();
+    void resolveService(peerContract, {
+      workspaceId: selectedWorkspaceId ?? undefined,
+      sessionId: selectedSessionId ?? undefined,
+      explicitInstanceId: activeInstanceId ?? undefined,
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!controller.signal.aborted) setBackendResolution(res);
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [
+    peerContract,
+    activeInstanceId,
+    selectedWorkspaceId,
+    selectedSessionId,
+    plugins,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+    resolveService,
+  ]);
+
+  const fallbackResolution = useMemo(() => {
+    if (!peerContract) return null;
+    return resolveServiceSelectionClientSide({
+      contract: peerContract,
+      plugins,
+      explicitInstanceId: activeInstanceId ?? undefined,
+      sessionBindings: selectedSessionId ? sessionBindingsBySession[selectedSessionId] : undefined,
+      workspaceBindings: selectedWorkspaceId ? workspaceBindingsByWorkspace[selectedWorkspaceId] : undefined,
+      compositionBindings,
+      compositionEntries,
+    });
+  }, [
+    peerContract,
+    plugins,
+    activeInstanceId,
+    selectedSessionId,
+    sessionBindingsBySession,
+    selectedWorkspaceId,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+    compositionEntries,
+  ]);
+
+  const activeResolution = backendResolution ?? fallbackResolution;
+  const sourceResolution = useMemo(() => {
+    if (peerContract !== HISTORY_IMPORT_CONTRACT) return null;
+    return resolveServiceSelectionClientSide({
+      contract: HISTORY_SOURCE_CONTRACT,
+      plugins,
+      workspaceBindings: selectedWorkspaceId ? workspaceBindingsByWorkspace[selectedWorkspaceId] : undefined,
+      compositionBindings,
+      compositionEntries,
+    });
+  }, [peerContract, plugins, selectedWorkspaceId, workspaceBindingsByWorkspace, compositionBindings, compositionEntries]);
+
+  const hostProps = useMemo<Record<string, unknown>>(
+    () => ({
+      apiBase:
+        typeof window !== 'undefined'
+          ? window.harnessMateBridge?.daemonUrl || window.location?.origin || ''
+          : '',
+      workspaceId: selectedWorkspaceId,
+      workspaces: workspaces.map((ws) => ({ id: ws.id, name: ws.name, rootPath: ws.rootPath })),
+      harnesses: harnesses.map((h) => ({ id: h.id, kind: h.kind, displayName: h.displayName })),
+      sessions: sessions.slice(0, 200).map((s) => ({
+        id: s.id,
+        workspaceId: s.workspaceId,
+        title: s.title,
+        harnessId: s.harnessId,
+        harnessKind: s.harnessKind,
+        nativeSessionId: s.nativeSessionId ?? null,
+        updatedAt: s.updatedAt,
+      })),
+      plugins: plugins.map((p) => ({
+        id: p.id,
+        instanceId: getPluginInstanceId(p),
+        name: p.name,
+        version: p.version,
+        enabled: p.enabled,
+        runtimeState: p.runtimeState,
+        provides: p.provides ?? [],
+        providedContracts: p.providedContracts ?? [],
+      })),
+      serviceResolution: activeResolution,
+      sourceResolution,
+      initialQuery: activeSlotId === SESSION_SEARCH_PAGE_SLOT_ID ? searchPageInitialQuery : '',
+      initialTab: activeSlotId === HISTORY_IMPORT_PAGE_SLOT_ID ? importPageInitialTab : 'native',
+    }),
+    [
+      selectedWorkspaceId,
+      workspaces,
+      harnesses,
+      sessions,
+      plugins,
+      activeResolution,
+      sourceResolution,
+      activeSlotId,
+      searchPageInitialQuery,
+      importPageInitialTab,
+    ],
+  );
+
   const knownOfflinePeerPage =
     !page &&
     parsedActive &&
@@ -391,6 +553,16 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
   }, [active, open, page, knownOfflinePeerPage]);
 
   if (!page && !knownOfflinePeerPage) return children;
+
+  const handleShellSelectInstance = (nextInstanceId: string | null) => {
+    if (!peerContract || !activeSlotId) return;
+    if (selectedWorkspaceId && typeof setWorkspaceBinding === 'function') {
+      void setWorkspaceBinding(selectedWorkspaceId, peerContract, nextInstanceId || null);
+    }
+    if (nextInstanceId) {
+      open(makeWorkspacePageKey(nextInstanceId, activeSlotId));
+    }
+  };
 
   if (knownOfflinePeerPage) {
     const title =
@@ -410,7 +582,7 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
           </button>
           <h1 className="truncate text-sm font-medium text-[var(--text-primary)]">{title}</h1>
         </header>
-        <div className="min-h-0 flex-1">
+        <div className="min-h-0 flex-1 overflow-auto p-4">
           {knownOfflinePeerPage.slotId === SESSION_SEARCH_PAGE_SLOT_ID ? (
             <SessionSearchWorkspacePage instanceId={knownOfflinePeerPage.instanceId} />
           ) : (
@@ -434,9 +606,22 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
         </button>
         <h1 className="truncate text-sm font-medium text-[var(--text-primary)]">{page!.title}</h1>
       </header>
+      {page!.sourceKind === 'iframe' && peerContract && activeResolution && (
+        <div
+          data-testid="workspace-shell-resolution"
+          className="border-b border-[var(--border-hairline)] px-4 py-2"
+        >
+          <ServiceResolutionBanner
+            title={peerContract === SESSION_SEARCH_CONTRACT ? '检索服务实例' : '导入服务实例'}
+            resolution={activeResolution}
+            plugins={plugins}
+            onSelectInstance={handleShellSelectInstance}
+          />
+        </div>
+      )}
       <div className="min-h-0 flex-1">
         <SlotErrorBoundary key={pageKey(page!)} registry={registry} item={page!}>
-          <WorkspacePageContent page={page!} />
+          <WorkspacePageContent page={page!} hostProps={hostProps} />
         </SlotErrorBoundary>
       </div>
     </main>

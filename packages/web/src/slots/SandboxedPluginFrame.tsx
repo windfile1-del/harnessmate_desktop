@@ -7,8 +7,10 @@ import type {
 import { Loader2, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { daemonApi } from '../api/client';
+import { isAbortError } from '../api/peer-workspace-client';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry, useSlotTheme } from './hooks';
+import { executeSandboxedBridgeMethod } from './sandbox-bridge-handler';
 import {
   buildIframeSrcDoc,
   collectThemeCssVars,
@@ -69,7 +71,20 @@ export function SandboxedPluginFrame({
   sessionRef.current = session;
 
   const sessionDto = useMemo(() => toPublicSessionDto(session), [session]);
-  const safeProps = useMemo(() => serializeSafeProps(props), [props]);
+  const safeProps = useMemo(() => {
+    const base = serializeSafeProps(props);
+    if (typeof base.apiBase !== 'string') {
+      base.apiBase =
+        typeof window !== 'undefined'
+          ? window.harnessMateBridge?.daemonUrl || window.location?.origin || ''
+          : '';
+    }
+    return base;
+  }, [props]);
+  const sessionDtoRef = useRef(sessionDto);
+  sessionDtoRef.current = sessionDto;
+  const safePropsRef = useRef(safeProps);
+  safePropsRef.current = safeProps;
   const initialThemeRef = useRef(theme);
   const initialSessionRef = useRef(sessionDto);
   const initialPropsRef = useRef(safeProps);
@@ -97,7 +112,7 @@ export function SandboxedPluginFrame({
         });
       });
     return () => controller.abort();
-  }, [pluginId, pluginName, revision, slot, slotId, ui, registry]);
+  }, [pluginId, effectiveInstanceId, pluginName, revision, slot, slotId, ui, registry]);
 
   const srcDoc = useMemo(() => {
     if (!doc) return null;
@@ -148,6 +163,7 @@ export function SandboxedPluginFrame({
     const activeRunId = doc.runId;
     const desktopView = window.harnessMateBridge?.desktopView ?? window.harnessMateBridge?.pluginBrowser;
     const viewId = desktopView ? window.crypto.randomUUID() : '';
+    const rpcAbort = new AbortController();
     let disposed = false;
     let unsubscribeBrowser: (() => void) | undefined;
 
@@ -156,7 +172,7 @@ export function SandboxedPluginFrame({
       payload: { ok: true; result?: unknown } | { ok: false; error: { code: string; message: string } },
     ) => {
       const win = iframeRef.current?.contentWindow;
-      if (disposed || !win) return;
+      if (disposed || rpcAbort.signal.aborted || !win) return;
       const msg: PluginSlotBridgeHostMessage = {
         type: 'hm:rpc:response',
         requestId,
@@ -165,19 +181,70 @@ export function SandboxedPluginFrame({
       win.postMessage(msg, '*');
     };
 
+    const runHostMethod = async (
+      method: string,
+      params: Record<string, unknown> | undefined,
+      iframeWindow: Window,
+      runId: string,
+    ): Promise<unknown> => {
+      if (method.startsWith('browser.') || method.startsWith('desktopView.')) {
+        if (!desktopView) {
+          throw Object.assign(new Error('桌面视图预览需要 HarnessMate Desktop'), { code: 'E_NOT_SUPPORTED' });
+        }
+        const action = method.startsWith('browser.')
+          ? method.slice('browser.'.length)
+          : method.slice('desktopView.'.length);
+        if ((action === 'open' || action === 'create' || action === 'mount' || action === 'navigate') && !unsubscribeBrowser) {
+          unsubscribeBrowser = desktopView.subscribe(viewId, (update) => {
+            if (disposed || rpcAbort.signal.aborted || iframeRef.current?.contentWindow !== iframeWindow) return;
+            iframeWindow.postMessage('frame' in update
+              ? { type: 'hm:browser:frame', runId, frame: update.frame } satisfies PluginSlotBridgeHostMessage
+              : { type: 'hm:browser:status', runId, status: update.status } satisfies PluginSlotBridgeHostMessage, '*');
+          });
+        }
+        const payload = (action === 'open' || action === 'create' || action === 'mount' || action === 'navigate')
+          ? { url: params?.url, width: params?.width, height: params?.height, pluginId, instanceId: effectiveInstanceId, runId }
+          : action === 'resize'
+            ? { width: params?.width, height: params?.height }
+            : action === 'focus'
+              ? { focused: params?.focused }
+              : params?.input;
+        await desktopView.call(viewId, action, payload);
+        return undefined;
+      }
+
+      return executeSandboxedBridgeMethod(
+        {
+          pluginId,
+          effectiveInstanceId,
+          slot,
+          slotId,
+          runId,
+          currentSession: sessionRef.current,
+          signal: rpcAbort.signal,
+          isDisposed: () => disposed,
+        },
+        method,
+        params,
+      );
+    };
+
     const onMessage = (event: MessageEvent) => {
       const iframeWindow = iframeRef.current?.contentWindow;
       if (!iframeWindow || event.source !== iframeWindow) return;
-      const data = event.data as PluginSlotBridgeIframeMessage | null;
-      if (!data || typeof data !== 'object' || typeof data.type !== 'string') return;
+      const raw = event.data as
+        | PluginSlotBridgeIframeMessage
+        | { type: 'hm:action'; action: string; params?: Record<string, unknown>; slotId?: string; runId?: string }
+        | null;
+      if (!raw || typeof raw !== 'object' || typeof raw.type !== 'string') return;
 
-      if (data.type === 'hm:resize' && data.slotId === slotId) {
-        const clamped = Math.max(48, Math.min(960, Math.round(Number(data.height) || 120)));
+      if (raw.type === 'hm:resize' && raw.slotId === slotId) {
+        const clamped = Math.max(48, Math.min(960, Math.round(Number(raw.height) || 120)));
         setHeight(clamped);
         return;
       }
 
-      if (data.type === 'hm:ready' && data.slotId === slotId) {
+      if (raw.type === 'hm:ready' && raw.slotId === slotId) {
         iframeWindow.postMessage(
           {
             type: 'hm:theme',
@@ -186,11 +253,34 @@ export function SandboxedPluginFrame({
           } satisfies PluginSlotBridgeHostMessage,
           '*',
         );
+        iframeWindow.postMessage(
+          {
+            type: 'hm:context',
+            session: sessionDtoRef.current,
+            props: safePropsRef.current,
+          } satisfies PluginSlotBridgeHostMessage,
+          '*',
+        );
         return;
       }
 
-      if (data.type === 'hm:rpc:request') {
-        const { requestId, runId, method, params } = data;
+      if (raw.type === 'hm:action') {
+        if (raw.runId && raw.runId !== activeRunId) return;
+        const actionName = typeof raw.action === 'string' ? raw.action.trim() : '';
+        if (
+          actionName === 'navigateToSession' ||
+          actionName === 'session.navigate' ||
+          actionName === 'refreshSessions' ||
+          actionName === 'refreshWorkspaces' ||
+          actionName === 'switchInstance'
+        ) {
+          void runHostMethod(actionName, raw.params, iframeWindow, activeRunId).catch(() => {});
+        }
+        return;
+      }
+
+      if (raw.type === 'hm:rpc:request') {
+        const { requestId, runId, method, params } = raw;
         if (runId !== activeRunId) {
           reply(requestId, {
             ok: false,
@@ -199,125 +289,29 @@ export function SandboxedPluginFrame({
           return;
         }
 
-        void (async () => {
-          try {
-            const currentSession = sessionRef.current;
-            const store = useAppStore.getState();
-
-            if (method.startsWith('browser.') || method.startsWith('desktopView.')) {
-              if (!desktopView) {
-                reply(requestId, { ok: false, error: { code: 'E_NOT_SUPPORTED', message: '桌面视图预览需要 HarnessMate Desktop' } });
-                return;
-              }
-              const action = method.startsWith('browser.')
-                ? method.slice('browser.'.length)
-                : method.slice('desktopView.'.length);
-              if ((action === 'open' || action === 'create' || action === 'mount' || action === 'navigate') && !unsubscribeBrowser) {
-                unsubscribeBrowser = desktopView.subscribe(viewId, (update) => {
-                  if (disposed || iframeRef.current?.contentWindow !== iframeWindow) return;
-                  iframeWindow.postMessage('frame' in update
-                    ? { type: 'hm:browser:frame', runId, frame: update.frame } satisfies PluginSlotBridgeHostMessage
-                    : { type: 'hm:browser:status', runId, status: update.status } satisfies PluginSlotBridgeHostMessage, '*');
-                });
-              }
-              const payload = (action === 'open' || action === 'create' || action === 'mount' || action === 'navigate')
-                ? { url: params?.url, width: params?.width, height: params?.height, pluginId, instanceId: effectiveInstanceId, runId }
-                : action === 'resize'
-                  ? { width: params?.width, height: params?.height }
-                  : action === 'focus'
-                    ? { focused: params?.focused }
-                    : params?.input;
-              await desktopView.call(viewId, action, payload);
-              reply(requestId, { ok: true });
-              return;
-            }
-
-            if (method === 'plugin.message') {
-              const res = await daemonApi.sendPluginUiMessage(effectiveInstanceId, {
-                slotId,
-                slot,
-                runId,
-                sessionId: currentSession?.id ?? null,
-                payload: params?.payload,
-              });
-              reply(requestId, { ok: true, result: res.result });
-              return;
-            }
-
-            if (method === 'composer.setDraft') {
-              if (!currentSession) {
-                reply(requestId, {
-                  ok: false,
-                  error: { code: 'E_NOT_SUPPORTED', message: '当前没有活动会话' },
-                });
-                return;
-              }
-              const text = typeof params?.text === 'string' ? params.text.slice(0, 12_000) : '';
-              store.setDraftText(currentSession.id, text);
-              reply(requestId, { ok: true, result: { ok: true } });
-              return;
-            }
-
-            if (method === 'ui.toast') {
-              const toastTitle = String(params?.title ?? '').trim().slice(0, 120);
-              if (!toastTitle) {
-                reply(requestId, {
-                  ok: false,
-                  error: { code: 'E_INVALID_INPUT', message: '通知标题不能为空' },
-                });
-                return;
-              }
-              const rawKind = params?.kind;
-              const kind = rawKind === 'success' || rawKind === 'warning' || rawKind === 'error' ? rawKind : 'info';
-              store.pushToast({
-                kind,
-                title: toastTitle,
-                body: typeof params?.body === 'string' ? params.body.slice(0, 300) : undefined,
-              });
-              reply(requestId, { ok: true, result: { ok: true } });
-              return;
-            }
-
-            if (method === 'command.run') {
-              if (!currentSession) {
-                reply(requestId, {
-                  ok: false,
-                  error: { code: 'E_NOT_SUPPORTED', message: '当前没有活动会话' },
-                });
-                return;
-              }
-              const command = String(params?.command ?? '').trim();
-              const args = typeof params?.args === 'string' ? params.args : '';
-              const result = await store.runPluginAction(currentSession.id, {
-                pluginId,
-                command,
-                harnessId: currentSession.harnessId,
-                args,
-              });
-              reply(requestId, { ok: true, result });
-              return;
-            }
-
-            reply(requestId, {
-              ok: false,
-              error: { code: 'E_NOT_SUPPORTED', message: `不支持的 UI 桥接方法: ${method}` },
-            });
-          } catch (err) {
+        void runHostMethod(method, params, iframeWindow, runId)
+          .then((result) => {
+            if (disposed || rpcAbort.signal.aborted) return;
+            reply(requestId, { ok: true, result });
+          })
+          .catch((err: unknown) => {
+            if (disposed || rpcAbort.signal.aborted || isAbortError(err)) return;
+            const errObj = err && typeof err === 'object' ? (err as { code?: unknown; message?: unknown }) : null;
             reply(requestId, {
               ok: false,
               error: {
-                code: 'E_INVALID_INPUT',
+                code: typeof errObj?.code === 'string' ? errObj.code : 'E_INVALID_INPUT',
                 message: err instanceof Error ? err.message : String(err),
               },
             });
-          }
-        })();
+          });
       }
     };
 
     window.addEventListener('message', onMessage);
     return () => {
       disposed = true;
+      rpcAbort.abort();
       window.removeEventListener('message', onMessage);
       if (unsubscribeBrowser) {
         unsubscribeBrowser();
