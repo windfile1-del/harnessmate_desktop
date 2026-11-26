@@ -31,11 +31,19 @@ import {
   HistoryImportController,
   SessionSearchController,
 } from '../src/lib/peer-workspace-controllers';
-import { SlotRegistry, SlotRegistryProvider, SlotSessionProvider } from '../src/slots';
+import {
+  SlotRegistry,
+  SlotRegistryProvider,
+  SlotSessionProvider,
+  PluginSlotSync,
+} from '../src/slots';
 import {
   registerBatch1WorkspacePages,
-  shouldSkipBatch1IframeSlot,
+  registerPluginIframeSlots,
 } from '../src/slots/PluginSlotSync';
+import { executeSandboxedBridgeMethod } from '../src/slots/sandbox-bridge-handler';
+import { buildIframeSrcDoc } from '../src/slots/sandbox-iframe-utils';
+import { daemonApi } from '../src/api/client';
 import { PluginWorkspaceLinks, PluginWorkspaceStage } from '../src/slots/PluginWorkspace';
 import { useAppStore } from '../src/stores/app-store';
 
@@ -448,15 +456,39 @@ describe('B1-05 · ServiceResolutionV1 & Navigation Compatibility', () => {
     expect(useAppStore.getState().explorerInitialQuery).toBe('oauth');
   });
 
-  it('registers workspace.pages via registerBatch1WorkspacePages, skips duplicate iframe slots, and cleans up on dispose', () => {
-    const searchFts = makePlugin('hm.plugin.session-search-fts', SESSION_SEARCH_CONTRACT, {
-      name: 'FTS5 搜索',
-    });
-    const searchAlt = makePlugin('hm.plugin.session-search-alt', SESSION_SEARCH_CONTRACT, {
-      name: 'Lite 搜索',
-    });
-    const importPlugin = makePlugin('hm.plugin.history-import', HISTORY_IMPORT_CONTRACT, {
-      name: '历史导入中心',
+  it('does NOT override plugins supplying ui/panel.html slots and keeps slot-less fallback clean', () => {
+    const searchWithUi: InstalledPluginInfo = {
+      ...makePlugin('hm.plugin.session-search-fts', SESSION_SEARCH_CONTRACT, {
+        name: 'FTS5 搜索',
+      }),
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: SESSION_SEARCH_PAGE_SLOT_ID,
+            title: 'FTS5 搜索',
+            ui: 'ui/panel.html',
+          },
+        ],
+      },
+    };
+    const importWithUi: InstalledPluginInfo = {
+      ...makePlugin('hm.plugin.history-import', HISTORY_IMPORT_CONTRACT, {
+        name: '历史导入中心',
+      }),
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: HISTORY_IMPORT_PAGE_SLOT_ID,
+            title: '历史导入',
+            ui: 'ui/panel.html',
+          },
+        ],
+      },
+    };
+    const slotlessSearch = makePlugin('user.slotless-search', SESSION_SEARCH_CONTRACT, {
+      name: '纯服务搜索',
     });
     const disabledSearch = makePlugin('hm.plugin.session-search-off', SESSION_SEARCH_CONTRACT, {
       name: '停用搜索',
@@ -464,25 +496,17 @@ describe('B1-05 · ServiceResolutionV1 & Navigation Compatibility', () => {
       runtimeState: 'DISPOSED',
     });
 
-    expect(
-      shouldSkipBatch1IframeSlot(importPlugin, { slot: 'workspace.pages', id: 'history-import' }),
-    ).toBe(true);
-    expect(
-      shouldSkipBatch1IframeSlot(importPlugin, { slot: 'workspace.pages', id: 'custom-subpage' }),
-    ).toBe(false);
-
     const registry = new SlotRegistry();
     const disposers = registerBatch1WorkspacePages(registry, [
-      searchFts,
-      searchAlt,
-      importPlugin,
+      searchWithUi,
+      importWithUi,
+      slotlessSearch,
       disabledSearch,
     ]);
+    // Bundled/3p plugins with ui/panel.html are NOT overridden by host React fallback
     const items = registry.getItems('workspace.pages', { hasSession: false });
     expect(items.map((item) => item.registrationKey)).toEqual([
-      'hm.plugin.session-search-fts:session-search',
-      'hm.plugin.session-search-alt:session-search',
-      'hm.plugin.history-import:history-import',
+      'user.slotless-search:session-search',
     ]);
 
     for (const dispose of disposers) dispose();
@@ -910,5 +934,256 @@ describe('B1-05 · SessionSearchWorkspacePage & Coexistence / Late-Response / Re
     expect(stageHtml).not.toContain('ChatFallback');
 
     controller.dispose();
+  });
+});
+
+describe('B1-05 · SandboxedPluginFrame Bridge & Third-Party Custom Standard Page Takeover', () => {
+  it('mounts bundled & 3rd-party ui/panel.html directly without host override and supports takeover, removal, and bridge RPCs', async () => {
+    const bundledImport: InstalledPluginInfo = {
+      ...makePlugin('hm.plugin.history-import', HISTORY_IMPORT_CONTRACT, {
+        name: '历史导入中心',
+      }),
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: HISTORY_IMPORT_PAGE_SLOT_ID,
+            title: '历史导入',
+            ui: 'ui/panel.html',
+          },
+        ],
+      },
+    };
+    const bundledSearch: InstalledPluginInfo = {
+      ...makePlugin('hm.plugin.session-search-fts', SESSION_SEARCH_CONTRACT, {
+        name: 'FTS5 搜索',
+      }),
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: SESSION_SEARCH_PAGE_SLOT_ID,
+            title: 'FTS5 搜索',
+            ui: 'ui/panel.html',
+          },
+        ],
+      },
+    };
+    const thirdPartyCustomSearch: InstalledPluginInfo = {
+      ...makePlugin('user.custom.search', SESSION_SEARCH_CONTRACT, {
+        instanceId: 'user.custom.search',
+        name: '第三方语义搜索',
+      }),
+      sourceKind: 'local_dir',
+      builtin: false,
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: SESSION_SEARCH_PAGE_SLOT_ID,
+            title: '自定义语义搜索页',
+            ui: 'ui/custom-search.html',
+            order: 15,
+          },
+        ],
+      },
+    };
+    const thirdPartyCustomImport: InstalledPluginInfo = {
+      ...makePlugin('user.custom.import', HISTORY_IMPORT_CONTRACT, {
+        instanceId: 'user.custom.import',
+        name: '第三方历史导入页',
+      }),
+      sourceKind: 'local_dir',
+      builtin: false,
+      contributes: {
+        slots: [
+          {
+            slot: 'workspace.pages',
+            id: HISTORY_IMPORT_PAGE_SLOT_ID,
+            title: '自定义导入工作台',
+            ui: 'ui/custom-import.html',
+          },
+        ],
+      },
+    };
+
+    const allPlugins = [
+      bundledImport,
+      bundledSearch,
+      thirdPartyCustomSearch,
+      thirdPartyCustomImport,
+    ];
+    const registry = new SlotRegistry();
+    const disposers = [
+      ...registerBatch1WorkspacePages(registry, allPlugins),
+      ...registerPluginIframeSlots(registry, allPlugins),
+    ];
+
+    const registeredPages = registry.getItems('workspace.pages', { hasSession: false });
+    expect(registeredPages.every((item) => item.sourceKind === 'iframe')).toBe(true);
+    expect(registeredPages.map((item) => item.registrationKey)).toEqual([
+      'user.custom.search:session-search',
+      'hm.plugin.history-import:history-import',
+      'hm.plugin.session-search-fts:session-search',
+      'user.custom.import:history-import',
+    ]);
+
+    // Selecting 3rd-party plugin renders thin shell banner + SandboxedPluginFrame (NOT React fallback page)
+    useAppStore.setState({
+      workspaces: [wsSample, wsSecond],
+      sessions: [sampleSession],
+      harnesses: [],
+      plugins: allPlugins,
+      selectedWorkspaceId: wsSample.id,
+      selectedSessionId: sampleSession.id,
+      workspaceBindingsByWorkspace: {
+        [wsSample.id]: { [SESSION_SEARCH_CONTRACT]: 'user.custom.search' },
+      },
+      activePluginPage: makeWorkspacePageKey('user.custom.search', SESSION_SEARCH_PAGE_SLOT_ID),
+      searchPageInitialQuery: '中文语义',
+    });
+
+    const customStageHtml = renderToStaticMarkup(
+      <SlotRegistryProvider registry={registry}>
+        <PluginWorkspaceStage>
+          <div>ChatFallback</div>
+        </PluginWorkspaceStage>
+      </SlotRegistryProvider>,
+    );
+    expect(customStageHtml).toContain('自定义语义搜索页');
+    expect(customStageHtml).toContain('workspace-shell-resolution');
+    expect(customStageHtml).toContain('user.custom.search');
+    expect(customStageHtml).toContain('正在加载沙箱视图 自定义语义搜索页');
+    expect(customStageHtml).not.toContain('session-search-workspace-page');
+
+    // Disabling bundledSearch removes its entry while keeping 3rd-party entry active
+    for (const d of disposers) d();
+    const afterDisablePlugins = [
+      bundledImport,
+      { ...bundledSearch, enabled: false, runtimeState: 'DISPOSED' as const },
+      thirdPartyCustomSearch,
+      thirdPartyCustomImport,
+    ];
+    const registryAfterDisable = new SlotRegistry();
+    registerBatch1WorkspacePages(registryAfterDisable, afterDisablePlugins);
+    registerPluginIframeSlots(registryAfterDisable, afterDisablePlugins);
+    expect(
+      registryAfterDisable
+        .getItems('workspace.pages', { hasSession: false })
+        .map((item) => item.registrationKey),
+    ).toEqual([
+      'user.custom.search:session-search',
+      'hm.plugin.history-import:history-import',
+      'user.custom.import:history-import',
+    ]);
+
+    // Verify buildIframeSrcDoc injects full context + host bridge helpers
+    const srcDoc = buildIframeSrcDoc({
+      html: '<body><div id="app">Custom Search</div></body>',
+      csp: "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'",
+      theme: 'dark',
+      cssVars: { '--bg-canvas': '#0b0e14' },
+      pluginId: 'user.custom.search',
+      instanceId: 'user.custom.search',
+      runId: 'run-custom-1',
+      slotId: SESSION_SEARCH_PAGE_SLOT_ID,
+      slot: 'workspace.pages',
+      session: null,
+      props: {
+        apiBase: 'http://127.0.0.1:4321',
+        workspaceId: 'ws-sample',
+        workspaces: [{ id: 'ws-sample', name: '样例工作区', rootPath: 'D:/Projects/sample' }],
+        initialQuery: '中文语义',
+      },
+    });
+    expect(srcDoc).toContain('http://127.0.0.1:4321');
+    expect(srcDoc).toContain('中文语义');
+    expect(srcDoc).toContain('requestPluginRoute');
+    expect(srcDoc).toContain('navigateToSession');
+    expect(srcDoc).toContain('refreshSessions');
+    expect(srcDoc).toContain('refreshWorkspaces');
+
+    // Verify SandboxedPluginFrame RPC handler: plugin.route, navigateToSession, refreshWorkspaces, abort on switch
+    const routeSpy = vi
+      .spyOn(daemonApi, 'callPluginInstanceRoute')
+      .mockImplementation(async (targetId, routePath, init) => {
+        expect(targetId).toBe('user.custom.search');
+        expect(routePath).toBe('/query?q=%E4%B8%AD%E6%96%87');
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        return { ok: true, value: { hits: [{ sessionId: 'sess-sample', turnId: 'import_9' }], nextOffset: null, fallbackUsed: false, tookMs: 3 } };
+      });
+    const listWorkspacesSpy = vi
+      .spyOn(daemonApi, 'listWorkspaces')
+      .mockResolvedValue({ workspaces: [wsSample, wsSecond] });
+    const selectSessionSpy = vi
+      .spyOn(useAppStore.getState(), 'selectSession')
+      .mockResolvedValue();
+
+    const activeAbort = new AbortController();
+    const execCtx = {
+      pluginId: 'user.custom.search',
+      effectiveInstanceId: 'user.custom.search',
+      slot: 'workspace.pages',
+      slotId: SESSION_SEARCH_PAGE_SLOT_ID,
+      runId: 'run-custom-1',
+      currentSession: null,
+      signal: activeAbort.signal,
+      isDisposed: () => activeAbort.signal.aborted,
+    };
+
+    const routeRes = await executeSandboxedBridgeMethod(execCtx, 'plugin.route', {
+      method: 'POST',
+      path: '/query',
+      query: { q: '中文' },
+      body: { q: '中文' },
+    });
+    expect(routeSpy).toHaveBeenCalledTimes(1);
+    expect((routeRes as { ok: boolean }).ok).toBe(true);
+
+    const wsRes = await executeSandboxedBridgeMethod(execCtx, 'refreshWorkspaces', {});
+    expect(listWorkspacesSpy).toHaveBeenCalledTimes(1);
+    expect((wsRes as { workspaces: Workspace[] }).workspaces).toHaveLength(2);
+
+    const navRes = await executeSandboxedBridgeMethod(execCtx, 'navigateToSession', {
+      sessionId: 'sess-sample',
+      turnId: 'import_9',
+      itemId: 'sess-sample:import_9:assistant',
+    });
+    expect(navRes).toEqual({
+      ok: true,
+      sessionId: 'sess-sample',
+      turnId: 'import_9',
+      itemId: 'sess-sample:import_9:assistant',
+    });
+    expect(selectSessionSpy).toHaveBeenCalledWith('sess-sample');
+    expect(useAppStore.getState().activePluginPage).toBeNull();
+    expect(useAppStore.getState().focusedTurn).toEqual({
+      sessionId: 'sess-sample',
+      turnId: 'import_9',
+      itemId: 'sess-sample:import_9:assistant',
+    });
+
+    // Simulate instance switch / unmount aborting an in-flight navigateToSession before it finishes
+    const abortedController = new AbortController();
+    const deferredSync = createDeferred<Session | null>();
+    vi.spyOn(useAppStore.getState(), 'syncImportedSession').mockImplementation(() => deferredSync.promise);
+    useAppStore.setState({
+      sessions: [],
+      activePluginPage: makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
+      focusedTurn: null,
+    });
+    const slowNavPromise = executeSandboxedBridgeMethod(
+      { ...execCtx, signal: abortedController.signal, isDisposed: () => abortedController.signal.aborted },
+      'navigateToSession',
+      { sessionId: 'late-session', turnId: 'late_turn' },
+    );
+    abortedController.abort();
+    deferredSync.resolve(sampleSession);
+    const abortedNavRes = await slowNavPromise;
+    expect(abortedNavRes).toEqual({ ok: false, aborted: true });
+    expect(useAppStore.getState().focusedTurn).toBeNull();
+    expect(useAppStore.getState().activePluginPage).toBe(
+      makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
+    );
   });
 });

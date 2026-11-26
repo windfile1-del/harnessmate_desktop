@@ -215,17 +215,62 @@ function ApprovalAnnotationsDetail({ approval }: { approval: ApprovalRequest }) 
   );
 }
 
-export function shouldSkipBatch1IframeSlot(
-  plugin: InstalledPluginInfo,
-  slotDef: { slot: AnyPluginSlotKey; id: string },
-): boolean {
-  return (
-    slotDef.slot === 'workspace.pages' &&
-    ((slotDef.id === HISTORY_IMPORT_PAGE_SLOT_ID &&
-      pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT)) ||
-      (slotDef.id === SESSION_SEARCH_PAGE_SLOT_ID &&
-        pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT)))
-  );
+export function registerPluginIframeSlots(
+  registry: SlotRegistry,
+  plugins: InstalledPluginInfo[],
+): Disposer[] {
+  const disposers: Disposer[] = [];
+  for (const plugin of plugins) {
+    if (!isPluginActive(plugin)) continue;
+    const instanceId = plugin.instanceId ?? plugin.id;
+    const revision = `${plugin.packageDigest ?? plugin.version}:${plugin.runId ?? 'decl'}`;
+    for (const slotDef of collectPluginIframeSlots(plugin)) {
+      const isCompactSlot =
+        slotDef.slot === 'statusbar.items' ||
+        slotDef.slot === 'composer.actions' ||
+        slotDef.slot === 'composer.traits' ||
+        slotDef.slot === 'session.sidebar.badge' ||
+        slotDef.slot === 'session.header.title';
+      const pageTitle =
+        slotDef.slot === 'workspace.pages' && instanceId !== plugin.id && !slotDef.title.includes(instanceId)
+          ? `${slotDef.title} (${instanceId})`
+          : slotDef.title;
+      disposers.push(
+        registry.register({
+          slot: slotDef.slot,
+          id: slotDef.id,
+          pluginId: instanceId,
+          pluginName: plugin.name,
+          title: pageTitle,
+          order: slotDef.order ?? 500,
+          key: slotDef.key,
+          sourceKind: 'iframe',
+          render: (rawProps) => {
+            const recordProps = rawProps as Record<string, unknown>;
+            const session = (recordProps.session as Session | null | undefined) ?? null;
+            return (
+              <SandboxedPluginFrame
+                key={`${instanceId}:${slotDef.slot}:${slotDef.id}:${revision}`}
+                pluginId={plugin.id}
+                instanceId={instanceId}
+                pluginName={plugin.name}
+                revision={revision}
+                slot={slotDef.slot}
+                slotId={slotDef.id}
+                title={slotDef.title}
+                ui={slotDef.ui}
+                session={session}
+                props={recordProps}
+                defaultHeight={slotDef.height}
+                compact={isCompactSlot}
+              />
+            );
+          },
+        }),
+      );
+    }
+  }
+  return disposers;
 }
 
 export function registerBatch1WorkspacePages(
@@ -233,25 +278,33 @@ export function registerBatch1WorkspacePages(
   plugins: InstalledPluginInfo[],
 ): Disposer[] {
   const disposers: Disposer[] = [];
+  const hasIframePageSlot = (plugin: InstalledPluginInfo, targetSlotId: string): boolean =>
+    collectPluginIframeSlots(plugin).some(
+      (s) => s.slot === 'workspace.pages' && s.id === targetSlotId,
+    );
+
+  // Only register host fallback views if an active provider lacks its own `workspace.pages` UI slot.
+  // Plugins supplying `ui/panel.html` (both bundled and 3rd-party custom UIs) are registered directly
+  // via step 3 (`SandboxedPluginFrame`) without host-side React override.
   const activeImportProviders = plugins.filter(
     (plugin) =>
-      isPluginInstanceReady(plugin) && pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT),
+      isPluginInstanceReady(plugin) &&
+      pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT) &&
+      !hasIframePageSlot(plugin, HISTORY_IMPORT_PAGE_SLOT_ID),
   );
   const activeSearchProviders = plugins.filter(
     (plugin) =>
-      isPluginInstanceReady(plugin) && pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT),
+      isPluginInstanceReady(plugin) &&
+      pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT) &&
+      !hasIframePageSlot(plugin, SESSION_SEARCH_PAGE_SLOT_ID),
   );
 
   for (const plugin of activeImportProviders) {
     const instanceId = getPluginInstanceId(plugin);
-    const customSlot = collectPluginIframeSlots(plugin).find(
-      (s) => s.slot === 'workspace.pages' && s.id === HISTORY_IMPORT_PAGE_SLOT_ID,
-    );
     const title =
-      customSlot?.title ??
-      (activeImportProviders.length > 1 || instanceId !== plugin.id
+      activeImportProviders.length > 1 || instanceId !== plugin.id
         ? `${plugin.name} (${instanceId})`
-        : '历史导入');
+        : '历史导入';
     disposers.push(
       registry.register({
         slot: 'workspace.pages',
@@ -259,7 +312,7 @@ export function registerBatch1WorkspacePages(
         pluginId: instanceId,
         pluginName: plugin.name,
         title,
-        order: customSlot?.order ?? 25,
+        order: 25,
         sourceKind: 'builtin',
         render: () => <HistoryImportWorkspacePage instanceId={instanceId} />,
       }),
@@ -268,14 +321,10 @@ export function registerBatch1WorkspacePages(
 
   for (const plugin of activeSearchProviders) {
     const instanceId = getPluginInstanceId(plugin);
-    const customSlot = collectPluginIframeSlots(plugin).find(
-      (s) => s.slot === 'workspace.pages' && s.id === SESSION_SEARCH_PAGE_SLOT_ID,
-    );
     const title =
-      customSlot?.title ??
-      (activeSearchProviders.length > 1 || instanceId !== plugin.id
+      activeSearchProviders.length > 1 || instanceId !== plugin.id
         ? `${plugin.name} (${instanceId})`
-        : '会话搜索');
+        : '会话搜索';
     disposers.push(
       registry.register({
         slot: 'workspace.pages',
@@ -283,7 +332,7 @@ export function registerBatch1WorkspacePages(
         pluginId: instanceId,
         pluginName: plugin.name,
         title,
-        order: customSlot?.order ?? 20,
+        order: 20,
         sourceKind: 'builtin',
         render: () => <SessionSearchWorkspacePage instanceId={instanceId} />,
       }),
@@ -1043,55 +1092,10 @@ export function PluginSlotSync() {
           }),
         );
       }
-
-      // 3. V4/V5 manifest contributes.slots & isolated runtimeSlots -> sandboxed iframe
-      const instanceId = plugin.instanceId ?? plugin.id;
-      const revision = `${plugin.packageDigest ?? plugin.version}:${plugin.runId ?? 'decl'}`;
-      for (const slotDef of collectPluginIframeSlots(plugin)) {
-        if (shouldSkipBatch1IframeSlot(plugin, slotDef)) {
-          continue;
-        }
-        const isCompactSlot =
-          slotDef.slot === 'statusbar.items' ||
-          slotDef.slot === 'composer.actions' ||
-          slotDef.slot === 'composer.traits' ||
-          slotDef.slot === 'session.sidebar.badge' ||
-          slotDef.slot === 'session.header.title';
-        disposers.push(
-          registry.register({
-            slot: slotDef.slot,
-            id: slotDef.id,
-            pluginId: instanceId,
-            pluginName: plugin.name,
-            title: slotDef.title,
-            order: slotDef.order ?? 500,
-            key: slotDef.key,
-            sourceKind: 'iframe',
-            render: (rawProps) => {
-              const recordProps = rawProps as Record<string, unknown>;
-              const session = (recordProps.session as Session | null | undefined) ?? null;
-              return (
-                <SandboxedPluginFrame
-                  key={`${instanceId}:${slotDef.slot}:${slotDef.id}:${revision}`}
-                  pluginId={plugin.id}
-                  instanceId={instanceId}
-                  pluginName={plugin.name}
-                  revision={revision}
-                  slot={slotDef.slot}
-                  slotId={slotDef.id}
-                  title={slotDef.title}
-                  ui={slotDef.ui}
-                  session={session}
-                  props={recordProps}
-                  defaultHeight={slotDef.height}
-                  compact={isCompactSlot}
-                />
-              );
-            },
-          }),
-        );
-      }
     }
+
+    // 3. V4/V5 manifest contributes.slots & isolated runtimeSlots -> sandboxed iframe
+    disposers.push(...registerPluginIframeSlots(registry, plugins));
 
     return () => {
       for (const dispose of disposers.reverse()) dispose();
