@@ -1,0 +1,31 @@
+{
+  "id": "user.history-source-custom",
+  "name": "自定义 JSONL 历史来源样例",
+  "version": "1.0.0",
+  "description": "使用公开 history.source.v1 契约实现的第三方自定义历史来源样例，可与预装来源并行安装、启停与配置。",
+  "author": "HarnessMate Community Example",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "history.source.v1"
+  ],
+  "permissions": [
+    "fs:cli_histories:read"
+  ],
+  "contributes": {
+    "settings": {
+      "rootDir": {
+        "type": "string",
+        "description": "自定义 JSONL 历史目录（未配置时读取插件包内 samples/ 目录样例）"
+      },
+      "sourceId": {
+        "type": "string",
+        "description": "可选自定义来源命名空间 ID"
+      }
+    }
+  }
+}

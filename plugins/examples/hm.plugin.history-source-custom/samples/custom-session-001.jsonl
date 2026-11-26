@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"nativeSessionId":"custom-session-001","title":"自定义来源样例 · 日志分析与构建诊断","harnessKind":"custom","updatedAt":1795651200000,"cwd":"D:\\HarnessMate\\workspace-custom-demo","workspaceLabel":"workspace-custom-demo"}}
+{"role":"user","text":"请检查构建流水线里的警告并总结根因。","timestamp":1795651190000}
+{"role":"assistant","text":"已检查构建日志：主要告警来自未声明的 peer contract 导出与旧路径引用，建议先对齐 manifest 再运行类型检查。","timestamp":1795651195000}
+{"role":"user","text":"请给出中文修复清单。","timestamp":1795651198000}
+{"role":"assistant","text":"修复清单：1) 更新 provides 为 history.source.v1；2) 使用分页游标切分长历史；3) 在停用钩子中取消在途读取。","timestamp":1795651200000}
