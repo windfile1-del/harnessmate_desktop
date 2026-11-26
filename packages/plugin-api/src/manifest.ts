@@ -5,7 +5,23 @@ import { FILE_PREVIEW_PERMISSION, FilePreviewContributionSchema } from './file-p
 
 export const PLUGIN_API_VERSION = '4.0.0';
 export const PLUGIN_MANIFEST_VERSION = 4;
-export const PluginServiceNameSchema = z.string().max(100).regex(/^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$/);
+
+export const PEER_CONTRACTS = {
+  browser: 'browser.v1',
+  filePreview: 'filePreview.v1',
+  approvalPolicy: 'approval.policy.v1',
+} as const;
+export const PEER_CONTRACT_NAMES = ['browser.v1', 'filePreview.v1', 'approval.policy.v1'] as const;
+export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
+
+export function isPeerContractName(name: string): name is PeerContractName {
+  return (PEER_CONTRACT_NAMES as readonly string[]).includes(name);
+}
+
+export const PluginServiceNameSchema = z.union([
+  z.enum(PEER_CONTRACT_NAMES),
+  z.string().max(100).regex(/^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$/),
+]);
 const services = z.array(PluginServiceNameSchema).max(32).refine((names) => new Set(names).size === names.length);
 
 export const BUILTIN_PUBLIC_SERVICES = ['ledger', 'handoff', 'git', 'usage', 'notify'] as const;
@@ -20,7 +36,7 @@ export function isBuiltinPublicService(name: string): name is BuiltinPublicServi
 }
 
 export function isThirdPartyCustomServiceName(name: string): boolean {
-  return !isReservedServiceName(name) && !isBuiltinPublicService(name) && name.includes('.') && !name.startsWith('core.');
+  return !isReservedServiceName(name) && !isBuiltinPublicService(name) && (isPeerContractName(name) || (name.includes('.') && !name.startsWith('core.')));
 }
 
 export const STATIC_PLUGIN_PERMISSIONS = [
@@ -173,6 +189,13 @@ export type PluginContributes = z.infer<typeof PluginContributesSchema>;
 
 const permissions = z.array(PluginPermissionSchema).max(64).refine((items) => new Set(items).size === items.length);
 
+export const PluginDependencyDeclarationSchema = z.object({
+  contract: PluginServiceNameSchema,
+  version: z.string().trim().min(1).max(40).optional(),
+  optional: z.boolean().optional(),
+}).strict();
+export type PluginDependencyDeclaration = z.infer<typeof PluginDependencyDeclarationSchema>;
+
 export const PluginManifestSchema = z.object({
   id: z.string().min(2).max(64).regex(/^[a-z0-9][a-z0-9._-]*$/),
   name: z.string().min(1).max(80),
@@ -187,6 +210,8 @@ export const PluginManifestSchema = z.object({
   inject: services.optional(),
   optional: services.optional(),
   provides: services.optional(),
+  dependencies: z.record(z.string().min(1).max(64), PluginDependencyDeclarationSchema).optional(),
+  startPage: z.string().trim().min(1).max(80).optional(),
   activationEvents: z.array(z.string().min(1).max(120)).max(32).optional(),
   permissions: permissions.optional(),
   contributes: PluginContributesSchema.default({}),

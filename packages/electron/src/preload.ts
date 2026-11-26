@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { PluginBrowserFrame, PluginBrowserStatus } from '@harnessmate/plugin-api';
+import type { DesktopViewFrame, DesktopViewStatus, PluginBrowserFrame, PluginBrowserStatus } from '@harnessmate/plugin-api';
 
 const daemonPort = process.env.HARNESSMATE_PORT || '4789';
 
@@ -9,6 +9,17 @@ contextBridge.exposeInMainWorld('harnessMateBridge', {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
   notify: (title: string, body: string): void => {
     ipcRenderer.send('desktop:notify', { title, body });
+  },
+  desktopView: {
+    call: (viewId: string, method: string, data?: unknown): Promise<void> =>
+      ipcRenderer.invoke('desktop-view:call', viewId, method, data),
+    subscribe: (viewId: string, listener: (payload: { frame: DesktopViewFrame } | { status: DesktopViewStatus }) => void) => {
+      const dispatch = (_event: Electron.IpcRendererEvent, payload: { viewId: string } & ({ frame: DesktopViewFrame } | { status: DesktopViewStatus })) => {
+        if (payload.viewId === viewId) listener('frame' in payload ? { frame: payload.frame } : { status: payload.status });
+      };
+      ipcRenderer.on('desktop-view:event', dispatch);
+      return () => { ipcRenderer.off('desktop-view:event', dispatch); };
+    },
   },
   pluginBrowser: {
     call: (viewId: string, method: string, data?: unknown): Promise<void> =>

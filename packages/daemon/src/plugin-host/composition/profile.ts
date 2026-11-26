@@ -7,11 +7,13 @@ import { PluginApiError } from '@harnessmate/plugin-api';
 import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,95}$/);
+const contractName = z.string().min(1).max(100);
 const entrySchema = z.object({
   id: identifier,
   name: identifier.optional(),
   disabled: z.boolean().optional(),
   config: z.record(z.unknown()).optional(),
+  bindings: z.record(contractName, identifier).optional(),
 }).strict();
 const entriesSchema = z.array(entrySchema).max(512).superRefine((entries, ctx) => {
   if (new Set(entries.map(({ id }) => id)).size !== entries.length) {
@@ -20,17 +22,21 @@ const entriesSchema = z.array(entrySchema).max(512).superRefine((entries, ctx) =
 });
 const profileSchema = z.object({
   bundles: z.array(identifier).max(32),
+  bindings: z.record(contractName, identifier).optional(),
+  startPage: z.string().min(1).max(160).optional(),
   extensions: z.object({ filePreviewProvider: identifier.optional() }).strict().optional(),
 }).strict();
 type ProfileConfig = z.infer<typeof profileSchema>;
 
-type LayerEntry = z.infer<typeof entrySchema>;
+export type CompositionLayerEntry = z.infer<typeof entrySchema>;
+type LayerEntry = CompositionLayerEntry;
 const recoverySchema = profileSchema.extend({ patch: entriesSchema });
 export interface CompositionEntry {
   id: string;
   name: string;
   disabled: boolean;
   config: Record<string, unknown>;
+  bindings: Record<string, string>;
   sources: string[];
 }
 export interface PluginProfile extends ProfileConfig {
@@ -66,7 +72,7 @@ function writeAtomic(file: string, content: string): void {
   }
 }
 
-const defaultBundle = 'harnessmate-core';
+export const defaultBundle = 'harnessmate-core';
 const OPTIONAL_BUILTIN_PLUGINS = new Set<string>([
   'hm.plugin.multi-harness-orchestrator',
   'hm.plugin.context-compression',
@@ -83,6 +89,20 @@ const defaultBuiltinEntry = (name: string): LayerEntry =>
   OPTIONAL_BUILTIN_PLUGINS.has(name)
     ? { name, id: entryId(name), disabled: true }
     : { name, id: entryId(name) };
+
+function sanitizeProfileForWrite(profile: ProfileConfig): ProfileConfig {
+  const out: ProfileConfig = { bundles: [...profile.bundles] };
+  if (profile.bindings && Object.keys(profile.bindings).length > 0) {
+    out.bindings = { ...profile.bindings };
+  }
+  if (profile.startPage) {
+    out.startPage = profile.startPage;
+  }
+  if (profile.extensions?.filePreviewProvider) {
+    out.extensions = { filePreviewProvider: profile.extensions.filePreviewProvider };
+  }
+  return out;
+}
 
 export class PluginComposition {
   private readonly profileFile: string;
@@ -139,24 +159,79 @@ export class PluginComposition {
     return fs.existsSync(this.recoveryFile);
   }
 
+  get isEmptyComposition(): boolean {
+    return this.profile.bundles.length === 0
+      && this.patch.every((entry) => entry.disabled === true);
+  }
+
   private saveRecovery(profile: ProfileConfig, patch: LayerEntry[]): void {
-    writeAtomic(this.recoveryFile, JSON.stringify({ ...profile, patch }));
+    writeAtomic(this.recoveryFile, JSON.stringify({ ...sanitizeProfileForWrite(profile), patch }));
   }
 
   private writeProfile(profile: ProfileConfig): void {
-    writeAtomic(this.profileFile, JSON.stringify(profile, null, 2) + '\n');
+    writeAtomic(this.profileFile, JSON.stringify(sanitizeProfileForWrite(profile), null, 2) + '\n');
   }
 
   get extensionBindings(): Readonly<NonNullable<ProfileConfig['extensions']>> | undefined {
     return this.profile.extensions;
   }
 
+  get contractBindings(): Record<string, string> {
+    return {
+      ...(this.profile.extensions?.filePreviewProvider
+        ? { 'filePreview.v1': this.profile.extensions.filePreviewProvider }
+        : {}),
+      ...(this.profile.bindings ?? {}),
+    };
+  }
+
+  get startPage(): string | undefined {
+    return this.profile.startPage;
+  }
+
   setFilePreviewProvider(pluginId: string | null): void {
     if ((this.extensionBindings?.filePreviewProvider ?? null) === pluginId) return;
-    const profile = profileSchema.parse({
-      bundles: this.profile.bundles,
+    const nextBindings = { ...(this.profile.bindings ?? {}) };
+    if (pluginId) {
+      nextBindings['filePreview.v1'] = pluginId;
+    } else {
+      delete nextBindings['filePreview.v1'];
+    }
+    const profile = profileSchema.parse(sanitizeProfileForWrite({
+      ...this.profile,
+      bindings: Object.keys(nextBindings).length > 0 ? nextBindings : undefined,
       extensions: pluginId ? { filePreviewProvider: pluginId } : undefined,
-    });
+    }));
+    this.saveRecovery(this.profile, this.patch);
+    this.writeProfile(profile);
+    this.profile = profile;
+  }
+
+  setContractBinding(contract: string, instanceId: string | null): void {
+    const nextBindings = { ...(this.profile.bindings ?? {}) };
+    if (instanceId) {
+      nextBindings[contract] = instanceId;
+    } else {
+      delete nextBindings[contract];
+    }
+    const nextExtensions = contract === 'filePreview.v1'
+      ? (instanceId ? { filePreviewProvider: instanceId } : undefined)
+      : this.profile.extensions;
+    const profile = profileSchema.parse(sanitizeProfileForWrite({
+      ...this.profile,
+      bindings: Object.keys(nextBindings).length > 0 ? nextBindings : undefined,
+      extensions: nextExtensions,
+    }));
+    this.saveRecovery(this.profile, this.patch);
+    this.writeProfile(profile);
+    this.profile = profile;
+  }
+
+  setStartPage(startPage: string | null): void {
+    const profile = profileSchema.parse(sanitizeProfileForWrite({
+      ...this.profile,
+      startPage: startPage ?? undefined,
+    }));
     this.saveRecovery(this.profile, this.patch);
     this.writeProfile(profile);
     this.profile = profile;
@@ -168,10 +243,18 @@ export class PluginComposition {
     return recoverySchema.parse(JSON.parse(text));
   }
 
-  restore(disabledPlugins?: readonly string[]): void {
-    const snapshot = disabledPlugins
-      ? recoverySchema.parse({ bundles: [defaultBundle], patch: disabledPlugins.map((id) => ({ id, disabled: true })) })
-      : this.readRecovery(this.recoveryFile);
+  restore(disabledPlugins?: readonly string[], options?: { empty?: boolean }): void {
+    const snapshot = options?.empty
+      ? recoverySchema.parse({ bundles: [], patch: [] })
+      : disabledPlugins
+        ? recoverySchema.parse({ bundles: [defaultBundle], patch: disabledPlugins.map((id) => ({ id, disabled: true })) })
+        : this.readRecovery(this.recoveryFile);
+    if (!options?.empty && !disabledPlugins && !this.canRestore()) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', '没有可恢复的组合配置');
+    }
+    if (options?.empty) {
+      this.saveRecovery(this.profile, this.patch);
+    }
     const layers = this.readLayers(snapshot.bundles);
     writeAtomic(this.pendingRestoreFile, JSON.stringify(snapshot));
     this.applyRestore(snapshot, layers);
@@ -181,10 +264,11 @@ export class PluginComposition {
     { patch, ...profile }: z.infer<typeof recoverySchema>,
     layers = this.readLayers(profile.bundles),
   ): void {
-    this.writeProfile(profile);
+    const sanitized = sanitizeProfileForWrite(profile);
+    this.writeProfile(sanitized);
     writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
     fs.rmSync(this.pendingRestoreFile);
-    this.profile = profile;
+    this.profile = sanitized;
     this.layers = layers;
     this.patch = patch;
   }
@@ -198,42 +282,66 @@ export class PluginComposition {
 
   resolve(installed: readonly string[], patch = this.patch): PluginProfile {
     const entries = new Map<string, CompositionEntry>();
-    const merge = ({ id, name, disabled, config }: LayerEntry, source: string) => {
+    const merge = ({ id, name, disabled, config, bindings }: LayerEntry, source: string) => {
       const previous = entries.get(id);
-      entries.set(id, { id, name: name ?? previous?.name ?? id, disabled: disabled ?? previous?.disabled ?? false,
-        config: { ...previous?.config, ...config }, sources: [...(previous?.sources ?? []), source] });
+      entries.set(id, {
+        id,
+        name: name ?? previous?.name ?? id,
+        disabled: disabled ?? previous?.disabled ?? false,
+        config: { ...previous?.config, ...config },
+        bindings: { ...previous?.bindings, ...bindings },
+        sources: [...(previous?.sources ?? []), source],
+      });
     };
     for (const { source, entries: layer } of this.layers) {
       for (const entry of layer) merge(entry, source);
     }
-    const bound = new Set([...entries.values(), ...patch].map(({ name }) => name));
-    for (const name of installed) if (!bound.has(name)) merge({ id: name, name }, '已安装');
+    const empty = this.profile.bundles.length === 0 && patch.every((entry) => entry.disabled === true);
+    const bound = new Set([...entries.values(), ...patch].map(({ name }) => name).filter(Boolean) as string[]);
+    for (const name of installed) {
+      if (!bound.has(name) && !entries.has(name)) {
+        merge({ id: name, name, ...(empty ? { disabled: true } : {}) }, '已安装');
+      }
+    }
     for (const entry of patch) merge(entry, 'patch.yml');
-    const names = new Set<string>();
-    const resolved = [...entries.values()].reverse().filter((entry) => {
-      if (names.has(entry.name)) return false;
-      names.add(entry.name);
-      return true;
-    }).reverse();
+    const resolved = [...entries.values()];
+    const bindings = this.contractBindings;
     return {
       bundles: [...this.profile.bundles],
+      ...(Object.keys(bindings).length > 0 && { bindings }),
+      ...(this.profile.startPage && { startPage: this.profile.startPage }),
       ...(this.extensionBindings && { extensions: { ...this.extensionBindings } }),
       entries: resolved,
     };
   }
 
-  setEnabled(name: string, enabled: boolean, installed: readonly string[]): void {
-    const entry = this.resolve(installed).entries.find((item) => item.name === name);
-    const id = entry?.id ?? entryId(name);
-    const baseline = this.resolve(installed, []).entries.find((item) => item.id === id && item.name === name);
+  setEnabled(idOrName: string, enabled: boolean, installed: readonly string[]): void {
+    const entries = this.resolve(installed).entries;
+    const entry = entries.find((item) => item.id === idOrName) ?? entries.find((item) => item.name === idOrName);
+    const id = entry?.id ?? entryId(idOrName);
+    const name = entry?.name ?? idOrName;
+    const baseline = this.resolve(installed, []).entries.find((item) => item.id === id);
     const existing = this.patch.find((item) => item.id === id) ?? { id };
-    const value = { ...existing };
+    const value: LayerEntry = { ...existing };
     if (!entry) value.name = name;
     if ((baseline?.disabled ?? false) === !enabled) delete value.disabled;
     else value.disabled = !enabled;
     if (value.disabled === existing.disabled && value.name === existing.name) return;
     const patch = this.patch.filter((item) => item.id !== id);
-    if (value.disabled !== undefined || value.name || value.config) patch.push(value);
+    if (value.disabled !== undefined || value.name || value.config || value.bindings) patch.push(value);
+    this.writePatch(patch);
+  }
+
+  upsertInstance(input: CompositionLayerEntry): void {
+    const parsed = entrySchema.parse(input);
+    const patch = this.patch.filter((item) => item.id !== parsed.id);
+    patch.push(parsed);
+    this.writePatch(patch);
+  }
+
+  removeInstance(instanceId: string): void {
+    const patch = this.patch.filter((entry) => entry.id !== instanceId);
+    if (patch.length === this.patch.length) return;
     this.writePatch(patch);
   }
 

@@ -1,0 +1,167 @@
+{
+  "draft": 1,
+  "source": {
+    "contract": "history.source.v1",
+    "version": "1.0.0",
+    "discover": {
+      "request": { "query": "样例", "limit": 1 },
+      "response": {
+        "ok": true,
+        "value": {
+          "sessions": [{
+            "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+            "title": "样例会话",
+            "harnessKind": "codex",
+            "updatedAt": 1795651200000,
+            "workspaceHint": { "label": "样例工作区" }
+          }],
+          "nextCursor": null
+        }
+      }
+    },
+    "read": {
+      "request": {
+        "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+        "limit": 10
+      },
+      "response": {
+        "ok": true,
+        "value": {
+          "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+          "items": [{ "itemId": "message-1", "role": "user", "text": "中文样例", "timestamp": 1795651200000 }],
+          "nextCursor": null,
+          "readStatus": "complete",
+          "warnings": []
+        }
+      },
+      "unreadable": { "ok": false, "error": { "code": "source_unreadable", "message": "样例记录已移动" } }
+    }
+  },
+  "import": {
+    "contract": "history.import.v1",
+    "version": "1.0.0",
+    "preview": {
+      "request": {
+        "input": {
+          "kind": "native",
+          "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+          "mode": "attach"
+        },
+        "workspaceId": "ws-sample"
+      },
+      "response": {
+        "ok": true,
+        "value": {
+          "input": {
+            "kind": "native",
+            "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+            "mode": "attach"
+          },
+          "existingSessionId": null,
+          "targetWorkspaceId": "ws-sample",
+          "importable": true,
+          "items": [{ "itemId": "message-1", "role": "user", "text": "中文样例", "timestamp": 1795651200000 }],
+          "readStatus": "complete",
+          "warnings": []
+        }
+      }
+    },
+    "import": {
+      "request": {
+        "input": {
+          "kind": "native",
+          "ref": { "sourceInstanceId": "history.sample.a", "sourceId": "sample-account-a", "nativeSessionId": "native-1" },
+          "mode": "attach"
+        },
+        "workspaceId": "ws-sample",
+        "requestId": "import-sample-1"
+      },
+      "response": { "ok": true, "value": { "sessionId": "sess-sample", "disposition": "created", "partial": false, "warnings": [] } },
+      "retry": { "ok": true, "value": { "sessionId": "sess-sample", "disposition": "reused", "partial": false, "warnings": [] } },
+      "cancelled": { "ok": false, "error": { "code": "cancelled", "message": "已在提交前取消" } }
+    }
+  },
+  "search": {
+    "contract": "session.search.v1",
+    "version": "1.0.0",
+    "query": {
+      "request": { "q": "中文", "workspaceId": "ws-sample", "driverId": "codex", "limit": 10, "offset": 0 },
+      "response": {
+        "ok": true,
+        "value": {
+          "hits": [{
+            "sessionId": "sess-sample",
+            "sessionTitle": "样例会话",
+            "workspaceId": "ws-sample",
+            "turnId": "import_1",
+            "turnSeq": 1,
+            "itemId": "sess-sample:import_1:user",
+            "blockType": "user_message",
+            "snippetText": "中文样例",
+            "snippetHtmlSafe": "<mark>中文</mark>样例",
+            "highlights": [{ "start": 0, "end": 2 }],
+            "driverId": "codex",
+            "createdAt": 1795651200000
+          }],
+          "nextOffset": null,
+          "fallbackUsed": false,
+          "tookMs": 3
+        }
+      }
+    },
+    "reindex": {
+      "request": {},
+      "response": { "ok": true, "value": { "jobId": "reindex-sample-1", "status": "queued" } }
+    }
+  },
+  "resolution": {
+    "unconfigured": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": null,
+      "source": "none", "status": "unconfigured", "candidates": []
+    },
+    "ambiguous": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": null,
+      "source": "none", "status": "selection_required", "candidates": [
+        { "instanceId": "history.sample.a", "pluginId": "user.history.sample", "version": "1.0.0" },
+        { "instanceId": "history.sample.b", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "oneCandidateWithoutOptIn": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": null,
+      "source": "none", "status": "selection_required", "candidates": [
+        { "instanceId": "history.sample.a", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "single": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": "history.sample.a",
+      "source": "single", "status": "ready", "candidates": [
+        { "instanceId": "history.sample.a", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "boundDisabled": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": "history.sample.a",
+      "source": "workspace", "status": "disabled", "candidates": [
+        { "instanceId": "history.sample.b", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "boundRestored": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": "history.sample.a",
+      "source": "workspace", "status": "ready", "candidates": [
+        { "instanceId": "history.sample.a", "pluginId": "user.history.sample", "version": "1.0.0" },
+        { "instanceId": "history.sample.b", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "boundIncompatible": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": "history.sample.a",
+      "source": "explicit", "status": "incompatible", "candidates": [
+        { "instanceId": "history.sample.b", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    },
+    "boundUnavailable": {
+      "contract": "history.source.v1", "versionRange": "^1.0.0", "instanceId": "history.sample.missing",
+      "source": "dependency", "status": "unavailable", "candidates": [
+        { "instanceId": "history.sample.b", "pluginId": "user.history.sample", "version": "1.0.0" }
+      ]
+    }
+  }
+}

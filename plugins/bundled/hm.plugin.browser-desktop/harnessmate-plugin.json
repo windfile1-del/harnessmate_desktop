@@ -1,0 +1,32 @@
+{
+  "id": "hm.plugin.browser-desktop",
+  "name": "桌面浏览器",
+  "version": "1.0.0",
+  "description": "基于通用桌面视图内核的交互式桌面浏览器插件。",
+  "author": "HarnessMate Core",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "browser.v1"
+  ],
+  "permissions": [
+    "browser:preview",
+    "storage:plugin",
+    "storage:workspace"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "desktop-browser",
+        "title": "桌面浏览器",
+        "ui": "ui/panel.html",
+        "order": 10
+      }
+    ]
+  }
+}

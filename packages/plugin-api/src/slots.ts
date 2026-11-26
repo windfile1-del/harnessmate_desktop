@@ -107,6 +107,11 @@ const workspaceSlots = {
     scope: 'root',
     description: '在侧栏提供入口并在主工作区打开独立插件页面',
   },
+  'workspace.start': {
+    cardinality: 'single',
+    scope: 'root',
+    description: '组合中提供的应用启动页与主工作区布局',
+  },
 } as const satisfies Record<string, PluginSlotContract>;
 
 export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
@@ -129,6 +134,7 @@ export const ALL_PLUGIN_SLOT_KEYS = [
   ...PLUGIN_SLOT_KEYS,
   ...PLUGIN_SLOT_KEYS_V5,
   'workspace.pages',
+  'workspace.start',
 ] as const satisfies readonly AnyPluginSlotKey[];
 
 const SLOT_ALIASES: Readonly<Record<string, AnyPluginSlotKey>> = {
@@ -162,6 +168,7 @@ export function isSafePluginUiPath(value: string): boolean {
 
 export const PluginSlotKeyInputSchema = z.enum([
   'workspace.pages',
+  'workspace.start',
   'session.header.title',
   'sidebar.tools',
   'composer.actions',

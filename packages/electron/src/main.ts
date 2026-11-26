@@ -71,6 +71,17 @@ function resolveWebDistDir(): string {
   return path.resolve(__dirname, '../../web/dist');
 }
 
+function resolveBundledPluginsDir(): string {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'bundled-plugins');
+  }
+  const staged = path.resolve(__dirname, '../resources/bundled-plugins');
+  if (fs.existsSync(staged)) {
+    return staged;
+  }
+  return path.resolve(__dirname, '../../../plugins/bundled');
+}
+
 function resolveAppIconPath(): string | null {
   const candidates = app.isPackaged
     ? [
@@ -126,6 +137,7 @@ async function ensureDaemonRunning(): Promise<void> {
   }
 
   const webDist = resolveWebDistDir();
+  const bundledPluginsDir = resolveBundledPluginsDir();
   let stderrLog = '';
 
   daemonProcess = spawn(process.execPath, ['--no-warnings', entry, ...(SAFE_MODE ? ['--safe-mode'] : [])], {
@@ -135,6 +147,7 @@ async function ensureDaemonRunning(): Promise<void> {
       HARNESSMATE_APP_VERSION: expectedVersion,
       HARNESSMATE_PORT: String(DAEMON_PORT),
       ...(fs.existsSync(webDist) ? { HARNESSMATE_WEB_DIST: webDist } : {}),
+      ...(fs.existsSync(bundledPluginsDir) ? { HARNESSMATE_BUNDLED_PLUGINS_DIR: bundledPluginsDir } : {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

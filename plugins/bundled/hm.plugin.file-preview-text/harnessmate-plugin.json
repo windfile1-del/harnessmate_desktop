@@ -1,0 +1,27 @@
+{
+  "id": "hm.plugin.file-preview-text",
+  "name": "文本文件预览",
+  "version": "1.0.0",
+  "description": "以纯文本与原始行号高亮预览工作区中的所有文件。",
+  "author": "HarnessMate Core",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "filePreview.v1"
+  ],
+  "permissions": [
+    "file:preview"
+  ],
+  "contributes": {
+    "filePreview": {
+      "extensions": [
+        "*"
+      ],
+      "viewerKind": "text"
+    }
+  }
+}

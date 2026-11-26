@@ -47,16 +47,18 @@ const validErrorCodes = new Set<string>(pluginErrorCodes);
 export type IsolatedHostRpcHandler = (
   method: string,
   params: Record<string, unknown>,
-  meta: { pluginId: string; runId: string },
+  meta: { pluginId: string; instanceId?: string; runId: string },
 ) => Promise<unknown> | unknown;
 
 export interface IsolatedProcessOptions {
   pluginId: string;
+  instanceId?: string;
   trustedLocal?: boolean;
   packageRoot: string;
   entryRelativePath: string;
   packageDigest: string;
   config: Readonly<Record<string, unknown>>;
+  bindings?: Readonly<Record<string, string>>;
   declaredPermissions: readonly string[];
   services: readonly string[];
   onRpc: IsolatedHostRpcHandler;
@@ -78,6 +80,7 @@ export function buildIsolatedChildEnv(): Record<string, string> {
 export class IsolatedPluginProcess {
   readonly runId = randomUUID();
   readonly pluginId: string;
+  readonly instanceId: string;
   private readonly child: ChildProcess;
   private readonly pending = new Map<number, {
     resolve: (value: unknown) => void;
@@ -95,6 +98,7 @@ export class IsolatedPluginProcess {
 
   constructor(private readonly opts: IsolatedProcessOptions) {
     this.pluginId = opts.pluginId;
+    this.instanceId = opts.instanceId ?? opts.pluginId;
     this.exitedPromise = new Promise<void>((resolve) => { this.resolveExited = resolve; });
     const entryFile = path.join(opts.packageRoot, opts.entryRelativePath.replace(/\\/g, '/'));
     const entryUrl = pathToFileURL(entryFile).href;
@@ -149,6 +153,8 @@ export class IsolatedPluginProcess {
       features: HOST_SUPPORTED_FEATURES,
       trustedLocal: this.opts.trustedLocal === true,
       pluginId: this.opts.pluginId,
+      instanceId: this.instanceId,
+      ...(this.opts.bindings ? { bindings: this.opts.bindings } : {}),
       packageDigest: this.opts.packageDigest,
       runId: this.runId,
       config: this.opts.config,
@@ -314,7 +320,11 @@ export class IsolatedPluginProcess {
     }
 
     void Promise.resolve()
-      .then(() => this.opts.onRpc(message.method, message.params ?? {}, { pluginId: this.pluginId, runId: message.runId }))
+      .then(() => this.opts.onRpc(message.method, message.params ?? {}, {
+        pluginId: this.pluginId,
+        instanceId: this.instanceId,
+        runId: message.runId,
+      }))
       .then((result) => {
         if (id !== undefined) this.sendResponse(id, this.runId, result);
       })

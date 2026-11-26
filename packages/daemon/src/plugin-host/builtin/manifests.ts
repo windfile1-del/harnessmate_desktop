@@ -1,6 +1,18 @@
 import type { PluginManifest } from '@harnessmate/plugin-api';
 import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 
+export const BUNDLED_PLUGIN_IDS = [
+  'hm.plugin.browser-desktop',
+  'hm.plugin.browser-headless',
+  'hm.plugin.file-preview-text',
+  'hm.plugin.file-preview-markdown',
+  'hm.plugin.approval-policy-default',
+] as const;
+
+export const BUNDLED_TRUSTED_LOCAL_IDS = new Set<string>([
+  'hm.plugin.browser-headless',
+]);
+
 export const BUILTIN_PLUGINS: PluginManifest[] = [
   {
     id: 'core.harness.codex',

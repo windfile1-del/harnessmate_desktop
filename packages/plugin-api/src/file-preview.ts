@@ -4,9 +4,20 @@ export const FILE_PREVIEW_FEATURE = 'ui.filePreview.v1';
 export const FILE_PREVIEW_PERMISSION = 'file:preview';
 
 export const FilePreviewContributionSchema = z.object({
-  extensions: z.array(z.string().regex(/^\.[a-z0-9][a-z0-9_-]{0,15}$/)).min(1).max(24)
-    .refine((values) => new Set(values).size === values.length),
+  extensions: z.array(
+    z.union([
+      z.literal('*'),
+      z.string().regex(/^\.[a-z0-9][a-z0-9_-]{0,15}$/),
+    ]),
+  ).min(1).max(24).refine((values) => new Set(values).size === values.length),
+  viewerKind: z.enum(['text', 'markdown', 'custom']).optional(),
 }).strict();
+
+export interface FilePreviewProviderMeta {
+  extensions: string[];
+  viewerKind?: 'text' | 'markdown' | 'custom';
+  title?: string;
+}
 
 export interface FilePreviewRequest {
   readonly version: 1;

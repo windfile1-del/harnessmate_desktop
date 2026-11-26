@@ -1,8 +1,10 @@
 export * from './contributions.js';
 export * from './slots.js';
 export * from './browser-preview.js';
+export * from './desktop-view.js';
 export * from './file-preview.js';
 export * from './manifest.js';
 export * from './context.js';
 export * from './events.js';
 export * from './rpc.js';
+

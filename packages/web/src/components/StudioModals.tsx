@@ -116,6 +116,10 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     rollbackPlugin,
     pushToast,
     selectedWorkspaceId,
+    selectedSessionId,
+    sessionBindingsBySession,
+    refreshSessionBindings,
+    setSessionBinding,
     workspaces,
     pluginPermissionRevision,
   } = useAppStore();
@@ -154,6 +158,10 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
       .catch((error: Error) => { if (current) pushToast({ kind: 'error', title: '无法读取组合', body: error.message }); });
     return () => { current = false; };
   }, [plugins, pluginPermissionRevision, previewWorkspace?.id, pushToast]);
+
+  useEffect(() => {
+    if (selectedSessionId) void refreshSessionBindings(selectedSessionId).catch(() => {});
+  }, [selectedSessionId, plugins, refreshSessionBindings]);
 
   useEffect(() => {
     if (tab !== 'catalog') return;
@@ -786,6 +794,72 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                     void runPluginAction(() => restorePluginComposition('builtin'));
                   }
                 }}>恢复内置组合</button>
+              <button type="button" disabled={busy}
+                className="rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 text-[var(--accent-rose)] disabled:opacity-50"
+                onClick={() => {
+                  if (window.confirm('切换到空业务组合（仅保留内核恢复页面）？插件文件和历史数据会保留。')) {
+                    void runPluginAction(() => restorePluginComposition('empty'));
+                  }
+                }}>进入空业务组合（仅内核）</button>
+            </div>
+            <div className="space-y-2 rounded-xl border border-[var(--border-hairline)] p-3">
+              <p className="font-medium text-[var(--text-primary)]">能力依赖绑定（平级实例选择）</p>
+              {(['browser.v1', 'filePreview.v1', 'approval.policy.v1'] as const).map((contract) => {
+                const providers = (composition.serviceProviders ?? []).filter((item) => item.contract === contract);
+                const label = contract === 'browser.v1' ? '浏览器实现 (browser.v1)'
+                  : contract === 'filePreview.v1' ? '文件查看器 (filePreview.v1)'
+                  : '工具审批策略 (approval.policy.v1)';
+                const sessionValue = selectedSessionId ? (sessionBindingsBySession[selectedSessionId]?.[contract] ?? '') : '';
+                return (
+                  <div key={contract} className="space-y-1 border-t border-[var(--border-hairline)] pt-2 first:border-t-0 first:pt-0">
+                    <label className="flex flex-wrap items-center justify-between gap-2">
+                      <span>{label}</span>
+                      <select
+                        aria-label={`组合默认 ${contract}`}
+                        value={composition.bindings?.[contract] ?? ''}
+                        disabled={busy || composition.safeMode || Boolean(composition.error)}
+                        className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 py-1 disabled:opacity-50"
+                        onChange={(event) => {
+                          const instanceId = event.target.value || null;
+                          void runPluginAction(async () => {
+                            await daemonApi.setCompositionBinding(contract, instanceId);
+                            await refreshPlugins();
+                          });
+                        }}
+                      >
+                        <option value="">自动选择默认实现</option>
+                        {providers.map((provider) => (
+                          <option key={provider.instanceId} value={provider.instanceId}>
+                            {provider.name} ({provider.instanceId}){provider.state === 'ACTIVE' ? '' : ` · ${provider.state}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {selectedSessionId && (
+                      <label className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--text-secondary)]">
+                        <span>当前会话绑定</span>
+                        <select
+                          aria-label={`当前会话 ${contract}`}
+                          value={sessionValue}
+                          disabled={busy}
+                          className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 py-0.5 disabled:opacity-50"
+                          onChange={(event) => {
+                            const instanceId = event.target.value || null;
+                            void runPluginAction(() => setSessionBinding(selectedSessionId, contract, instanceId));
+                          }}
+                        >
+                          <option value="">跟随组合/工作区默认</option>
+                          {providers.map((provider) => (
+                            <option key={provider.instanceId} value={provider.instanceId}>
+                              {provider.name} ({provider.instanceId})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                );
+              })}
             </div>
             <div className="space-y-1 rounded-xl border border-[var(--border-hairline)] p-3">
               <label className="flex flex-wrap items-center justify-between gap-2">
@@ -826,6 +900,11 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                     : plugin.runtimeState === 'PENDING' ? '等待服务' : plugin.runtimeState === 'FAILED' ? '加载失败' : '已启用'}</span>
                 </div>
                 <p className="mt-1 text-[var(--text-secondary)]">{entry.sources.join(' → ')}</p>
+                {entry.bindings && Object.keys(entry.bindings).length > 0 && (
+                  <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                    依赖绑定：{Object.entries(entry.bindings).map(([k, v]) => `${k} → ${v}`).join(' · ')}
+                  </p>
+                )}
                 {Object.keys(entry.config).length > 0 && <details className="mt-2">
                   <summary className="cursor-pointer text-[var(--accent-indigo)]">查看配置</summary>
                   <pre className="overflow-auto whitespace-pre-wrap break-all">{JSON.stringify(entry.config, null, 2)}</pre>

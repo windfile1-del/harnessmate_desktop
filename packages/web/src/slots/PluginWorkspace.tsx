@@ -1,5 +1,6 @@
-import { ArrowLeft, Puzzle } from 'lucide-react';
+import { ArrowLeft, Globe, Puzzle } from 'lucide-react';
 import { useEffect, type ReactNode } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useAppStore } from '../stores/app-store';
 import { useSlotItems, useSlotRegistry } from './hooks';
 import { SlotErrorBoundary } from './SlotRenderer';
@@ -11,12 +12,44 @@ function pageKey(page: RegisteredSlotItem<'workspace.pages'>) {
 
 export function PluginWorkspaceLinks() {
   const pages = useSlotItems('workspace.pages');
-  const active = useAppStore((state) => state.activePluginPage);
-  const open = useAppStore((state) => state.setActivePluginPage);
-  if (!pages.length) return null;
+  const {
+    active,
+    open,
+    selectedSessionId,
+    plugins,
+    sessionBindingsBySession,
+    refreshSessionBindings,
+    setSessionBinding,
+  } = useAppStore(useShallow((state) => ({
+    active: state.activePluginPage,
+    open: state.setActivePluginPage,
+    selectedSessionId: state.selectedSessionId,
+    plugins: state.plugins,
+    sessionBindingsBySession: state.sessionBindingsBySession,
+    refreshSessionBindings: state.refreshSessionBindings,
+    setSessionBinding: state.setSessionBinding,
+  })));
+
+  useEffect(() => {
+    if (selectedSessionId) void refreshSessionBindings(selectedSessionId).catch(() => {});
+  }, [selectedSessionId, plugins, refreshSessionBindings]);
+
+  const browserProviders = plugins.filter(
+    (plugin) =>
+      plugin.enabled &&
+      (!plugin.runtimeState || plugin.runtimeState === 'ACTIVE') &&
+      (plugin.providedContracts?.some((entry) => entry.contract === 'browser.v1') ||
+        plugin.provides?.includes('browser.v1')),
+  );
+  const currentBrowserId = selectedSessionId
+    ? sessionBindingsBySession[selectedSessionId]?.['browser.v1'] ?? browserProviders[0]?.instanceId ?? browserProviders[0]?.id ?? ''
+    : '';
+  const boundPage = pages.find((page) => page.pluginId === currentBrowserId);
+
+  if (!pages.length && !(selectedSessionId && browserProviders.length > 0)) return null;
 
   return (
-    <nav aria-label="插件工作页" className="max-h-36 space-y-1 overflow-y-auto px-3.5 pb-2">
+    <nav aria-label="插件工作页" className="max-h-48 space-y-1 overflow-y-auto px-3.5 pb-2">
       {pages.map((page) => (
         <button
           type="button"
@@ -30,6 +63,49 @@ export function PluginWorkspaceLinks() {
           <span className="truncate">{page.title}</span>
         </button>
       ))}
+      {selectedSessionId && browserProviders.length > 0 && (
+        <div
+          className="mt-1 space-y-1 rounded-lg px-2 py-1.5 text-[11px]"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-hairline)',
+          }}
+        >
+          <div className="flex items-center justify-between gap-1 text-[var(--text-muted)]">
+            <span className="inline-flex items-center gap-1">
+              <Globe size={11} />
+              会话浏览器
+            </span>
+            {boundPage && (
+              <button
+                type="button"
+                onClick={() => open(pageKey(boundPage))}
+                className="cursor-pointer text-[10.5px] text-[var(--accent-indigo)] hover:underline"
+              >
+                打开工作页
+              </button>
+            )}
+          </div>
+          <select
+            aria-label="当前会话浏览器实例"
+            value={currentBrowserId}
+            onChange={(event) => {
+              const nextId = event.target.value || null;
+              void setSessionBinding(selectedSessionId, 'browser.v1', nextId);
+            }}
+            className="w-full rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] text-[var(--text-primary)]"
+          >
+            {browserProviders.map((provider) => {
+              const id = provider.instanceId ?? provider.id;
+              return (
+                <option key={id} value={id}>
+                  {provider.name} ({id})
+                </option>
+              );
+            })}
+          </select>
+        </div>
+      )}
     </nav>
   );
 }

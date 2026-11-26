@@ -918,7 +918,8 @@ export function PluginSlotSync() {
         );
       }
 
-      // 3. V4 manifest contributes.slots & isolated runtimeSlots -> sandboxed iframe
+      // 3. V4/V5 manifest contributes.slots & isolated runtimeSlots -> sandboxed iframe
+      const instanceId = plugin.instanceId ?? plugin.id;
       const revision = `${plugin.packageDigest ?? plugin.version}:${plugin.runId ?? 'decl'}`;
       for (const slotDef of collectPluginIframeSlots(plugin)) {
         const isCompactSlot =
@@ -931,7 +932,7 @@ export function PluginSlotSync() {
           registry.register({
             slot: slotDef.slot,
             id: slotDef.id,
-            pluginId: plugin.id,
+            pluginId: instanceId,
             pluginName: plugin.name,
             title: slotDef.title,
             order: slotDef.order ?? 500,
@@ -942,8 +943,9 @@ export function PluginSlotSync() {
               const session = (recordProps.session as Session | null | undefined) ?? null;
               return (
                 <SandboxedPluginFrame
-                  key={`${plugin.id}:${slotDef.slot}:${slotDef.id}:${revision}`}
+                  key={`${instanceId}:${slotDef.slot}:${slotDef.id}:${revision}`}
                   pluginId={plugin.id}
+                  instanceId={instanceId}
                   pluginName={plugin.name}
                   revision={revision}
                   slot={slotDef.slot}

@@ -64,9 +64,21 @@
         "inject": {
           "type": "array",
           "items": {
-            "type": "string",
-            "maxLength": 100,
-            "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "browser.v1",
+                  "filePreview.v1",
+                  "approval.policy.v1"
+                ]
+              },
+              {
+                "type": "string",
+                "maxLength": 100,
+                "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*$"
+              }
+            ]
           },
           "maxItems": 32
         },
@@ -75,6 +87,38 @@
         },
         "provides": {
           "$ref": "#/definitions/PluginManifestV4/properties/inject"
+        },
+        "dependencies": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "contract": {
+                "$ref": "#/definitions/PluginManifestV4/properties/inject/items"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "optional": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "contract"
+            ],
+            "additionalProperties": false
+          },
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "startPage": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
         },
         "activationEvents": {
           "type": "array",
@@ -703,6 +747,7 @@
                     "type": "string",
                     "enum": [
                       "workspace.pages",
+                      "workspace.start",
                       "session.header.title",
                       "sidebar.tools",
                       "composer.actions",
@@ -766,11 +811,27 @@
                 "extensions": {
                   "type": "array",
                   "items": {
-                    "type": "string",
-                    "pattern": "^\\.[a-z0-9][a-z0-9_-]{0,15}$"
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "const": "*"
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^\\.[a-z0-9][a-z0-9_-]{0,15}$"
+                      }
+                    ]
                   },
                   "minItems": 1,
                   "maxItems": 24
+                },
+                "viewerKind": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "markdown",
+                    "custom"
+                  ]
                 }
               },
               "required": [

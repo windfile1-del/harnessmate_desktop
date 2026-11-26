@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>桌面浏览器</title>
+  <link rel="stylesheet" href="./panel.css">
+</head>
+<body>
+  <div class="header-row">
+    <span class="badge" id="instance-badge">desktop</span>
+    <span id="status" role="status">输入要打开的 HTTP(S) 网址。</span>
+  </div>
+  <div id="navigation" class="row">
+    <input id="url" type="url" placeholder="https://example.com 或 http://localhost:3000" aria-label="网页地址" required>
+    <button id="open-url" type="button">打开</button>
+  </div>
+  <div class="row" aria-label="网页控制">
+    <button id="back" type="button">后退</button>
+    <button id="forward" type="button">前进</button>
+    <button id="reload" type="button">刷新</button>
+    <button id="close" type="button">关闭</button>
+  </div>
+  <img id="preview" alt="桌面视图实时画面" draggable="false" tabindex="0" hidden>
+  <div id="text-entry" class="row" hidden>
+    <input id="text" type="text" placeholder="输入文本到已聚焦网页控件（支持中文）" aria-label="网页文本输入">
+    <button id="send-text" type="button">输入</button>
+  </div>
+  <div id="history" class="history"></div>
+  <script src="./panel.js"></script>
+</body>
+</html>

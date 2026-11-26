@@ -32,8 +32,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { Slot, SlotErrorBoundary, useSlotItems, useSlotRegistry } from '../slots';
 import {
   daemonApi,
+  type FilePreviewViewerDto,
   type ProjectInstructionInfo,
   type RenderedFilePreview,
+  type SessionFileViewResponse,
   type TerminalExecResult,
 } from '../api/client';
 import { formatTokenCount, resolveHarnessMeta } from '../lib/harness-meta';
@@ -71,6 +73,7 @@ export function InspectorDrawer({
     isPluginEnabled,
     plugins,
     pluginPermissionRevision,
+    setSessionBinding,
   } = useAppStore(useShallow((state) => ({
     harnesses: state.harnesses,
     inspectorTab: state.inspectorTab,
@@ -93,6 +96,7 @@ export function InspectorDrawer({
     isPluginEnabled: state.isPluginEnabled,
     plugins: state.plugins,
     pluginPermissionRevision: state.pluginPermissionRevision,
+    setSessionBinding: state.setSessionBinding,
   })));
 
   const slotRegistry = useSlotRegistry();
@@ -130,16 +134,26 @@ export function InspectorDrawer({
     content: string;
     truncated: boolean;
   } | null>(null);
+  const [selectedViewerId, setSelectedViewerId] = useState<string | undefined>(undefined);
+  const [fileViewMeta, setFileViewMeta] = useState<Pick<
+    SessionFileViewResponse,
+    'resolvedInstanceId' | 'boundInstanceId' | 'boundSource' | 'dependencyStatus' | 'dependencyMessage' | 'availableViewers'
+  > | null>(null);
   const activePreview = inspectorFile?.sessionId === session.id && previewFile?.target === inspectorFile ? previewFile : null;
   const [renderedPreview, setRenderedPreview] = useState<{
     source: NonNullable<typeof previewFile>;
     plugins: typeof plugins;
     permissionRevision: number;
+    viewerId?: string;
     preview: RenderedFilePreview;
   }>();
   const clearRenderedPreview = useCallback(() => setRenderedPreview(undefined), []);
-  const pluginPreview = renderedPreview?.source === activePreview && renderedPreview.plugins === plugins
-    && renderedPreview.permissionRevision === pluginPermissionRevision ? renderedPreview.preview : undefined;
+  const pluginPreview = renderedPreview?.source === activePreview
+    && renderedPreview.plugins === plugins
+    && renderedPreview.permissionRevision === pluginPermissionRevision
+    && renderedPreview.viewerId === selectedViewerId
+    ? renderedPreview.preview
+    : undefined;
   const previewPath = activePreview?.relativePath;
   const openPreviewLink = useCallback(({ path, line }: FileLink) => {
     const directory = previewPath?.slice(0, previewPath.lastIndexOf('/') + 1) ?? '';
@@ -176,21 +190,60 @@ export function InspectorDrawer({
   }, [inspectorTab, session.id]);
 
   useEffect(() => {
-    if (inspectorTab !== 'files' || inspectorFile?.sessionId !== session.id) return;
-    const controller = new AbortController();
-    void daemonApi.readSessionFile(session.id, inspectorFile.path, controller.signal).then((res) => {
-      if (!controller.signal.aborted) setPreviewFile({ ...res, target: inspectorFile });
-    }).catch((err: unknown) => {
-      if (!controller.signal.aborted) pushToast({
-        kind: 'error',
-        title: '无法读取文件',
-        body: err instanceof Error ? err.message : String(err),
-      });
-    });
-    return () => controller.abort();
-  }, [inspectorFile, inspectorTab, session.id, pushToast]);
+    setSelectedViewerId(undefined);
+  }, [inspectorFile?.sessionId, inspectorFile?.path, inspectorFile?.line]);
 
   useEffect(() => {
+    if (inspectorTab !== 'files' || inspectorFile?.sessionId !== session.id) return;
+    const controller = new AbortController();
+    if (typeof daemonApi.getSessionFileView === 'function') {
+      void daemonApi.getSessionFileView(
+        session.id,
+        inspectorFile.path,
+        inspectorFile.line,
+        selectedViewerId,
+        controller.signal,
+      ).then((res) => {
+        if (controller.signal.aborted) return;
+        const source = { ...res.file, target: inspectorFile };
+        setPreviewFile(source);
+        setFileViewMeta({
+          resolvedInstanceId: res.resolvedInstanceId,
+          boundInstanceId: res.boundInstanceId,
+          boundSource: res.boundSource,
+          dependencyStatus: res.dependencyStatus,
+          dependencyMessage: res.dependencyMessage,
+          availableViewers: res.availableViewers,
+        });
+        setRenderedPreview(res.preview
+          ? { source, plugins, permissionRevision: pluginPermissionRevision, viewerId: selectedViewerId, preview: res.preview }
+          : undefined);
+      }).catch((err: unknown) => {
+        if (!controller.signal.aborted) pushToast({
+          kind: 'error',
+          title: '无法读取文件',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } else {
+      void daemonApi.readSessionFile(session.id, inspectorFile.path, controller.signal).then((res) => {
+        if (!controller.signal.aborted) {
+          setFileViewMeta(null);
+          setPreviewFile({ ...res, target: inspectorFile });
+        }
+      }).catch((err: unknown) => {
+        if (!controller.signal.aborted) pushToast({
+          kind: 'error',
+          title: '无法读取文件',
+          body: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    return () => controller.abort();
+  }, [inspectorFile, inspectorTab, session.id, selectedViewerId, plugins, pluginPermissionRevision, pushToast]);
+
+  useEffect(() => {
+    if (typeof daemonApi.getSessionFileView === 'function') return;
     if (inspectorTab !== 'files' || !activePreview ||
       !plugins.some((plugin) => plugin.runtimeState === 'ACTIVE' && plugin.contributes.filePreview)) return;
     const controller = new AbortController();
@@ -899,7 +952,7 @@ export function InspectorDrawer({
                 }}
               >
                 <div
-                  className="flex items-center justify-between px-3 py-1.5 text-[11px]"
+                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px]"
                   style={{ borderBottom: '1px solid var(--border-hairline)' }}
                 >
                   <div className="flex min-w-0 items-center gap-2">
@@ -908,15 +961,78 @@ export function InspectorDrawer({
                     </span>
                     {pluginPreview && <span className="truncate text-[var(--text-muted)]">{pluginPreview.pluginName}</span>}
                   </div>
-                  <button
-                    type="button"
-                    aria-label="关闭文件预览"
-                    onClick={closeInspectorFile}
-                    className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-                  >
-                    <X size={13} />
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    {fileViewMeta && fileViewMeta.availableViewers.length > 0 && (
+                      <>
+                        <select
+                          aria-label="选择文件查看器"
+                          value={selectedViewerId ?? fileViewMeta.resolvedInstanceId ?? fileViewMeta.boundInstanceId ?? ''}
+                          onChange={(event) => {
+                            const nextId = event.target.value || undefined;
+                            setSelectedViewerId(nextId);
+                          }}
+                          className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[10.5px] text-[var(--text-secondary)]"
+                        >
+                          {fileViewMeta.availableViewers.map((viewer: FilePreviewViewerDto) => (
+                            <option key={viewer.instanceId} value={viewer.instanceId} disabled={!viewer.ready || !viewer.authorized}>
+                              {viewer.name}{!viewer.ready ? '（未就绪）' : !viewer.authorized ? '（待授权）' : ''}
+                            </option>
+                          ))}
+                        </select>
+                        {(selectedViewerId ?? fileViewMeta.resolvedInstanceId) &&
+                          (selectedViewerId ?? fileViewMeta.resolvedInstanceId) !== fileViewMeta.boundInstanceId && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const targetViewer = selectedViewerId ?? fileViewMeta.resolvedInstanceId;
+                              if (targetViewer) void setSessionBinding(session.id, 'filePreview.v1', targetViewer);
+                            }}
+                            className="cursor-pointer rounded border border-[var(--border-hairline)] px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+                          >
+                            设为会话默认
+                          </button>
+                        )}
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      aria-label="关闭文件预览"
+                      onClick={closeInspectorFile}
+                      className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
                 </div>
+                {fileViewMeta && (fileViewMeta.dependencyStatus === 'unavailable' || fileViewMeta.dependencyStatus === 'unauthorized' || fileViewMeta.dependencyStatus === 'failed') && (
+                  <div
+                    role="status"
+                    className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px] text-[var(--accent-rose)]"
+                    style={{
+                      backgroundColor: 'var(--accent-rose-soft)',
+                      borderBottom: '1px solid color-mix(in srgb, var(--accent-rose) 28%, transparent)',
+                    }}
+                  >
+                    <span>{fileViewMeta.dependencyMessage ?? '当前文件查看器暂不可用，已回落纯文本内容。'}</span>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {fileViewMeta.availableViewers
+                        .filter((viewer) => viewer.ready && viewer.authorized)
+                        .map((viewer) => (
+                          <button
+                            key={viewer.instanceId}
+                            type="button"
+                            onClick={() => {
+                              setSelectedViewerId(viewer.instanceId);
+                              void setSessionBinding(session.id, 'filePreview.v1', viewer.instanceId);
+                            }}
+                            className="cursor-pointer rounded bg-[var(--bg-surface)] px-2 py-0.5 text-[10.5px] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+                          >
+                            切换到{viewer.name}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
                 <FilePreviewBody
                   key={activePreview.target.path}
                   content={activePreview.content}

@@ -24,6 +24,8 @@ import {
   type PluginHarnessDriverRegistration,
   type PluginHarnessSessionHandle,
   type PluginModule,
+  type PluginRouteRequest,
+  type PluginRouteResponse,
   type PluginRpcMessage,
   type PluginRpcResponse,
   type PluginRuntimeSlotDescriptor,
@@ -36,6 +38,8 @@ import {
   type PublicNetStreamInit,
   type PublicSlotRegistration,
   type ServiceImplementation,
+  type ServiceProvideMeta,
+  type ServiceProviderDescriptor,
   type SpawnCliSpec,
 } from '@harnessmate/plugin-api';
 
@@ -71,6 +75,8 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
   const toolHandlers = new Map<string, { meta: { name: string; description: string; inputSchema: Record<string, unknown>; readOnly?: boolean }; handler: (input: Record<string, unknown>, meta: { sessionId: string; workspaceId: string }) => unknown }>();
   const slotHandlers = new Map<string, { meta: PluginRuntimeSlotDescriptor; onMessage?: PublicSlotRegistration['onMessage'] }>();
   const providedServices = new Map<string, ServiceImplementation>();
+  const serviceMeta = new Map<string, ServiceProvideMeta>();
+  const routeHandlers = new Map<string, (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse>();
   const sections = new Map<string, { id: string; order?: number; text: string }>();
   const composeListeners = new Set<(event: never) => unknown>();
   const offerListeners = new Set<(event: never) => unknown>();
@@ -185,6 +191,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
     return {
       runId: handshake.runId,
       pluginId: handshake.pluginId,
+      instanceId: handshake.instanceId ?? handshake.pluginId,
       api: {
         version: PLUGIN_API_VERSION,
         has: (feature: string) => {
@@ -204,14 +211,33 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         if (!availableServices.has(name)) return undefined;
         return createServiceProxy(name) as Service;
       },
-      provide: (name: string, service: ServiceImplementation): Disposer => registerEffect(() => {
+      provide: (name: string, service: ServiceImplementation, meta?: ServiceProvideMeta): Disposer => registerEffect(() => {
         if (providedServices.has(name)) throw new PluginApiError('E_CONFLICT', `服务 ${name} 已注册`);
         providedServices.set(name, service);
+        if (meta) serviceMeta.set(name, meta);
         return () => {
           providedServices.delete(name);
+          serviceMeta.delete(name);
           rpcNotify('service.unprovide', { name });
         };
       }),
+      services: {
+        list: (contract?: string) => rpcCall<ServiceProviderDescriptor[]>('services.list', contract ? { contract } : {}),
+        call: <T = unknown>(contract: string, method: string, args: unknown[] = [], opts?: { instanceId?: string }) =>
+          rpcCall<T>('services.call', { contract, method, args, ...(opts ?? {}) }),
+      },
+      routes: {
+        register: (pathPrefix: string, handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse): Disposer =>
+          registerEffect(() => {
+            const normalized = pathPrefix.startsWith('/') ? pathPrefix : `/${pathPrefix}`;
+            if (routeHandlers.has(normalized)) throw new PluginApiError('E_CONFLICT', `路由前缀 ${normalized} 已注册`);
+            routeHandlers.set(normalized, handler);
+            return () => {
+              routeHandlers.delete(normalized);
+              rpcNotify('routes.unregister', { pathPrefix: normalized });
+            };
+          }),
+      },
       on: subscribe,
       commands: {
         register: (command, handler) => registerEffect(() => {
@@ -629,6 +655,8 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           optional: mod.optional,
           provides: [...providedServices.keys()],
           serviceMethods,
+          serviceMeta: Object.fromEntries(serviceMeta),
+          routes: [...routeHandlers.keys()],
           commands: [...commandHandlers.keys()],
           tools: [...toolHandlers.values()].map(({ meta }) => meta),
           slots: [...slotHandlers.values()].map(({ meta }) => meta),
@@ -889,6 +917,22 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           await sess.handle.dispose();
         }
         result = { ok: true };
+      } else if (method === 'host.route.handle') {
+        const reqPath = typeof params.path === 'string' && params.path.startsWith('/') ? params.path : `/${String(params.path ?? '')}`;
+        const matched = [...routeHandlers.entries()]
+          .filter(([prefix]) => reqPath === prefix || reqPath.startsWith(`${prefix}/`) || prefix === '/')
+          .sort((a, b) => b[0].length - a[0].length)[0];
+        if (!matched) {
+          result = { status: 404, body: { error: `未注册路由 ${reqPath}` } };
+        } else {
+          result = (await matched[1]({
+            method: String(params.httpMethod ?? 'GET'),
+            path: reqPath,
+            query: (params.query ?? {}) as Record<string, string>,
+            headers: (params.headers ?? {}) as Record<string, string>,
+            ...(params.body !== undefined ? { body: params.body } : {}),
+          })) ?? { status: 200, body: {} };
+        }
       } else {
         throw new PluginApiError('E_NOT_SUPPORTED', `未知 RPC 方法 ${method}`);
       }

@@ -84,7 +84,7 @@ export interface PluginRouterDeps {
   onNotify?: (pluginId: string, input: { title: string; body?: string; level?: 'info' | 'warn' | 'error' }) => void;
   onClipboardWrite?: (pluginId: string, text: string) => void;
   runNativeCommand?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
-  onDynamicUnregister?: (pluginId: string, runId: string, kind: 'service' | 'command' | 'tool' | 'section' | 'slot', name: string) => void;
+  onDynamicUnregister?: (pluginId: string, runId: string, kind: 'service' | 'command' | 'tool' | 'section' | 'slot' | 'route', name: string) => void;
 }
 
 function toPublicTurnBlock(item: TurnBlockRecord, truncateOmitted = false): PublicTurnBlock {
@@ -270,12 +270,13 @@ export class IsolatedPluginRpcRouter {
   async handle(
     method: string,
     params: Record<string, unknown>,
-    meta: { pluginId: string; runId: string },
+    meta: { pluginId: string; instanceId?: string; runId: string },
   ): Promise<unknown> {
-    if (!this.deps.isCurrentRun(meta.pluginId, meta.runId)) {
+    const instanceId = meta.instanceId ?? meta.pluginId;
+    if (!this.deps.isCurrentRun(instanceId, meta.runId)) {
       throw new PluginApiError('E_STALE_RUN', '插件实例标识已过期');
     }
-    const plugin = this.deps.getPluginInfo(meta.pluginId);
+    const plugin = this.deps.getPluginInfo(instanceId) ?? this.deps.getPluginInfo(meta.pluginId);
     if (!plugin) throw new PluginApiError('E_STALE_RUN', '插件未加载');
 
     switch (method) {
@@ -295,7 +296,7 @@ export class IsolatedPluginRpcRouter {
       case 'events.subscribe':
       case 'events.unsubscribe': {
         if (typeof params.event === 'string') {
-          this.deps.onSubscriptionChange?.(meta.pluginId, meta.runId, params.event, method === 'events.subscribe');
+          this.deps.onSubscriptionChange?.(instanceId, meta.runId, params.event, method === 'events.subscribe');
         }
         return { ok: true };
       }
@@ -314,9 +315,50 @@ export class IsolatedPluginRpcRouter {
         return { ok: true };
       case 'slots.unregister':
         if (typeof params.slot === 'string' && typeof params.id === 'string') {
-          this.deps.onDynamicUnregister?.(meta.pluginId, meta.runId, 'slot', `${params.slot}:${params.id}`);
+          this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'slot', `${params.slot}:${params.id}`);
         }
         return { ok: true };
+      case 'routes.unregister':
+        if (typeof params.path === 'string') {
+          this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'route', params.path);
+        }
+        return { ok: true };
+
+      case 'services.list': {
+        const contract = typeof params.contract === 'string' && params.contract.trim() ? params.contract.trim() : undefined;
+        return this.deps.host.listServiceProviders(contract).map(({ pluginId, instanceId: provId, contract: c, version, metadata }) => ({
+          pluginId,
+          instanceId: provId,
+          contract: c,
+          version,
+          ...(metadata ? { metadata } : {}),
+        }));
+      }
+
+      case 'services.call': {
+        const contract = String(params.contract ?? '');
+        const fnName = String(params.method ?? '');
+        const args = Array.isArray(params.args) ? params.args : [];
+        const targetInstanceId = typeof params.instanceId === 'string' && params.instanceId.trim()
+          ? params.instanceId.trim()
+          : undefined;
+        if (!contract || !fnName) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名或方法名');
+        if (contract === 'harness' || contract.startsWith('harness.') || contract === 'mcpHub' || contract === 'remote') {
+          throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接调用内部服务 ${contract}`);
+        }
+        const service = this.deps.host.resolveServiceFor<Record<string, unknown>>(instanceId, contract, targetInstanceId);
+        if (!service) {
+          throw new PluginApiError(
+            'E_SERVICE_UNAVAILABLE',
+            targetInstanceId ? `服务 ${contract}@${targetInstanceId} 不可用` : `服务 ${contract} 不可用`,
+          );
+        }
+        const fn = service[fnName];
+        if (typeof fn !== 'function') {
+          throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${contract}.${fnName} 不存在`);
+        }
+        return await fn(...args);
+      }
 
       case 'service.call': {
         const serviceName = String(params.service ?? '');
@@ -326,7 +368,7 @@ export class IsolatedPluginRpcRouter {
         if (serviceName === 'harness' || serviceName.startsWith('harness.') || serviceName === 'mcpHub' || serviceName === 'remote') {
           throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接调用内部服务 ${serviceName}`);
         }
-        const service = this.deps.host.get<Record<string, unknown>>(serviceName);
+        const service = this.deps.host.resolveServiceFor<Record<string, unknown>>(instanceId, serviceName);
         if (!service) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${serviceName} 不可用`);
         if (serviceName === 'ledger') {
           return this.handleLedgerServiceCall(plugin, meta, fnName, args);
@@ -729,13 +771,13 @@ export class IsolatedPluginRpcRouter {
         if (!driver || typeof driver.driverId !== 'string') {
           throw new PluginApiError('E_INVALID_INPUT', '驱动描述符无效');
         }
-        this.deps.onDriverRegister?.(meta.pluginId, meta.runId, driver);
+        this.deps.onDriverRegister?.(instanceId, meta.runId, driver);
         return { ok: true };
       }
 
       case 'harnesses.unregisterDriver': {
         if (typeof params.driverId === 'string') {
-          this.deps.onDriverUnregister?.(meta.pluginId, meta.runId, params.driverId);
+          this.deps.onDriverUnregister?.(instanceId, meta.runId, params.driverId);
         }
         return { ok: true };
       }
@@ -744,7 +786,7 @@ export class IsolatedPluginRpcRouter {
         const handleId = typeof params.handleId === 'string' ? params.handleId : '';
         const event = params.event && typeof params.event === 'object' ? params.event as Record<string, unknown> : null;
         if (handleId && event) {
-          this.deps.onDriverSessionEvent?.(meta.pluginId, meta.runId, handleId, event);
+          this.deps.onDriverSessionEvent?.(instanceId, meta.runId, handleId, event);
         }
         return { ok: true };
       }
@@ -754,15 +796,15 @@ export class IsolatedPluginRpcRouter {
           throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
         }
         return await this.deps.cliProcesses.spawn(
-          plugin,
+          { ...plugin, id: instanceId },
           meta.runId,
           params as unknown as SpawnCliSpec,
           {
             onOutput: (processId, stream, chunk) => {
-              this.deps.onCliOutput?.(meta.pluginId, meta.runId, processId, stream, chunk);
+              this.deps.onCliOutput?.(instanceId, meta.runId, processId, stream, chunk);
             },
             onExit: (processId, code, signal) => {
-              this.deps.onCliExit?.(meta.pluginId, meta.runId, processId, code, signal);
+              this.deps.onCliExit?.(instanceId, meta.runId, processId, code, signal);
             },
           },
         );
@@ -772,14 +814,14 @@ export class IsolatedPluginRpcRouter {
         if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
         const processId = typeof params.processId === 'string' ? params.processId : '';
         const data = typeof params.data === 'string' ? params.data : '';
-        this.deps.cliProcesses.writeStdin(meta.pluginId, meta.runId, processId, data);
+        this.deps.cliProcesses.writeStdin(instanceId, meta.runId, processId, data);
         return { ok: true };
       }
 
       case 'runtime.cli.closeStdin': {
         if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
         const processId = typeof params.processId === 'string' ? params.processId : '';
-        this.deps.cliProcesses.closeStdin(meta.pluginId, meta.runId, processId);
+        this.deps.cliProcesses.closeStdin(instanceId, meta.runId, processId);
         return { ok: true };
       }
 
@@ -787,7 +829,7 @@ export class IsolatedPluginRpcRouter {
         if (!this.deps.cliProcesses) throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用 CLI 进程托管');
         const processId = typeof params.processId === 'string' ? params.processId : '';
         const signal = params.signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM';
-        await this.deps.cliProcesses.kill(meta.pluginId, meta.runId, processId, signal);
+        await this.deps.cliProcesses.kill(instanceId, meta.runId, processId, signal);
         return { ok: true };
       }
 
@@ -874,7 +916,7 @@ export class IsolatedPluginRpcRouter {
       case 'storage.plugin.delete':
       case 'storage.plugin.keys': {
         this.deps.permissions.assertGranted(plugin, 'storage:plugin');
-        return this.handleStorage('plugin', meta.pluginId, method.slice('storage.plugin.'.length), params);
+        return this.handleStorage('plugin', instanceId, method.slice('storage.plugin.'.length), params);
       }
 
       case 'storage.workspace.get':
@@ -883,7 +925,7 @@ export class IsolatedPluginRpcRouter {
       case 'storage.workspace.keys': {
         const workspace = this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'storage:workspace', workspace.id);
-        return this.handleStorage(`workspace:${workspace.id}`, meta.pluginId, method.slice('storage.workspace.'.length), params);
+        return this.handleStorage(`workspace:${workspace.id}`, instanceId, method.slice('storage.workspace.'.length), params);
       }
 
       case 'fs.read': {
@@ -1036,7 +1078,7 @@ export class IsolatedPluginRpcRouter {
         const headers: Record<string, string> = {};
         response.headers.forEach((value, key) => { headers[key] = value; });
         this.activeNetStreams.set(streamId, {
-          pluginId: meta.pluginId,
+          pluginId: instanceId,
           runId: meta.runId,
           controller,
         });
@@ -1044,7 +1086,7 @@ export class IsolatedPluginRpcRouter {
         const pump = async () => {
           try {
             if (!response.body) {
-              this.deps.onNetStreamEnd?.(meta.pluginId, meta.runId, streamId);
+              this.deps.onNetStreamEnd?.(instanceId, meta.runId, streamId);
               return;
             }
             const reader = response.body.getReader();
@@ -1059,21 +1101,21 @@ export class IsolatedPluginRpcRouter {
               if (value && value.byteLength > 0) {
                 const text = decoder.decode(value, { stream: true });
                 if (text) {
-                  this.deps.onNetStreamChunk?.(meta.pluginId, meta.runId, streamId, text);
+                  this.deps.onNetStreamChunk?.(instanceId, meta.runId, streamId, text);
                 }
               }
             }
             const flushText = decoder.decode();
             if (flushText) {
-              this.deps.onNetStreamChunk?.(meta.pluginId, meta.runId, streamId, flushText);
+              this.deps.onNetStreamChunk?.(instanceId, meta.runId, streamId, flushText);
             }
             if (this.activeNetStreams.has(streamId)) {
-              this.deps.onNetStreamEnd?.(meta.pluginId, meta.runId, streamId);
+              this.deps.onNetStreamEnd?.(instanceId, meta.runId, streamId);
             }
           } catch (err) {
             if (this.activeNetStreams.has(streamId)) {
               const msg = err instanceof Error ? err.message : String(err);
-              this.deps.onNetStreamError?.(meta.pluginId, meta.runId, streamId, msg);
+              this.deps.onNetStreamError?.(instanceId, meta.runId, streamId, msg);
             }
           } finally {
             this.activeNetStreams.delete(streamId);
@@ -1092,7 +1134,7 @@ export class IsolatedPluginRpcRouter {
       case 'net.stream.close': {
         const streamId = typeof params.streamId === 'string' ? params.streamId : '';
         const existing = this.activeNetStreams.get(streamId);
-        if (existing && existing.pluginId === meta.pluginId && existing.runId === meta.runId) {
+        if (existing && existing.pluginId === instanceId && existing.runId === meta.runId) {
           this.activeNetStreams.delete(streamId);
           try { existing.controller.abort(); } catch {}
         }

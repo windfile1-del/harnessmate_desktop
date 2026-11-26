@@ -457,6 +457,7 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
   const ctx: IsolatedPluginContextV5 = {
     runId,
     pluginId,
+    instanceId: pluginId,
     api: {
       version: PLUGIN_API_VERSION,
       has: (feature: string) => featureSet.has(feature) || services.has(feature),
@@ -477,6 +478,23 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
           services.delete(name);
         };
       }),
+    services: {
+      list: async (contract?: string) =>
+        [...services.keys()]
+          .filter((name) => !contract || name === contract)
+          .map((contractName) => ({ pluginId, instanceId: pluginId, contract: contractName, version: '1.0.0' })),
+      call: async <T = unknown>(contract: string, method: string, args: unknown[] = []) => {
+        const svc = services.get(contract);
+        const fn = svc?.[method];
+        if (typeof fn !== 'function') {
+          throw new PluginApiError('E_SERVICE_UNAVAILABLE', `模拟服务 ${contract}.${method} 不可用`);
+        }
+        return (await fn(...args)) as T;
+      },
+    },
+    routes: {
+      register: () => registerEffect(() => () => {}),
+    },
     on: subscribe,
     commands: {
       register: (command, handler) =>

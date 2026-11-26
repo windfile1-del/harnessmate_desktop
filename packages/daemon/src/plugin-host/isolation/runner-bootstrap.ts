@@ -58,6 +58,8 @@ const commandHandlers = new Map();
 const toolHandlers = new Map();
 const slotHandlers = new Map();
 const providedServices = new Map();
+const providedServiceMeta = new Map();
+const routeHandlers = new Map();
 const sections = new Map();
 const composeListeners = new Set();
 const offerListeners = new Set();
@@ -153,6 +155,7 @@ function buildContext(handshake) {
   return {
     runId: handshake.runId,
     pluginId: handshake.pluginId,
+    instanceId: handshake.instanceId || handshake.pluginId,
     api: {
       version: handshake.pluginApi,
       has(feature) {
@@ -172,15 +175,53 @@ function buildContext(handshake) {
       if (!availableServices.has(name)) return undefined;
       return createServiceProxy(name);
     },
-    provide(name, service) {
+    provide(name, service, meta) {
       return registerEffect(() => {
         if (providedServices.has(name)) throw new PluginApiError('E_CONFLICT', '服务 ' + name + ' 已注册');
         providedServices.set(name, service);
+        if (meta && typeof meta === 'object') {
+          providedServiceMeta.set(name, {
+            ...(typeof meta.version === 'string' ? { version: meta.version } : {}),
+            ...(meta.metadata && typeof meta.metadata === 'object' ? { metadata: meta.metadata } : {}),
+          });
+        }
         return () => {
           providedServices.delete(name);
+          providedServiceMeta.delete(name);
           rpcNotify('service.unprovide', { name });
         };
       });
+    },
+    services: {
+      list: (contract) => rpcCall('services.list', { contract }),
+      call: (contract, method, args, opts) => rpcCall('services.call', {
+        contract,
+        method,
+        args: Array.isArray(args) ? args : [],
+        instanceId: opts && opts.instanceId,
+      }),
+    },
+    routes: {
+      register(pathPrefix, handler) {
+        return registerEffect(() => {
+          const raw = String(pathPrefix || '').trim();
+          const normalized = raw.startsWith('/') ? raw : '/' + raw;
+          if (!normalized || normalized.includes('..') || normalized.includes('\\\\')) {
+            throw new PluginApiError('E_INVALID_INPUT', '无效的插件路由前缀: ' + raw);
+          }
+          if (typeof handler !== 'function') {
+            throw new PluginApiError('E_INVALID_INPUT', '路由处理函数无效');
+          }
+          if (routeHandlers.has(normalized)) {
+            throw new PluginApiError('E_CONFLICT', '路由 ' + normalized + ' 已注册');
+          }
+          routeHandlers.set(normalized, handler);
+          return () => {
+            routeHandlers.delete(normalized);
+            rpcNotify('routes.unregister', { path: normalized });
+          };
+        });
+      },
     },
     on: subscribe,
     commands: {
@@ -606,8 +647,11 @@ async function handleMessage(message) {
       filePreviewRenderer = typeof mod.renderFilePreview === 'function' ? mod.renderFilePreview.bind(mod) : undefined;
       handshakeCompleted = true;
       const serviceMethods = {};
+      const serviceMeta = {};
       for (const [serviceName, impl] of providedServices) {
         serviceMethods[serviceName] = Object.keys(impl).filter((k) => typeof impl[k] === 'function');
+        const meta = providedServiceMeta.get(serviceName);
+        if (meta) serviceMeta[serviceName] = meta;
       }
       result = {
         sdkVersion: typeof mod.sdkVersion === 'string' ? mod.sdkVersion : '4.0.0',
@@ -617,6 +661,8 @@ async function handleMessage(message) {
         optional: mod.optional,
         provides: [...providedServices.keys()],
         serviceMethods,
+        serviceMeta,
+        routes: [...routeHandlers.keys()],
         commands: [...commandHandlers.keys()],
         tools: [...toolHandlers.values()].map(({ meta }) => meta),
         slots: [...slotHandlers.values()].map(({ meta }) => meta),
@@ -654,6 +700,27 @@ async function handleMessage(message) {
         throw new PluginApiError('E_SERVICE_UNAVAILABLE', '服务 ' + String(params.service) + '.' + String(params.method) + ' 不可用');
       }
       result = await fn(...(Array.isArray(params.args) ? params.args : []));
+    } else if (method === 'host.route.handle') {
+      const reqPath = typeof params.path === 'string' ? params.path : '/';
+      let matchedPrefix = '';
+      let matchedHandler = null;
+      for (const [prefix, handler] of routeHandlers) {
+        if ((reqPath === prefix || reqPath.startsWith(prefix === '/' ? '/' : prefix + '/') || prefix === '/') && prefix.length >= matchedPrefix.length) {
+          matchedPrefix = prefix;
+          matchedHandler = handler;
+        }
+      }
+      if (!matchedHandler) {
+        result = { status: 404, body: { error: '插件路由不存在', path: reqPath } };
+      } else {
+        result = await matchedHandler({
+          method: String(params.httpMethod || 'GET'),
+          path: reqPath,
+          query: params.query || {},
+          headers: params.headers || {},
+          body: params.body,
+        });
+      }
     } else if (method === 'host.handoff.compose') {
       const collected = [];
       for (const listener of [...composeListeners]) {

@@ -1,0 +1,33 @@
+{
+  "id": "hm.plugin.browser-headless",
+  "name": "无头浏览器",
+  "version": "1.0.0",
+  "description": "独立启动本地无头浏览后端进程并提供应用内交互视图，支持多实例与会话绑定。",
+  "author": "HarnessMate Core",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "browser.v1"
+  ],
+  "permissions": [
+    "storage:plugin",
+    "storage:workspace",
+    "net:127.0.0.1",
+    "net:localhost"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "headless-browser",
+        "title": "无头浏览器",
+        "ui": "ui/panel.html",
+        "order": 20
+      }
+    ]
+  }
+}

@@ -31,6 +31,10 @@ export const HOST_SUPPORTED_FEATURES = [
   ...HOST_FEATURES_V5,
   'ui.workspace.pages',
   'runtime.trustedLocal',
+  'peer.assembly.v1',
+  'desktop.view.v1',
+  'plugin.routes.v1',
+  'approval.policy.v1',
   FILE_PREVIEW_FEATURE,
 ] as const;
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
@@ -41,6 +45,8 @@ export interface PluginHandshakeRequest {
   pluginApi: string;
   features: readonly string[];
   pluginId: string;
+  instanceId?: string;
+  bindings?: Readonly<Record<string, string>>;
   packageDigest: string;
   runId: string;
   config: Readonly<Record<string, unknown>>;
@@ -56,6 +62,8 @@ export interface PluginHandshakeResponse {
   optional?: readonly string[];
   provides?: readonly string[];
   serviceMethods?: Record<string, readonly string[]>;
+  serviceMeta?: Record<string, { version?: string; metadata?: Record<string, unknown> }>;
+  routes?: readonly string[];
   commands?: readonly string[];
   tools?: Array<{ name: string; description: string; inputSchema: Record<string, unknown>; readOnly?: boolean }>;
   slots?: PluginRuntimeSlotDescriptor[];

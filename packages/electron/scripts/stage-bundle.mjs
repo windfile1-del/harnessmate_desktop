@@ -11,11 +11,13 @@ const repoDesktopRoot = path.resolve(electronRoot, '../..');
 const resourcesDir = path.join(electronRoot, 'resources');
 const daemonOutDir = path.join(resourcesDir, 'daemon');
 const webOutDir = path.join(resourcesDir, 'web-dist');
+const bundledPluginsOutDir = path.join(resourcesDir, 'bundled-plugins');
 const buildAssetsDir = path.join(electronRoot, 'build');
 
 fs.rmSync(resourcesDir, { recursive: true, force: true });
 fs.mkdirSync(daemonOutDir, { recursive: true });
 fs.mkdirSync(webOutDir, { recursive: true });
+fs.mkdirSync(bundledPluginsOutDir, { recursive: true });
 fs.mkdirSync(buildAssetsDir, { recursive: true });
 
 // 1. Bundle @harnessmate/daemon into a single self-contained CommonJS file
@@ -66,6 +68,12 @@ if (!fs.existsSync(webDistSrc)) {
   throw new Error(`Missing web build at ${webDistSrc}. Run pnpm build first.`);
 }
 fs.cpSync(webDistSrc, webOutDir, { recursive: true });
+
+// 2b. Copy bundled peer plugins into resources/bundled-plugins
+const bundledPluginsSrc = path.join(repoDesktopRoot, 'plugins/bundled');
+if (fs.existsSync(bundledPluginsSrc)) {
+  fs.cpSync(bundledPluginsSrc, bundledPluginsOutDir, { recursive: true });
+}
 
 // 3. Generate Star Loom Atelier application icon (PNG + multi-size Windows ICO)
 const sizes = [256, 64, 48, 32, 16];

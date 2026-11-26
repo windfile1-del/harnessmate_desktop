@@ -679,7 +679,54 @@ export interface ContextHandoffPreviewV2 {
     };
     renderedPayload: string;
 }
+export interface ServiceProvideMeta {
+    version?: string;
+    metadata?: Record<string, unknown>;
+}
+export interface ServiceProviderDescriptor {
+    pluginId: string;
+    instanceId: string;
+    contract: string;
+    version: string;
+    metadata?: Record<string, unknown>;
+}
+export interface PluginRouteRequest {
+    method: string;
+    path: string;
+    query: Record<string, string>;
+    headers: Record<string, string>;
+    body?: unknown;
+}
+export interface PluginRouteResponse {
+    status?: number;
+    headers?: Record<string, string>;
+    body?: unknown;
+}
+export interface ApprovalPolicyRequest {
+    sessionId: string;
+    workspaceId: string;
+    pluginId: string;
+    instanceId: string;
+    toolName: string;
+    readOnly: boolean;
+    args: Record<string, unknown>;
+}
+export interface ApprovalPolicyDecision {
+    decision: 'allow' | 'deny' | 'ask';
+    reason?: string;
+}
 export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
+    readonly instanceId: string;
+    provide(name: string, service: ServiceImplementation, meta?: ServiceProvideMeta): Disposer;
+    readonly services: {
+        list(contract?: string): Promise<ServiceProviderDescriptor[]>;
+        call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: {
+            instanceId?: string;
+        }): Promise<T>;
+    };
+    readonly routes: {
+        register(pathPrefix: string, handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse): Disposer;
+    };
     readonly harnesses: {
         registerDriver(driver: PluginHarnessDriverRegistration): Disposer;
         listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
@@ -932,7 +979,7 @@ import type { PluginRuntimeSlotDescriptor } from './slots.js';
 export declare const PLUGIN_RPC_PROTOCOL_VERSION = 1;
 export declare const HOST_FEATURES_V5: readonly ["harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
 export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
-export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal", "ui.filePreview.v1"];
+export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal", "peer.assembly.v1", "desktop.view.v1", "plugin.routes.v1", "approval.policy.v1", "ui.filePreview.v1"];
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 export interface PluginHandshakeRequest {
     trustedLocal?: boolean;
@@ -940,6 +987,8 @@ export interface PluginHandshakeRequest {
     pluginApi: string;
     features: readonly string[];
     pluginId: string;
+    instanceId?: string;
+    bindings?: Readonly<Record<string, string>>;
     packageDigest: string;
     runId: string;
     config: Readonly<Record<string, unknown>>;
@@ -954,6 +1003,11 @@ export interface PluginHandshakeResponse {
     optional?: readonly string[];
     provides?: readonly string[];
     serviceMethods?: Record<string, readonly string[]>;
+    serviceMeta?: Record<string, {
+        version?: string;
+        metadata?: Record<string, unknown>;
+    }>;
+    routes?: readonly string[];
     commands?: readonly string[];
     tools?: Array<{
         name: string;
@@ -1093,6 +1147,11 @@ declare const workspaceSlots: {
         readonly scope: "root";
         readonly description: "在侧栏提供入口并在主工作区打开独立插件页面";
     };
+    readonly 'workspace.start': {
+        readonly cardinality: "single";
+        readonly scope: "root";
+        readonly description: "组合中提供的应用启动页与主工作区布局";
+    };
 };
 export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
 export declare const PLUGIN_SLOT_KEYS_V5: readonly ["chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
@@ -1101,6 +1160,11 @@ export declare const ALL_PLUGIN_UI_SLOTS: {
         readonly cardinality: "list";
         readonly scope: "root";
         readonly description: "在侧栏提供入口并在主工作区打开独立插件页面";
+    };
+    readonly 'workspace.start': {
+        readonly cardinality: "single";
+        readonly scope: "root";
+        readonly description: "组合中提供的应用启动页与主工作区布局";
     };
     readonly 'chat.block': {
         readonly cardinality: "keyed";
@@ -1173,14 +1237,14 @@ export declare const ALL_PLUGIN_UI_SLOTS: {
         readonly description: "包裹聊天消息内容的容器组件";
     };
 };
-export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge", "workspace.pages"];
+export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge", "workspace.pages", "workspace.start"];
 export declare function normalizePluginSlotKey(key: string): PluginSlotKey;
 export declare function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey;
 export declare function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey;
 export declare function isSafePluginUiPath(value: string): boolean;
-export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
 export declare const PluginSlotContributionSchema: z.ZodObject<{
-    slot: z.ZodEnum<["workspace.pages", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+    slot: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
     id: z.ZodString;
     title: z.ZodString;
     ui: z.ZodEffects<z.ZodString, string, string>;
@@ -1190,7 +1254,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -1198,7 +1262,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -1327,16 +1391,78 @@ export interface PluginBrowserBridge {
     onStatus(listener: (status: PluginBrowserStatus) => void): () => void;
 }
 
+/** Options for creating or mounting a kernel-managed desktop view. */
+export interface DesktopViewCreateOptions {
+    url: string;
+    width?: number;
+    height?: number;
+    title?: string;
+}
+export interface DesktopViewResizeOptions {
+    width: number;
+    height: number;
+}
+export type DesktopViewInput = {
+    type: 'click' | 'move';
+    x: number;
+    y: number;
+} | {
+    type: 'wheel';
+    x: number;
+    y: number;
+    deltaX: number;
+    deltaY: number;
+} | {
+    type: 'key';
+    key: 'Enter' | 'Tab' | 'Escape' | 'Backspace' | 'Delete' | 'Left' | 'Right' | 'Up' | 'Down' | 'Home' | 'End' | 'PageUp' | 'PageDown';
+} | {
+    type: 'text';
+    text: string;
+};
+export interface DesktopViewFrame {
+    dataUrl: string;
+    width: number;
+    height: number;
+}
+export interface DesktopViewStatus {
+    state: 'loading' | 'ready' | 'error' | 'closed';
+    url?: string;
+    message?: string;
+}
+export interface DesktopViewBridge {
+    readonly available: boolean;
+    create(options: DesktopViewCreateOptions): Promise<void>;
+    mount(options: DesktopViewCreateOptions): Promise<void>;
+    navigate(url: string): Promise<void>;
+    resize(options: DesktopViewResizeOptions): Promise<void>;
+    focus(focused?: boolean): Promise<void>;
+    input(event: DesktopViewInput): Promise<void>;
+    back(): Promise<void>;
+    forward(): Promise<void>;
+    reload(): Promise<void>;
+    destroy(): Promise<void>;
+    onFrame(listener: (frame: DesktopViewFrame) => void): () => void;
+    onStatus(listener: (status: DesktopViewStatus) => void): () => void;
+}
+
 import { z } from 'zod';
 export declare const FILE_PREVIEW_FEATURE = "ui.filePreview.v1";
 export declare const FILE_PREVIEW_PERMISSION = "file:preview";
 export declare const FilePreviewContributionSchema: z.ZodObject<{
-    extensions: z.ZodEffects<z.ZodArray<z.ZodString, "many">, string[], string[]>;
+    extensions: z.ZodEffects<z.ZodArray<z.ZodUnion<[z.ZodLiteral<"*">, z.ZodString]>, "many">, string[], string[]>;
+    viewerKind: z.ZodOptional<z.ZodEnum<["text", "markdown", "custom"]>>;
 }, "strict", z.ZodTypeAny, {
     extensions: string[];
+    viewerKind?: "text" | "custom" | "markdown" | undefined;
 }, {
     extensions: string[];
+    viewerKind?: "text" | "custom" | "markdown" | undefined;
 }>;
+export interface FilePreviewProviderMeta {
+    extensions: string[];
+    viewerKind?: 'text' | 'markdown' | 'custom';
+    title?: string;
+}
 export interface FilePreviewRequest {
     readonly version: 1;
     readonly relativePath: string;

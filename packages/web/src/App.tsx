@@ -2,6 +2,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
 import { ChatStage } from './components/ChatStage';
+import { KernelRecoveryView } from './components/KernelRecoveryView';
 import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
 import { registerSubagentManagerView } from './components/agy/native/child/register';
 import { registerSwarmStudioView } from './components/agy/native/swarm/register';
@@ -41,6 +42,14 @@ function StatusbarSlotStrip({ session }: { session: import('@harnessmate/protoco
   );
 }
 
+function MainStageContent({ selectedSession }: { selectedSession: import('@harnessmate/protocol').Session | null }) {
+  const startItems = useSlotItems('workspace.start');
+  if (!selectedSession && startItems.length > 0) {
+    return <Slot name="workspace.start" slotProps={{ session: null }} className="flex min-h-0 flex-1" />;
+  }
+  return <ChatStage />;
+}
+
 export function App() {
   const triageEnabled = useAppStore((state) => isTriageEnabled(state.plugins));
   const composing = useRef(false);
@@ -56,6 +65,7 @@ export function App() {
     openModal,
     toasts,
     dismissToast,
+    emptyComposition,
     agyNativeWorkbenchEnabled,
     setNativeWorkbenchRoute,
   } = useAppStore(useShallow((state) => ({
@@ -70,6 +80,7 @@ export function App() {
     openModal: state.openModal,
     toasts: state.toasts,
     dismissToast: state.dismissToast,
+    emptyComposition: state.emptyComposition,
     agyNativeWorkbenchEnabled: state.agyNativeWorkbenchEnabled,
     setNativeWorkbenchRoute: state.setNativeWorkbenchRoute,
   })));
@@ -171,9 +182,18 @@ export function App() {
         {triageEnabled && <TriageInboxLifecycle />}
         <div className="flex h-screen w-screen flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 overflow-hidden">
-            {!sidebarCollapsed && <Sidebar />}
-            <PluginWorkspaceStage><ChatStage /></PluginWorkspaceStage>
-            <ModalHost />
+            {emptyComposition ? (
+              <>
+                <KernelRecoveryView />
+                <ModalHost />
+              </>
+            ) : (
+              <>
+                {!sidebarCollapsed && <Sidebar />}
+                <PluginWorkspaceStage><MainStageContent selectedSession={selectedSession} /></PluginWorkspaceStage>
+                <ModalHost />
+              </>
+            )}
           </div>
           <StatusbarSlotStrip session={selectedSession} />
 

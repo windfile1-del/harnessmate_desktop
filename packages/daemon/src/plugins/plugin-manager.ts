@@ -4,12 +4,15 @@ import { randomUUID } from 'node:crypto';
 import {
   FILE_PREVIEW_PERMISSION,
   FilePreviewResultSchema,
+  PEER_CONTRACTS,
   PluginApiError,
   isBuiltinPublicService,
+  isPeerContractName,
   isReservedServiceName,
   isThirdPartyCustomServiceName,
   normalizePluginSlotKey,
   type FilePreviewRequest,
+  type FilePreviewResult,
   type PluginEventV4,
 } from '@harnessmate/plugin-api';
 import {
@@ -36,8 +39,9 @@ import { PluginRuntime } from './plugin-runtime.js';
 import { normalizePluginManifest } from '../plugin-host/manifest/normalize.js';
 import { PluginHost, type HostPlugin } from '../plugin-host/runtime/lifecycle.js';
 import { toPluginEvent } from '../plugin-host/runtime/map-event.js';
-import { PluginComposition } from '../plugin-host/composition/profile.js';
-import { BUILTIN_PLUGINS } from '../plugin-host/builtin/manifests.js';
+import { PluginComposition, type CompositionEntry, type CompositionLayerEntry } from '../plugin-host/composition/profile.js';
+import { resolveCapabilityBinding, type ResolvedCapabilityBinding } from '../plugin-host/composition/bindings.js';
+import { BUILTIN_PLUGINS, BUNDLED_PLUGIN_IDS, BUNDLED_TRUSTED_LOCAL_IDS } from '../plugin-host/builtin/manifests.js';
 import { IsolatedPluginManager } from '../plugin-host/isolation/isolated-manager.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
 import { PluginSecretStore } from '../plugin-host/isolation/plugin-secrets.js';
@@ -74,11 +78,31 @@ export interface PluginManagerOptions {
   permissions?: PluginPermissionService;
   pluginSecrets?: PluginSecretStore;
   crashPolicy?: CrashPolicy;
+  bundledPluginsDir?: string;
   onDevReload?: () => void;
+}
+
+function resolveBundledPluginsDir(explicitDir?: string): string | undefined {
+  const candidates = [
+    explicitDir,
+    process.env.HARNESSMATE_BUNDLED_PLUGINS_DIR,
+    typeof (process as unknown as { resourcesPath?: string }).resourcesPath === 'string'
+      ? path.resolve((process as unknown as { resourcesPath: string }).resourcesPath, 'bundled-plugins')
+      : undefined,
+    path.resolve(process.cwd(), 'plugins', 'bundled'),
+    path.resolve(process.cwd(), '..', '..', 'plugins', 'bundled'),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return fs.realpathSync(candidate);
+    }
+  }
+  return undefined;
 }
 
 export class PluginManager {
   private plugins = new Map<string, LoadedPluginRecord>();
+  private instances = new Map<string, LoadedPluginRecord>();
   private readonly pluginHarnesses = new Map<string, { adapter: HarnessAdapter; config: string }>();
   private mutation = Promise.resolve();
   private registryChanged = false;
@@ -89,6 +113,8 @@ export class PluginManager {
   private readonly permissionRevision = new Map<string, number>();
   private readonly hostLogs = new Map<string, PluginLogEntryDto[]>();
   private readonly dataDir: string;
+  private readonly store?: HarnessMateStore;
+  private readonly bundledPluginsDir?: string;
   readonly host = new PluginHost((error) => console.error('插件生命周期错误', error));
   readonly permissions?: PluginPermissionService;
   readonly pluginSecrets?: PluginSecretStore;
@@ -106,7 +132,9 @@ export class PluginManager {
     fs.mkdirSync(this.pluginsDir, { recursive: true });
     this.pluginsDir = fs.realpathSync(this.pluginsDir);
     this.dataDir = path.dirname(this.pluginsDir);
-    const builtins = BUILTIN_PLUGINS.map(({ id }) => id);
+    this.store = options?.store;
+    this.bundledPluginsDir = resolveBundledPluginsDir(options?.bundledPluginsDir);
+    const builtins = [...BUILTIN_PLUGINS.map(({ id }) => id), ...BUNDLED_PLUGIN_IDS];
     this.composition = new PluginComposition(this.dataDir, builtins);
     if (options?.safeMode) this.safeComposition = new PluginComposition(this.dataDir, builtins);
     this.registryService = new PluginRegistryService(this.dataDir);
@@ -124,8 +152,8 @@ export class PluginManager {
         host: this.host,
         permissions: this.permissions,
         pluginSecrets: this.pluginSecrets,
-        getPluginInfo: (pluginId) => this.plugins.get(pluginId)?.info,
-        requestRestart: (pluginId) => this.restartIsolatedPlugin(pluginId),
+        getPluginInfo: (id) => this.instances.get(id)?.info ?? this.plugins.get(id)?.info,
+        requestRestart: (instanceId) => this.restartIsolatedPlugin(instanceId),
         crashPolicy: options.crashPolicy,
       });
     }
@@ -175,10 +203,12 @@ export class PluginManager {
     this.isolated?.clearLogs(pluginId);
   }
 
-  private restartIsolatedPlugin(pluginId: string): Promise<void> {
+  private restartIsolatedPlugin(instanceId: string): Promise<void> {
     return this.serialize(async () => {
-      if (!this.plugins.has(pluginId)) return;
-      this.restartGeneration.set(pluginId, (this.restartGeneration.get(pluginId) ?? 0) + 1);
+      const inst = this.instances.get(instanceId);
+      const pluginId = inst?.info.id ?? instanceId;
+      if (!this.plugins.has(pluginId) && !inst) return;
+      this.restartGeneration.set(instanceId, (this.restartGeneration.get(instanceId) ?? 0) + 1);
       await this.activate(this.plugins);
     });
   }
@@ -188,22 +218,134 @@ export class PluginManager {
       const record = this.plugins.get(pluginId);
       if (!record?.info.main) return;
       this.isolated?.clearCrashHistory(pluginId);
+      for (const [instId, inst] of this.instances) {
+        if (inst.info.id === pluginId) this.isolated?.clearCrashHistory(instId);
+      }
       this.permissionRevision.set(pluginId, (this.permissionRevision.get(pluginId) ?? 0) + 1);
       await this.activate(this.plugins);
     });
   }
 
   private installedNames(records = this.plugins): string[] {
-    return [...records.values()].filter(({ info }) => !info.builtin && !info.id.startsWith('broken.')).map(({ info }) => info.id);
+    return [...records.values()]
+      .filter(({ info }) => !info.builtin && info.sourceKind !== 'bundled' && !info.id.startsWith('broken.'))
+      .map(({ info }) => info.id);
+  }
+
+  isEmptyComposition(): boolean {
+    return !this.safeComposition && !this.compositionError && this.composition.isEmptyComposition;
   }
 
   getComposition() {
+    const resolved = this.safeComposition?.resolve([]) ?? this.composition.resolve(this.installedNames());
     return {
-      ...(this.safeComposition?.resolve([]) ?? this.composition.resolve(this.installedNames())),
+      ...resolved,
+      emptyComposition: this.isEmptyComposition(),
+      serviceProviders: this.listServiceProviders(),
       error: this.compositionError,
       safeMode: Boolean(this.safeComposition),
       canRestore: this.composition.canRestore(),
     };
+  }
+
+  listServiceProviders(contract?: string) {
+    return this.host.listServiceProviders(contract).map((item) => ({
+      ...item,
+      state: this.host.status(item.instanceId)?.state ?? 'DISPOSED',
+      name: this.instances.get(item.instanceId)?.info.name ?? this.plugins.get(item.pluginId)?.info.name ?? item.pluginId,
+      sourceKind: this.instances.get(item.instanceId)?.info.sourceKind ?? this.plugins.get(item.pluginId)?.info.sourceKind ?? 'installed',
+    }));
+  }
+
+  private isEntryInComposition(instanceId: string): boolean {
+    const resolved = this.safeComposition?.resolve([]) ?? this.composition.resolve(this.installedNames());
+    return resolved.entries.some((entry) => entry.id === instanceId && !entry.disabled);
+  }
+
+  resolveCapabilityBinding(contract: string, scope?: { sessionId?: string; workspaceId?: string }): ResolvedCapabilityBinding {
+    return resolveCapabilityBinding({
+      contract,
+      sessionId: scope?.sessionId,
+      workspaceId: scope?.workspaceId,
+      store: this.store,
+      composition: this.safeComposition ?? this.composition,
+      isEntryInComposition: (instanceId) => this.isEntryInComposition(instanceId),
+    });
+  }
+
+  setCompositionBinding(contract: string, instanceId: string | null): Promise<void> {
+    return this.serialize(async () => {
+      if (this.safeComposition || this.compositionError) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '请在组合配置可用的正常模式中修改默认提供方');
+      }
+      if (instanceId !== null) {
+        const prov = this.host.listServiceProviders(contract).find((p) => p.instanceId === instanceId);
+        if (!prov && !this.instances.has(instanceId) && !this.plugins.has(instanceId)) {
+          throw new PluginApiError('E_SERVICE_UNAVAILABLE', `实例 ${instanceId} 不存在或未提供 ${contract}`);
+        }
+      }
+      this.composition.setContractBinding(contract, instanceId);
+      this.host.setDefaultBindings(this.composition.contractBindings);
+    });
+  }
+
+  setWorkspaceBinding(workspaceId: string, contract: string, instanceId: string | null): Promise<void> {
+    return this.serialize(async () => {
+      if (!this.store) throw new PluginApiError('E_NOT_SUPPORTED', '未启用持久化存储');
+      if (!this.store.getWorkspace(workspaceId)) throw new PluginApiError('E_INVALID_INPUT', '工作区不存在');
+      this.store.setCapabilityBinding('workspace', workspaceId, contract, instanceId);
+    });
+  }
+
+  setSessionBinding(sessionId: string, contract: string, instanceId: string | null): Promise<void> {
+    return this.serialize(async () => {
+      if (!this.store) throw new PluginApiError('E_NOT_SUPPORTED', '未启用持久化存储');
+      if (!this.store.getSession(sessionId)) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
+      this.store.setCapabilityBinding('session', sessionId, contract, instanceId);
+    });
+  }
+
+  upsertCompositionInstance(entry: CompositionLayerEntry): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      if (this.safeComposition || this.compositionError) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '请在组合配置可用的正常模式中修改组合实例');
+      }
+      const pluginId = entry.name ?? entry.id;
+      if (!this.plugins.has(pluginId)) {
+        throw new PluginApiError('E_INVALID_INPUT', `插件 ${pluginId} 未安装`);
+      }
+      this.composition.upsertInstance(entry);
+      await this.activate(this.plugins);
+      return this.listInstalled();
+    });
+  }
+
+  removeCompositionInstance(instanceId: string): Promise<InstalledPluginInfo[]> {
+    return this.serialize(async () => {
+      if (this.safeComposition || this.compositionError) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '请在组合配置可用的正常模式中修改组合实例');
+      }
+      this.composition.removeInstance(instanceId);
+      await this.activate(this.plugins);
+      await this.isolated?.awaitPendingDisposals();
+      return this.listInstalled();
+    });
+  }
+
+  authorizeInstanceView(
+    instanceId: string,
+    runId: string,
+    permission = 'browser:preview',
+  ): { ok: true } | { ok: false; status: 403 | 409; code: 'E_PERMISSION_DENIED' | 'E_STALE_RUN'; error: string } {
+    const pkg = this.getInstancePackageRoot(instanceId);
+    const inst = this.instances.get(instanceId) ?? this.plugins.get(instanceId);
+    if (!pkg || !inst || !this.isInstanceEnabled(instanceId) || runId !== (pkg.runId ?? pkg.digest)) {
+      return { ok: false, status: 409, code: 'E_STALE_RUN', error: '插件实例已停止或已更新' };
+    }
+    if (this.permissions && !this.permissions.isGranted(inst.info, permission)) {
+      return { ok: false, status: 403, code: 'E_PERMISSION_DENIED', error: `请在插件中心授权 ${permission}` };
+    }
+    return { ok: true };
   }
 
   get filePreviewProviderId(): string | undefined {
@@ -211,20 +353,58 @@ export class PluginManager {
     return this.composition.extensionBindings?.filePreviewProvider;
   }
 
-  private readyFilePreviewProvider(pluginId: string) {
-    const entry = this.isolated?.getActive(pluginId);
+  private readyFilePreviewProvider(instanceId: string) {
+    const entry = this.isolated?.getActive(instanceId);
     if (entry?.process.alive && entry.handshake?.hasFilePreview && entry.info.contributes.filePreview
-      && this.isPluginEnabled(pluginId)) return entry;
+      && this.isInstanceEnabled(instanceId)) return entry;
   }
 
   listFilePreviewProviders(workspaceId?: string) {
-    return this.listInstalled().flatMap(({ id, name, contributes }) => {
-      if (!contributes.filePreview) return [];
-      const entry = this.readyFilePreviewProvider(id);
+    return this.listFilePreviewViewers(workspaceId).map(({ instanceId, name, extensions, ready, authorized }) => ({
+      id: instanceId,
+      name,
+      extensions,
+      ready,
+      authorized,
+    }));
+  }
+
+  listFilePreviewViewers(workspaceId?: string) {
+    const viewers: Array<{
+      instanceId: string;
+      pluginId: string;
+      name: string;
+      extensions: string[];
+      viewerKind: 'text' | 'markdown' | 'custom';
+      ready: boolean;
+      authorized: boolean;
+      sourceKind: string;
+    }> = [];
+    const candidates = new Map<string, LoadedPluginRecord>();
+    for (const [instId, rec] of this.instances) {
+      if (rec.info.contributes.filePreview) candidates.set(instId, rec);
+    }
+    for (const [pluginId, rec] of this.plugins) {
+      if (rec.info.contributes.filePreview && !candidates.has(pluginId)) candidates.set(pluginId, rec);
+    }
+    for (const [instanceId, rec] of candidates) {
+      const fp = rec.info.contributes.filePreview;
+      if (!fp) continue;
+      const entry = this.readyFilePreviewProvider(instanceId);
       const ready = Boolean(entry);
       const authorized = Boolean(workspaceId && entry && this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId));
-      return [{ id, name, extensions: contributes.filePreview.extensions, ready, authorized }];
-    });
+      viewers.push({
+        instanceId,
+        pluginId: rec.info.id,
+        name: rec.info.name,
+        extensions: fp.extensions,
+        viewerKind: fp.viewerKind ?? (fp.extensions.includes('*') ? 'text' : fp.extensions.includes('.md') ? 'markdown' : 'custom'),
+        ready,
+        authorized,
+        sourceKind: rec.info.sourceKind ?? (rec.info.builtin ? 'kernel' : 'installed'),
+      });
+    }
+    return viewers;
   }
 
   setFilePreviewProvider(pluginId: string | null, workspaceId?: string): Promise<void> {
@@ -240,16 +420,75 @@ export class PluginManager {
         }
       }
       this.composition.setFilePreviewProvider(pluginId);
+      this.host.setDefaultBindings(this.composition.contractBindings);
     });
   }
 
-  async renderFilePreview(workspaceId: string, request: FilePreviewRequest) {
-    const bindings = this.composition.extensionBindings;
-    const pluginId = this.filePreviewProviderId;
-    const entry = pluginId && this.readyFilePreviewProvider(pluginId);
-    if (!entry || !this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId) ||
-      !entry.info.contributes.filePreview?.extensions.includes(path.extname(request.relativePath).toLowerCase())) return null;
+  async renderPeerFilePreview(
+    workspaceId: string,
+    request: FilePreviewRequest,
+    opts?: { sessionId?: string; explicitInstanceId?: string; requireExplicitMatch?: boolean },
+  ): Promise<{
+    preview: (FilePreviewResult & { pluginId: string; instanceId: string; pluginName: string }) | null;
+    resolvedInstanceId: string | null;
+    boundInstanceId: string | null;
+    boundSource: string;
+    dependencyStatus: 'ready' | 'unavailable' | 'unauthorized' | 'unsupported_extension' | 'failed';
+    dependencyMessage?: string;
+  }> {
+    const resolvedBinding = this.resolveCapabilityBinding(PEER_CONTRACTS.filePreview, {
+      sessionId: opts?.sessionId,
+      workspaceId,
+    });
+    const targetId = opts?.explicitInstanceId ?? resolvedBinding.instanceId;
+    if (!targetId) {
+      return {
+        preview: null,
+        resolvedInstanceId: null,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'unavailable',
+        dependencyMessage: '当前组合未启用任何文件预览插件',
+      };
+    }
 
+    const entry = this.readyFilePreviewProvider(targetId);
+    if (!entry) {
+      return {
+        preview: null,
+        resolvedInstanceId: targetId,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'unavailable',
+        dependencyMessage: `文件查看器 ${targetId} 当前已停用或未就绪`,
+      };
+    }
+
+    if (!this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)) {
+      return {
+        preview: null,
+        resolvedInstanceId: targetId,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'unauthorized',
+        dependencyMessage: `文件查看器 ${entry.info.name} 未获得此工作区的 file:preview 权限`,
+      };
+    }
+
+    const exts = entry.info.contributes.filePreview?.extensions ?? [];
+    const ext = path.extname(request.relativePath).toLowerCase();
+    if (!exts.includes('*') && !exts.includes(ext)) {
+      return {
+        preview: null,
+        resolvedInstanceId: targetId,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'unsupported_extension',
+      };
+    }
+
+    const bindingsBefore = this.composition.extensionBindings;
+    const contractBindingsBefore = this.composition.contractBindings;
     let revoked = false;
     const unsubscribe = this.permissions.onChange((event) => {
       if (event.pluginId === entry.pluginId && event.capability === FILE_PREVIEW_PERMISSION
@@ -259,28 +498,84 @@ export class PluginManager {
     });
     try {
       const result = await entry.process.call<unknown>('host.filePreview.render', { request }, 600, entry.runId);
-      if (revoked || bindings !== this.composition.extensionBindings || this.filePreviewProviderId !== entry.pluginId
-        || this.readyFilePreviewProvider(entry.pluginId) !== entry
-        || !this.permissions.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)) return null;
-      if (result === null) return null;
+      if (
+        revoked
+        || this.readyFilePreviewProvider(targetId) !== entry
+        || !this.permissions.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)
+        || (opts?.requireExplicitMatch && (bindingsBefore !== this.composition.extensionBindings || this.filePreviewProviderId !== targetId))
+        || (!opts?.explicitInstanceId && contractBindingsBefore['filePreview.v1'] !== this.composition.contractBindings['filePreview.v1'])
+      ) {
+        return {
+          preview: null,
+          resolvedInstanceId: targetId,
+          boundInstanceId: resolvedBinding.instanceId,
+          boundSource: resolvedBinding.source,
+          dependencyStatus: 'failed',
+          dependencyMessage: '查看器状态或权限已变更，已丢弃过期结果',
+        };
+      }
+      if (result === null) {
+        return {
+          preview: null,
+          resolvedInstanceId: targetId,
+          boundInstanceId: resolvedBinding.instanceId,
+          boundSource: resolvedBinding.source,
+          dependencyStatus: 'ready',
+        };
+      }
       const parsed = FilePreviewResultSchema.safeParse(result);
       if (!parsed.success) {
         this.appendHostLog(entry.pluginId, 'warn', '文件预览返回了无效的结果，已使用内置预览');
-        return null;
+        return {
+          preview: null,
+          resolvedInstanceId: targetId,
+          boundInstanceId: resolvedBinding.instanceId,
+          boundSource: resolvedBinding.source,
+          dependencyStatus: 'failed',
+          dependencyMessage: '文件查看器返回了无效的输出格式',
+        };
       }
-      return { ...parsed.data, pluginId: entry.pluginId, pluginName: entry.info.name };
+      return {
+        preview: { ...parsed.data, pluginId: entry.pluginId, instanceId: targetId, pluginName: entry.info.name },
+        resolvedInstanceId: targetId,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'ready',
+      };
     } catch (error) {
       const reason = error instanceof PluginApiError ? error.code : 'E_INTERNAL';
       this.appendHostLog(entry.pluginId, 'warn', `文件预览调用失败，已使用内置预览 (${reason})`);
-      return null;
+      return {
+        preview: null,
+        resolvedInstanceId: targetId,
+        boundInstanceId: resolvedBinding.instanceId,
+        boundSource: resolvedBinding.source,
+        dependencyStatus: 'failed',
+        dependencyMessage: `文件查看器调用失败 (${reason})`,
+      };
     } finally {
       unsubscribe();
     }
   }
 
-  restoreComposition(useDefaults: boolean): Promise<void> {
+  async renderFilePreview(workspaceId: string, request: FilePreviewRequest) {
+    const pluginId = this.filePreviewProviderId;
+    if (!pluginId) return null;
+    const res = await this.renderPeerFilePreview(workspaceId, request, {
+      explicitInstanceId: pluginId,
+      requireExplicitMatch: true,
+    });
+    return res.preview;
+  }
+
+  restoreComposition(modeOrUseDefaults: boolean | 'previous' | 'builtin' | 'empty'): Promise<void> {
     return this.serialize(async () => {
-      this.composition.restore(useDefaults ? this.installedNames() : undefined);
+      if (modeOrUseDefaults === 'empty') {
+        this.composition.restore(undefined, { empty: true });
+      } else {
+        const useDefaults = modeOrUseDefaults === true || modeOrUseDefaults === 'builtin';
+        this.composition.restore(useDefaults ? this.installedNames() : undefined);
+      }
       await this.loadRegistry();
       await this.isolated?.awaitPendingDisposals();
     });
@@ -320,12 +615,45 @@ export class PluginManager {
         info: {
           ...manifest,
           builtin: true,
+          sourceKind: 'kernel',
+          instanceId: manifest.id,
           enabled,
           sourcePath: null,
           hasRuntimeHook: Boolean(manifest.contributes.hooks?.length),
           loadError: null,
         },
       });
+    }
+
+    if (this.bundledPluginsDir && fs.existsSync(this.bundledPluginsDir)) {
+      const bundledDirs = fs.readdirSync(this.bundledPluginsDir, { withFileTypes: true });
+      for (const entry of bundledDirs) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+        const dir = path.join(this.bundledPluginsDir, entry.name);
+        if (!fs.existsSync(path.join(dir, MANIFEST_FILE))) continue;
+        try {
+          const pack = readPluginPackage(dir);
+          if (next.has(pack.manifest.id)) continue;
+          const enabled = this.desiredEnabled(pack.manifest.id, true);
+          next.set(pack.manifest.id, {
+            info: {
+              ...pack.manifest,
+              builtin: true,
+              sourceKind: 'bundled',
+              instanceId: pack.manifest.id,
+              enabled,
+              sourcePath: null,
+              hasRuntimeHook: false,
+              loadError: null,
+              packageDigest: pack.digest,
+            },
+            packageRoot: dir,
+            digest: pack.digest,
+          });
+        } catch (error) {
+          this.appendHostLog(entry.name, 'error', `预装插件加载失败: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
 
     const directories = fs.readdirSync(this.pluginsDir, { withFileTypes: true });
@@ -414,42 +742,90 @@ export class PluginManager {
   private async activate(next: Map<string, LoadedPluginRecord>): Promise<void> {
     const previousAdapters = this.registry.listAdapters();
     const composition = this.safeComposition?.resolve([]) ?? this.composition.resolve(this.installedNames(next));
-    const entries = new Map(composition.entries.map((entry) => [entry.name, entry]));
-    const ranked = [...next.values()].sort((first, second) =>
-      composition.entries.findIndex(({ name }) => name === first.info.id) -
-      composition.entries.findIndex(({ name }) => name === second.info.id));
-    const definitions: HostPlugin[] = ranked.map(({ info, digest, packageRoot }) => {
-      const entry = entries.get(info.id);
+    this.host.setDefaultBindings(composition.bindings ?? {});
+
+    const nextInstances = new Map<string, LoadedPluginRecord>();
+    const definitions: HostPlugin[] = [];
+    const seenPlugins = new Set<string>();
+
+    for (const entry of composition.entries) {
+      const pkg = next.get(entry.name) ?? next.get(entry.id);
+      if (!pkg) continue;
+      seenPlugins.add(pkg.info.id);
+      const { info, digest, packageRoot } = pkg;
+      const enabled = this.safeComposition
+        ? (info.builtin && !entry.disabled)
+        : !entry.disabled;
       const core = this.firstParty.get(info.id);
+      const trustedLocal = Boolean(
+        info.devTrustedLocal || (info.sourceKind === 'bundled' && BUNDLED_TRUSTED_LOCAL_IDS.has(info.id)),
+      );
       const revision = JSON.stringify([
         digest,
-        info.devTrustedLocal === true,
-        entry?.config,
+        trustedLocal,
+        entry.config,
+        entry.bindings,
         info.inject,
         info.provides,
-        this.restartGeneration.get(info.id) ?? 0,
+        this.restartGeneration.get(entry.id) ?? this.restartGeneration.get(info.id) ?? 0,
         this.permissionRevision.get(info.id) ?? 0,
       ]);
-      if (!info.builtin && info.main && packageRoot && digest && this.isolated) {
-        return this.isolated.createHostPlugin({
-          info,
+      const instRecord: LoadedPluginRecord = {
+        ...pkg,
+        info: {
+          ...info,
+          instanceId: entry.id,
+          enabled,
+          bindings: Object.keys(entry.bindings).length > 0 ? entry.bindings : undefined,
+        },
+      };
+      nextInstances.set(entry.id, instRecord);
+      if (entry.id === info.id || !nextInstances.has(info.id)) {
+        next.set(info.id, instRecord);
+      }
+      if (info.main && packageRoot && digest && this.isolated) {
+        definitions.push(this.isolated.createHostPlugin({
+          info: instRecord.info,
+          instanceId: entry.id,
           packageRoot,
           entryRelativePath: info.main,
           digest,
-          enabled: info.enabled,
-          config: entry?.config,
+          enabled,
+          config: entry.config,
+          bindings: entry.bindings,
+          trustedLocal,
           revision,
+        }));
+      } else {
+        definitions.push({
+          id: entry.id,
+          pluginId: info.id,
+          enabled,
+          revision,
+          error: info.loadError && !packageRoot && !info.builtin ? info.loadError : undefined,
+          inject: core?.inject ?? info.inject,
+          provides: core?.provides,
+          dependencies: info.dependencies ? Object.values(info.dependencies) : undefined,
+          bindings: entry.bindings,
+          apply: core?.apply ?? (() => {}),
+          config: entry.config,
         });
       }
-      return { id: info.id, enabled: info.enabled, revision,
-        error: info.loadError && !packageRoot && !info.builtin ? info.loadError : undefined,
-        inject: core?.inject ?? info.inject, provides: core?.provides, apply: core?.apply ?? (() => {}),
-        config: entry?.config };
-    });
+    }
+
+    // Ensure non-composition records (e.g. broken.* or empty composition disabled records) reflect disabled state
+    for (const [id, pkg] of next) {
+      if (!seenPlugins.has(id)) {
+        pkg.info.enabled = false;
+      }
+    }
+
     await this.host.reconcileAsync(definitions);
+    this.instances = nextInstances;
+
     const wanted = new Map<string, NonNullable<PluginManifest['contributes']['harnesses']>[number]>();
-    for (const rec of next.values()) {
-      if (!rec.info.enabled || this.host.status(rec.info.id)?.state !== 'ACTIVE' || !this.host.get('harness.acp')) continue;
+    for (const [instanceId, rec] of nextInstances) {
+      if (!rec.info.enabled || this.host.status(instanceId)?.state !== 'ACTIVE' || !this.host.get('harness.acp')) continue;
       for (const config of rec.info.contributes.harnesses ?? []) wanted.set(config.id, config);
     }
     for (const [id, record] of this.pluginHarnesses) {
@@ -480,13 +856,13 @@ export class PluginManager {
 
   private desiredEnabled(id: string, builtin: boolean): boolean {
     if (this.safeComposition) {
-      return builtin && !this.safeComposition.resolve([]).entries.find(({ name }) => name === id)?.disabled;
+      return builtin && !this.safeComposition.resolve([]).entries.find((e) => e.id === id || e.name === id)?.disabled;
     }
     if (this.compositionError && !builtin) return this.plugins.get(id)?.info.enabled ?? false;
     const installed = this.installedNames();
     if (!builtin && !installed.includes(id)) installed.push(id);
-    const entry = this.composition.resolve(installed).entries.find(({ name }) => name === id);
-    return entry ? !entry.disabled : !builtin;
+    const entry = this.composition.resolve(installed).entries.find((e) => e.id === id || e.name === id);
+    return entry ? !entry.disabled : false;
   }
 
   private async prepare(pack: PluginPackage, directory: string, root: string, enabled: boolean, canRollback: boolean) {
@@ -529,7 +905,7 @@ export class PluginManager {
         if (!normalized.permissions?.includes(`service:provide:${service}`)) {
           throw new PluginApiError('E_PERMISSION_DENIED', `替换公共服务 ${service} 必须在 permissions 中声明 service:provide:${service}`);
         }
-      } else if (!isThirdPartyCustomServiceName(service)) {
+      } else if (!isPeerContractName(service) && !isThirdPartyCustomServiceName(service)) {
         throw new PluginApiError('E_INVALID_INPUT', `第三方服务 ${service} 必须带命名空间前缀，例如 acme.service`);
       }
     }
@@ -604,14 +980,18 @@ export class PluginManager {
     }
   }
 
-  getPluginPackageRoot(pluginId: string): { packageRoot: string; digest?: string; runId?: string } | undefined {
-    const rec = this.plugins.get(pluginId);
-    if (!rec || !rec.packageRoot || !this.isPluginEnabled(pluginId)) return undefined;
+  getInstancePackageRoot(instanceId: string): { packageRoot: string; digest?: string; runId?: string } | undefined {
+    const rec = this.instances.get(instanceId) ?? this.plugins.get(instanceId);
+    if (!rec || !rec.packageRoot || !this.isInstanceEnabled(instanceId)) return undefined;
     return {
       packageRoot: rec.packageRoot,
       digest: rec.digest,
-      runId: this.isolated?.getRunId(pluginId),
+      runId: this.isolated?.getRunId(instanceId),
     };
+  }
+
+  getPluginPackageRoot(pluginId: string): { packageRoot: string; digest?: string; runId?: string } | undefined {
+    return this.getInstancePackageRoot(pluginId);
   }
 
   getDataPanel(pluginId: string, panelId: string) {
@@ -622,23 +1002,48 @@ export class PluginManager {
     return panel && projection ? { panel, projection } : undefined;
   }
 
+  private toInstalledInfo(instanceId: string, { info, runtime }: LoadedPluginRecord): InstalledPluginInfo {
+    const status = this.host.status(instanceId);
+    const runId = this.isolated?.getRunId(instanceId);
+    const runtimeSlots = this.isolated?.listSlots(instanceId);
+    const routes = this.isolated?.listRoutes(instanceId);
+    const providedContracts = this.host.listServiceProviders()
+      .filter((p) => p.instanceId === instanceId)
+      .map(({ contract, version, metadata }) => ({ contract, version, ...(metadata ? { metadata } : {}) }));
+    const isKernel = info.sourceKind === 'kernel' || (info.builtin && !info.main && !info.entry);
+    const isTrustedLocal = Boolean(
+      info.devTrustedLocal || (info.sourceKind === 'bundled' && BUNDLED_TRUSTED_LOCAL_IDS.has(info.id)),
+    );
+    const runtimeMode = isKernel ? 'kernel' : isTrustedLocal ? 'trusted-local' :
+      (info.main || info.entry) ? 'isolated' : 'declarative';
+    return {
+      ...info,
+      instanceId,
+      sourceKind: info.sourceKind ?? (info.devMode ? 'dev' : info.builtin ? 'kernel' : 'installed'),
+      runtimeState: runtime?.failed ? 'FAILED' : status?.state,
+      missingServices: status?.missingServices,
+      loadError: status?.error ?? info.loadError,
+      ...(runId ? { runId } : {}),
+      ...(runtimeSlots?.length ? { runtimeSlots } : {}),
+      ...(routes?.length ? { routes } : {}),
+      ...(providedContracts.length ? { providedContracts } : {}),
+      runtimeMode,
+    };
+  }
+
   listInstalled(): InstalledPluginInfo[] {
-    return [...this.plugins.values()].map(({ info, runtime }) => {
-      const status = this.host.status(info.id);
-      const runId = this.isolated?.getRunId(info.id);
-      const runtimeSlots = this.isolated?.listSlots(info.id);
-      const runtimeMode = info.builtin ? 'kernel' : info.devTrustedLocal ? 'trusted-local' :
-        (info.main || info.entry) ? 'isolated' : 'declarative';
-      return {
-        ...info,
-        runtimeState: runtime?.failed ? 'FAILED' : status?.state,
-        missingServices: status?.missingServices,
-        loadError: status?.error ?? info.loadError,
-        ...(runId ? { runId } : {}),
-        ...(runtimeSlots?.length ? { runtimeSlots } : {}),
-        runtimeMode,
-      };
-    });
+    const out: InstalledPluginInfo[] = [];
+    const emitted = new Set<string>();
+    for (const [id, rec] of this.plugins) {
+      out.push(this.toInstalledInfo(rec.info.instanceId ?? id, rec));
+      emitted.add(rec.info.instanceId ?? id);
+    }
+    for (const [instanceId, rec] of this.instances) {
+      if (!emitted.has(instanceId)) {
+        out.push(this.toInstalledInfo(instanceId, rec));
+      }
+    }
+    return out;
   }
 
   listCatalog(): PluginCatalogItem[] {
@@ -672,9 +1077,13 @@ export class PluginManager {
     return [...remoteItems, ...builtinItems];
   }
 
+  isInstanceEnabled(instanceId: string): boolean {
+    const rec = this.instances.get(instanceId) ?? this.plugins.get(instanceId);
+    return Boolean(rec?.info.enabled && this.host.status(instanceId)?.state === 'ACTIVE' && !rec.runtime?.failed);
+  }
+
   isPluginEnabled(id: string): boolean {
-    const rec = this.plugins.get(id);
-    return Boolean(rec?.info.enabled && this.host.status(id)?.state === 'ACTIVE' && !rec.runtime?.failed);
+    return this.isInstanceEnabled(id);
   }
 
   listActiveSlashCommands(): Array<PluginSlashCommand & { pluginId: string; pluginName: string }> {
@@ -709,12 +1118,13 @@ export class PluginManager {
 
   togglePlugin(id: string, enabled: boolean): Promise<InstalledPluginInfo[]> {
     return this.serialize(async () => {
-      const record = this.plugins.get(id);
+      const record = this.instances.get(id) ?? this.plugins.get(id);
       if (!record) throw new Error(`Plugin not found: ${id}`);
       if (this.safeComposition && (enabled || record.info.builtin)) {
         throw new PluginApiError('E_NOT_SUPPORTED', '安全模式只允许停用第三方插件');
       }
       if (this.compositionError) throw new PluginApiError('E_INVALID_INPUT', '请先在「查看完整组合」中恢复组合配置');
+      const pluginId = record.info.id;
       let candidate: LoadedPluginRecord = { ...record, info: { ...record.info, enabled }, runtime: undefined };
       if (enabled && !record.info.builtin) {
         if (!record.packageRoot) throw new Error('请先修复或回退损坏的插件');
@@ -723,7 +1133,7 @@ export class PluginManager {
           throw new Error('插件文件已变更，请重新预览并安装');
         }
         const occupied = new Map(this.plugins);
-        occupied.delete(id);
+        occupied.delete(pluginId);
         this.validateManifest(pack.manifest, occupied);
         candidate = await this.prepare(pack, record.packageRoot, record.info.sourcePath!, true, Boolean(record.info.canRollback));
         if (record.info.devMode) {
@@ -739,7 +1149,9 @@ export class PluginManager {
         throw error;
       }
       if (enabled) this.isolated?.clearCrashHistory(id);
-      await this.activate(new Map(this.plugins).set(id, candidate));
+      const nextPlugins = new Map(this.plugins);
+      if (id === pluginId) nextPlugins.set(pluginId, candidate);
+      await this.activate(nextPlugins);
       if (!enabled) await this.isolated?.awaitPendingDisposals();
       return this.listInstalled();
     });
@@ -847,8 +1259,6 @@ export class PluginManager {
           candidate.runtime?.retire();
           candidate = { ...candidate, runtime: undefined, info: { ...candidate.info, enabled, hasRuntimeHook: false } };
         }
-        writeRevisionPointer(root, { current: revision, previous, currentDigest: candidate.digest, previousDigest,
-          currentTrusted: trusted, previousTrusted: pointer?.currentTrusted });
       } catch (error) {
         candidate?.runtime?.retire();
         this.removeRevision(root, revision);
@@ -861,20 +1271,16 @@ export class PluginManager {
         if (otherId !== id && otherId.startsWith('broken.') && record.info.sourcePath === root) next.delete(otherId);
       }
       await this.activate(next.set(id, candidate));
-      // Transactional check for V4 main plugins: if activation failed for non-permission/non-conflict reason, rollback!
+      // Candidate-ready-first upgrade: commit saved revision pointer ONLY after candidate is ready!
       const status = this.host.status(id);
       const awaitingProvidePermission = (candidate.info.provides ?? []).some(
         (service) => isBuiltinPublicService(service) && !this.permissions?.isGranted(candidate.info, `service:provide:${service}`, GLOBAL_WORKSPACE_SCOPE),
       );
-      const provideConflict = (candidate.info.provides ?? []).some((service) => Boolean(this.host.get(service)));
+      const provideConflict = Boolean(status?.error && (status.error.includes('E_CONFLICT') || status.error.includes('已经')));
       if (enabled && candidate.info.main && status?.state === 'FAILED' && !awaitingProvidePermission && !provideConflict) {
         const failMessage = status.error ?? '隔离插件激活失败';
         await this.isolated?.awaitPendingDisposals();
-        if (pointer) {
-          writeRevisionPointer(root, pointer);
-        } else if (previous) {
-          writeRevisionPointer(root, { current: previous, currentDigest: previousDigest, currentTrusted: Boolean(old && requiresPluginTrust(old.info)) });
-        } else {
+        if (!pointer && !previous) {
           try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* best-effort cleanup */ }
         }
         this.removeRevision(root, revision);
@@ -884,6 +1290,8 @@ export class PluginManager {
         await this.activate(restored);
         throw new Error(failMessage);
       }
+      writeRevisionPointer(root, { current: revision, previous, currentDigest: candidate.digest, previousDigest,
+        currentTrusted: trusted, previousTrusted: pointer?.currentTrusted });
       if (pointer?.previous) this.removeRevision(root, pointer.previous);
       return this.listInstalled();
     });

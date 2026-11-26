@@ -101,6 +101,8 @@ import type {
   PluginUiMessageRequest,
   PluginBrowserFrame,
   PluginBrowserStatus,
+  DesktopViewFrame,
+  DesktopViewStatus,
   SwitchHarnessRequest,
   TerminalContextChip,
   ToggleMcpServerRequest,
@@ -129,6 +131,10 @@ declare global {
       pickDirectory: () => Promise<string | null>;
       openExternal: (url: string) => Promise<void>;
       notify: (title: string, body: string) => void;
+      desktopView?: {
+        call: (viewId: string, method: string, data?: unknown) => Promise<void>;
+        subscribe: (viewId: string, listener: (payload: { frame: DesktopViewFrame } | { status: DesktopViewStatus }) => void) => () => void;
+      };
       pluginBrowser?: {
         call: (viewId: string, method: string, data?: unknown) => Promise<void>;
         subscribe: (viewId: string, listener: (payload: { frame: PluginBrowserFrame } | { status: PluginBrowserStatus }) => void) => () => void;
@@ -154,7 +160,40 @@ export interface TerminalExecResult {
   timedOut: boolean;
 }
 
-export type RenderedFilePreview = FilePreviewResult & { pluginId: string; pluginName: string };
+export type RenderedFilePreview = FilePreviewResult & { pluginId: string; instanceId?: string; pluginName: string };
+
+export interface ServiceProviderDto {
+  pluginId: string;
+  instanceId: string;
+  contract: string;
+  version: string;
+  metadata?: Record<string, unknown>;
+  state: string;
+  name: string;
+  sourceKind: string;
+}
+
+export interface FilePreviewViewerDto {
+  instanceId: string;
+  pluginId: string;
+  name: string;
+  extensions: string[];
+  viewerKind: 'text' | 'markdown' | 'custom';
+  ready: boolean;
+  authorized: boolean;
+  sourceKind: string;
+}
+
+export interface SessionFileViewResponse {
+  file: { relativePath: string; content: string; truncated: boolean; sizeBytes: number };
+  preview: RenderedFilePreview | null;
+  resolvedInstanceId: string | null;
+  boundInstanceId: string | null;
+  boundSource: string;
+  dependencyStatus: 'ready' | 'unavailable' | 'unauthorized' | 'unsupported_extension' | 'failed';
+  dependencyMessage?: string;
+  availableViewers: FilePreviewViewerDto[];
+}
 
 export interface PluginBundleResponse {
   plugins: InstalledPluginInfo[];
@@ -162,6 +201,7 @@ export interface PluginBundleResponse {
   slashCommands: Array<PluginSlashCommand & { pluginId: string; pluginName: string }>;
   mcpPresets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
   pluginsDir: string;
+  emptyComposition?: boolean;
   harnesses?: HarnessInfo[];
 }
 
@@ -242,6 +282,7 @@ export const daemonApi = {
   health: () =>
     apiFetch<{
       status: string;
+      emptyComposition?: boolean;
       protocolVersion: string;
       desktopId: string;
       desktopName: string;
@@ -376,20 +417,96 @@ export const daemonApi = {
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
 
-  getPluginComposition: (workspaceId?: string) => apiFetch<{ bundles: string[]; error?: string; safeMode: boolean; canRestore: boolean;
-    entries: Array<{ id: string; name: string; disabled: boolean; config: Record<string, unknown>; sources: string[] }>;
+  listServiceProviders: (contract?: string) =>
+    apiFetch<{ providers: ServiceProviderDto[] }>(
+      `/api/v1/plugins/services${contract ? `?contract=${encodeURIComponent(contract)}` : ''}`,
+    ),
+
+  getPluginComposition: (workspaceId?: string) => apiFetch<{
+    bundles: string[];
+    error?: string;
+    safeMode: boolean;
+    canRestore: boolean;
+    emptyComposition?: boolean;
+    bindings?: Record<string, string>;
+    startPage?: string;
+    serviceProviders?: ServiceProviderDto[];
+    entries: Array<{ id: string; name: string; disabled: boolean; config: Record<string, unknown>; bindings?: Record<string, string>; sources: string[] }>;
     extensions?: { filePreviewProvider?: string };
     filePreviewProviders: Array<{ id: string; name: string; extensions: string[]; ready: boolean; authorized: boolean }>;
+    filePreviewViewers?: FilePreviewViewerDto[];
   }>(`/api/v1/plugins/composition${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
+
+  setCompositionBinding: (contract: string, instanceId: string | null) =>
+    apiFetch<{ ok: true }>('/api/v1/plugins/composition/bindings', {
+      method: 'PUT',
+      body: JSON.stringify({ contract, instanceId }),
+    }),
+
+  upsertCompositionInstance: (entry: {
+    id: string;
+    name?: string;
+    disabled?: boolean;
+    config?: Record<string, unknown>;
+    bindings?: Record<string, string>;
+  }) =>
+    apiFetch<PluginBundleResponse>('/api/v1/plugins/composition/instances', {
+      method: 'PUT',
+      body: JSON.stringify(entry),
+    }),
+
+  removeCompositionInstance: (instanceId: string) =>
+    apiFetch<PluginBundleResponse>(`/api/v1/plugins/composition/instances/${encodeURIComponent(instanceId)}`, {
+      method: 'DELETE',
+    }),
 
   setFilePreviewProvider: (pluginId: string | null, workspaceId?: string) =>
     apiFetch<{ ok: true }>('/api/v1/plugins/composition/file-preview', {
       method: 'PUT', body: JSON.stringify({ pluginId, workspaceId }),
     }),
 
-  restorePluginComposition: (source: 'previous' | 'builtin') =>
+  restorePluginComposition: (source: 'previous' | 'builtin' | 'empty') =>
     apiFetch<PluginBundleResponse>('/api/v1/plugins/composition/restore', {
       method: 'POST', body: JSON.stringify({ source }),
+    }),
+
+  getWorkspaceBindings: (workspaceId: string) =>
+    apiFetch<{
+      workspaceId: string;
+      bindings: Array<{ contract: string; instanceId: string; updatedAt: number }>;
+      resolved: Record<string, { contract: string; instanceId: string | null; source: string }>;
+    }>(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/bindings`),
+
+  setWorkspaceBinding: (workspaceId: string, contract: string, instanceId: string | null) =>
+    apiFetch<{ workspaceId: string; resolved: { contract: string; instanceId: string | null; source: string } }>(
+      `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/bindings`,
+      { method: 'PUT', body: JSON.stringify({ contract, instanceId }) },
+    ),
+
+  getSessionBindings: (sessionId: string) =>
+    apiFetch<{
+      sessionId: string;
+      bindings: Array<{ contract: string; instanceId: string; updatedAt: number }>;
+      resolved: Record<string, { contract: string; instanceId: string | null; source: string }>;
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/bindings`),
+
+  setSessionBinding: (sessionId: string, contract: string, instanceId: string | null) =>
+    apiFetch<{ sessionId: string; resolved: { contract: string; instanceId: string | null; source: string } }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/bindings`,
+      { method: 'PUT', body: JSON.stringify({ contract, instanceId }) },
+    ),
+
+  openSessionBrowser: (sessionId: string, url: string, instanceId?: string) =>
+    apiFetch<{
+      ok: boolean;
+      dependencyStatus: string;
+      instanceId: string | null;
+      boundSource: string;
+      pageKey?: string | null;
+      dependencyMessage?: string;
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/browser/open`, {
+      method: 'POST',
+      body: JSON.stringify({ url, ...(instanceId ? { instanceId } : {}) }),
     }),
 
   previewTurnSuggestion: (id: string, text: string, attachments?: Attachment[]) =>
@@ -825,6 +942,15 @@ export const daemonApi = {
     if (line !== undefined) query.set('line', String(line));
     return apiFetch<{ preview: RenderedFilePreview | null }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-preview?${query}`, { signal },
+    );
+  },
+
+  getSessionFileView: (sessionId: string, path: string, line?: number, instanceId?: string, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ path });
+    if (line !== undefined) query.set('line', String(line));
+    if (instanceId) query.set('instanceId', instanceId);
+    return apiFetch<SessionFileViewResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-view?${query}`, { signal },
     );
   },
 

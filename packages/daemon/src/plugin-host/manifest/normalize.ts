@@ -19,7 +19,7 @@ export function normalizePluginManifest(manifest: PluginManifest): PluginManifes
     throw new PluginApiError('E_INVALID_INPUT', 'V2/V3 清单使用声明式扩展接口');
   }
   if (generation < PLUGIN_MANIFEST_VERSION && (manifest.main || manifest.engines || manifest.inject || manifest.optional
-    || manifest.provides || manifest.permissions || manifest.activationEvents || manifest.contributes.commands?.length
+    || manifest.provides || manifest.dependencies || manifest.startPage || manifest.permissions || manifest.activationEvents || manifest.contributes.commands?.length
     || manifest.contributes.slots?.length || manifest.contributes.filePreview || manifest.contributes.settings)) {
     throw new PluginApiError('E_INVALID_INPUT', 'main、engines、插槽、权限与服务声明需要 V4 清单');
   }

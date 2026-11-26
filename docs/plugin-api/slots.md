@@ -21,3 +21,4 @@
 | `inspector.diff` | `single` | `session` | 接管或增强右侧 Diff 与检查点视图 |
 | `session.sidebar.badge` | `list` | `session-maybe` | 侧栏会话行轻量状态徽标 |
 | `workspace.pages` | `list` | `root` | 在侧栏提供入口并在主工作区打开独立插件页面 |
+| `workspace.start` | `single` | `root` | 组合中提供的应用启动页与主工作区布局 |

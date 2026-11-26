@@ -180,6 +180,8 @@ interface AppState {
 
   // Modular Plugin System
   plugins: InstalledPluginInfo[];
+  emptyComposition: boolean;
+  sessionBindingsBySession: Record<string, Record<string, string | null>>;
   pluginPermissionRevision: number;
   invalidatePluginPermissions: () => void;
   selectedPluginPanel: string | null;
@@ -282,10 +284,12 @@ interface AppState {
   refreshAll: () => Promise<void>;
   refreshHarnesses: () => Promise<void>;
   refreshPlugins: () => Promise<void>;
+  refreshSessionBindings: (sessionId: string) => Promise<void>;
+  setSessionBinding: (sessionId: string, contract: string, instanceId: string | null) => Promise<void>;
   installPlugin: (req: InstallPluginRequest) => Promise<void>;
   togglePlugin: (id: string, enabled: boolean) => Promise<void>;
   reloadPlugins: () => Promise<void>;
-  restorePluginComposition: (source: 'previous' | 'builtin') => Promise<void>;
+  restorePluginComposition: (source: 'previous' | 'builtin' | 'empty') => Promise<void>;
   rollbackPlugin: (id: string) => Promise<void>;
   uninstallPlugin: (id: string) => Promise<void>;
 
@@ -743,6 +747,8 @@ export const useAppStore = create<AppState>((set, get) => {
     remoteStatus: null,
 
     plugins: [],
+    emptyComposition: false,
+    sessionBindingsBySession: {},
     pluginPermissionRevision: 0,
     invalidatePluginPermissions: () => set((state) => ({ pluginPermissionRevision: state.pluginPermissionRevision + 1 })),
     selectedPluginPanel: null,
@@ -1216,6 +1222,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const pRes = await daemonApi.listPlugins();
       set({
         plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
@@ -1223,10 +1230,43 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
+    refreshSessionBindings: async (sessionId) => {
+      if (typeof daemonApi.getSessionBindings !== 'function') return;
+      const res = await daemonApi.getSessionBindings(sessionId);
+      const map: Record<string, string | null> = {};
+      for (const [contract, resolved] of Object.entries(res.resolved ?? {})) {
+        map[contract] = resolved.instanceId;
+      }
+      set((state) => ({
+        sessionBindingsBySession: {
+          ...state.sessionBindingsBySession,
+          [sessionId]: map,
+        },
+      }));
+    },
+
+    setSessionBinding: async (sessionId, contract, instanceId) => {
+      const res = await daemonApi.setSessionBinding(sessionId, contract, instanceId);
+      set((state) => ({
+        sessionBindingsBySession: {
+          ...state.sessionBindingsBySession,
+          [sessionId]: {
+            ...(state.sessionBindingsBySession[sessionId] ?? {}),
+            [contract]: res.resolved.instanceId,
+          },
+        },
+      }));
+      get().pushToast({
+        kind: 'success',
+        title: instanceId ? '已更新会话能力绑定' : '已恢复会话默认能力绑定',
+      });
+    },
+
     installPlugin: async (req) => {
       const pRes = await daemonApi.installPlugin(req);
       set({
         plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
@@ -1240,6 +1280,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const pRes = await daemonApi.togglePlugin(id, enabled);
       set({
         plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
@@ -1252,6 +1293,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const pRes = await daemonApi.reloadPlugins();
       set({
         plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
@@ -1266,17 +1308,28 @@ export const useAppStore = create<AppState>((set, get) => {
     restorePluginComposition: async (source) => {
       const result = await daemonApi.restorePluginComposition(source);
       set({
-        plugins: result.plugins, pluginCatalog: result.catalog, slashCommands: result.slashCommands,
-        mcpPresets: result.mcpPresets, ...(result.harnesses ? { harnesses: result.harnesses } : {}),
+        plugins: result.plugins,
+        emptyComposition: Boolean(result.emptyComposition),
+        pluginCatalog: result.catalog,
+        slashCommands: result.slashCommands,
+        mcpPresets: result.mcpPresets,
+        ...(result.harnesses ? { harnesses: result.harnesses } : {}),
       });
-      get().pushToast({ kind: 'success', title: '组合配置已恢复' });
+      get().pushToast({
+        kind: 'success',
+        title: source === 'empty' ? '已进入空业务组合恢复模式' : '组合配置已恢复',
+      });
     },
 
     rollbackPlugin: async (id) => {
       const pRes = await daemonApi.rollbackPlugin(id);
       set({
-        plugins: pRes.plugins, pluginCatalog: pRes.catalog, slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets, ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
+        plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
+        pluginCatalog: pRes.catalog,
+        slashCommands: pRes.slashCommands,
+        mcpPresets: pRes.mcpPresets,
+        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       get().pushToast({ kind: 'success', title: '已切换到上一版插件' });
     },
@@ -1284,6 +1337,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const pRes = await daemonApi.uninstallPlugin(id);
       set({
         plugins: pRes.plugins,
+        emptyComposition: Boolean(pRes.emptyComposition),
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,

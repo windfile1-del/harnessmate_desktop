@@ -1,0 +1,30 @@
+{
+  "id": "hm.plugin.file-preview-markdown",
+  "name": "Markdown 文件预览",
+  "version": "1.0.0",
+  "description": "将 Markdown 文档渲染为结构化视图，支持工作区链接跳转与行号定位。",
+  "author": "HarnessMate Core",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "filePreview.v1"
+  ],
+  "permissions": [
+    "file:preview"
+  ],
+  "contributes": {
+    "filePreview": {
+      "extensions": [
+        ".md",
+        ".markdown",
+        ".mdown",
+        ".mkd"
+      ],
+      "viewerKind": "markdown"
+    }
+  }
+}

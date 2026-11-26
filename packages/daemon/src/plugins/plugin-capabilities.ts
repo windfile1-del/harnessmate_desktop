@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { PEER_CONTRACTS, PluginApiError } from '@harnessmate/plugin-api';
 import type { InstalledPluginInfo, PluginAction, PluginPermission, PluginProgram, Session, SetPluginPermissionRequest } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
 import type { PluginMcpConnection } from '../harnesses/types.js';
@@ -175,6 +176,34 @@ export class PluginCapabilities {
     }
     const tool = this.listLeaseTools(lease).find((entry) => entry.name === name);
     if (!tool) throw new Error('插件工具未授权或版本已变更');
+
+    // Enforce session-selected approval.policy.v1 plugin decision in kernel
+    const policyBinding = this.plugins.resolveCapabilityBinding(PEER_CONTRACTS.approvalPolicy, {
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+    });
+    if (policyBinding.instanceId && this.plugins.isolated) {
+      const policyActive = this.plugins.isolated.getActive(policyBinding.instanceId);
+      if (!policyActive?.process.alive) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', `审批策略实例 ${policyBinding.instanceId} 暂不可用`);
+      }
+      const decision = await this.plugins.isolated.invokeApprovalPolicy(policyBinding.instanceId, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        pluginId: tool.permission.pluginId,
+        instanceId: tool.permission.pluginId,
+        toolName: tool.kind === 'isolated' ? tool.toolName : tool.name,
+        readOnly: tool.readOnly,
+        args,
+      });
+      if (decision.decision !== 'allow') {
+        throw new PluginApiError(
+          'E_PERMISSION_DENIED',
+          decision.reason || `审批策略 (${policyBinding.instanceId}) 拒绝执行工具 ${name}`,
+        );
+      }
+    }
+
     if (tool.kind === 'program') {
       const text = typeof args.text === 'string' && args.text.length <= pluginTextLimit ? args.text : null;
       if (text === null) throw new Error('Invalid tool arguments');

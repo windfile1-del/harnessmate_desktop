@@ -17,6 +17,8 @@ extraResources:
     to: daemon
   - from: resources/web-dist
     to: web-dist
+  - from: resources/bundled-plugins
+    to: bundled-plugins
   - from: build/icon.png
     to: build/icon.png
 win:

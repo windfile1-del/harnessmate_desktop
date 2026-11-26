@@ -1,0 +1,14 @@
+body { margin: 12px; color: var(--text-primary, #e5e7eb); font: 12.5px system-ui; }
+.header-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.badge { padding: 2px 7px; border-radius: 6px; font: 11px ui-monospace, monospace; background: var(--accent-indigo-soft, rgba(99,102,241,0.18)); color: var(--accent-indigo, #818cf8); }
+.row { display: flex; gap: 6px; margin-bottom: 8px; }
+[hidden] { display: none !important; }
+input, button { color: inherit; padding: 6px 8px; background: var(--bg-surface, #171923); border: 1px solid var(--border-hairline, #3d4352); border-radius: 6px; font-size: 12px; }
+input { flex: 1; min-width: 0; }
+button { cursor: pointer; }
+button:disabled { opacity: 0.45; cursor: default; }
+#status { color: var(--text-secondary, #aeb7c8); overflow-wrap: anywhere; }
+#preview { width: min(100%, 1000px); display: block; border-radius: 6px; margin-bottom: 8px; border: 1px solid var(--border-hairline, #3d4352); cursor: default; }
+#preview:focus-visible { outline: 2px solid var(--accent-indigo, #889cf8); }
+.history { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.history-item { font-size: 11px; padding: 3px 7px; }

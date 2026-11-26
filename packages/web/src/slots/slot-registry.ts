@@ -16,6 +16,9 @@ import type { ProjectedToolCall, ProjectedTurn } from '../lib/projector';
 import type { TurnBlock } from '../lib/work-groups';
 
 export interface SlotPropsMap {
+  'workspace.start': {
+    session: Session | null;
+  };
   'workspace.pages': Record<string, never>;
   // V4 slots (100% backward compatible)
   'session.header.title': {

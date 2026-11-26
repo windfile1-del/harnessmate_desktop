@@ -9,11 +9,15 @@ import {
   pluginEventContracts,
   type ApprovalAnnotateEvent,
   type ApprovalAnnotation,
+  type ApprovalPolicyDecision,
+  type ApprovalPolicyRequest,
   type HandoffComposeEvent,
   type HandoffOfferDecision,
   type HandoffShouldOfferEvent,
   type PluginEventV4,
   type PluginHandshakeResponse,
+  type PluginRouteRequest,
+  type PluginRouteResponse,
   type PluginRuntimeSlotDescriptor,
   type PublicAdapterUsageLimitResult,
   type PublicCommandResult,
@@ -81,12 +85,15 @@ interface ProxyDriverSessionEntry {
 
 export interface ActiveIsolatedPlugin {
   pluginId: string;
+  instanceId: string;
   runId: string;
   info: InstalledPluginInfo;
   process: IsolatedPluginProcess;
   handshake: PluginHandshakeResponse;
   subscribedEvents: Set<string>;
   commands: Set<string>;
+  routes: Set<string>;
+  serviceMeta: Record<string, { version?: string; metadata?: Record<string, unknown> }>;
   tools: Map<string, { name: string; description: string; inputSchema: Record<string, unknown>; readOnly?: boolean }>;
   slots: Map<string, PluginRuntimeSlotDescriptor>;
   sections: Map<string, { id: string; order?: number; text: string }>;
@@ -204,13 +211,14 @@ export class IsolatedPluginManager {
         if (subscribed) entry.subscribedEvents.add(event);
         else entry.subscribedEvents.delete(event);
       },
-      onDynamicUnregister: (pluginId, runId, kind, name) => {
-        const entry = this.active.get(pluginId);
+      onDynamicUnregister: (instanceId, runId, kind, name) => {
+        const entry = this.active.get(instanceId);
         if (!entry || entry.runId !== runId) return;
         if (kind === 'command') entry.commands.delete(name);
         else if (kind === 'tool') entry.tools.delete(name);
         else if (kind === 'section') entry.sections.delete(name);
         else if (kind === 'slot') entry.slots.delete(name);
+        else if (kind === 'route') entry.routes.delete(name);
       },
       runNativeCommand: (sessionId, command, args) => {
         if (!this.nativeCommandRunner) {
@@ -258,10 +266,52 @@ export class IsolatedPluginManager {
     this.router.clearLogs(pluginId);
   }
 
-  listSlots(pluginId: string): PluginRuntimeSlotDescriptor[] {
-    const entry = this.active.get(pluginId);
+  listSlots(instanceId: string): PluginRuntimeSlotDescriptor[] {
+    const entry = this.active.get(instanceId);
     if (!entry || !entry.process.alive) return [];
     return [...entry.slots.values()];
+  }
+
+  listRoutes(instanceId: string): string[] {
+    const entry = this.active.get(instanceId);
+    if (!entry || !entry.process.alive) return [];
+    return [...entry.routes.values()];
+  }
+
+  async dispatchRoute(instanceId: string, req: PluginRouteRequest): Promise<PluginRouteResponse> {
+    const entry = this.active.get(instanceId);
+    if (!entry || !entry.process.alive) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', '插件实例未处于活动状态');
+    }
+    return entry.process.call<PluginRouteResponse>(
+      'host.route.handle',
+      {
+        httpMethod: req.method,
+        path: req.path,
+        query: req.query,
+        headers: req.headers,
+        body: req.body,
+      },
+      ISOLATED_TIMEOUTS.command,
+      entry.runId,
+    );
+  }
+
+  async invokeApprovalPolicy(instanceId: string, req: ApprovalPolicyRequest): Promise<ApprovalPolicyDecision> {
+    const entry = this.active.get(instanceId);
+    if (!entry || !entry.process.alive) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', `审批策略实例 ${instanceId} 不可用`);
+    }
+    const result = await entry.process.call<ApprovalPolicyDecision>(
+      'host.service.call',
+      { service: 'approval.policy.v1', method: 'evaluateToolCall', args: [req] },
+      ISOLATED_TIMEOUTS.waterfall,
+      entry.runId,
+    );
+    if (!result || (result.decision !== 'allow' && result.decision !== 'deny' && result.decision !== 'ask')) {
+      throw new PluginApiError('E_INVALID_INPUT', `审批策略实例 ${instanceId} 返回了无效决策`);
+    }
+    return result;
   }
 
   async sendSlotMessage(
@@ -303,22 +353,31 @@ export class IsolatedPluginManager {
 
   createHostPlugin(params: {
     info: InstalledPluginInfo;
+    instanceId?: string;
     packageRoot: string;
     entryRelativePath: string;
     digest: string;
     enabled: boolean;
     config?: Readonly<Record<string, unknown>>;
+    bindings?: Readonly<Record<string, string>>;
+    trustedLocal?: boolean;
     revision: string;
   }): HostPlugin {
-    const { info, packageRoot, entryRelativePath, digest, enabled, config, revision } = params;
-    const crashFailure = this.lastCrashReason.get(info.id);
+    const { info, packageRoot, entryRelativePath, digest, enabled, config, bindings, revision } = params;
+    const instanceId = params.instanceId ?? info.instanceId ?? info.id;
+    const trustedLocal = params.trustedLocal ?? info.devTrustedLocal;
+    const crashFailure = this.lastCrashReason.get(instanceId);
+    const dependencies = info.dependencies ? Object.values(info.dependencies) : undefined;
     return {
-      id: info.id,
+      id: instanceId,
+      pluginId: info.id,
       revision,
       enabled,
       error: crashFailure,
       inject: info.inject,
       provides: info.provides,
+      dependencies,
+      bindings,
       config,
       apply: async (ctx, resolvedConfig) => {
         await this.awaitPendingDisposals();
@@ -335,17 +394,19 @@ export class IsolatedPluginManager {
         let procRef: IsolatedPluginProcess | undefined;
         const proc = new IsolatedPluginProcess({
           pluginId: info.id,
-          trustedLocal: info.devTrustedLocal,
+          instanceId,
+          trustedLocal,
           packageRoot,
           entryRelativePath,
           packageDigest: digest,
           config: resolvedConfig,
+          bindings,
           declaredPermissions: info.permissions ?? [],
           services: this.opts.host.listServices(),
           onRpc: (method, rpcParams, meta) => this.router.handle(method, rpcParams, meta),
           onExit: (code, signal, stderr) => {
-            if (!procRef || this.active.get(info.id)?.process !== procRef) return;
-            this.handleUnexpectedCrash(info.id, procRef.runId, code, signal, stderr);
+            if (!procRef || this.active.get(instanceId)?.process !== procRef) return;
+            this.handleUnexpectedCrash(instanceId, procRef.runId, code, signal, stderr);
           },
         });
         procRef = proc;
@@ -353,12 +414,15 @@ export class IsolatedPluginManager {
         // Register temporary active entry during handshake so child RPC calls during apply() pass isCurrentRun
         const placeholder: ActiveIsolatedPlugin = {
           pluginId: info.id,
+          instanceId,
           runId: proc.runId,
           info,
           process: proc,
           handshake: { sdkVersion: '4.0.0' },
           subscribedEvents: new Set(),
           commands: new Set(),
+          routes: new Set(),
+          serviceMeta: {},
           tools: new Map(),
           slots: new Map(),
           sections: new Map(),
@@ -370,16 +434,16 @@ export class IsolatedPluginManager {
           hasApprovalAnnotate: false,
           hasHandoffRedact: false,
         };
-        this.active.set(info.id, placeholder);
+        this.active.set(instanceId, placeholder);
 
         ctx.effect(() => () => {
-          this.router.abortNetStreamsForRun(info.id, proc.runId);
+          this.router.abortNetStreamsForRun(instanceId, proc.runId);
           this.cleanupPluginDrivers(placeholder);
-          const cliTask = this.cliProcesses.killAllForRun(info.id, proc.runId)
+          const cliTask = this.cliProcesses.killAllForRun(instanceId, proc.runId)
             .finally(() => { this.pendingDisposals.delete(cliTask); });
           this.pendingDisposals.add(cliTask);
-          if (this.active.get(info.id)?.runId === proc.runId) {
-            this.active.delete(info.id);
+          if (this.active.get(instanceId)?.runId === proc.runId) {
+            this.active.delete(instanceId);
           }
           const task = proc.dispose().finally(() => { this.pendingDisposals.delete(task); });
           this.pendingDisposals.add(task);
@@ -393,8 +457,8 @@ export class IsolatedPluginManager {
           }
         } catch (error) {
           this.cleanupPluginDrivers(placeholder);
-          await this.cliProcesses.killAllForRun(info.id, proc.runId);
-          if (this.active.get(info.id)?.runId === proc.runId) this.active.delete(info.id);
+          await this.cliProcesses.killAllForRun(instanceId, proc.runId);
+          if (this.active.get(instanceId)?.runId === proc.runId) this.active.delete(instanceId);
           await proc.dispose();
           throw error;
         }
@@ -402,6 +466,8 @@ export class IsolatedPluginManager {
         placeholder.handshake = handshake;
         for (const ev of handshake.subscribedEvents ?? []) placeholder.subscribedEvents.add(ev);
         for (const cmd of handshake.commands ?? []) placeholder.commands.add(cmd);
+        for (const route of handshake.routes ?? []) placeholder.routes.add(route);
+        placeholder.serviceMeta = handshake.serviceMeta ?? {};
         for (const tool of handshake.tools ?? []) placeholder.tools.set(tool.name, tool);
         for (const slotDef of handshake.slots ?? []) {
           if (isValidPluginSlotKey(slotDef.slot) && isSafePluginUiPath(slotDef.ui)) {
@@ -436,9 +502,11 @@ export class IsolatedPluginManager {
             this.opts.permissions.assertGranted(info, `service:provide:${serviceName}`, GLOBAL_WORKSPACE_SCOPE);
           }
           const methods = handshake.serviceMethods?.[serviceName] ?? [];
+          const meta = handshake.serviceMeta?.[serviceName];
           const proxyTarget: Record<string, unknown> = {
             __thirdParty: true,
             __pluginId: info.id,
+            __instanceId: instanceId,
             __runId: capturedRunId,
           };
           for (const methodName of methods) {
@@ -456,49 +524,53 @@ export class IsolatedPluginManager {
               return prop in target ? target[prop] : undefined;
             },
           });
-          ctx.provide(serviceName, serviceProxy);
+          ctx.provide(serviceName, serviceProxy, {
+            version: meta?.version ?? info.version,
+            metadata: meta?.metadata,
+            runId: capturedRunId,
+          });
         }
       },
     };
   }
 
   private handleUnexpectedCrash(
-    pluginId: string,
+    instanceId: string,
     crashedRunId: string,
     code: number | null,
     signal: NodeJS.Signals | null,
     stderr: string,
   ): void {
-    const current = this.active.get(pluginId);
+    const current = this.active.get(instanceId);
     if (!current || current.runId !== crashedRunId) return;
     const detail = stderr ? `${code ?? signal ?? 'crash'}: ${stderr.slice(0, 200)}` : `exit ${code ?? signal ?? 'unknown'}`;
-    this.router.abortNetStreamsForRun(pluginId, crashedRunId);
+    this.router.abortNetStreamsForRun(instanceId, crashedRunId);
     this.cleanupPluginDrivers(current, `隔离进程异常退出 (${detail})`);
-    const cliTask = this.cliProcesses.killAllForRun(pluginId, crashedRunId)
+    const cliTask = this.cliProcesses.killAllForRun(instanceId, crashedRunId)
       .finally(() => { this.pendingDisposals.delete(cliTask); });
     this.pendingDisposals.add(cliTask);
-    this.active.delete(pluginId);
+    this.active.delete(instanceId);
 
-    const tracker = this.crashTrackers.get(pluginId) ?? new CrashBackoffTracker(this.opts.crashPolicy);
-    this.crashTrackers.set(pluginId, tracker);
+    const tracker = this.crashTrackers.get(instanceId) ?? new CrashBackoffTracker(this.opts.crashPolicy);
+    this.crashTrackers.set(instanceId, tracker);
     const outcome = tracker.recordCrash();
 
     if (outcome.exhausted) {
       const reason = `隔离进程 10 分钟内崩溃 ${outcome.count} 次，已停止重启 (${detail})`;
-      this.lastCrashReason.set(pluginId, reason);
-      this.opts.host.fail(pluginId, reason);
+      this.lastCrashReason.set(instanceId, reason);
+      this.opts.host.fail(instanceId, reason);
       return;
     }
 
-    this.opts.host.fail(pluginId, `隔离进程异常退出 (${detail})，将在 ${outcome.delayMs}ms 后退避重启`);
-    const existingTimer = this.restartTimers.get(pluginId);
+    this.opts.host.fail(instanceId, `隔离进程异常退出 (${detail})，将在 ${outcome.delayMs}ms 后退避重启`);
+    const existingTimer = this.restartTimers.get(instanceId);
     if (existingTimer) clearTimeout(existingTimer);
     const timer = setTimeout(() => {
-      this.restartTimers.delete(pluginId);
-      void this.opts.requestRestart(pluginId).catch(() => {});
+      this.restartTimers.delete(instanceId);
+      void this.opts.requestRestart(instanceId).catch(() => {});
     }, outcome.delayMs);
     timer.unref();
-    this.restartTimers.set(pluginId, timer);
+    this.restartTimers.set(instanceId, timer);
   }
 
   syncServices(services: readonly string[]): void {
@@ -597,8 +669,9 @@ export class IsolatedPluginManager {
     toolName: string,
     input: Record<string, unknown>,
     meta: { sessionId: string; workspaceId: string },
+    instanceId?: string,
   ): Promise<string> {
-    const entry = this.active.get(pluginId);
+    const entry = this.active.get(instanceId ?? pluginId);
     if (!entry || entry.runId !== expectedRunId) {
       throw new PluginApiError('E_STALE_RUN', '插件工具所属实例已重启或卸载');
     }

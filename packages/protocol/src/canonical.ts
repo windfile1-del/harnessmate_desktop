@@ -619,6 +619,15 @@ export const GeneratedPluginManifestSchema = PluginManifestSchema
 export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   builtin: z.boolean(),
   enabled: z.boolean(),
+  instanceId: z.string().optional(),
+  sourceKind: z.enum(['kernel', 'bundled', 'installed', 'dev']).optional(),
+  bindings: z.record(z.string()).optional(),
+  providedContracts: z.array(z.object({
+    contract: z.string(),
+    version: z.string().optional(),
+    metadata: z.record(z.unknown()).optional(),
+  })).optional(),
+  routes: z.array(z.string()).optional(),
   sourcePath: z.string().nullable().optional(),
   hasRuntimeHook: z.boolean().optional(),
   loadError: z.string().nullable().optional(),

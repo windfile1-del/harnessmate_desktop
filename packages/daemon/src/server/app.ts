@@ -142,6 +142,7 @@ import { runPluginProgram } from '../plugins/plugin-program.js';
 import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
 import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
+import { authorizeLegacyPluginBrowserView, renderLegacyFilePreview } from '../plugin-host/compat/legacy-compat.js';
 import { PluginSecretStore } from '../plugin-host/isolation/plugin-secrets.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
@@ -155,6 +156,7 @@ export interface CreateDaemonOptions {
   webDistDir?: string | null;
   pluginCrashPolicy?: CrashPolicy;
   pluginSafeMode?: boolean;
+  bundledPluginsDir?: string;
   nativeFeatureFlags?: Partial<AgyNativeFeatureFlags>;
 }
 
@@ -236,7 +238,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       paths.agyProfilesDir,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
-      onDevReload: () => wsGateway.notifyPluginsChanged() },
+      bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
@@ -348,7 +350,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (principal.kind === 'local' && !isLocalBrowserRequest(request.headers)) {
       return reply.code(403).send({ error: 'Local API origin or host is not allowed' });
     }
-    if (urlPath.startsWith('/api/v1/plugins/') && (request.method !== 'GET' || urlPath === '/api/v1/plugins/composition')
+    if ((urlPath.startsWith('/api/v1/plugins/') || urlPath.startsWith('/api/v1/plugin-instances/'))
+      && (request.method !== 'GET' || urlPath === '/api/v1/plugins/composition')
       && (principal.kind !== 'local' || !isLoopbackAddress(request.socket.remoteAddress))) {
       return reply.code(403).send({ error: '插件管理仅在本机可用' });
     }
@@ -361,6 +364,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     status: 'ok',
     daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.6.0',
     pluginSafeMode: Boolean(opts.pluginSafeMode),
+    emptyComposition: pluginManager.isEmptyComposition(),
     protocolVersion: PROTOCOL_VERSION,
     desktopId: config.desktopId,
     desktopName: config.desktopName,
@@ -705,13 +709,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     slashCommands: pluginManager.listActiveSlashCommands(),
     mcpPresets: pluginManager.listActiveMcpPresets(),
     pluginsDir: paths.pluginsDir,
+    emptyComposition: pluginManager.isEmptyComposition(),
   });
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
+  app.get('/api/v1/plugins/services', async (request) => {
+    const { contract } = request.query as { contract?: string };
+    return { providers: pluginManager.listServiceProviders(typeof contract === 'string' && contract.trim() ? contract.trim() : undefined) };
+  });
   app.get('/api/v1/plugins/composition', async (request) => {
     const { workspaceId } = request.query as { workspaceId?: string };
     const workspace = typeof workspaceId === 'string' ? store.getWorkspace(workspaceId) : undefined;
-    return { ...pluginManager.getComposition(), filePreviewProviders: pluginManager.listFilePreviewProviders(workspace?.id) };
+    return {
+      ...pluginManager.getComposition(),
+      filePreviewProviders: pluginManager.listFilePreviewProviders(workspace?.id),
+      filePreviewViewers: pluginManager.listFilePreviewViewers(workspace?.id),
+    };
   });
   registerPluginMcp(app, pluginCapabilities, store, {
     getOrchestrator: () => sessionManager.getOrchestratorService(),
@@ -963,15 +976,66 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.post('/api/v1/plugins/:id/browser-authorize', async (request, reply) => {
     const { id } = request.params as { id: string };
     const { runId } = (request.body ?? {}) as { runId?: unknown };
-    const pkg = pluginManager.getPluginPackageRoot(id);
-    const plugin = pkg && pluginManager.listInstalled().find((entry) => entry.id === id);
-    if (!pkg || !plugin || typeof runId !== 'string' || runId !== (pkg.runId ?? pkg.digest)) {
+    if (typeof runId !== 'string') {
       return reply.code(409).send({ error: '插件实例已停止或已更新', code: 'E_STALE_RUN' });
     }
-    if (!pluginPermissions.isGranted(plugin, 'browser:preview')) {
-      return reply.code(403).send({ error: '请在插件中心授权 browser:preview', code: 'E_PERMISSION_DENIED' });
+    const authResult = authorizeLegacyPluginBrowserView(pluginManager, id, runId);
+    if (!authResult.ok) {
+      return reply.code(authResult.status).send({ error: authResult.error, code: authResult.code });
     }
     return { ok: true };
+  });
+
+  app.post('/api/v1/plugin-instances/:instanceId/view-authorize', async (request, reply) => {
+    const { instanceId } = request.params as { instanceId: string };
+    const { runId, permission } = (request.body ?? {}) as { runId?: unknown; permission?: unknown };
+    if (typeof runId !== 'string') {
+      return reply.code(409).send({ error: '插件实例已停止或已更新', code: 'E_STALE_RUN' });
+    }
+    const perm = typeof permission === 'string' && permission.trim() ? permission.trim() : 'browser:preview';
+    const authResult = pluginManager.authorizeInstanceView(instanceId, runId, perm);
+    if (!authResult.ok) {
+      return reply.code(authResult.status).send({ error: authResult.error, code: authResult.code });
+    }
+    return { ok: true };
+  });
+
+  app.all('/api/v1/plugin-instances/:instanceId/routes/*', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: '插件本地路由仅允许本机访问', code: 'E_PERMISSION_DENIED' });
+    }
+    const { instanceId, '*': wildcardPath } = request.params as { instanceId: string; '*': string };
+    if (!pluginManager.isolated) {
+      return reply.code(400).send({ error: '隔离插件运行时不可用', code: 'E_NOT_SUPPORTED' });
+    }
+    try {
+      const routePath = `/${(wildcardPath ?? '').replace(/^\/+/, '')}`;
+      const query: Record<string, string> = {};
+      if (request.query && typeof request.query === 'object') {
+        for (const [k, v] of Object.entries(request.query as Record<string, unknown>)) {
+          if (typeof v === 'string') query[k] = v;
+        }
+      }
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(request.headers)) {
+        if (typeof v === 'string') headers[k] = v;
+      }
+      const res = await pluginManager.isolated.dispatchRoute(instanceId, {
+        method: request.method,
+        path: routePath,
+        query,
+        headers,
+        body: request.body,
+      });
+      if (res?.headers) {
+        for (const [k, v] of Object.entries(res.headers)) reply.header(k, v);
+      }
+      return reply.code(res?.status ?? 200).send(res?.body ?? { ok: true });
+    } catch (error) {
+      const code = error instanceof PluginApiError ? error.code : 'E_INTERNAL';
+      const status = code === 'E_SERVICE_UNAVAILABLE' || code === 'E_STALE_RUN' ? 503 : code === 'E_TIMEOUT' ? 504 : 400;
+      return reply.code(status).send({ error: error instanceof Error ? error.message : String(error), code });
+    }
   });
 
   app.post('/api/v1/plugins/:id/ui-message', async (request, reply) => {
@@ -1030,13 +1094,138 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  app.post('/api/v1/plugins/composition/restore', async (request, reply) => {
-    const source = (request.body as { source?: unknown } | null)?.source;
-    if (source !== 'previous' && source !== 'builtin') return reply.code(400).send({ error: '请选择要恢复的组合配置' });
+  app.put('/api/v1/plugins/composition/bindings', async (request, reply) => {
+    const { contract, instanceId } = (request.body ?? {}) as { contract?: unknown; instanceId?: unknown };
+    if (typeof contract !== 'string' || !contract.trim() || (instanceId !== null && typeof instanceId !== 'string')) {
+      return reply.code(400).send({ error: '请提供有效的契约名与实例 ID' });
+    }
     try {
-      await pluginManager.restoreComposition(source === 'builtin');
+      await pluginManager.setCompositionBinding(contract.trim(), instanceId as string | null);
+      wsGateway.notifyPluginsChanged();
+      return { ok: true, composition: pluginManager.getComposition() };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put('/api/v1/plugins/composition/instances', async (request, reply) => {
+    const body = (request.body ?? {}) as {
+      id?: unknown;
+      name?: unknown;
+      disabled?: unknown;
+      config?: unknown;
+      bindings?: unknown;
+    };
+    if (typeof body.id !== 'string' || !body.id.trim()) {
+      return reply.code(400).send({ error: '请提供有效的实例 ID' });
+    }
+    try {
+      await pluginManager.upsertCompositionInstance({
+        id: body.id.trim(),
+        ...(typeof body.name === 'string' && body.name.trim() ? { name: body.name.trim() } : {}),
+        ...(typeof body.disabled === 'boolean' ? { disabled: body.disabled } : {}),
+        ...(body.config && typeof body.config === 'object' && !Array.isArray(body.config)
+          ? { config: body.config as Record<string, unknown> }
+          : {}),
+        ...(body.bindings && typeof body.bindings === 'object' && !Array.isArray(body.bindings)
+          ? { bindings: body.bindings as Record<string, string> }
+          : {}),
+      });
       wsGateway.notifyPluginsChanged();
       return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.delete('/api/v1/plugins/composition/instances/:instanceId', async (request, reply) => {
+    const { instanceId } = request.params as { instanceId: string };
+    try {
+      await pluginManager.removeCompositionInstance(instanceId);
+      wsGateway.notifyPluginsChanged();
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/v1/plugins/composition/restore', async (request, reply) => {
+    const source = (request.body as { source?: unknown } | null)?.source;
+    if (source !== 'previous' && source !== 'builtin' && source !== 'empty') {
+      return reply.code(400).send({ error: '请选择要恢复的组合配置' });
+    }
+    try {
+      await pluginManager.restoreComposition(source);
+      wsGateway.notifyPluginsChanged();
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get('/api/v1/workspaces/:id/bindings', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    return {
+      workspaceId: id,
+      bindings: store.listCapabilityBindings('workspace', id),
+      resolved: {
+        'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { workspaceId: id }),
+        'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { workspaceId: id }),
+        'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { workspaceId: id }),
+      },
+    };
+  });
+
+  app.put('/api/v1/workspaces/:id/bindings', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    const { contract, instanceId } = (request.body ?? {}) as { contract?: unknown; instanceId?: unknown };
+    if (typeof contract !== 'string' || !contract.trim() || (instanceId !== null && typeof instanceId !== 'string')) {
+      return reply.code(400).send({ error: '请提供有效的契约名与实例 ID' });
+    }
+    try {
+      await pluginManager.setWorkspaceBinding(id, contract.trim(), instanceId as string | null);
+      return {
+        workspaceId: id,
+        bindings: store.listCapabilityBindings('workspace', id),
+        resolved: pluginManager.resolveCapabilityBinding(contract.trim(), { workspaceId: id }),
+      };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/bindings', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    return {
+      sessionId: id,
+      bindings: store.listCapabilityBindings('session', id),
+      resolved: {
+        'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { sessionId: id, workspaceId: session.workspaceId }),
+      },
+    };
+  });
+
+  app.put('/api/v1/sessions/:id/bindings', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const { contract, instanceId } = (request.body ?? {}) as { contract?: unknown; instanceId?: unknown };
+    if (typeof contract !== 'string' || !contract.trim() || (instanceId !== null && typeof instanceId !== 'string')) {
+      return reply.code(400).send({ error: '请提供有效的契约名与实例 ID' });
+    }
+    try {
+      await pluginManager.setSessionBinding(id, contract.trim(), instanceId as string | null);
+      return {
+        sessionId: id,
+        bindings: store.listCapabilityBindings('session', id),
+        resolved: pluginManager.resolveCapabilityBinding(contract.trim(), { sessionId: id, workspaceId: session.workspaceId }),
+      };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -1671,12 +1860,105 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const line = Number(q.line);
     try {
       const file = readWorkspaceFilePreview(session.cwd, q.path);
-      const preview = await pluginManager.renderFilePreview(session.workspaceId, {
+      const preview = await renderLegacyFilePreview(pluginManager, session.workspaceId, {
         ...file, version: 1, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}),
       });
       return { preview };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/file-view', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const q = request.query as { path?: string; line?: string; instanceId?: string };
+    if (typeof q.path !== 'string' || !q.path) return reply.code(400).send({ error: 'Missing path parameter' });
+    reply.header('Cache-Control', 'no-store');
+    const line = Number(q.line);
+    try {
+      const file = readWorkspaceFilePreview(session.cwd, q.path);
+      const rendered = await pluginManager.renderPeerFilePreview(
+        session.workspaceId,
+        { ...file, version: 1, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}) },
+        {
+          sessionId: session.id,
+          explicitInstanceId: typeof q.instanceId === 'string' && q.instanceId.trim() ? q.instanceId.trim() : undefined,
+        },
+      );
+      return {
+        file,
+        ...rendered,
+        availableViewers: pluginManager.listFilePreviewViewers(session.workspaceId),
+      };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post('/api/v1/sessions/:id/browser/open', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const { url, instanceId: explicitInstanceId } = (request.body ?? {}) as { url?: unknown; instanceId?: unknown };
+    if (typeof url !== 'string' || !url.trim()) {
+      return reply.code(400).send({ error: '请提供要打开的网址' });
+    }
+    const availableBrowsers = pluginManager.listServiceProviders('browser.v1');
+    const resolved = pluginManager.resolveCapabilityBinding('browser.v1', {
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+    });
+    const targetId = typeof explicitInstanceId === 'string' && explicitInstanceId.trim()
+      ? explicitInstanceId.trim()
+      : resolved.instanceId;
+    if (!targetId) {
+      return {
+        ok: false,
+        dependencyStatus: 'unavailable',
+        instanceId: null,
+        boundSource: resolved.source,
+        dependencyMessage: '当前没有可用的浏览器插件实例',
+        availableBrowsers,
+      };
+    }
+    const service = pluginManager.host.getServiceByInstance<Record<string, (...args: unknown[]) => Promise<unknown>>>(
+      targetId,
+      'browser.v1',
+    );
+    if (!service || typeof service.open !== 'function' || !pluginManager.isInstanceEnabled(targetId)) {
+      return {
+        ok: false,
+        dependencyStatus: 'unavailable',
+        instanceId: targetId,
+        boundSource: resolved.source,
+        dependencyMessage: `浏览器实例 ${targetId} 当前已停用或未就绪`,
+        availableBrowsers,
+      };
+    }
+    try {
+      const result = await service.open(url.trim(), session.id);
+      const slots = pluginManager.isolated?.listSlots(targetId) ?? [];
+      const pageSlot = slots.find((s) => s.slot === 'workspace.pages');
+      return {
+        ok: true,
+        dependencyStatus: 'ready',
+        instanceId: targetId,
+        boundSource: resolved.source,
+        pageKey: pageSlot ? `${targetId}:${pageSlot.id}` : null,
+        result,
+        availableBrowsers,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        dependencyStatus: 'failed',
+        instanceId: targetId,
+        boundSource: resolved.source,
+        dependencyMessage: error instanceof Error ? error.message : String(error),
+        availableBrowsers,
+      };
     }
   });
 

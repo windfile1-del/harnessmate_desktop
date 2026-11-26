@@ -331,6 +331,15 @@ export class HarnessMateStore {
         PRIMARY KEY (scope, plugin_id, key)
       );
 
+      CREATE TABLE IF NOT EXISTS capability_bindings (
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        contract TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (scope_type, scope_id, contract)
+      );
+
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -1677,6 +1686,58 @@ export class HarnessMateStore {
       'SELECT key FROM plugin_kv_storage WHERE scope = ? AND plugin_id = ? ORDER BY key ASC',
     ).all(scope, pluginId) as Array<{ key: string }>;
     return rows.map(({ key }) => key);
+  }
+
+  // ── Scoped Capability Bindings (Workspace / Session) ─────────────────
+
+  getCapabilityBinding(
+    scopeType: 'workspace' | 'session',
+    scopeId: string,
+    contract: string,
+  ): { instanceId: string; updatedAt: number } | null {
+    const row = this.db.prepare(
+      'SELECT instance_id, updated_at FROM capability_bindings WHERE scope_type = ? AND scope_id = ? AND contract = ?',
+    ).get(scopeType, scopeId, contract) as { instance_id: string; updated_at: number } | undefined;
+    return row ? { instanceId: row.instance_id, updatedAt: row.updated_at } : null;
+  }
+
+  listCapabilityBindings(
+    scopeType: 'workspace' | 'session',
+    scopeId: string,
+  ): Array<{ contract: string; instanceId: string; updatedAt: number }> {
+    const rows = this.db.prepare(
+      'SELECT contract, instance_id, updated_at FROM capability_bindings WHERE scope_type = ? AND scope_id = ? ORDER BY contract ASC',
+    ).all(scopeType, scopeId) as Array<{ contract: string; instance_id: string; updated_at: number }>;
+    return rows.map((row) => ({
+      contract: row.contract,
+      instanceId: row.instance_id,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  setCapabilityBinding(
+    scopeType: 'workspace' | 'session',
+    scopeId: string,
+    contract: string,
+    instanceId: string | null,
+  ): void {
+    if (!instanceId) {
+      this.db.prepare(
+        'DELETE FROM capability_bindings WHERE scope_type = ? AND scope_id = ? AND contract = ?',
+      ).run(scopeType, scopeId, contract);
+      return;
+    }
+    this.db.prepare(
+      `INSERT INTO capability_bindings (scope_type, scope_id, contract, instance_id, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (scope_type, scope_id, contract) DO UPDATE SET
+         instance_id = excluded.instance_id,
+         updated_at = excluded.updated_at`,
+    ).run(scopeType, scopeId, contract, instanceId, Date.now());
+  }
+
+  deleteCapabilityBindingsForScope(scopeType: 'workspace' | 'session', scopeId: string): void {
+    this.db.prepare('DELETE FROM capability_bindings WHERE scope_type = ? AND scope_id = ?').run(scopeType, scopeId);
   }
 
   // ── Session Harness Bindings (Per-Harness Sync Watermarks) ───────────

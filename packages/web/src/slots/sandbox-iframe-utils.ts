@@ -92,12 +92,14 @@ export function buildIframeSrcDoc(params: {
   theme: 'dark' | 'light';
   cssVars: Record<string, string>;
   pluginId: string;
+  instanceId?: string;
   runId: string;
   slotId: string;
   slot: AnyPluginSlotKey;
   session: PublicSession | null;
   props: Record<string, unknown>;
   browserAvailable?: boolean;
+  desktopViewAvailable?: boolean;
 }): string {
   const sanitizedCssVars: Record<string, string> = {};
   for (const [key, value] of Object.entries(params.cssVars)) {
@@ -107,6 +109,7 @@ export function buildIframeSrcDoc(params: {
   }
   const initPayload = safeJsonForInlineScript({
     pluginId: params.pluginId,
+    instanceId: params.instanceId ?? params.pluginId,
     runId: params.runId,
     slotId: params.slotId,
     slot: params.slot,
@@ -115,6 +118,7 @@ export function buildIframeSrcDoc(params: {
     session: params.session,
     props: params.props,
     browserAvailable: params.browserAvailable === true,
+    desktopViewAvailable: (params.desktopViewAvailable ?? params.browserAvailable) === true,
   });
 
   const cspMeta = `<meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttr(params.csp)}">`;
@@ -198,6 +202,7 @@ export function buildIframeSrcDoc(params: {
 
   window.harnessMate = {
     get pluginId() { return init.pluginId; },
+    get instanceId() { return init.instanceId; },
     get runId() { return init.runId; },
     get slotId() { return init.slotId; },
     get slot() { return init.slot; },
@@ -212,6 +217,21 @@ export function buildIframeSrcDoc(params: {
     resize: function (height) { post({ type: 'hm:resize', slotId: init.slotId, height: Number(height) || 120 }); },
     onTheme: function (cb) { themeListeners.push(cb); return function () { themeListeners = themeListeners.filter(function (fn) { return fn !== cb; }); }; },
     onContext: function (cb) { contextListeners.push(cb); return function () { contextListeners = contextListeners.filter(function (fn) { return fn !== cb; }); }; },
+    desktopView: {
+      available: init.desktopViewAvailable,
+      create: function (options) { return call('desktopView.create', options); },
+      mount: function (options) { return call('desktopView.mount', options); },
+      navigate: function (url) { return call('desktopView.navigate', { url: url }); },
+      resize: function (options) { return call('desktopView.resize', options); },
+      focus: function (focused) { return call('desktopView.focus', { focused: focused !== false }); },
+      input: function (input) { return call('desktopView.input', { input: input }); },
+      back: function () { return call('desktopView.back'); },
+      forward: function () { return call('desktopView.forward'); },
+      reload: function () { return call('desktopView.reload'); },
+      destroy: function () { return call('desktopView.destroy'); },
+      onFrame: function (cb) { browserFrameListeners.add(cb); return function () { browserFrameListeners.delete(cb); }; },
+      onStatus: function (cb) { browserStatusListeners.add(cb); return function () { browserStatusListeners.delete(cb); }; }
+    },
     browser: {
       available: init.browserAvailable,
       open: function (options) { return call('browser.open', options); },

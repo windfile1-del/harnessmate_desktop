@@ -17,6 +17,7 @@ import {
 
 export interface SandboxedPluginFrameProps {
   pluginId: string;
+  instanceId?: string;
   pluginName: string;
   revision: string;
   slot: AnyPluginSlotKey;
@@ -45,6 +46,7 @@ function serializeSafeProps(input: Record<string, unknown> | undefined): Record<
 
 export function SandboxedPluginFrame({
   pluginId,
+  instanceId,
   pluginName,
   revision,
   slot,
@@ -56,6 +58,7 @@ export function SandboxedPluginFrame({
   defaultHeight,
   compact = false,
 }: SandboxedPluginFrameProps) {
+  const effectiveInstanceId = instanceId ?? pluginId;
   const registry = useSlotRegistry();
   const theme = useSlotTheme();
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -76,7 +79,7 @@ export function SandboxedPluginFrame({
     setDoc(null);
     setError(null);
     void daemonApi
-      .getPluginUiDoc(pluginId, ui, controller.signal)
+      .getPluginUiDoc(effectiveInstanceId, ui, controller.signal)
       .then((res) => {
         if (controller.signal.aborted) return;
         setDoc({ html: res.html, csp: res.csp, runId: res.runId });
@@ -104,14 +107,16 @@ export function SandboxedPluginFrame({
       theme: initialThemeRef.current,
       cssVars: collectThemeCssVars(),
       pluginId,
+      instanceId: effectiveInstanceId,
       runId: doc.runId,
       slotId,
       slot,
       session: initialSessionRef.current,
       props: initialPropsRef.current,
-      browserAvailable: Boolean(window.harnessMateBridge?.pluginBrowser),
+      browserAvailable: Boolean(window.harnessMateBridge?.desktopView ?? window.harnessMateBridge?.pluginBrowser),
+      desktopViewAvailable: Boolean(window.harnessMateBridge?.desktopView ?? window.harnessMateBridge?.pluginBrowser),
     });
-  }, [doc, pluginId, slotId, slot]);
+  }, [doc, pluginId, effectiveInstanceId, slotId, slot]);
 
   // Live theme CSS variable sync without reloading iframe
   useEffect(() => {
@@ -141,8 +146,8 @@ export function SandboxedPluginFrame({
   useEffect(() => {
     if (!doc) return;
     const activeRunId = doc.runId;
-    const browser = window.harnessMateBridge?.pluginBrowser;
-    const viewId = browser ? window.crypto.randomUUID() : '';
+    const desktopView = window.harnessMateBridge?.desktopView ?? window.harnessMateBridge?.pluginBrowser;
+    const viewId = desktopView ? window.crypto.randomUUID() : '';
     let disposed = false;
     let unsubscribeBrowser: (() => void) | undefined;
 
@@ -199,29 +204,36 @@ export function SandboxedPluginFrame({
             const currentSession = sessionRef.current;
             const store = useAppStore.getState();
 
-            if (method.startsWith('browser.')) {
-              if (!browser) {
-                reply(requestId, { ok: false, error: { code: 'E_NOT_SUPPORTED', message: '浏览器预览需要 HarnessMate Desktop' } });
+            if (method.startsWith('browser.') || method.startsWith('desktopView.')) {
+              if (!desktopView) {
+                reply(requestId, { ok: false, error: { code: 'E_NOT_SUPPORTED', message: '桌面视图预览需要 HarnessMate Desktop' } });
                 return;
               }
-              const action = method.slice('browser.'.length);
-              if (action === 'open' && !unsubscribeBrowser) {
-                unsubscribeBrowser = browser.subscribe(viewId, (update) => {
+              const action = method.startsWith('browser.')
+                ? method.slice('browser.'.length)
+                : method.slice('desktopView.'.length);
+              if ((action === 'open' || action === 'create' || action === 'mount' || action === 'navigate') && !unsubscribeBrowser) {
+                unsubscribeBrowser = desktopView.subscribe(viewId, (update) => {
                   if (disposed || iframeRef.current?.contentWindow !== iframeWindow) return;
                   iframeWindow.postMessage('frame' in update
                     ? { type: 'hm:browser:frame', runId, frame: update.frame } satisfies PluginSlotBridgeHostMessage
                     : { type: 'hm:browser:status', runId, status: update.status } satisfies PluginSlotBridgeHostMessage, '*');
                 });
               }
-              await browser.call(viewId, action, action === 'open'
-                ? { url: params?.url, width: params?.width, height: params?.height, pluginId, runId }
-                : params?.input);
+              const payload = (action === 'open' || action === 'create' || action === 'mount' || action === 'navigate')
+                ? { url: params?.url, width: params?.width, height: params?.height, pluginId, instanceId: effectiveInstanceId, runId }
+                : action === 'resize'
+                  ? { width: params?.width, height: params?.height }
+                  : action === 'focus'
+                    ? { focused: params?.focused }
+                    : params?.input;
+              await desktopView.call(viewId, action, payload);
               reply(requestId, { ok: true });
               return;
             }
 
             if (method === 'plugin.message') {
-              const res = await daemonApi.sendPluginUiMessage(pluginId, {
+              const res = await daemonApi.sendPluginUiMessage(effectiveInstanceId, {
                 slotId,
                 slot,
                 runId,
@@ -309,10 +321,10 @@ export function SandboxedPluginFrame({
       window.removeEventListener('message', onMessage);
       if (unsubscribeBrowser) {
         unsubscribeBrowser();
-        void browser?.call(viewId, 'close').catch(() => {});
+        void desktopView?.call(viewId, 'destroy').catch(() => {});
       }
     };
-  }, [doc, pluginId, slot, slotId]);
+  }, [doc, pluginId, effectiveInstanceId, slot, slotId]);
 
   if (error) {
     return (

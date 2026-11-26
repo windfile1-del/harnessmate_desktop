@@ -1,0 +1,16 @@
+{
+  "id": "hm.plugin.approval-policy-default",
+  "name": "默认工具审批策略",
+  "version": "1.0.0",
+  "description": "为会话的模型工具调用提供可按会话替换的审批策略契约实现。",
+  "author": "HarnessMate Core",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "approval.policy.v1"
+  ]
+}

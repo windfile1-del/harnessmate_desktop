@@ -632,7 +632,61 @@ export interface ContextHandoffPreviewV2 {
   renderedPayload: string;
 }
 
+export interface ServiceProvideMeta {
+  version?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ServiceProviderDescriptor {
+  pluginId: string;
+  instanceId: string;
+  contract: string;
+  version: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PluginRouteRequest {
+  method: string;
+  path: string;
+  query: Record<string, string>;
+  headers: Record<string, string>;
+  body?: unknown;
+}
+
+export interface PluginRouteResponse {
+  status?: number;
+  headers?: Record<string, string>;
+  body?: unknown;
+}
+
+export interface ApprovalPolicyRequest {
+  sessionId: string;
+  workspaceId: string;
+  pluginId: string;
+  instanceId: string;
+  toolName: string;
+  readOnly: boolean;
+  args: Record<string, unknown>;
+}
+
+export interface ApprovalPolicyDecision {
+  decision: 'allow' | 'deny' | 'ask';
+  reason?: string;
+}
+
 export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
+  readonly instanceId: string;
+  provide(name: string, service: ServiceImplementation, meta?: ServiceProvideMeta): Disposer;
+  readonly services: {
+    list(contract?: string): Promise<ServiceProviderDescriptor[]>;
+    call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: { instanceId?: string }): Promise<T>;
+  };
+  readonly routes: {
+    register(
+      pathPrefix: string,
+      handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse,
+    ): Disposer;
+  };
   readonly harnesses: {
     registerDriver(driver: PluginHarnessDriverRegistration): Disposer;
     listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;

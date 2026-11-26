@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>无头浏览器</title>
+  <link rel="stylesheet" href="./panel.css">
+</head>
+<body>
+  <div class="header-row">
+    <span class="badge" id="instance-badge">headless</span>
+    <span class="badge muted" id="worker-badge">worker</span>
+    <span id="status" role="status">无头浏览器已就绪。</span>
+  </div>
+  <div class="row">
+    <input id="url" type="url" placeholder="https://example.com 或 http://127.0.0.1:..." aria-label="无头浏览器网址" required>
+    <button id="open-url" type="button">访问</button>
+  </div>
+  <div class="row">
+    <button id="back" type="button">后退</button>
+    <button id="forward" type="button">前进</button>
+    <button id="reload" type="button">刷新</button>
+    <button id="close" type="button">清空</button>
+  </div>
+  <div class="row">
+    <input id="input-text" type="text" placeholder="向无头会话发送中文或表单输入..." aria-label="无头输入">
+    <button id="send-input" type="button">发送输入</button>
+  </div>
+  <section class="card">
+    <h2 id="page-title">无头浏览器就绪</h2>
+    <div id="input-echo" class="echo"></div>
+    <pre id="page-body">等待访问页面…</pre>
+  </section>
+  <section id="links-section" class="card" hidden>
+    <h3>页面链接</h3>
+    <div id="links" class="links"></div>
+  </section>
+  <script src="./panel.js"></script>
+</body>
+</html>
