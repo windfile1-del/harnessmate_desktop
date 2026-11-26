@@ -5,7 +5,7 @@
 - **共同基线**：`b1/baseline`（commit `4eed4537f15d48e4e99d2cd033fe2e15d578083f`）
 - **交付分支**：`b1/b1-03-history-import`
 - **交付文件清单**：
-  - 导入插件：[harnessmate-plugin.json](../../../plugins/bundled/hm.plugin.history-import/harnessmate-plugin.json)、[index.mjs](../../../plugins/bundled/hm.plugin.history-import/index.mjs)、[panel.html](../../../plugins/bundled/hm.plugin.history-import/ui/panel.html)
+  - 导入插件：[harnessmate-plugin.json](../../../plugins/bundled/hm.plugin.history-import/harnessmate-plugin.json)、[index.mjs](../../../plugins/bundled/hm.plugin.history-import/index.mjs)、[panel.html](../../../plugins/bundled/hm.plugin.history-import/ui/panel.html)、[panel.js](../../../plugins/bundled/hm.plugin.history-import/ui/panel.js)、[panel.css](../../../plugins/bundled/hm.plugin.history-import/ui/panel.css)
   - 会话事务适配器：[history-import-adapter.ts](../../../packages/daemon/src/core/history-import-adapter.ts)
   - 已提交变更读模型与一致性快照：[session-change-feed.ts](../../../packages/daemon/src/core/session-change-feed.ts)
   - SQLite 最小增量迁移：[sqlite.ts](../../../packages/daemon/src/db/sqlite.ts)
@@ -84,6 +84,7 @@
 3. 预迁移旧库升级保留工作区/会话、命中旧 `native_history_imports`（`codex_cli`）并允许独立账号同名导入，验证降级只读旧表可读。
 4. 事务内触发器模拟异常回滚（0 会话/0 变更日志残留）、`secret_request` 跳过、分页快照一致性与并发写入游标续读（`upsert_item` / `upsert_session` / `delete_item` / `delete_session`）。
 5. 兼容 HTTP 路由（`/api/v1/harnesses/discovered-sessions`、`/api/v1/harnesses/import-session` 回环校验、`/api/v1/sessions/import-bundle` 归档包重复语义）与实例路由 `/preview`、`/import` 对齐；停用插件返回 `503`（区分 `unconfigured` 与已绑定 `disabled`）且已导入会话仍可打开/回放/导出，恢复后可继续使用。
+6. CSP 沙箱工作页与变更日志传播（`buildSandboxedPluginHtml` 内联 `ui/panel.css` + `ui/panel.js` 符合 `SANDBOX_IFRAME_CSP`、零直接 `fetch()`、零内联脚本、`requestPluginRoute`/`navigateToSession`/`refreshSessions` 宿主持桥对齐 `#51`；插槽 `status`/`workspaces`/`import` 与原/归档导入、`deleteSession` 实时写入 `session_change_log` 供 `B1-04` 立即消费；测试临时根目录改用 `HARNESSMATE_TEST_TMP || TEMP || TMP || os.tmpdir()`）。
 
 ### 5.2 脱敏旧版数据副本验证（`D:\HarnessMate\b1-tmp\b1-03\legacy-copy-test\harnessmate.db`）
 
@@ -99,9 +100,9 @@
 | 命令 | 结果与退出码 |
 | --- | --- |
 | `pnpm --filter @harnessmate/protocol --filter @harnessmate/plugin-api --filter @harnessmate/plugin-sdk build` | 退出码 `0` |
-| `pnpm --filter @harnessmate/daemon test tests/b1-03-history-import.test.ts tests/session-explorer-approval.test.ts --maxWorkers=1 --testTimeout=60000` | 退出码 `0`（`b1-03-history-import.test.ts` 5/5、`session-explorer-approval.test.ts` 7/7） |
-| `pnpm --filter @harnessmate/daemon test tests/plugin-peer-assembly.test.ts --maxWorkers=1` | 退出码 `0`（4/4，首次三文件串行混跑时第 4 用例受并发负载影响超过内置 `25000ms` 超时，单独复跑全部通过） |
+| `pnpm --filter @harnessmate/daemon test tests/b1-03-history-import.test.ts tests/session-explorer-approval.test.ts --maxWorkers=1 --testTimeout=60000` | 退出码 `0`（`b1-03-history-import.test.ts` 6/6、`session-explorer-approval.test.ts` 7/7） |
+| `pnpm --filter @harnessmate/daemon test tests/plugin-peer-assembly.test.ts --maxWorkers=1` | 退出码 `0`（4/4） |
 | `pnpm typecheck` | 退出码 `0`（6 个工作区包通过） |
 | `pnpm contracts:check` | 退出码 `0` |
-| `pnpm --filter @harnessmate/daemon build` + 脱敏副本校验脚本 | 退出码 `0` |
-| `git diff --check -- packages/daemon/src/db/sqlite.ts packages/daemon/src/core/history-import-adapter.ts packages/daemon/src/core/session-change-feed.ts packages/daemon/src/server/routes/history-import-compat.ts packages/daemon/tests/b1-03-history-import.test.ts plugins/bundled/hm.plugin.history-import/` | 退出码 `0`（无空白错误） |
+| `pnpm --filter @harnessmate/daemon build` + 脱敏副本校验脚本 | 退出码 `0`（首轮交付实测，未修改生产存储逻辑） |
+| `git diff --check` | 退出码 `0`（无空白错误） |

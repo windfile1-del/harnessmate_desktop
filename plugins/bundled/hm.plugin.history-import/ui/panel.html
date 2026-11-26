@@ -3,11 +3,152 @@
 <head>
   <meta charset="utf-8">
   <title>历史会话导入</title>
+  <link rel="stylesheet" href="./panel.css">
 </head>
 <body>
-  <main>
-    <h1>历史会话导入</h1>
-    <p>此页面由 <code>hm.plugin.history-import</code>（<code>history.import.v1</code>）提供，支持来源选择、预览、目标工作区绑定、归档包导入与读取阶段取消。</p>
-  </main>
+  <header class="topbar">
+    <div class="title-group">
+      <h1>历史会话导入</h1>
+      <span id="instance-badge" class="badge accent">history-import</span>
+      <span id="source-count-badge" class="badge">来源: 0</span>
+    </div>
+    <div class="tabs" role="tablist" aria-label="导入方式">
+      <button id="tab-native" type="button" role="tab" aria-selected="true" class="active">原生历史来源</button>
+      <button id="tab-bundle" type="button" role="tab" aria-selected="false">归档包 (.json)</button>
+    </div>
+  </header>
+
+  <div id="resolution-banner" class="banner warn" hidden></div>
+  <div id="status-line" class="status-line" role="status">正在初始化历史来源与工作区…</div>
+
+  <section id="native-view">
+    <div class="toolbar">
+      <select id="source-filter" aria-label="来源实例筛选">
+        <option value="">全部来源</option>
+      </select>
+      <input id="query-input" type="search" placeholder="筛选标题、工作目录或原生会话 ID…" aria-label="筛选历史会话">
+      <button id="btn-discover" type="button">刷新扫描</button>
+    </div>
+
+    <div id="source-errors-banner" class="banner error" hidden>
+      <strong id="source-errors-title">部分来源读取失败（其余来源已继续展示）</strong>
+      <ul id="source-errors-list" class="error-list"></ul>
+    </div>
+
+    <div class="workspace-grid">
+      <section class="panel" aria-label="已发现的历史会话">
+        <div class="panel-header">
+          <h2>可导入历史会话</h2>
+          <span id="session-count-badge" class="badge">0 条</span>
+        </div>
+        <div id="session-groups" class="session-groups">
+          <div class="empty-state">正在扫描来源…</div>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="预览与导入配置">
+        <div class="panel-header">
+          <h2 id="detail-title">请选择一条历史会话</h2>
+          <span id="detail-badge" class="badge" hidden>未选择</span>
+        </div>
+        <div id="detail-empty" class="empty-state">
+          从左侧选择一个历史会话后，可固定按该来源引用读取预览、选择目标工作区并执行导入（读取阶段可取消）。
+        </div>
+        <div id="detail-body" class="panel-body" hidden>
+          <div id="existing-session-banner" class="banner success" hidden>
+            <div class="banner-row">
+              <span id="existing-session-text"></span>
+              <button id="btn-open-existing" type="button">打开已有会话</button>
+            </div>
+          </div>
+
+          <div id="preview-warnings-banner" class="banner warn" hidden>
+            <ul id="preview-warnings-list" class="error-list"></ul>
+          </div>
+
+          <div class="form-grid">
+            <div class="field">
+              <label for="native-mode">导入模式</label>
+              <select id="native-mode">
+                <option value="attach">接管续跑 (attach)</option>
+                <option value="mirror">只读镜像副本 (mirror)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="native-workspace">目标工作区</label>
+              <select id="native-workspace"></select>
+            </div>
+            <div class="field full">
+              <label for="native-title-preview">会话标题 / 原目录</label>
+              <input id="native-title-preview" type="text" readonly>
+            </div>
+          </div>
+
+          <div class="actions-row">
+            <button id="btn-refresh-preview" type="button">重新预览</button>
+            <button id="btn-import-native" type="button" class="primary">导入此会话</button>
+            <button id="btn-cancel-import" type="button" class="danger" hidden>取消读取</button>
+          </div>
+
+          <div id="native-result-banner" class="banner success" hidden>
+            <div class="banner-row">
+              <span id="native-result-text"></span>
+              <button id="btn-open-imported" type="button" class="primary">打开会话</button>
+            </div>
+          </div>
+
+          <div id="native-error-banner" class="banner error" hidden></div>
+
+          <div id="preview-messages" class="preview-list"></div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <section id="bundle-view" hidden>
+    <div class="panel">
+      <div class="panel-header">
+        <h2>便携归档包导入 (PortableSessionBundleV2)</h2>
+        <span class="badge">bundleVersion = 2</span>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="field">
+            <label for="bundle-file">选择 .json 归档文件</label>
+            <input id="bundle-file" type="file" accept=".json,application/json">
+          </div>
+          <div class="field">
+            <label for="bundle-workspace">目标工作区</label>
+            <select id="bundle-workspace"></select>
+          </div>
+          <div class="field full">
+            <label for="bundle-title-override">自定义标题（可选）</label>
+            <input id="bundle-title-override" type="text" placeholder="留空则沿用归档包内原标题">
+          </div>
+          <div class="field full">
+            <label for="bundle-json">归档包 JSON 内容</label>
+            <textarea id="bundle-json" placeholder="在此粘贴 PortableSessionBundleV2 JSON 或通过上方按钮选择文件…"></textarea>
+          </div>
+        </div>
+
+        <div class="actions-row">
+          <button id="btn-preview-bundle" type="button">预览归档包</button>
+          <button id="btn-import-bundle" type="button" class="primary">导入归档包</button>
+        </div>
+
+        <div id="bundle-error-banner" class="banner error" hidden></div>
+        <div id="bundle-result-banner" class="banner success" hidden>
+          <div class="banner-row">
+            <span id="bundle-result-text"></span>
+            <button id="btn-open-bundle-session" type="button" class="primary">打开会话</button>
+          </div>
+        </div>
+
+        <div id="bundle-preview-messages" class="preview-list" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <script src="./panel.js"></script>
 </body>
 </html>

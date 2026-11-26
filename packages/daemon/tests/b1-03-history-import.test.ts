@@ -10,6 +10,7 @@ import { HarnessRegistry } from '../src/harnesses/registry.js';
 import type { HarnessAdapter } from '../src/harnesses/types.js';
 import { BUILTIN_PLUGINS } from '../src/plugin-host/builtin/manifests.js';
 import { PluginManager } from '../src/plugins/plugin-manager.js';
+import { buildSandboxedPluginHtml, SANDBOX_IFRAME_CSP } from '../src/plugins/plugin-ui.js';
 import { SessionExplorerService } from '../src/core/session-explorer-service.js';
 import { SessionChangeFeedService } from '../src/core/session-change-feed.js';
 import { HistoryImportAdapter } from '../src/core/history-import-adapter.js';
@@ -20,7 +21,10 @@ import {
   registerHistoryImportCompatRoutes,
 } from '../src/server/routes/history-import-compat.js';
 
-const TEMP_ROOT = 'D:\\HarnessMate\\b1-tmp\\b1-03';
+const TEMP_ROOT = path.join(
+  process.env.HARNESSMATE_TEST_TMP || process.env.TEMP || process.env.TMP || os.tmpdir(),
+  'hm-b1-03-tests',
+);
 const cleanupDirs: string[] = [];
 const managers: PluginManager[] = [];
 const stores: HarnessMateStore[] = [];
@@ -1069,5 +1073,178 @@ export function apply(ctx) {
     expect((routeImport.body as any).ok).toBe(true);
     expect((routeImport.body as any).value.sessionId).toBe(importedSessionId);
     expect((routeImport.body as any).value.disposition).toBe('reused');
+  }, 30_000);
+
+  it('serves CSP-compliant UI assets, handles slot/route workspace flows, and propagates native/bundle/deleteSession changes to session_change_log', async () => {
+    // 1. Verify bundled ui/panel.html inlines ./panel.css & ./panel.js cleanly for SandboxedPluginFrame
+    const bundledPkgDir = fs.existsSync(path.resolve(process.cwd(), 'plugins', 'bundled', 'hm.plugin.history-import'))
+      ? path.resolve(process.cwd(), 'plugins', 'bundled', 'hm.plugin.history-import')
+      : path.resolve(process.cwd(), '..', '..', 'plugins', 'bundled', 'hm.plugin.history-import');
+    const doc = buildSandboxedPluginHtml(bundledPkgDir, 'ui/panel.html');
+    expect(doc.csp).toBe(SANDBOX_IFRAME_CSP);
+    expect(doc.html).toContain('data-inlined-from="ui/panel.css"');
+    expect(doc.html).toContain('data-inlined-from="ui/panel.js"');
+    expect(doc.html).not.toMatch(/<script[^>]*\bsrc=/i);
+    expect(doc.html).not.toMatch(/<link[^>]*\brel=["']stylesheet["']/i);
+    // CSP connect-src 'none' forbids direct fetch() inside iframe UI
+    expect(doc.html).not.toMatch(/\bfetch\s*\(/);
+    expect(doc.html).toContain('requestPluginRoute');
+    expect(doc.html).toContain('navigateToSession');
+    expect(doc.html).toContain('refreshSessions');
+
+    // 2. Verify slot onMessage + HTTP routes + session_change_log live propagation across native/bundle/delete
+    const { store, registry, pluginManager, changeFeed } = await setupImportHarness({
+      sourcePluginFiles: {
+        'history.ui': {
+          pluginId: 'history-ui',
+          code: `
+export async function apply(ctx) {
+  ctx.provide('history.source.v1', {
+    async discover() {
+      return {
+        ok: true,
+        value: {
+          sessions: [
+            {
+              ref: { sourceInstanceId: 'history.ui', sourceId: 'codex:default', nativeSessionId: 'ui-sid-1' },
+              title: 'UI 发现测试会话',
+              harnessKind: 'codex',
+              updatedAt: 1700000000500,
+              messageCount: 2,
+              workspaceHint: { cwd: null },
+            },
+          ],
+        },
+      };
+    },
+    async read(req) {
+      if (req.ref.nativeSessionId !== 'ui-sid-1') {
+        return { ok: false, error: { code: 'not_found', message: 'not found' } };
+      }
+      return {
+        ok: true,
+        value: {
+          items: [
+            { role: 'user', text: 'UI 导入问题' },
+            { role: 'assistant', text: 'UI 导入答复' },
+          ],
+          readStatus: 'complete',
+          warnings: [],
+        },
+      };
+    },
+    async cancel() {
+      return { ok: true, value: { cancelled: false, status: 'not_found' } };
+    },
+  }, { version: '1.0.0', metadata: { title: 'UI 测试来源' } });
+}
+`,
+        },
+      },
+    });
+    const wsDir = ensureTempDir('hm-b1-03-ui-ws-');
+    const ws = store.createWorkspace({
+      id: 'ws-ui',
+      name: 'UI Workspace',
+      rootPath: wsDir,
+      isGitRepo: false,
+      gitBranch: null,
+      createdAt: Date.now(),
+    });
+
+    const msgStatus = await pluginManager.isolated!.sendSlotMessage(
+      'hm.plugin.history-import',
+      'history-import',
+      undefined,
+      { type: 'status' },
+      null,
+      'workspace.pages',
+    );
+    expect((msgStatus as any).ok).toBe(true);
+    expect((msgStatus as any).value.instanceId).toBe('hm.plugin.history-import');
+
+    const msgWorkspaces = await pluginManager.isolated!.sendSlotMessage(
+      'hm.plugin.history-import',
+      'history-import',
+      undefined,
+      { type: 'workspaces' },
+      null,
+      'workspace.pages',
+    );
+    expect((msgWorkspaces as any).ok).toBe(true);
+    expect((msgWorkspaces as any).value.workspaces.some((w: any) => w.id === ws.id)).toBe(true);
+
+    const routeDiscover = await pluginManager.isolated!.dispatchRoute('hm.plugin.history-import', {
+      method: 'POST',
+      path: '/discover',
+      query: {},
+      headers: {},
+      body: {},
+    });
+    expect(routeDiscover.status).toBe(200);
+    expect((routeDiscover.body as any).ok).toBe(true);
+    expect((routeDiscover.body as any).value.sessions).toHaveLength(1);
+
+    const seqBeforeImport = changeFeed.getLatestSeq();
+    const msgImport = await pluginManager.isolated!.sendSlotMessage(
+      'hm.plugin.history-import',
+      'history-import',
+      undefined,
+      {
+        type: 'import',
+        params: {
+          requestId: 'ui-native-req-1',
+          workspaceId: ws.id,
+          input: {
+            kind: 'native',
+            ref: { sourceInstanceId: 'history.ui', sourceId: 'codex:default', nativeSessionId: 'ui-sid-1' },
+            mode: 'attach',
+          },
+        },
+      },
+      null,
+      'workspace.pages',
+    );
+    expect((msgImport as any).ok).toBe(true);
+    const nativeSessionId = (msgImport as any).value.sessionId as string;
+
+    const changesAfterNative = changeFeed.readCommittedChanges({ afterSeq: seqBeforeImport, limit: 50 });
+    expect(changesAfterNative.changes.some((c) => c.kind === 'upsert_session' && c.sessionId === nativeSessionId)).toBe(true);
+    expect(changesAfterNative.changes.some((c) => c.kind === 'upsert_item' && c.sessionId === nativeSessionId)).toBe(true);
+
+    // Bundle import via slot onMessage also writes to session_change_log
+    const exported = new SessionExplorerService(store, registry).exportSession(nativeSessionId, 'json_bundle');
+    expect(exported.format).toBe('json_bundle');
+    if (exported.format !== 'json_bundle') throw new Error('expected json_bundle');
+    const seqBeforeBundle = changesAfterNative.latestSeq;
+    const msgBundle = await pluginManager.isolated!.sendSlotMessage(
+      'hm.plugin.history-import',
+      'history-import',
+      undefined,
+      {
+        type: 'import',
+        params: {
+          requestId: 'ui-bundle-req-1',
+          workspaceId: ws.id,
+          input: {
+            kind: 'bundle',
+            bundle: exported.bundle,
+            titleOverride: 'UI 归档导入会话',
+          },
+        },
+      },
+      null,
+      'workspace.pages',
+    );
+    expect((msgBundle as any).ok).toBe(true);
+    const bundleSessionId = (msgBundle as any).value.sessionId as string;
+    const changesAfterBundle = changeFeed.readCommittedChanges({ afterSeq: seqBeforeBundle, limit: 50 });
+    expect(changesAfterBundle.changes.some((c) => c.kind === 'upsert_session' && c.sessionId === bundleSessionId)).toBe(true);
+    expect(changesAfterBundle.changes.some((c) => c.kind === 'upsert_item' && c.sessionId === bundleSessionId)).toBe(true);
+
+    const seqBeforeDelete = changesAfterBundle.latestSeq;
+    store.deleteSession(nativeSessionId);
+    const changesAfterDelete = changeFeed.readCommittedChanges({ afterSeq: seqBeforeDelete, limit: 50 });
+    expect(changesAfterDelete.changes.some((c) => c.kind === 'delete_session' && c.sessionId === nativeSessionId)).toBe(true);
   }, 30_000);
 });

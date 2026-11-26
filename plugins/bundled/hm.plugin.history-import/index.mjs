@@ -596,17 +596,27 @@ export function apply(ctx) {
       if (!payload || typeof payload !== 'object') {
         return fail('invalid_request', '无效工作页消息');
       }
+      const params =
+        payload.params && typeof payload.params === 'object' ? payload.params : payload;
       switch (payload.type) {
+        case 'status':
+          return ok({
+            instanceId: ctx.instanceId,
+            pluginId: ctx.pluginId,
+            activeOperations: inFlightByOpId.size,
+          });
         case 'sources':
           return ok({ sources: await listSources() });
+        case 'workspaces':
+          return ok({ workspaces: await callData('listWorkspaces', []) });
         case 'discover':
-          return discover(payload.params ?? {});
+          return discover(params);
         case 'preview':
-          return preview(payload.params ?? {});
+          return preview(params);
         case 'import':
-          return performImport(payload.params ?? {});
+          return performImport(params);
         case 'cancel':
-          return cancel(payload.params ?? {});
+          return cancel(params);
         default:
           return fail('invalid_request', '未知导入工作页操作');
       }
