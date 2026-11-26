@@ -1,50 +1,180 @@
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  padding: 12px;
-  font-family: system-ui, -apple-system, sans-serif;
+  padding: 14px;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   font-size: 13px;
   color: #e5e7eb;
-  background: #111827;
+  background: #0b1120;
 }
-.header-row, .search-row {
+.shell {
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.header-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.brand-group {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
+}
+.engine-pill {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: #1e3a8a;
+  color: #bfdbfe;
+  font-size: 11px;
+  font-weight: 600;
 }
 .badge {
   padding: 2px 8px;
   border-radius: 999px;
   background: #1f2937;
   color: #93c5fd;
-  font-family: monospace;
+  font-family: ui-monospace, monospace;
   font-size: 11px;
 }
-#query {
-  flex: 1;
-  padding: 6px 10px;
+.status-text {
+  font-size: 12px;
+  color: #9ca3af;
+}
+.controls-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #1f2937;
+  background: #111827;
+}
+.search-row, .index-row, .summary-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.index-row, .summary-bar {
+  justify-content: space-between;
+}
+.index-actions, .pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #9ca3af;
+}
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+input[type='search'], input[type='datetime-local'], select {
+  padding: 6px 9px;
   border-radius: 6px;
   border: 1px solid #374151;
   background: #1f2937;
   color: #f9fafb;
+  font-size: 12px;
 }
+#query { flex: 1; min-width: 220px; font-size: 13px; }
 button {
   padding: 6px 12px;
   border-radius: 6px;
   border: 1px solid #374151;
   background: #2563eb;
   color: #fff;
+  font-size: 12px;
   cursor: pointer;
 }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
-.results { display: flex; flex-direction: column; gap: 8px; }
-.hit {
-  padding: 10px;
+button.btn-secondary { background: #1e293b; color: #e2e8f0; }
+button.btn-ghost { background: transparent; color: #cbd5e1; }
+button.btn-danger { background: #dc2626; border-color: #ef4444; }
+button.btn-accent { background: #0284c7; border-color: #38bdf8; }
+button:hover:not(:disabled) { filter: brightness(1.1); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.summary-bar {
+  padding: 6px 10px;
   border-radius: 8px;
-  border: 1px solid #374151;
-  background: #1f2937;
+  background: #111827;
+  border: 1px solid #1f2937;
+  font-size: 12px;
+  color: #cbd5e1;
 }
-.hit-title { font-weight: 600; margin-bottom: 4px; }
-.hit-meta { font-size: 11px; color: #9ca3af; margin-bottom: 4px; }
-.hit-snippet { color: #d1d5db; }
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hit {
+  padding: 11px 12px;
+  border-radius: 8px;
+  border: 1px solid #1f2937;
+  border-left: 3px solid #3b82f6;
+  background: #111827;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.hit:hover, .hit:focus-visible {
+  border-color: #3b82f6;
+  background: #172033;
+  outline: none;
+}
+.hit-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.hit-title {
+  font-weight: 600;
+  color: #f3f4f6;
+}
+.hit-jump {
+  font-size: 11px;
+  color: #60a5fa;
+  white-space: nowrap;
+}
+.hit-meta {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-bottom: 6px;
+}
+.hit-snippet {
+  color: #d1d5db;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.hit-snippet mark {
+  background: rgba(59, 130, 246, 0.35);
+  color: #fef08a;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.empty-state {
+  padding: 20px;
+  text-align: center;
+  border-radius: 8px;
+  border: 1px dashed #374151;
+  color: #9ca3af;
+}

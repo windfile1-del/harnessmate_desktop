@@ -131,6 +131,7 @@ export interface ReindexJobStatus {
   jobId: string;
   mode: 'full' | 'incremental' | 'resume';
   status: ReindexJobState;
+  workspaceId?: string | null;
   indexedCount: number;
   deletedCount: number;
   totalEstimate?: number;
@@ -143,6 +144,11 @@ export interface ReindexJobStatus {
   updatedAt: number;
   finishedAt?: number | null;
   error?: string | null;
+}
+
+export interface ScopedRebuildSkip {
+  workspaceId: string;
+  upToSeq: number;
 }
 
 export interface SearchEngineStatus {
@@ -677,6 +683,7 @@ interface SyncStateRow {
   snapshot_id: string | null;
   snapshot_watermark: number | null;
   snapshot_cursor: string | null;
+  scoped_skips_json: string | null;
   reindex_state: string;
   job_json: string | null;
   updated_at: number;
@@ -767,14 +774,19 @@ export class SessionSearchEngineInstance {
         snapshot_id TEXT,
         snapshot_watermark INTEGER,
         snapshot_cursor TEXT,
+        scoped_skips_json TEXT NOT NULL DEFAULT '[]',
         reindex_state TEXT NOT NULL DEFAULT 'idle',
         job_json TEXT,
         updated_at INTEGER NOT NULL
       );
     `);
+    const syncCols = db.prepare('PRAGMA table_info(search_sync_state)').all() as unknown as Array<{ name: string }>;
+    if (!syncCols.some((c) => c.name === 'scoped_skips_json')) {
+      db.exec("ALTER TABLE search_sync_state ADD COLUMN scoped_skips_json TEXT NOT NULL DEFAULT '[]';");
+    }
     db.prepare(
-      `INSERT OR IGNORE INTO search_sync_state (id, cursor_seq, reindex_state, updated_at)
-       VALUES (1, 0, 'idle', ?)`,
+      `INSERT OR IGNORE INTO search_sync_state (id, cursor_seq, scoped_skips_json, reindex_state, updated_at)
+       VALUES (1, 0, '[]', 'idle', ?)`,
     ).run(Date.now());
     this.db = db;
     return db;
@@ -901,10 +913,53 @@ export class SessionSearchEngineInstance {
   private readSyncStateRow(db = this.ensureDb()): SyncStateRow {
     return db
       .prepare(
-        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, reindex_state, job_json, updated_at
+        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, scoped_skips_json, reindex_state, job_json, updated_at
          FROM search_sync_state WHERE id = 1`,
       )
       .get() as unknown as SyncStateRow;
+  }
+
+  private parseScopedSkips(raw: string | null): ScopedRebuildSkip[] {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (s): s is ScopedRebuildSkip =>
+          Boolean(s && typeof s === 'object' && typeof s.workspaceId === 'string' && typeof s.upToSeq === 'number'),
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  private mergeScopedSkip(skips: ScopedRebuildSkip[], workspaceId: string, upToSeq: number): ScopedRebuildSkip[] {
+    const map = new Map<string, number>();
+    for (const s of skips) map.set(s.workspaceId, s.upToSeq);
+    map.set(workspaceId, Math.max(map.get(workspaceId) ?? 0, upToSeq));
+    return [...map.entries()].map(([ws, seq]) => ({ workspaceId: ws, upToSeq: seq }));
+  }
+
+  private pruneScopedSkips(skips: ScopedRebuildSkip[], cursorSeq: number): ScopedRebuildSkip[] {
+    return skips.filter((s) => s.upToSeq > cursorSeq);
+  }
+
+  private resolveChangeWorkspaceId(change: SessionSearchChange): string | null {
+    if (change.kind === 'upsert_item') {
+      return change.item?.workspaceId ?? change.workspaceId ?? null;
+    }
+    if (change.kind === 'upsert_session') {
+      return change.session?.workspaceId ?? change.workspaceId ?? null;
+    }
+    return change.workspaceId ?? null;
+  }
+
+  private shouldSkipScopedChange(change: SessionSearchChange, skips: ScopedRebuildSkip[]): boolean {
+    if (skips.length === 0) return false;
+    const wsId = this.resolveChangeWorkspaceId(change);
+    if (!wsId) return false;
+    const skip = skips.find((s) => s.workspaceId === wsId);
+    return Boolean(skip && change.changeSeq <= skip.upToSeq);
   }
 
   private parseJobJson(raw: string | null): ReindexJobStatus | null {
@@ -1026,8 +1081,10 @@ export class SessionSearchEngineInstance {
       if (this.disposed || this.paused || this.generation !== startGen) break;
       if (page.changes.length === 0) {
         if (page.latestSeq > state.cursor_seq) {
-          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, updated_at = ? WHERE id = 1').run(
+          const pruned = this.pruneScopedSkips(this.parseScopedSkips(state.scoped_skips_json), page.latestSeq);
+          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
             page.latestSeq,
+            JSON.stringify(pruned),
             Date.now(),
           );
         }
@@ -1035,9 +1092,13 @@ export class SessionSearchEngineInstance {
       }
 
       const maxBatchSeq = page.changes[page.changes.length - 1]!.changeSeq;
+      const skips = this.parseScopedSkips(state.scoped_skips_json);
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const change of page.changes) {
+          if (this.shouldSkipScopedChange(change, skips)) {
+            continue;
+          }
           if (change.kind === 'upsert_item' && change.item) {
             this.upsertItemInTx(db, change.item);
           } else if (change.kind === 'upsert_session') {
@@ -1050,8 +1111,10 @@ export class SessionSearchEngineInstance {
           totalApplied += 1;
         }
         const nextCursorSeq = Math.max(state.cursor_seq, maxBatchSeq);
-        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, updated_at = ? WHERE id = 1').run(
+        const prunedSkips = this.pruneScopedSkips(skips, nextCursorSeq);
+        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
           nextCursorSeq,
+          JSON.stringify(prunedSkips),
           Date.now(),
         );
         db.exec('COMMIT');
@@ -1130,11 +1193,15 @@ export class SessionSearchEngineInstance {
         Boolean(stateRow.snapshot_id || stateRow.snapshot_cursor !== null || stateRow.snapshot_watermark !== null);
 
       const now = Date.now();
+      const targetWorkspaceId = canResume
+        ? (prevJob?.workspaceId ?? opts?.workspaceId ?? null)
+        : (opts?.workspaceId ?? null);
       let job: ReindexJobStatus = canResume && prevJob
         ? {
             ...prevJob,
             mode: 'resume',
             status: 'running',
+            workspaceId: targetWorkspaceId,
             updatedAt: now,
             finishedAt: null,
             error: null,
@@ -1143,6 +1210,7 @@ export class SessionSearchEngineInstance {
             jobId: opts?.jobId ?? `reindex_${crypto.randomBytes(5).toString('hex')}`,
             mode: 'full',
             status: 'running',
+            workspaceId: targetWorkspaceId,
             indexedCount: 0,
             deletedCount: 0,
             cursorSeq: stateRow.cursor_seq,
@@ -1160,14 +1228,14 @@ export class SessionSearchEngineInstance {
         // Fresh full rebuild: reset index tables atomically before reading snapshot page 1
         db.exec('BEGIN IMMEDIATE');
         try {
-          if (opts?.workspaceId) {
+          if (targetWorkspaceId) {
             const existingIds = db
               .prepare('SELECT item_id FROM search_items WHERE workspace_id = ?')
-              .all(opts.workspaceId) as unknown as Array<{ item_id: string }>;
+              .all(targetWorkspaceId) as unknown as Array<{ item_id: string }>;
             for (const row of existingIds) {
               db.prepare('DELETE FROM search_fts WHERE item_id = ?').run(row.item_id);
             }
-            db.prepare('DELETE FROM search_items WHERE workspace_id = ?').run(opts.workspaceId);
+            db.prepare('DELETE FROM search_items WHERE workspace_id = ?').run(targetWorkspaceId);
           } else {
             db.exec('DELETE FROM search_items; DELETE FROM search_fts; DELETE FROM search_sessions_meta;');
           }
@@ -1222,14 +1290,14 @@ export class SessionSearchEngineInstance {
               snapshotId,
               cursor,
               limit: this.batchSize,
-              workspaceId: opts?.workspaceId,
+              workspaceId: targetWorkspaceId ?? undefined,
             });
           } catch {
             // If snapshot expired across process restart, re-open a consistent snapshot from start;
             // upsertItemInTx is idempotent by item_id.
             page = await this.readModel.readSearchSnapshot({
               limit: this.batchSize,
-              workspaceId: opts?.workspaceId,
+              workspaceId: targetWorkspaceId ?? undefined,
             });
           }
 
@@ -1255,7 +1323,7 @@ export class SessionSearchEngineInstance {
 
           snapshotId = page.snapshotId;
           watermarkSeq = page.watermarkSeq;
-          const nextCursor = page.nextCursor;
+          const nextCursor = page.nextCursor ?? null;
 
           db.exec('BEGIN IMMEDIATE');
           try {
@@ -1271,16 +1339,30 @@ export class SessionSearchEngineInstance {
             job.updatedAt = Date.now();
 
             if (!nextCursor) {
-              // Final snapshot page: atomically advance cursor_seq to snapshot watermark!
-              const currentCursor = this.readSyncStateRow(db).cursor_seq;
-              const nextCursorSeq = Math.max(currentCursor, watermarkSeq);
-              job.cursorSeq = nextCursorSeq;
-              db.prepare(
-                `UPDATE search_sync_state
-                 SET cursor_seq = ?, snapshot_id = NULL, snapshot_watermark = NULL,
-                     snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
-                 WHERE id = 1`,
-              ).run(nextCursorSeq, JSON.stringify(job), job.updatedAt);
+              const syncRow = this.readSyncStateRow(db);
+              const currentCursor = syncRow.cursor_seq;
+              if (targetWorkspaceId) {
+                // Scoped workspace rebuild: preserve global cursor_seq so unconsumed changes in other workspaces are NOT skipped!
+                const nextSkips = watermarkSeq > currentCursor
+                  ? this.mergeScopedSkip(this.parseScopedSkips(syncRow.scoped_skips_json), targetWorkspaceId, watermarkSeq)
+                  : this.parseScopedSkips(syncRow.scoped_skips_json);
+                job.cursorSeq = currentCursor;
+                db.prepare(
+                  `UPDATE search_sync_state
+                   SET scoped_skips_json = ?, snapshot_id = NULL, snapshot_watermark = NULL,
+                       snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
+                   WHERE id = 1`,
+                ).run(JSON.stringify(nextSkips), JSON.stringify(job), job.updatedAt);
+              } else {
+                const nextCursorSeq = Math.max(currentCursor, watermarkSeq);
+                job.cursorSeq = nextCursorSeq;
+                db.prepare(
+                  `UPDATE search_sync_state
+                   SET cursor_seq = ?, scoped_skips_json = '[]', snapshot_id = NULL, snapshot_watermark = NULL,
+                       snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
+                   WHERE id = 1`,
+                ).run(nextCursorSeq, JSON.stringify(job), job.updatedAt);
+              }
             } else {
               db.prepare(
                 `UPDATE search_sync_state
@@ -1478,6 +1560,17 @@ export class SessionSearchEngineInstance {
       resumeAvailable: Boolean(row.snapshot_id || row.snapshot_cursor !== null || row.snapshot_watermark !== null),
       lastError: this.lastError,
     };
+  }
+
+  /**
+   * Synchronizes committed changes before querying so newly imported/updated/deleted sessions
+   * are immediately reflected without manual reindex.
+   */
+  async queryAsync(opts: SessionSearchQueryRequest): Promise<SessionSearchQueryResult> {
+    if (!this.paused && !this.disposed) {
+      await this.syncIncremental();
+    }
+    return this.query(opts);
   }
 
   /**

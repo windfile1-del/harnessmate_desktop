@@ -6,18 +6,83 @@
   <link rel="stylesheet" href="./panel.css">
 </head>
 <body>
-  <div class="header-row">
-    <span class="badge" id="instance-badge">session-search-lite</span>
-    <span id="status" role="status">就绪</span>
+  <div class="shell">
+    <header class="header-row">
+      <div class="brand-group">
+        <span class="engine-pill">第三方替代引擎 · Lite 倒排检索</span>
+        <span class="badge" id="instance-badge">session-search-lite</span>
+      </div>
+      <span id="status" class="status-text" role="status">正在连接索引状态…</span>
+    </header>
+
+    <section class="controls-card" aria-label="Lite 搜索条件与索引操作">
+      <div class="search-row">
+        <input
+          id="query"
+          type="search"
+          placeholder="输入关键词（Lite 内存倒排 + 中文二元分词）"
+          aria-label="搜索关键词"
+        >
+        <button id="run-search" type="button" class="btn-primary">检索</button>
+        <button id="clear-filters" type="button" class="btn-ghost">重置</button>
+      </div>
+
+      <div class="filter-row">
+        <label class="field">
+          <span>工作区</span>
+          <select id="workspace-filter" aria-label="按工作区筛选">
+            <option value="">全部工作区</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>驱动 / Harness</span>
+          <select id="driver-filter" aria-label="按驱动筛选">
+            <option value="">全部驱动</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>起始时间</span>
+          <input id="from-ts" type="datetime-local" aria-label="起始时间">
+        </label>
+        <label class="field">
+          <span>结束时间</span>
+          <input id="to-ts" type="datetime-local" aria-label="结束时间">
+        </label>
+        <label class="field field-compact">
+          <span>每页</span>
+          <select id="limit-select" aria-label="每页条数">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="index-row">
+        <label class="checkbox-label">
+          <input id="scope-reindex" type="checkbox">
+          <span>仅重建当前工作区</span>
+        </label>
+        <div class="index-actions">
+          <button id="run-sync" type="button" class="btn-secondary">增量同步</button>
+          <button id="run-reindex" type="button" class="btn-secondary">重建 Lite 索引</button>
+          <button id="cancel-reindex" type="button" class="btn-danger" hidden>取消重建</button>
+          <button id="resume-reindex" type="button" class="btn-accent" hidden>断点续跑</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="summary-bar" class="summary-bar" hidden>
+      <span id="query-meta"></span>
+      <div class="pager">
+        <button id="prev-page" type="button" class="btn-ghost" disabled>上一页</button>
+        <span id="page-info">第 1 页</span>
+        <button id="next-page" type="button" class="btn-ghost" disabled>下一页</button>
+      </div>
+    </div>
+
+    <main id="results" class="results" aria-live="polite"></main>
   </div>
-  <div class="search-row">
-    <input id="query" type="search" placeholder="输入关键词（轻量倒排索引）" aria-label="搜索关键词">
-    <button id="run-search" type="button">搜索</button>
-    <button id="run-reindex" type="button">重建索引</button>
-    <button id="cancel-reindex" type="button" hidden>取消</button>
-    <button id="resume-reindex" type="button" hidden>续跑</button>
-  </div>
-  <div id="results" class="results"></div>
   <script src="./panel.js"></script>
 </body>
 </html>

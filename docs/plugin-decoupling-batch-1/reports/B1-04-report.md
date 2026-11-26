@@ -14,7 +14,8 @@
 | 替代搜索实现样例 | `plugins/examples/hm.plugin.session-search-lite/` | 纯 JS 轻量倒排 + 中文二元分词实现，无 SQLite 依赖，通过同一 `session.search.v1` (`1.0.0`) 契约独立安装、启用与切换。 |
 | 投影与索引引擎 | `packages/daemon/src/core/session-search-engine.ts` | 提供 `SessionSearchEngineInstance`、`SessionSearchEngineManager`、`FixtureSessionSearchReadModel`、`StoreSessionSearchReadModel` 与 `createSessionSearchReadModelService`。各实例独立拥有 `.fts.sqlite` 文件与同步水位 `cursor_seq`。 |
 | 旧路由兼容适配 | `packages/daemon/src/server/routes/session-search-compat.ts` | 提供 `registerSessionSearchCompatRoutes`、实例解析 `resolveSessionSearchInstance` 与 `LEGACY_DIRECT_SEARCH_INDEX_CALL_SITES` 清单，供 B1-06 在 `server/app.ts` 挂载。 |
-| 自动化验证测试 | `packages/daemon/tests/b1-04-session-search.test.ts` | 覆盖旧检索结果对照、并发重建、暂停期间增删改恢复、取消与断点续跑、模拟崩溃恢复、删除重放幂等性及 FTS/Lite 双实例按工作区并存与兼容路由切换。 |
+| 自动化验证测试 | `packages/daemon/tests/b1-04-session-search.test.ts` | 覆盖旧检索结果对照、并发重建、暂停期间增删改恢复、取消与断点续跑、模拟崩溃恢复、删除重放幂等性、FTS/Lite 双实例按工作区并存，以及 FTS/Lite 分发入口直测（启用态实时导入删除、两阶段分块注错与篡改自愈、按工作区重建不跳别区变更、UI CSP/桥接约束）。 |
+| 搜索插件面板 UI | `plugins/bundled/hm.plugin.session-search-fts/ui/` & `plugins/examples/hm.plugin.session-search-lite/ui/` | 对齐 `SandboxedPluginFrame`（`window.harnessMate.requestPluginRoute` / `onContext` / `navigateToSession`，零内联脚本与 `innerHTML`），支持工作区/驱动/时间范围筛选、分页、安全 `<mark>` 高亮及点击跳转；Lite 具备独立视觉主题用于第三方 UI 接管验收。 |
 
 ## 3. 默认与替代插件配置及安装示例
 
@@ -62,12 +63,15 @@
 ## 4. 已提交变更读模型与一致性快照用法
 
 1. **与 B1-03 对齐接口**：插件优先通过 `ctx.services.list()` 探测 `hm.session-data.v1`（并兼容 `session.readModel.v1` / `session.changes.v1`），缺失时回落到公共 `ctx.sessions.list` + `ctx.sessions.listItems`。
-2. **全量快照与续读闭环**：
-   - 重建开始时调用 `readSearchSnapshot({ limit })` 获取 `{ snapshotId, watermarkSeq, items, nextCursor }`，按页在单次事务内幂等写入 `search_items` 与 `search_fts`（按 `item_id` 去重，跳过 `secret_request`）。
-   - 最后一页提交时在同一个 SQLite `BEGIN IMMEDIATE ... COMMIT` 事务内将 `cursor_seq` 推进到 `max(cursor_seq, watermarkSeq)`，随即执行 `readCommittedChanges({ afterSeq: watermarkSeq })` 补齐重建期间并发提交的 `upsert_item` / `upsert_session` / `delete_session` / `delete_item`。
+2. **全量快照、启用态实时同步与按工作区重建闭环**：
+   - **启用态即时同步（A5 修复）**：监听 `turn.completed`、`message.user`、`message.assistant.completed`、`session.created` 事件并在启动时通过串行 `enqueueSync()` 自动追赶；同时在 `query()` 执行前自动等待一次轻量 `enqueueSync()`，确保外部导入（含 Bundle 导入）、会话改名与删除在启用态无需手动 `reindex` 即可立即命中/消除。
+   - **两阶段持久化与完整性校验（A5 修复）**：沙箱 `:memory:` FTS 与 Lite 插件均采用两阶段代次提交（阶段 1 逐块写入 `fts:gen:<gen>:chunk:<i>` / `lite:gen:<gen>:chunk:<i>`；阶段 2 仅在全部分块成功后原子提交 `fts:meta` / `lite:meta` 含 `schemaVersion: 2`、`generation`、`cursorSeq`、`scopedSkips`、`totalBytes`、`sha256`；阶段 3 清理旧代分块）。写入异常绝不吞错，回滚新分块并恢复内存 `cursor_seq`；重启时校验分块数量、字节数与 SHA-256，受损时重置游标安全重建。
+   - **按工作区重建隔离（A5 修复）**：全量 `reindex({ workspaceId: 'A' })` 仅清除并重扫目标工作区条目，**不推进全局 `cursor_seq`**，而是记录 `{ workspaceId: 'A', upToSeq: snapSeq }` 于 `scopedSkips`，后续增量追赶跳过 `A` 的 `<= snapSeq` 已快照变更而完整消费其他工作区（如 `B`）的未消费新增/更新/删除，直至全局水位跨越 `upToSeq` 后裁剪。
 3. **代次隔离与取消/崩溃续跑**：
    - `generation` 令牌和 `disposed` 标志确保实例停用、重载或取消后旧任务立即停止提交。
    - 取消或崩溃重启后保留 `snapshot_id`、`snapshot_watermark`、`snapshot_cursor` 与 `cursor_seq`，`start()` 自动将残留 `running` 任务标记为可续跑，`resumeReindex()` 从断点继续。
+4. **插件 UI 面板与 `SandboxedPluginFrame` 对齐（A2 修复）**：
+   - `panel.js` 严格遵守沙箱 CSP（无 `fetch()`、无内联脚本/样式、无 `innerHTML`，高亮使用 `document.createElement('mark')` + `TextNode`），通过 `window.harnessMate.onContext` 同步工作区/驱动列表与 `initialQuery`，经 `requestPluginRoute`（回落 `sendToPlugin`）调用 `/status`、`/query`、`/sync`、`/reindex`、`/reindex/cancel`、`/reindex/resume`，点击命中卡片通过 `navigateToSession({ sessionId, turnId, itemId, workspaceId, closeWorkspace: true })` 跳转定位。
 
 ## 5. Legacy 直接索引调用点清单与 B1-06 挂载说明
 
@@ -113,10 +117,9 @@ B1-06 在整合分支挂载兼容路由并清理旧写入路径时，需处理�
 | `pnpm --filter @harnessmate/protocol --filter @harnessmate/plugin-api --filter @harnessmate/plugin-sdk build` | `0` | 三包构建通过 |
 | `pnpm contracts:check` | `0` | 公共契约快照校验通过 |
 | `pnpm typecheck` | `0` | 6 个工作区包类型检查全部通过 |
-| `pnpm --filter @harnessmate/daemon test tests/b1-04-session-search.test.ts --maxWorkers=1 --testTimeout=60000` | `0` | `3/3` 通过（同夹具 FTS5/CJK/XSS/分页对照；并发写入/暂停增删改/取消续跑/崩溃恢复/删除重放；FTS + Lite 双工作区并存与兼容路由） |
-| `pnpm --filter @harnessmate/daemon test tests/session-explorer-approval.test.ts --maxWorkers=1 --testTimeout=60000` | `0` | `7/7` 通过 |
-| `pnpm --filter @harnessmate/daemon test tests/plugin-peer-assembly.test.ts --maxWorkers=1 --testTimeout=60000` | `0` | `4/4` 通过（注：与其它两个长测试串联在单进程压力下曾触发其自带 25s 硬超时 1 次，单独重跑稳定 `4/4` 通过） |
-| `git diff --check` | 待提交后复核 | 将在写入本报告并暂存文件后执行最终校验 |
+| `pnpm --filter @harnessmate/daemon test tests/b1-04-session-search.test.ts --maxWorkers=1 --testTimeout=60000` | `0` | `10/10` 通过（旧实现对照 + 并发/断点恢复/删除重放 + 双工作区与兼容路由 + FTS/Lite 分发入口启用态实时同步、两阶段分块注错与 SHA-256 恢复、按工作区重建隔离与 UI CSP/桥接检验） |
+| `pnpm --filter @harnessmate/daemon test tests/session-explorer-approval.test.ts tests/plugin-peer-assembly.test.ts --maxWorkers=1 --testTimeout=60000` | `0` | `11/11` 通过（`session-explorer-approval` `7/7` + `plugin-peer-assembly` `4/4`） |
+| `git diff --check` | `0` | 提交前暂存区格式/空白符校验通过（见最新提交前检查） |
 
 ### 未覆盖范围与规模说明
 

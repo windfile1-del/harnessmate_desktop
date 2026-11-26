@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -618,4 +618,346 @@ describe('B1-04 · Session Search Engine & Peer Plugins', () => {
 
     await compatApp.close();
   }, 60_000);
+});
+
+describe('B1-04 direct plugin entrypoint guarantees (FTS & Lite)', () => {
+  function createPluginHarness(
+    readModel: FixtureSessionSearchReadModel,
+    options: {
+      instanceId: string;
+      pluginId: string;
+      backingMap?: Map<string, unknown>;
+      onStorageSet?: (key: string, value: unknown, rawMap: Map<string, unknown>) => void;
+    },
+  ) {
+    const rawMap = options.backingMap ?? new Map<string, unknown>();
+    const provided = new Map<string, Record<string, (...args: unknown[]) => unknown>>();
+    const eventHandlers = new Map<string, Array<(payload: unknown) => void>>();
+    const cleanups: Array<() => void | Promise<void>> = [];
+
+    const ctx = {
+      instanceId: options.instanceId,
+      pluginId: options.pluginId,
+      storage: {
+        plugin: {
+          async get(key: string) {
+            return rawMap.has(key) ? structuredClone(rawMap.get(key)) : undefined;
+          },
+          async set(key: string, value: unknown) {
+            options.onStorageSet?.(key, value, rawMap);
+            rawMap.set(key, structuredClone(value));
+          },
+          async delete(key: string) {
+            rawMap.delete(key);
+          },
+          async keys() {
+            return [...rawMap.keys()];
+          },
+        },
+      },
+      services: {
+        async list() {
+          return [{ contract: 'hm.session-data.v1', version: '1.0.0' }];
+        },
+        async call(contract: string, method: string, args: unknown[] = []) {
+          if (contract !== 'hm.session-data.v1') {
+            throw new Error(`Unknown contract: ${contract}`);
+          }
+          if (method === 'readSearchSnapshot') {
+            return readModel.readSearchSnapshot((args[0] ?? {}) as Parameters<FixtureSessionSearchReadModel['readSearchSnapshot']>[0]);
+          }
+          if (method === 'readCommittedChanges') {
+            return readModel.readCommittedChanges((args[0] ?? { afterSeq: 0 }) as Parameters<FixtureSessionSearchReadModel['readCommittedChanges']>[0]);
+          }
+          throw new Error(`Unknown method: ${method}`);
+        },
+      },
+      events: {
+        on(eventName: string, handler: (payload: unknown) => void) {
+          const list = eventHandlers.get(eventName) ?? [];
+          list.push(handler);
+          eventHandlers.set(eventName, list);
+          return () => {
+            const idx = list.indexOf(handler);
+            if (idx >= 0) list.splice(idx, 1);
+          };
+        },
+      },
+      routes: {
+        register() {},
+      },
+      slots: {
+        register() {},
+      },
+      sessions: {
+        async list() {
+          return [];
+        },
+        async listItems() {
+          return { items: [] };
+        },
+      },
+      provide(contract: string, impl: Record<string, (...args: unknown[]) => unknown>) {
+        provided.set(contract, impl);
+      },
+      effect(factory: () => void | (() => void | Promise<void>)) {
+        const dispose = factory();
+        if (typeof dispose === 'function') cleanups.push(dispose);
+      },
+    };
+
+    return {
+      ctx,
+      rawMap,
+      emit(eventName: string, payload?: unknown) {
+        for (const fn of eventHandlers.get(eventName) ?? []) fn(payload);
+      },
+      service() {
+        const svc = provided.get('session.search.v1');
+        if (!svc) throw new Error('session.search.v1 not provided');
+        return svc as {
+          query: (req: Record<string, unknown>) => Promise<{ ok: boolean; value: { hits: Array<Record<string, unknown>>; nextOffset: number | null; fallbackUsed: boolean } }>;
+          reindex: (req?: Record<string, unknown>) => Promise<{ ok: boolean; value: Record<string, unknown>; error?: { code: string; message: string } }>;
+          getStatus: () => Promise<{ ok: boolean; value: Record<string, unknown> }>;
+          cancelReindex: () => Promise<{ ok: boolean; value: Record<string, unknown> }>;
+          resumeReindex: (req?: Record<string, unknown>) => Promise<{ ok: boolean; value: Record<string, unknown> }>;
+          sync: () => Promise<{ ok: boolean; value?: { appliedChanges: number; cursorSeq: number }; error?: { code: string; message: string } }>;
+        };
+      },
+      async dispose() {
+        for (const fn of cleanups.splice(0)) await fn();
+      },
+    };
+  }
+
+  it.each([
+    { label: 'FTS bundled entrypoint', pluginId: 'hm.plugin.session-search-fts', dir: ftsBundledDir, prefix: 'fts' },
+    { label: 'Lite example entrypoint', pluginId: 'hm.plugin.session-search-lite', dir: liteExampleDir, prefix: 'lite' },
+  ])('$label: enabled-time native/bundle import, update & delete sync without manual reindex', async ({ pluginId, dir }) => {
+    const mod = await import(pathToFileURL(path.join(dir, 'index.mjs')).href);
+    const readModel = new FixtureSessionSearchReadModel();
+    const h = createPluginHarness(readModel, { instanceId: `${pluginId}.live`, pluginId });
+    await mod.apply(h.ctx, { batchSize: 10 });
+    const svc = h.service();
+
+    try {
+      const t0 = Date.now();
+      // Native session & bundled import committed while plugin is enabled (NO manual reindex!)
+      readModel.commitSession({ id: 'sess-native-1', title: '初始原生会话', workspaceId: 'ws-live', driverId: 'codex', updatedAt: t0 });
+      readModel.commitItem({
+        sessionId: 'sess-native-1',
+        itemId: 'sess-native-1:t1:msg',
+        turnId: 't1',
+        turnSeq: 1,
+        textBody: '启用态导入 量子校验令牌 alpha',
+        createdAt: t0 + 1,
+      });
+
+      const hitBeforeReindex = await svc.query({ q: '量子校验令牌', workspaceId: 'ws-live' });
+      expect(hitBeforeReindex.ok).toBe(true);
+      expect(hitBeforeReindex.value.hits).toHaveLength(1);
+      expect(hitBeforeReindex.value.hits[0].itemId).toBe('sess-native-1:t1:msg');
+
+      // Bundle import of second session + title update -> immediately reflected in query()
+      readModel.commitSession({ id: 'sess-bundle-2', title: 'Bundle 导入归档', workspaceId: 'ws-live', driverId: 'claude', updatedAt: t0 + 2 });
+      readModel.commitItem({
+        sessionId: 'sess-bundle-2',
+        itemId: 'sess-bundle-2:t1:msg',
+        turnId: 't1',
+        turnSeq: 1,
+        textBody: 'bundle归档 矢量检索结果 beta',
+        createdAt: t0 + 3,
+      });
+      readModel.commitSession({ id: 'sess-native-1', title: '改名后的原生会话', workspaceId: 'ws-live', driverId: 'codex', updatedAt: t0 + 4 });
+
+      const bundleHit = await svc.query({ q: '矢量检索结果', workspaceId: 'ws-live' });
+      expect(bundleHit.ok).toBe(true);
+      expect(bundleHit.value.hits).toHaveLength(1);
+      expect(bundleHit.value.hits[0].sessionId).toBe('sess-bundle-2');
+
+      const renamedHit = await svc.query({ q: '量子校验令牌', workspaceId: 'ws-live' });
+      expect(renamedHit.value.hits[0].sessionTitle).toBe('改名后的原生会话');
+
+      // Delete session while enabled -> immediately disappears on next query()
+      readModel.deleteSession('sess-native-1');
+      const afterDelete = await svc.query({ q: '量子校验令牌', workspaceId: 'ws-live' });
+      expect(afterDelete.ok).toBe(true);
+      expect(afterDelete.value.hits).toHaveLength(0);
+    } finally {
+      await h.dispose();
+    }
+  });
+
+  it.each([
+    { label: 'FTS', pluginId: 'hm.plugin.session-search-fts', dir: ftsBundledDir, prefix: 'fts' },
+    { label: 'Lite', pluginId: 'hm.plugin.session-search-lite', dir: liteExampleDir, prefix: 'lite' },
+  ])('$label: two-phase generation commit keeps meta/cursor intact on chunk write failure & verifies integrity on restart', async ({ pluginId, dir, prefix }) => {
+    const mod = await import(pathToFileURL(path.join(dir, 'index.mjs')).href);
+    const readModel = new FixtureSessionSearchReadModel();
+    const sharedStorage = new Map<string, unknown>();
+
+    // Generation 1: commit baseline session cleanly
+    const t0 = Date.now();
+    readModel.commitSession({ id: 'sess-p2-1', title: '第一代基线会话', workspaceId: 'ws-p2', driverId: 'codex', updatedAt: t0 });
+    readModel.commitItem({
+      sessionId: 'sess-p2-1',
+      itemId: 'sess-p2-1:t1:1',
+      turnId: 't1',
+      turnSeq: 1,
+      textBody: '基线保留内容 keep-gen-one',
+      createdAt: t0 + 1,
+    });
+
+    const h1 = createPluginHarness(readModel, { instanceId: `${pluginId}.p2`, pluginId, backingMap: sharedStorage });
+    await mod.apply(h1.ctx, { batchSize: 10 });
+    const s1 = await h1.service().sync();
+    expect(s1.ok).toBe(true);
+    const gen1Cursor = s1.value!.cursorSeq;
+    const metaGen1 = sharedStorage.get(`${prefix}:meta`) as Record<string, unknown>;
+    expect(metaGen1.schemaVersion).toBe(2);
+    expect(metaGen1.generation).toBeGreaterThanOrEqual(1);
+    expect(metaGen1.cursorSeq).toBe(gen1Cursor);
+    const prevGen = Number(metaGen1.generation);
+    await h1.dispose();
+
+    // Add large multi-chunk payload (> 180 KiB so next generation produces >= 2 chunks) and inject failure on chunk:1
+    const bigPayload = 'Z'.repeat(120 * 1024);
+    readModel.commitSession({ id: 'sess-p2-2', title: '第二代大文本会话', workspaceId: 'ws-p2', driverId: 'codex', updatedAt: t0 + 10 });
+    readModel.commitItem({
+      sessionId: 'sess-p2-2',
+      itemId: 'sess-p2-2:t1:1',
+      turnId: 't1',
+      turnSeq: 1,
+      textBody: `gen2-part1 ${bigPayload}`,
+      createdAt: t0 + 11,
+    });
+    readModel.commitItem({
+      sessionId: 'sess-p2-2',
+      itemId: 'sess-p2-2:t1:2',
+      turnId: 't1',
+      turnSeq: 2,
+      textBody: `gen2-part2-after-fail ${bigPayload}`,
+      createdAt: t0 + 12,
+    });
+
+    const nextGenKey = `${prefix}:gen:${prevGen + 1}:chunk:1`;
+    const hFail = createPluginHarness(readModel, {
+      instanceId: `${pluginId}.p2`,
+      pluginId,
+      backingMap: sharedStorage,
+      onStorageSet(key) {
+        if (key === nextGenKey) {
+          throw new Error('E_INJECTED_DISK_FULL');
+        }
+      },
+    });
+    await mod.apply(hFail.ctx, { batchSize: 10, autoSyncOnStart: false });
+    const failSync = await hFail.service().sync();
+    expect(failSync.ok).toBe(false);
+    expect(failSync.error?.message).toContain('E_INJECTED_DISK_FULL');
+
+    // Meta MUST remain on old generation & old cursorSeq, and failed chunk:0 must be rolled back
+    const metaAfterFail = sharedStorage.get(`${prefix}:meta`) as Record<string, unknown>;
+    expect(metaAfterFail.generation).toBe(prevGen);
+    expect(metaAfterFail.cursorSeq).toBe(gen1Cursor);
+    expect(sharedStorage.has(`${prefix}:gen:${prevGen + 1}:chunk:0`)).toBe(false);
+    await hFail.dispose();
+
+    // Restart cleanly -> restores intact gen1 and catches up gen2 without data loss
+    const hRecover = createPluginHarness(readModel, { instanceId: `${pluginId}.p2`, pluginId, backingMap: sharedStorage });
+    await mod.apply(hRecover.ctx, { batchSize: 10 });
+    const recoveredQuery = await hRecover.service().query({ q: 'gen2-part2-after-fail' });
+    expect(recoveredQuery.ok).toBe(true);
+    expect(recoveredQuery.value.hits).toHaveLength(1);
+    const baseQuery = await hRecover.service().query({ q: 'keep-gen-one' });
+    expect(baseQuery.value.hits).toHaveLength(1);
+    await hRecover.dispose();
+
+    // Tamper / corrupt a persisted chunk -> restart safely resets cursorSeq to 0 and re-syncs cleanly
+    const metaIntact = sharedStorage.get(`${prefix}:meta`) as Record<string, unknown>;
+    sharedStorage.delete(`${prefix}:gen:${metaIntact.generation}:chunk:0`);
+    const hCorrupt = createPluginHarness(readModel, { instanceId: `${pluginId}.p2`, pluginId, backingMap: sharedStorage });
+    await mod.apply(hCorrupt.ctx, { batchSize: 10, autoSyncOnStart: false });
+    const corruptStatus = await hCorrupt.service().getStatus();
+    expect(corruptStatus.value.cursorSeq).toBe(0);
+    expect(String(corruptStatus.value.lastError || '')).toContain('缺失分块');
+    const healed = await hCorrupt.service().query({ q: 'keep-gen-one' });
+    expect(healed.value.hits).toHaveLength(1);
+    await hCorrupt.dispose();
+  });
+
+  it.each([
+    { label: 'FTS', pluginId: 'hm.plugin.session-search-fts', dir: ftsBundledDir },
+    { label: 'Lite', pluginId: 'hm.plugin.session-search-lite', dir: liteExampleDir },
+  ])('$label: scoped workspace rebuild updates only target workspace without skipping other workspace changes', async ({ pluginId, dir }) => {
+    const mod = await import(pathToFileURL(path.join(dir, 'index.mjs')).href);
+    const readModel = new FixtureSessionSearchReadModel();
+    const h = createPluginHarness(readModel, { instanceId: `${pluginId}.scoped`, pluginId });
+
+    const t0 = Date.now();
+    // Baseline in ws-A and ws-B -> sync once
+    readModel.commitSession({ id: 'sess-A-old', title: 'A 旧会话', workspaceId: 'ws-A', driverId: 'codex', updatedAt: t0 });
+    readModel.commitItem({ sessionId: 'sess-A-old', itemId: 'sess-A-old:1', turnId: 't1', turnSeq: 1, textBody: 'alpha-baseline-A', createdAt: t0 + 1 });
+    readModel.commitSession({ id: 'sess-B-old', title: 'B 将被删除的会话', workspaceId: 'ws-B', driverId: 'codex', updatedAt: t0 + 2 });
+    readModel.commitItem({ sessionId: 'sess-B-old', itemId: 'sess-B-old:1', turnId: 't1', turnSeq: 1, textBody: 'beta-obsolete-B', createdAt: t0 + 3 });
+
+    await mod.apply(h.ctx, { batchSize: 10, autoSyncOnStart: false });
+    const svc = h.service();
+    try {
+      const baseSync = await svc.sync();
+      const baseSeq = baseSync.value!.cursorSeq;
+
+      // Commit interleaved unconsumed changes across ws-B and ws-A:
+      // #1 ws-B new session, #2 ws-A new session, #3 ws-B delete old session
+      readModel.commitSession({ id: 'sess-B-new', title: 'B 未消费新会话', workspaceId: 'ws-B', driverId: 'claude', updatedAt: t0 + 10 });
+      readModel.commitItem({ sessionId: 'sess-B-new', itemId: 'sess-B-new:1', turnId: 't1', turnSeq: 1, textBody: 'beta-unconsumed-B', createdAt: t0 + 11 });
+      readModel.commitSession({ id: 'sess-A-new', title: 'A 重建新会话', workspaceId: 'ws-A', driverId: 'codex', updatedAt: t0 + 12 });
+      readModel.commitItem({ sessionId: 'sess-A-new', itemId: 'sess-A-new:1', turnId: 't1', turnSeq: 1, textBody: 'alpha-rebuilt-A', createdAt: t0 + 13 });
+      readModel.deleteSession('sess-B-old');
+
+      // Reindex ONLY ws-A while ws-B has unconsumed changes!
+      const scopedReindex = await svc.reindex({ mode: 'full', workspaceId: 'ws-A' });
+      expect(scopedReindex.ok).toBe(true);
+      expect(scopedReindex.value.status).toBe('completed');
+
+      // Verify ws-A rebuilt, ws-B unconsumed upsert WAS applied, ws-B delete WAS applied, and global cursorSeq converged!
+      const hitA = await svc.query({ q: 'alpha-rebuilt-A', workspaceId: 'ws-A' });
+      expect(hitA.value.hits).toHaveLength(1);
+
+      const hitBNew = await svc.query({ q: 'beta-unconsumed-B', workspaceId: 'ws-B' });
+      expect(hitBNew.value.hits).toHaveLength(1);
+      expect(hitBNew.value.hits[0].sessionId).toBe('sess-B-new');
+
+      const hitBOld = await svc.query({ q: 'beta-obsolete-B', workspaceId: 'ws-B' });
+      expect(hitBOld.value.hits).toHaveLength(0);
+
+      const status = await svc.getStatus();
+      expect(Number(status.value.cursorSeq)).toBeGreaterThan(baseSeq);
+      expect(status.value.cursorSeq).toBe(status.value.latestSourceSeq);
+    } finally {
+      await h.dispose();
+    }
+  });
+
+  it('FTS & Lite UI assets satisfy SandboxedPluginFrame bridge and CSP constraints', () => {
+    for (const dir of [ftsBundledDir, liteExampleDir]) {
+      const html = fs.readFileSync(path.join(dir, 'ui', 'panel.html'), 'utf8');
+      const js = fs.readFileSync(path.join(dir, 'ui', 'panel.js'), 'utf8');
+      const css = fs.readFileSync(path.join(dir, 'ui', 'panel.css'), 'utf8');
+
+      expect(html).not.toMatch(/<script\b[^>]*>[\s\S]+<\/script>/i);
+      expect(html).toContain('workspace-filter');
+      expect(html).toContain('driver-filter');
+      expect(html).toContain('prev-page');
+      expect(html).toContain('next-page');
+
+      expect(js).not.toContain('innerHTML');
+      expect(js).not.toContain('fetch(');
+      expect(js).toContain('requestPluginRoute');
+      expect(js).toContain('onContext');
+      expect(js).toContain('navigateToSession');
+      expect(js).toContain("document.createElement('mark')");
+      expect(css).toContain('mark');
+    }
+  });
 });
