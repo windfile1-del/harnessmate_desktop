@@ -4,6 +4,12 @@ import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } fro
 import { useShallow } from 'zustand/react/shallow';
 import { daemonApi } from '../api/client';
 import {
+  HISTORY_IMPORT_CONTRACT,
+  SESSION_SEARCH_CONTRACT,
+  getPluginInstanceId,
+  pluginProvidesContract,
+} from '../api/peer-contracts';
+import {
   commandKey,
   commandPaletteRegistry,
   delegatedSearchQuery,
@@ -243,6 +249,30 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
     modal('usage', '打开用量看板', 'core.account-usage', ['usage', 'quota']);
     modal('remote_pairing', '移动端扫码联动', 'core.remote-mobile');
     modal('session_explorer', '打开会话检索与导入', explorerId, ['Session Explorer', '全文搜索', 'FTS']);
+    for (const plugin of plugins) {
+      const instId = getPluginInstanceId(plugin);
+      if (!activePlugins.has(plugin.id) && !activePlugins.has(instId)) continue;
+      if (pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT)) {
+        add(
+          `search-page:${instId}`,
+          plugin.id,
+          'navigation',
+          `打开会话搜索工作页 · ${plugin.name} (${instId})`,
+          () => get().openSessionSearchPage({ instanceId: instId }),
+          ['search', 'fts', '全文搜索', instId],
+        );
+      }
+      if (pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT)) {
+        add(
+          `import-page:${instId}`,
+          plugin.id,
+          'navigation',
+          `打开历史导入工作页 · ${plugin.name} (${instId})`,
+          () => get().openHistoryImportPage({ instanceId: instId }),
+          ['import', 'history', '历史导入', instId],
+        );
+      }
+    }
     modal('risk_rules', '打开审批规则', 'hm.plugin.approval-center');
     add('theme', 'core', 'theme', theme === 'dark' ? '切换浅色主题' : '切换深色主题',
       () => get().toggleTheme(), ['theme', 'dark', 'light']);
@@ -251,9 +281,19 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
   }, [activePlugins, catalog, currentSession, harnesses, inspectorItems, plugins, registered, scope, selectedId, sessions, theme, triage, workspaces]);
   const index = useMemo(() => indexCommands(entries), [entries]);
   const delegated = delegatedSearchQuery(query);
+  const fullTextAvailable = useMemo(
+    () =>
+      activePlugins.has(explorerId) ||
+      plugins.some(
+        (plugin) =>
+          (activePlugins.has(plugin.id) || activePlugins.has(getPluginInstanceId(plugin))) &&
+          pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT),
+      ),
+    [activePlugins, plugins],
+  );
   const results = useMemo(() => {
     if (delegated !== undefined) {
-      return delegated ? [createFullTextCommand(delegated, activePlugins.has(explorerId), useAppStore.getState().openSessionSearch)] : [];
+      return delegated ? [createFullTextCommand(delegated, fullTextAvailable, useAppStore.getState().openSessionSearch)] : [];
     }
     const slash = parsePaletteSlash(query);
     if (slash) {
@@ -261,7 +301,7 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
       if (exact.length) return rankCommands(exact, '', mru);
     }
     return rankCommands(index, query, mru).slice(0, 80);
-  }, [activePlugins, delegated, index, mru, query]);
+  }, [delegated, fullTextAvailable, index, mru, query]);
   const row = Math.min(activeIndex, Math.max(0, results.length - 1));
   const active = results[row];
 

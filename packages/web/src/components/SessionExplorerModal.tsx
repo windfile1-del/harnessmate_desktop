@@ -669,26 +669,48 @@ export function SessionExplorerModal({ onClose }: { onClose: () => void }) {
     focusTurn,
     importNativeSession,
     importSessionBundle,
+    openSessionSearchPage,
+    openHistoryImportPage,
     pushToast,
   } = useAppStore();
 
   const selectedSession = sessions.find((s) => s.id === selectedSessionId) ?? null;
 
   return (
-    <SessionExplorerView
-      workspaces={workspaces}
-      harnesses={harnesses}
-      sessions={sessions}
-      initialQuery={explorerInitialQuery}
-      selectedSession={selectedSession}
-      onJumpToHit={(hit) => {
-        onClose();
-        void selectSession(hit.sessionId).then(() => {
-          if (hit.turnId) {
-            focusTurn({ sessionId: hit.sessionId, turnId: hit.turnId });
-          }
-        });
-      }}
+    <div className="flex max-h-[82vh] flex-col">
+      <div
+        className="flex flex-wrap items-center justify-end gap-2 px-5 py-2 text-[11.5px]"
+        style={{ borderBottom: '1px solid var(--border-hairline)', backgroundColor: 'var(--bg-elevated)' }}
+      >
+        <button
+          type="button"
+          onClick={() => openSessionSearchPage({ query: explorerInitialQuery })}
+          className="cursor-pointer rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+        >
+          在独立搜索工作页中打开
+        </button>
+        <button
+          type="button"
+          onClick={() => openHistoryImportPage()}
+          className="cursor-pointer rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+        >
+          在独立导入工作页中打开
+        </button>
+      </div>
+      <SessionExplorerView
+        workspaces={workspaces}
+        harnesses={harnesses}
+        sessions={sessions}
+        initialQuery={explorerInitialQuery}
+        selectedSession={selectedSession}
+        onJumpToHit={(hit) => {
+          onClose();
+          void selectSession(hit.sessionId).then(() => {
+            if (hit.turnId) {
+              focusTurn({ sessionId: hit.sessionId, turnId: hit.turnId, itemId: hit.itemId });
+            }
+          });
+        }}
       onImportNative={async (item, mode, workspaceId) => {
         try {
           await importNativeSession({
@@ -713,5 +735,6 @@ export function SessionExplorerModal({ onClose }: { onClose: () => void }) {
       }}
       onClose={onClose}
     />
+    </div>
   );
 }

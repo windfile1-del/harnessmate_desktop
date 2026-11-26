@@ -123,6 +123,27 @@ import type {
   WsClientFrame,
   WsServerFrame,
 } from '@harnessmate/protocol';
+import {
+  unwrapContractResult,
+  type ContractResult,
+  type HistoryImportCommitRequest,
+  type HistoryImportCommitValue,
+  type HistoryImportPreviewRequest,
+  type HistoryImportPreviewValue,
+  type HistorySourceDiscoverRequest,
+  type HistorySourceDiscoverValue,
+  type HistorySourceReadRequest,
+  type HistorySourceReadValue,
+  type HistorySourceStatusValue,
+  type SearchCancelRequest,
+  type SearchInstanceStatus,
+  type SearchQueryRequest,
+  type SearchQueryValue,
+  type SearchReindexJob,
+  type SearchReindexRequest,
+  type SearchResumeRequest,
+  type ServiceResolutionV1,
+} from './peer-contracts';
 
 declare global {
   interface Window {
@@ -421,6 +442,173 @@ export const daemonApi = {
     apiFetch<{ providers: ServiceProviderDto[] }>(
       `/api/v1/plugins/services${contract ? `?contract=${encodeURIComponent(contract)}` : ''}`,
     ),
+
+  resolveServiceSelection: (
+    contract: string,
+    opts?: {
+      versionRange?: string;
+      sessionId?: string;
+      workspaceId?: string;
+      callerInstanceId?: string;
+      explicitInstanceId?: string;
+      allowSingleCandidate?: boolean;
+      signal?: AbortSignal;
+    },
+  ) => {
+    const params = new URLSearchParams();
+    params.set('contract', contract);
+    if (opts?.versionRange) params.set('versionRange', opts.versionRange);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.workspaceId) params.set('workspaceId', opts.workspaceId);
+    if (opts?.callerInstanceId) params.set('callerInstanceId', opts.callerInstanceId);
+    if (opts?.explicitInstanceId) params.set('explicitInstanceId', opts.explicitInstanceId);
+    if (opts?.allowSingleCandidate !== undefined) {
+      params.set('allowSingleCandidate', opts.allowSingleCandidate ? '1' : '0');
+    }
+    return apiFetch<ServiceResolutionV1>(`/api/v1/plugins/services/resolve?${params.toString()}`, {
+      signal: opts?.signal,
+    });
+  },
+
+  callPluginInstanceRoute: <T = unknown>(
+    instanceId: string,
+    routePath: string,
+    init?: RequestInit,
+  ) => {
+    const normalized = routePath.startsWith('/') ? routePath : `/${routePath}`;
+    return apiFetch<T>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes${normalized}`,
+      init,
+    );
+  },
+
+  discoverHistoryFromInstance: async (
+    instanceId: string,
+    req: HistorySourceDiscoverRequest,
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<HistorySourceDiscoverValue> | HistorySourceDiscoverValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/discover`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  readHistoryFromInstance: async (
+    instanceId: string,
+    req: HistorySourceReadRequest,
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<HistorySourceReadValue> | HistorySourceReadValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/read`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  getHistorySourceStatus: async (instanceId: string, signal?: AbortSignal) => {
+    const res = await apiFetch<ContractResult<HistorySourceStatusValue> | HistorySourceStatusValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/status`,
+      { signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  cancelHistorySource: async (instanceId: string, operationId: string) => {
+    const res = await apiFetch<ContractResult<{ cancelled: boolean }> | { cancelled: boolean }>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/cancel`,
+      { method: 'POST', body: JSON.stringify({ operationId }) },
+    );
+    return unwrapContractResult(res);
+  },
+
+  previewHistoryImport: async (
+    instanceId: string,
+    req: HistoryImportPreviewRequest,
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<HistoryImportPreviewValue> | HistoryImportPreviewValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/preview`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  commitHistoryImport: async (
+    instanceId: string,
+    req: HistoryImportCommitRequest,
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<HistoryImportCommitValue> | HistoryImportCommitValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/import`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  cancelHistoryImport: async (instanceId: string, payload: { requestId?: string; operationId?: string }) => {
+    const res = await apiFetch<ContractResult<{ cancelled: boolean }> | { cancelled: boolean }>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/cancel`,
+      { method: 'POST', body: JSON.stringify(payload) },
+    );
+    return unwrapContractResult(res);
+  },
+
+  querySessionSearchInstance: async (
+    instanceId: string,
+    req: SearchQueryRequest,
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<SearchQueryValue> | SearchQueryValue>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/query`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  getSessionSearchStatus: async (instanceId: string, signal?: AbortSignal) => {
+    const res = await apiFetch<ContractResult<SearchInstanceStatus> | SearchInstanceStatus>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/status`,
+      { signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  reindexSessionSearchInstance: async (
+    instanceId: string,
+    req: SearchReindexRequest = {},
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<SearchReindexJob> | SearchReindexJob>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/reindex`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  cancelSessionSearchReindex: async (
+    instanceId: string,
+    req: SearchCancelRequest = {},
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<SearchReindexJob> | SearchReindexJob>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/reindex/cancel`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
+
+  resumeSessionSearchReindex: async (
+    instanceId: string,
+    req: SearchResumeRequest = {},
+    signal?: AbortSignal,
+  ) => {
+    const res = await apiFetch<ContractResult<SearchReindexJob> | SearchReindexJob>(
+      `/api/v1/plugin-instances/${encodeURIComponent(instanceId)}/routes/reindex/resume`,
+      { method: 'POST', body: JSON.stringify(req), signal },
+    );
+    return unwrapContractResult(res);
+  },
 
   getPluginComposition: (workspaceId?: string) => apiFetch<{
     bundles: string[];
