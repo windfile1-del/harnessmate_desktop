@@ -64,6 +64,18 @@ import type {
 import { create } from 'zustand';
 import { ApiHttpError, DaemonWsClient, daemonApi } from '../api/client';
 import {
+  HISTORY_IMPORT_CONTRACT,
+  HISTORY_IMPORT_PAGE_SLOT_ID,
+  SESSION_SEARCH_CONTRACT,
+  SESSION_SEARCH_PAGE_SLOT_ID,
+  getPluginInstanceId,
+  isPluginInstanceReady,
+  makeWorkspacePageKey,
+  pluginProvidesContract,
+  type ServiceResolutionV1,
+} from '../api/peer-contracts';
+import { defaultPeerWorkspaceTransport } from '../api/peer-workspace-client';
+import {
   DEFAULT_WORKBENCH_ROUTE,
   type WorkbenchRouteState,
 } from '../components/agy/native/shared/workbench-registry';
@@ -182,16 +194,24 @@ interface AppState {
   plugins: InstalledPluginInfo[];
   emptyComposition: boolean;
   sessionBindingsBySession: Record<string, Record<string, string | null>>;
+  workspaceBindingsByWorkspace: Record<string, Record<string, string | null>>;
+  compositionBindings: Record<string, string>;
+  compositionEntries: Array<{ id: string; name: string; disabled: boolean }>;
+  serviceResolutionsByKey: Record<string, ServiceResolutionV1>;
   pluginPermissionRevision: number;
   invalidatePluginPermissions: () => void;
   selectedPluginPanel: string | null;
-  focusedTurn: { sessionId: string; turnId: string } | null;
+  focusedTurn: { sessionId: string; turnId: string; itemId?: string } | null;
   openPluginPanel: (key: string) => void;
   focusTurn: (target: AppState['focusedTurn']) => void;
   pluginCatalog: PluginCatalogItem[];
   slashCommands: Array<PluginSlashCommand & { pluginId: string; pluginName: string }>;
   mcpPresets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
   pluginsDir: string;
+  searchPageInitialQuery: string;
+  searchPageTargetInstanceId: string | null;
+  importPageTargetInstanceId: string | null;
+  importPageInitialTab: 'native' | 'bundle';
 
   // MCP Hub & Usage Telemetry
   mcpServers: McpServerEntry[];
@@ -250,6 +270,10 @@ interface AppState {
   openModal: (modal: ActiveModal, presetHarnessId?: string | null) => void;
   openCommandPalette: (query?: string) => void;
   openSessionSearch: (query: string) => void;
+  openSessionSearchPage: (opts?: { query?: string; instanceId?: string | null }) => void;
+  openHistoryImportPage: (opts?: { instanceId?: string | null; tab?: 'native' | 'bundle' }) => void;
+  openArchivedSession: (sessionId: string) => Promise<void>;
+  syncImportedSession: (sessionId: string) => Promise<Session | null>;
   refreshTriage: (checkSnoozes: boolean, signal: AbortSignal) => Promise<void>;
   updateTriage: (id: string, patch: UpdateSessionTriageRequest) => Promise<void>;
   markTriageViewed: (id: string, req: MarkSessionViewedRequest, signal?: AbortSignal) => Promise<void>;
@@ -284,8 +308,21 @@ interface AppState {
   refreshAll: () => Promise<void>;
   refreshHarnesses: () => Promise<void>;
   refreshPlugins: () => Promise<void>;
+  refreshCompositionBindings: (workspaceId?: string) => Promise<void>;
   refreshSessionBindings: (sessionId: string) => Promise<void>;
   setSessionBinding: (sessionId: string, contract: string, instanceId: string | null) => Promise<void>;
+  refreshWorkspaceBindings: (workspaceId: string) => Promise<void>;
+  setWorkspaceBinding: (workspaceId: string, contract: string, instanceId: string | null) => Promise<void>;
+  resolveService: (
+    contract: string,
+    opts?: {
+      workspaceId?: string;
+      sessionId?: string;
+      explicitInstanceId?: string;
+      allowSingleCandidate?: boolean;
+      signal?: AbortSignal;
+    },
+  ) => Promise<ServiceResolutionV1>;
   installPlugin: (req: InstallPluginRequest) => Promise<void>;
   togglePlugin: (id: string, enabled: boolean) => Promise<void>;
   reloadPlugins: () => Promise<void>;
@@ -749,6 +786,10 @@ export const useAppStore = create<AppState>((set, get) => {
     plugins: [],
     emptyComposition: false,
     sessionBindingsBySession: {},
+    workspaceBindingsByWorkspace: {},
+    compositionBindings: {},
+    compositionEntries: [],
+    serviceResolutionsByKey: {},
     pluginPermissionRevision: 0,
     invalidatePluginPermissions: () => set((state) => ({ pluginPermissionRevision: state.pluginPermissionRevision + 1 })),
     selectedPluginPanel: null,
@@ -759,6 +800,10 @@ export const useAppStore = create<AppState>((set, get) => {
     slashCommands: [],
     mcpPresets: [],
     pluginsDir: '',
+    searchPageInitialQuery: '',
+    searchPageTargetInstanceId: null,
+    importPageTargetInstanceId: null,
+    importPageInitialTab: 'native',
 
     mcpServers: [],
     mcpLoading: false,
@@ -937,8 +982,94 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId, paletteInitialQuery: '', explorerInitialQuery: '' }),
     openCommandPalette: (query = '') =>
       set({ activeModal: 'command_palette', paletteInitialQuery: query }),
-    openSessionSearch: (query) =>
-      set({ activeModal: 'session_explorer', explorerInitialQuery: query }),
+    openSessionSearchPage: (opts) => {
+      const state = get();
+      const searchProviders = state.plugins.filter((p) =>
+        pluginProvidesContract(p, SESSION_SEARCH_CONTRACT),
+      );
+      const readyProviders = searchProviders.filter(isPluginInstanceReady);
+      const explicit = opts?.instanceId ?? null;
+      const boundId =
+        (state.selectedWorkspaceId
+          ? state.workspaceBindingsByWorkspace[state.selectedWorkspaceId]?.[SESSION_SEARCH_CONTRACT]
+          : undefined) ?? state.compositionBindings[SESSION_SEARCH_CONTRACT];
+      const chosenId =
+        explicit ??
+        (boundId && readyProviders.some((p) => getPluginInstanceId(p) === boundId) ? boundId : null) ??
+        (readyProviders[0] ? getPluginInstanceId(readyProviders[0]) : null) ??
+        boundId ??
+        (searchProviders[0] ? getPluginInstanceId(searchProviders[0]) : null);
+      if (chosenId) {
+        set({
+          activeModal: null,
+          activePluginPage: makeWorkspacePageKey(chosenId, SESSION_SEARCH_PAGE_SLOT_ID),
+          searchPageInitialQuery: opts?.query ?? '',
+          searchPageTargetInstanceId: explicit ?? chosenId,
+        });
+        return;
+      }
+      set({
+        activeModal: 'session_explorer',
+        explorerInitialQuery: opts?.query ?? '',
+      });
+    },
+    openHistoryImportPage: (opts) => {
+      const state = get();
+      const importProviders = state.plugins.filter((p) =>
+        pluginProvidesContract(p, HISTORY_IMPORT_CONTRACT),
+      );
+      const readyProviders = importProviders.filter(isPluginInstanceReady);
+      const explicit = opts?.instanceId ?? null;
+      const boundId =
+        (state.selectedWorkspaceId
+          ? state.workspaceBindingsByWorkspace[state.selectedWorkspaceId]?.[HISTORY_IMPORT_CONTRACT]
+          : undefined) ?? state.compositionBindings[HISTORY_IMPORT_CONTRACT];
+      const chosenId =
+        explicit ??
+        (boundId && readyProviders.some((p) => getPluginInstanceId(p) === boundId) ? boundId : null) ??
+        (readyProviders[0] ? getPluginInstanceId(readyProviders[0]) : null) ??
+        boundId ??
+        (importProviders[0] ? getPluginInstanceId(importProviders[0]) : null);
+      if (chosenId) {
+        set({
+          activeModal: null,
+          activePluginPage: makeWorkspacePageKey(chosenId, HISTORY_IMPORT_PAGE_SLOT_ID),
+          importPageTargetInstanceId: explicit ?? chosenId,
+          importPageInitialTab: opts?.tab ?? 'native',
+        });
+        return;
+      }
+      set({ activeModal: 'session_explorer', explorerInitialQuery: '' });
+    },
+    openSessionSearch: (query) => {
+      const state = get();
+      const hasSearchPlugin = state.plugins.some((p) =>
+        pluginProvidesContract(p, SESSION_SEARCH_CONTRACT),
+      );
+      if (hasSearchPlugin) {
+        state.openSessionSearchPage({ query });
+        return;
+      }
+      set({ activeModal: 'session_explorer', explorerInitialQuery: query });
+    },
+    openArchivedSession: async (sessionId) => {
+      set({ activeModal: null, activePluginPage: null });
+      await get().selectSession(sessionId);
+    },
+    syncImportedSession: async (sessionId) => {
+      const [{ workspaces }, { sessions }] = await Promise.all([
+        daemonApi.listWorkspaces(),
+        daemonApi.listSessions(),
+      ]);
+      const found = sessions.find((s) => s.id === sessionId) ?? null;
+      set((state) => ({
+        workspaces,
+        sessions: found
+          ? [found, ...state.sessions.filter((item) => item.id !== found.id)]
+          : sessions,
+      }));
+      return found;
+    },
     refreshTriage: async (checkSnoozes, signal) => {
       const result = await (checkSnoozes ? daemonApi.checkTriageSnoozes(signal) : daemonApi.getTriageState(signal));
       if (!signal.aborted) ingestTriage(result.sessions);
@@ -1227,7 +1358,82 @@ export const useAppStore = create<AppState>((set, get) => {
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
         pluginsDir: pRes.pluginsDir,
+        serviceResolutionsByKey: {},
       });
+      void get().refreshCompositionBindings(get().selectedWorkspaceId ?? undefined).catch(() => {});
+    },
+
+    refreshCompositionBindings: async (workspaceId) => {
+      if (typeof daemonApi.getPluginComposition !== 'function') return;
+      const comp = await daemonApi.getPluginComposition(workspaceId);
+      set({
+        compositionBindings: comp.bindings ?? {},
+        compositionEntries: (comp.entries ?? []).map((e) => ({
+          id: e.id,
+          name: e.name,
+          disabled: e.disabled,
+        })),
+      });
+    },
+
+    refreshWorkspaceBindings: async (workspaceId) => {
+      if (typeof daemonApi.getWorkspaceBindings !== 'function') return;
+      const res = await daemonApi.getWorkspaceBindings(workspaceId);
+      const map: Record<string, string | null> = {};
+      for (const item of res.bindings ?? []) {
+        map[item.contract] = item.instanceId;
+      }
+      set((state) => ({
+        workspaceBindingsByWorkspace: {
+          ...state.workspaceBindingsByWorkspace,
+          [workspaceId]: map,
+        },
+      }));
+    },
+
+    setWorkspaceBinding: async (workspaceId, contract, instanceId) => {
+      const res = await daemonApi.setWorkspaceBinding(workspaceId, contract, instanceId);
+      set((state) => ({
+        workspaceBindingsByWorkspace: {
+          ...state.workspaceBindingsByWorkspace,
+          [workspaceId]: {
+            ...(state.workspaceBindingsByWorkspace[workspaceId] ?? {}),
+            [contract]: res.resolved.instanceId,
+          },
+        },
+        serviceResolutionsByKey: {},
+      }));
+      get().pushToast({
+        kind: 'success',
+        title: instanceId ? '已更新工作区能力绑定' : '已恢复工作区默认能力绑定',
+      });
+    },
+
+    resolveService: async (contract, opts) => {
+      const state = get();
+      const workspaceId = opts?.workspaceId;
+      const sessionId = opts?.sessionId;
+      const explicitInstanceId = opts?.explicitInstanceId;
+      const resolution = await defaultPeerWorkspaceTransport.resolveServiceSelection(contract, {
+        workspaceId,
+        sessionId,
+        explicitInstanceId,
+        allowSingleCandidate: opts?.allowSingleCandidate ?? true,
+        plugins: state.plugins,
+        sessionBindings: sessionId ? state.sessionBindingsBySession[sessionId] : undefined,
+        workspaceBindings: workspaceId ? state.workspaceBindingsByWorkspace[workspaceId] : undefined,
+        compositionBindings: state.compositionBindings,
+        compositionEntries: state.compositionEntries,
+        signal: opts?.signal,
+      });
+      const cacheKey = `${contract}|${workspaceId ?? ''}|${sessionId ?? ''}|${explicitInstanceId ?? ''}`;
+      set((prev) => ({
+        serviceResolutionsByKey: {
+          ...prev.serviceResolutionsByKey,
+          [cacheKey]: resolution,
+        },
+      }));
+      return resolution;
     },
 
     refreshSessionBindings: async (sessionId) => {
@@ -1271,6 +1477,7 @@ export const useAppStore = create<AppState>((set, get) => {
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
         pluginsDir: pRes.pluginsDir,
+        serviceResolutionsByKey: {},
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       get().pushToast({ kind: 'success', title: '插件已安装' });
@@ -1284,6 +1491,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
+        serviceResolutionsByKey: {},
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       get().pushToast({ kind: 'info', title: enabled ? '已启用插件' : '已停用插件' });
@@ -1297,6 +1505,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
+        serviceResolutionsByKey: {},
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       const failures = pRes.plugins.filter((plugin) => plugin.loadError);
@@ -1313,6 +1522,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginCatalog: result.catalog,
         slashCommands: result.slashCommands,
         mcpPresets: result.mcpPresets,
+        serviceResolutionsByKey: {},
         ...(result.harnesses ? { harnesses: result.harnesses } : {}),
       });
       get().pushToast({
@@ -1329,6 +1539,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
+        serviceResolutionsByKey: {},
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       get().pushToast({ kind: 'success', title: '已切换到上一版插件' });
@@ -1341,6 +1552,7 @@ export const useAppStore = create<AppState>((set, get) => {
         pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
+        serviceResolutionsByKey: {},
         ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
       });
       get().pushToast({ kind: 'info', title: '已卸载外部插件' });

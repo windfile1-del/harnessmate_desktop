@@ -33,7 +33,19 @@ import {
   ParallelExecutionBoard,
 } from '../components/OrchestratorBoard';
 import { PluginDataPanel } from '../components/PluginDataPanel';
+import { HistoryImportWorkspacePage } from '../components/HistoryImportWorkspacePage';
+import { SessionSearchWorkspacePage } from '../components/SessionSearchWorkspacePage';
 import { SideChatDrawer } from '../components/SideChatDrawer';
+import {
+  HISTORY_IMPORT_CONTRACT,
+  HISTORY_IMPORT_PAGE_SLOT_ID,
+  LEGACY_EXPLORER_PLUGIN_ID,
+  SESSION_SEARCH_CONTRACT,
+  SESSION_SEARCH_PAGE_SLOT_ID,
+  getPluginInstanceId,
+  isPluginInstanceReady,
+  pluginProvidesContract,
+} from '../api/peer-contracts';
 import {
   TerminalStatusbarBadge,
   TerminalWorkspaceDrawer,
@@ -201,6 +213,117 @@ function ApprovalAnnotationsDetail({ approval }: { approval: ApprovalRequest }) 
       ))}
     </div>
   );
+}
+
+export function shouldSkipBatch1IframeSlot(
+  plugin: InstalledPluginInfo,
+  slotDef: { slot: AnyPluginSlotKey; id: string },
+): boolean {
+  return (
+    slotDef.slot === 'workspace.pages' &&
+    ((slotDef.id === HISTORY_IMPORT_PAGE_SLOT_ID &&
+      pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT)) ||
+      (slotDef.id === SESSION_SEARCH_PAGE_SLOT_ID &&
+        pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT)))
+  );
+}
+
+export function registerBatch1WorkspacePages(
+  registry: SlotRegistry,
+  plugins: InstalledPluginInfo[],
+): Disposer[] {
+  const disposers: Disposer[] = [];
+  const activeImportProviders = plugins.filter(
+    (plugin) =>
+      isPluginInstanceReady(plugin) && pluginProvidesContract(plugin, HISTORY_IMPORT_CONTRACT),
+  );
+  const activeSearchProviders = plugins.filter(
+    (plugin) =>
+      isPluginInstanceReady(plugin) && pluginProvidesContract(plugin, SESSION_SEARCH_CONTRACT),
+  );
+
+  for (const plugin of activeImportProviders) {
+    const instanceId = getPluginInstanceId(plugin);
+    const customSlot = collectPluginIframeSlots(plugin).find(
+      (s) => s.slot === 'workspace.pages' && s.id === HISTORY_IMPORT_PAGE_SLOT_ID,
+    );
+    const title =
+      customSlot?.title ??
+      (activeImportProviders.length > 1 || instanceId !== plugin.id
+        ? `${plugin.name} (${instanceId})`
+        : '历史导入');
+    disposers.push(
+      registry.register({
+        slot: 'workspace.pages',
+        id: HISTORY_IMPORT_PAGE_SLOT_ID,
+        pluginId: instanceId,
+        pluginName: plugin.name,
+        title,
+        order: customSlot?.order ?? 25,
+        sourceKind: 'builtin',
+        render: () => <HistoryImportWorkspacePage instanceId={instanceId} />,
+      }),
+    );
+  }
+
+  for (const plugin of activeSearchProviders) {
+    const instanceId = getPluginInstanceId(plugin);
+    const customSlot = collectPluginIframeSlots(plugin).find(
+      (s) => s.slot === 'workspace.pages' && s.id === SESSION_SEARCH_PAGE_SLOT_ID,
+    );
+    const title =
+      customSlot?.title ??
+      (activeSearchProviders.length > 1 || instanceId !== plugin.id
+        ? `${plugin.name} (${instanceId})`
+        : '会话搜索');
+    disposers.push(
+      registry.register({
+        slot: 'workspace.pages',
+        id: SESSION_SEARCH_PAGE_SLOT_ID,
+        pluginId: instanceId,
+        pluginName: plugin.name,
+        title,
+        order: customSlot?.order ?? 20,
+        sourceKind: 'builtin',
+        render: () => <SessionSearchWorkspacePage instanceId={instanceId} />,
+      }),
+    );
+  }
+
+  const explorerPlugin = plugins.find((p) => p.id === LEGACY_EXPLORER_PLUGIN_ID);
+  if (
+    explorerPlugin &&
+    isPluginActive(explorerPlugin) &&
+    !plugins.some((p) => pluginProvidesContract(p, SESSION_SEARCH_CONTRACT)) &&
+    !plugins.some((p) => pluginProvidesContract(p, HISTORY_IMPORT_CONTRACT))
+  ) {
+    disposers.push(
+      registry.register({
+        slot: 'workspace.pages',
+        id: SESSION_SEARCH_PAGE_SLOT_ID,
+        pluginId: LEGACY_EXPLORER_PLUGIN_ID,
+        pluginName: explorerPlugin.name,
+        title: '会话搜索',
+        order: 20,
+        sourceKind: 'builtin',
+        render: () => <SessionSearchWorkspacePage instanceId={LEGACY_EXPLORER_PLUGIN_ID} />,
+      }),
+    );
+    disposers.push(
+      registry.register({
+        slot: 'workspace.pages',
+        id: HISTORY_IMPORT_PAGE_SLOT_ID,
+        pluginId: LEGACY_EXPLORER_PLUGIN_ID,
+        pluginName: explorerPlugin.name,
+        title: '历史导入',
+        order: 25,
+        sourceKind: 'builtin',
+        render: () => <HistoryImportWorkspacePage instanceId={LEGACY_EXPLORER_PLUGIN_ID} />,
+      }),
+    );
+  }
+
+  return disposers;
 }
 
 export function registerTriageBadge(registry: SlotRegistry, plugins: InstalledPluginInfo[]): Disposer | undefined {
@@ -900,6 +1023,9 @@ export function PluginSlotSync() {
       }
     }
 
+    // 2b. Batch 1 History Import (`history.import.v1`) & Session Search (`session.search.v1`) workspace pages
+    disposers.push(...registerBatch1WorkspacePages(registry, plugins));
+
     // 2. V1 panels -> inspector.tabs
     for (const plugin of plugins) {
       if (!isPluginActive(plugin)) continue;
@@ -922,6 +1048,9 @@ export function PluginSlotSync() {
       const instanceId = plugin.instanceId ?? plugin.id;
       const revision = `${plugin.packageDigest ?? plugin.version}:${plugin.runId ?? 'decl'}`;
       for (const slotDef of collectPluginIframeSlots(plugin)) {
+        if (shouldSkipBatch1IframeSlot(plugin, slotDef)) {
+          continue;
+        }
         const isCompactSlot =
           slotDef.slot === 'statusbar.items' ||
           slotDef.slot === 'composer.actions' ||

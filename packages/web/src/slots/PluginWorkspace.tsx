@@ -1,6 +1,21 @@
-import { ArrowLeft, Globe, Puzzle } from 'lucide-react';
-import { useEffect, type ReactNode } from 'react';
+import { ArrowLeft, Globe, History, Puzzle, Search } from 'lucide-react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
+import {
+  HISTORY_IMPORT_CONTRACT,
+  HISTORY_IMPORT_PAGE_SLOT_ID,
+  SESSION_SEARCH_CONTRACT,
+  SESSION_SEARCH_PAGE_SLOT_ID,
+  getPluginInstanceId,
+  makeWorkspacePageKey,
+  parseWorkspacePageKey,
+  pluginProvidesContract,
+  resolveServiceSelectionClientSide,
+  type ServiceResolutionV1,
+} from '../api/peer-contracts';
+import { formatResolutionSummary } from '../api/peer-workspace-client';
+import { HistoryImportWorkspacePage } from '../components/HistoryImportWorkspacePage';
+import { SessionSearchWorkspacePage } from '../components/SessionSearchWorkspacePage';
 import { useAppStore } from '../stores/app-store';
 import { useSlotItems, useSlotRegistry } from './hooks';
 import { SlotErrorBoundary } from './SlotRenderer';
@@ -16,23 +31,153 @@ export function PluginWorkspaceLinks() {
     active,
     open,
     selectedSessionId,
+    selectedWorkspaceId,
     plugins,
     sessionBindingsBySession,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+    compositionEntries,
     refreshSessionBindings,
+    refreshWorkspaceBindings,
     setSessionBinding,
+    setWorkspaceBinding,
+    resolveService,
+    openSessionSearchPage,
+    openHistoryImportPage,
   } = useAppStore(useShallow((state) => ({
     active: state.activePluginPage,
     open: state.setActivePluginPage,
     selectedSessionId: state.selectedSessionId,
+    selectedWorkspaceId: state.selectedWorkspaceId,
     plugins: state.plugins,
     sessionBindingsBySession: state.sessionBindingsBySession,
+    workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace ?? {},
+    compositionBindings: state.compositionBindings ?? {},
+    compositionEntries: state.compositionEntries ?? [],
     refreshSessionBindings: state.refreshSessionBindings,
+    refreshWorkspaceBindings: state.refreshWorkspaceBindings,
     setSessionBinding: state.setSessionBinding,
+    setWorkspaceBinding: state.setWorkspaceBinding,
+    resolveService: state.resolveService,
+    openSessionSearchPage: state.openSessionSearchPage,
+    openHistoryImportPage: state.openHistoryImportPage,
   })));
+
+  const hasSearchOrImport = useMemo(
+    () =>
+      plugins.some(
+        (p) =>
+          pluginProvidesContract(p, SESSION_SEARCH_CONTRACT) ||
+          pluginProvidesContract(p, HISTORY_IMPORT_CONTRACT),
+      ) ||
+      Boolean(compositionBindings[SESSION_SEARCH_CONTRACT] || compositionBindings[HISTORY_IMPORT_CONTRACT]) ||
+      Boolean(
+        selectedWorkspaceId &&
+          (workspaceBindingsByWorkspace[selectedWorkspaceId]?.[SESSION_SEARCH_CONTRACT] ||
+            workspaceBindingsByWorkspace[selectedWorkspaceId]?.[HISTORY_IMPORT_CONTRACT]),
+      ),
+    [plugins, compositionBindings, selectedWorkspaceId, workspaceBindingsByWorkspace],
+  );
+
+  const [backendSearchRes, setBackendSearchRes] = useState<ServiceResolutionV1 | null>(null);
+  const [backendImportRes, setBackendImportRes] = useState<ServiceResolutionV1 | null>(null);
 
   useEffect(() => {
     if (selectedSessionId) void refreshSessionBindings(selectedSessionId).catch(() => {});
   }, [selectedSessionId, plugins, refreshSessionBindings]);
+
+  useEffect(() => {
+    if (selectedWorkspaceId && typeof refreshWorkspaceBindings === 'function') {
+      void refreshWorkspaceBindings(selectedWorkspaceId).catch(() => {});
+    }
+  }, [selectedWorkspaceId, plugins, refreshWorkspaceBindings]);
+
+  useEffect(() => {
+    if (!hasSearchOrImport || typeof resolveService !== 'function') {
+      setBackendSearchRes(null);
+      setBackendImportRes(null);
+      return;
+    }
+    const controller = new AbortController();
+    void resolveService(SESSION_SEARCH_CONTRACT, {
+      workspaceId: selectedWorkspaceId ?? undefined,
+      sessionId: selectedSessionId ?? undefined,
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!controller.signal.aborted) setBackendSearchRes(res);
+      })
+      .catch(() => {});
+    void resolveService(HISTORY_IMPORT_CONTRACT, {
+      workspaceId: selectedWorkspaceId ?? undefined,
+      sessionId: selectedSessionId ?? undefined,
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!controller.signal.aborted) setBackendImportRes(res);
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [
+    hasSearchOrImport,
+    resolveService,
+    selectedWorkspaceId,
+    selectedSessionId,
+    plugins,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+  ]);
+
+  const fallbackSearchRes = useMemo(
+    () =>
+      hasSearchOrImport
+        ? resolveServiceSelectionClientSide({
+            contract: SESSION_SEARCH_CONTRACT,
+            plugins,
+            sessionBindings: selectedSessionId ? sessionBindingsBySession[selectedSessionId] : undefined,
+            workspaceBindings: selectedWorkspaceId ? workspaceBindingsByWorkspace[selectedWorkspaceId] : undefined,
+            compositionBindings,
+            compositionEntries,
+          })
+        : null,
+    [
+      hasSearchOrImport,
+      plugins,
+      selectedSessionId,
+      sessionBindingsBySession,
+      selectedWorkspaceId,
+      workspaceBindingsByWorkspace,
+      compositionBindings,
+      compositionEntries,
+    ],
+  );
+
+  const fallbackImportRes = useMemo(
+    () =>
+      hasSearchOrImport
+        ? resolveServiceSelectionClientSide({
+            contract: HISTORY_IMPORT_CONTRACT,
+            plugins,
+            sessionBindings: selectedSessionId ? sessionBindingsBySession[selectedSessionId] : undefined,
+            workspaceBindings: selectedWorkspaceId ? workspaceBindingsByWorkspace[selectedWorkspaceId] : undefined,
+            compositionBindings,
+            compositionEntries,
+          })
+        : null,
+    [
+      hasSearchOrImport,
+      plugins,
+      selectedSessionId,
+      sessionBindingsBySession,
+      selectedWorkspaceId,
+      workspaceBindingsByWorkspace,
+      compositionBindings,
+      compositionEntries,
+    ],
+  );
+
+  const searchResolution = backendSearchRes ?? fallbackSearchRes;
+  const importResolution = backendImportRes ?? fallbackImportRes;
 
   const browserProviders = plugins.filter(
     (plugin) =>
@@ -46,10 +191,13 @@ export function PluginWorkspaceLinks() {
     : '';
   const boundPage = pages.find((page) => page.pluginId === currentBrowserId);
 
-  if (!pages.length && !(selectedSessionId && browserProviders.length > 0)) return null;
+  if (!pages.length && !(selectedSessionId && browserProviders.length > 0) && !hasSearchOrImport) return null;
+
+  const searchSummary = searchResolution ? formatResolutionSummary(searchResolution) : null;
+  const importSummary = importResolution ? formatResolutionSummary(importResolution) : null;
 
   return (
-    <nav aria-label="插件工作页" className="max-h-48 space-y-1 overflow-y-auto px-3.5 pb-2">
+    <nav aria-label="插件工作页" className="max-h-56 space-y-1 overflow-y-auto px-3.5 pb-2">
       {pages.map((page) => (
         <button
           type="button"
@@ -63,6 +211,110 @@ export function PluginWorkspaceLinks() {
           <span className="truncate">{page.title}</span>
         </button>
       ))}
+      {hasSearchOrImport && searchResolution && searchSummary && (
+        <div
+          data-testid="sidebar-search-resolution"
+          className="mt-1 space-y-1 rounded-lg px-2 py-1.5 text-[11px]"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-hairline)',
+          }}
+        >
+          <div className="flex items-center justify-between gap-1 text-[var(--text-muted)]">
+            <span className="inline-flex items-center gap-1">
+              <Search size={11} />
+              会话搜索 · {searchSummary.label}
+            </span>
+            <button
+              type="button"
+              onClick={() => openSessionSearchPage({ instanceId: searchResolution.instanceId })}
+              className="cursor-pointer text-[10.5px] text-[var(--accent-indigo)] hover:underline"
+            >
+              {searchResolution.status === 'ready' ? '打开工作页' : '查看状态'}
+            </button>
+          </div>
+          {(searchResolution.candidates.length > 0 || searchResolution.instanceId) && (
+            <select
+              aria-label="当前会话搜索实例"
+              value={searchResolution.instanceId ?? ''}
+              onChange={(event) => {
+                const nextId = event.target.value || null;
+                if (selectedWorkspaceId && typeof setWorkspaceBinding === 'function') {
+                  void setWorkspaceBinding(selectedWorkspaceId, SESSION_SEARCH_CONTRACT, nextId);
+                } else if (nextId) {
+                  open(makeWorkspacePageKey(nextId, SESSION_SEARCH_PAGE_SLOT_ID));
+                }
+              }}
+              className="w-full rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] text-[var(--text-primary)]"
+            >
+              {!searchResolution.instanceId && <option value="">选择搜索实例...</option>}
+              {searchResolution.instanceId &&
+                !searchResolution.candidates.some((c) => c.instanceId === searchResolution.instanceId) && (
+                  <option value={searchResolution.instanceId}>
+                    {searchResolution.instanceId} ({searchSummary.label})
+                  </option>
+                )}
+              {searchResolution.candidates.map((cand) => (
+                <option key={cand.instanceId} value={cand.instanceId}>
+                  {cand.instanceId} ({cand.version})
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
+      {hasSearchOrImport && importResolution && importSummary && (
+        <div
+          data-testid="sidebar-import-resolution"
+          className="mt-1 space-y-1 rounded-lg px-2 py-1.5 text-[11px]"
+          style={{
+            backgroundColor: 'var(--bg-surface)',
+            border: '1px solid var(--border-hairline)',
+          }}
+        >
+          <div className="flex items-center justify-between gap-1 text-[var(--text-muted)]">
+            <span className="inline-flex items-center gap-1">
+              <History size={11} />
+              历史导入 · {importSummary.label}
+            </span>
+            <button
+              type="button"
+              onClick={() => openHistoryImportPage({ instanceId: importResolution.instanceId })}
+              className="cursor-pointer text-[10.5px] text-[var(--accent-indigo)] hover:underline"
+            >
+              {importResolution.status === 'ready' ? '打开工作页' : '查看状态'}
+            </button>
+          </div>
+          {(importResolution.candidates.length > 0 || importResolution.instanceId) && (
+            <select
+              aria-label="当前历史导入实例"
+              value={importResolution.instanceId ?? ''}
+              onChange={(event) => {
+                const nextId = event.target.value || null;
+                if (selectedWorkspaceId && typeof setWorkspaceBinding === 'function') {
+                  void setWorkspaceBinding(selectedWorkspaceId, HISTORY_IMPORT_CONTRACT, nextId);
+                } else if (nextId) {
+                  open(makeWorkspacePageKey(nextId, HISTORY_IMPORT_PAGE_SLOT_ID));
+                }
+              }}
+              className="w-full rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] text-[var(--text-primary)]"
+            >
+              {!importResolution.instanceId && <option value="">选择导入实例...</option>}
+              {importResolution.instanceId &&
+                !importResolution.candidates.some((c) => c.instanceId === importResolution.instanceId) && (
+                  <option value={importResolution.instanceId}>
+                    {importResolution.instanceId} ({importSummary.label})
+                  </option>
+                )}
+              {importResolution.candidates.map((cand) => (
+                <option key={cand.instanceId} value={cand.instanceId}>
+                  {cand.instanceId} ({cand.version})
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
       {selectedSessionId && browserProviders.length > 0 && (
         <div
           className="mt-1 space-y-1 rounded-lg px-2 py-1.5 text-[11px]"
@@ -119,13 +371,55 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
   const pages = useSlotItems('workspace.pages');
   const active = useAppStore((state) => state.activePluginPage);
   const open = useAppStore((state) => state.setActivePluginPage);
+  const plugins = useAppStore((state) => state.plugins);
   const page = pages.find((item) => pageKey(item) === active);
 
-  useEffect(() => {
-    if (active && !page) open(null);
-  }, [active, open, page]);
+  const parsedActive = parseWorkspacePageKey(active);
+  const knownOfflinePeerPage =
+    !page &&
+    parsedActive &&
+    (parsedActive.slotId === SESSION_SEARCH_PAGE_SLOT_ID ||
+      parsedActive.slotId === HISTORY_IMPORT_PAGE_SLOT_ID) &&
+    plugins.some(
+      (p) => getPluginInstanceId(p) === parsedActive.instanceId || p.id === parsedActive.instanceId,
+    )
+      ? parsedActive
+      : null;
 
-  if (!page) return children;
+  useEffect(() => {
+    if (active && !page && !knownOfflinePeerPage) open(null);
+  }, [active, open, page, knownOfflinePeerPage]);
+
+  if (!page && !knownOfflinePeerPage) return children;
+
+  if (knownOfflinePeerPage) {
+    const title =
+      knownOfflinePeerPage.slotId === SESSION_SEARCH_PAGE_SLOT_ID
+        ? `会话搜索 (${knownOfflinePeerPage.instanceId})`
+        : `历史导入 (${knownOfflinePeerPage.instanceId})`;
+    return (
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-[var(--bg-surface)]">
+        <header className="flex items-center gap-3 border-b border-[var(--border-hairline)] px-4 py-3">
+          <button
+            type="button"
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+            onClick={() => open(null)}
+          >
+            <ArrowLeft size={14} />
+            返回会话
+          </button>
+          <h1 className="truncate text-sm font-medium text-[var(--text-primary)]">{title}</h1>
+        </header>
+        <div className="min-h-0 flex-1">
+          {knownOfflinePeerPage.slotId === SESSION_SEARCH_PAGE_SLOT_ID ? (
+            <SessionSearchWorkspacePage instanceId={knownOfflinePeerPage.instanceId} />
+          ) : (
+            <HistoryImportWorkspacePage instanceId={knownOfflinePeerPage.instanceId} />
+          )}
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-[var(--bg-surface)]">
@@ -138,11 +432,11 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
           <ArrowLeft size={14} />
           返回会话
         </button>
-        <h1 className="truncate text-sm font-medium text-[var(--text-primary)]">{page.title}</h1>
+        <h1 className="truncate text-sm font-medium text-[var(--text-primary)]">{page!.title}</h1>
       </header>
       <div className="min-h-0 flex-1">
-        <SlotErrorBoundary key={pageKey(page)} registry={registry} item={page}>
-          <WorkspacePageContent page={page} />
+        <SlotErrorBoundary key={pageKey(page!)} registry={registry} item={page!}>
+          <WorkspacePageContent page={page!} />
         </SlotErrorBoundary>
       </div>
     </main>

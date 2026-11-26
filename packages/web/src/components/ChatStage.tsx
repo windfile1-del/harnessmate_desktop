@@ -541,7 +541,10 @@ export function ChatStage() {
 
   useEffect(() => {
     if (!focusedTurn || focusedTurn.sessionId !== selectedSessionId) return;
-    const target = document.getElementById(`chat-turn-${focusedTurn.turnId}`);
+    const itemTarget = focusedTurn.itemId
+      ? document.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(focusedTurn.itemId)}"]`)
+      : null;
+    const target = itemTarget ?? document.getElementById(`chat-turn-${focusedTurn.turnId}`);
     if (!target) {
       const index = timeline.items.findIndex((item) => item.kind === 'turn' && item.turnId === focusedTurn.turnId);
       if (index >= 0 && index < firstVisible) {
@@ -2211,7 +2214,7 @@ const TurnBlock = memo(function TurnBlock({
               const block = segment.block;
               if (block.type === 'assistant_text') {
                 return (
-                  <div key={block.blockId} className="pl-0.5">
+                  <div key={block.blockId} data-item-id={block.blockId} className="pl-0.5">
                     <Slot
                       name="chat.message.wrapper"
                       slotProps={{ session, turn, children: null }}

@@ -138,6 +138,7 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
     createSession,
     importNativeSession,
     addWorkspace,
+    openHistoryImportPage,
     pushToast,
   } = useAppStore();
 
@@ -470,18 +471,27 @@ function NewSessionModal({ onClose }: { onClose: () => void }) {
         </div>
       ) : (
         <div className="max-h-[420px] space-y-2 overflow-y-auto p-5">
-          <label className="flex flex-wrap items-center gap-2 pb-1 text-[12px] text-[var(--text-secondary)]">
-            原工作目录不可用时
-            <select
-              aria-label="历史会话的备用工作区"
-              value={workspaceId}
-              onChange={(event) => setWorkspaceId(event.target.value)}
-              className="min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2 py-1"
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-1">
+            <label className="flex flex-wrap items-center gap-2 text-[12px] text-[var(--text-secondary)]">
+              原工作目录不可用时
+              <select
+                aria-label="历史会话的备用工作区"
+                value={workspaceId}
+                onChange={(event) => setWorkspaceId(event.target.value)}
+                className="min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-2 py-1"
+              >
+                <option value="">选择本地工作区</option>
+                {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => openHistoryImportPage()}
+              className="cursor-pointer rounded-lg border border-[var(--border-focus)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent-indigo)] hover:bg-[var(--bg-active)]"
             >
-              <option value="">选择本地工作区</option>
-              {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
-            </select>
-          </label>
+              打开完整历史导入工作页
+            </button>
+          </div>
           {historyLoading || historyError || discoveredSessions.length === 0 ? (
             <div className="py-10 text-center text-[12.5px] text-[var(--text-muted)]">
               {historyLoading ? '正在查找本机会话…' : historyError || '未发现 Codex、Claude Code 或 Antigravity 的本地会话。'}
