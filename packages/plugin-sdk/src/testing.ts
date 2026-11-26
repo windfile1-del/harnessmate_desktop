@@ -6,6 +6,7 @@ import {
   isSafePluginUiPath,
   isValidPluginSlotKey,
   normalizeAnyPluginSlotKey,
+  serviceResolutionErrorCode,
   type ContextHandoffPreviewV2,
   type Disposer,
   type HandoffRedactEvent,
@@ -38,7 +39,10 @@ import {
   type PublicSessionNotice,
   type PublicSlotRegistration,
   type PublicTurnBlock,
+  type ResolveServiceSelectionOptions,
+  type ServiceCallOptions,
   type ServiceImplementation,
+  type ServiceResolutionV1,
   type SpawnCliSpec,
 } from '@harnessmate/plugin-api';
 
@@ -337,6 +341,7 @@ export interface CreateMockPluginHostOptions {
   permissions?: readonly string[];
   features?: readonly string[];
   services?: Record<string, ServiceImplementation>;
+  serviceResolutions?: Record<string, ServiceResolutionV1>;
   sessions?: Array<PublicSession | MockSessionController>;
   secrets?: Record<string, string>;
   workspaceFiles?: Record<string, Record<string, string>>;
@@ -483,7 +488,49 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
         [...services.keys()]
           .filter((name) => !contract || name === contract)
           .map((contractName) => ({ pluginId, instanceId: pluginId, contract: contractName, version: '1.0.0' })),
-      call: async <T = unknown>(contract: string, method: string, args: unknown[] = []) => {
+      resolve: async (contract: string, opts?: ResolveServiceSelectionOptions): Promise<ServiceResolutionV1> => {
+        const overridden = options.serviceResolutions?.[contract];
+        if (overridden) return overridden;
+        const versionRange = opts?.versionRange ?? '*';
+        const hasService = services.has(contract);
+        const candidates = hasService ? [{ instanceId: pluginId, pluginId, version: '1.0.0' }] : [];
+        if (opts?.explicitInstanceId) {
+          if (hasService && opts.explicitInstanceId === pluginId) {
+            return { contract, versionRange, instanceId: pluginId, source: 'explicit', status: 'ready', candidates };
+          }
+          return {
+            contract,
+            versionRange,
+            instanceId: opts.explicitInstanceId,
+            source: 'explicit',
+            status: 'unavailable',
+            candidates,
+          };
+        }
+        if (!hasService) {
+          return { contract, versionRange, instanceId: null, source: 'none', status: 'unconfigured', candidates: [] };
+        }
+        if (opts?.allowSingleCandidate) {
+          return { contract, versionRange, instanceId: pluginId, source: 'single', status: 'ready', candidates };
+        }
+        return { contract, versionRange, instanceId: pluginId, source: 'composition', status: 'ready', candidates };
+      },
+      call: async <T = unknown>(contract: string, method: string, args: unknown[] = [], opts?: ServiceCallOptions) => {
+        if (opts?.versionRange !== undefined || opts?.sessionId !== undefined || opts?.workspaceId !== undefined || opts?.allowSingleCandidate !== undefined) {
+          const resolution = await ctx.services.resolve(contract, {
+            versionRange: opts.versionRange,
+            sessionId: opts.sessionId,
+            workspaceId: opts.workspaceId,
+            explicitInstanceId: opts.instanceId,
+            allowSingleCandidate: opts.allowSingleCandidate,
+          });
+          if (resolution.status !== 'ready') {
+            throw new PluginApiError(
+              serviceResolutionErrorCode(resolution.status),
+              `模拟服务 ${contract} 解析失败: ${resolution.status}`,
+            );
+          }
+        }
         const svc = services.get(contract);
         const fn = svc?.[method];
         if (typeof fn !== 'function') {

@@ -1,5 +1,13 @@
-import { PEER_CONTRACTS } from '@harnessmate/plugin-api';
+import semver from 'semver';
+import {
+  PluginApiError,
+  type ResolveServiceSelectionOptions,
+  type SelectionSource,
+  type ServiceCandidate,
+  type ServiceResolutionV1,
+} from '@harnessmate/plugin-api';
 import type { HarnessMateStore } from '../../db/sqlite.js';
+import type { PluginHost } from '../runtime/lifecycle.js';
 import type { PluginComposition } from './profile.js';
 
 export type BindingSource = 'session' | 'workspace' | 'composition' | 'default' | 'none';
@@ -9,12 +17,6 @@ export interface ResolvedCapabilityBinding {
   instanceId: string | null;
   source: BindingSource;
 }
-
-export const DEFAULT_BUNDLED_PROVIDERS: Readonly<Record<string, string>> = {
-  [PEER_CONTRACTS.browser]: 'hm.plugin.browser-desktop',
-  [PEER_CONTRACTS.filePreview]: 'hm.plugin.file-preview-text',
-  [PEER_CONTRACTS.approvalPolicy]: 'hm.plugin.approval-policy-default',
-};
 
 export function resolveCapabilityBinding(params: {
   contract: string;
@@ -40,15 +42,162 @@ export function resolveCapabilityBinding(params: {
     }
   }
 
-  const compBinding = composition.contractBindings[contract];
-  if (compBinding) {
-    return { contract, instanceId: compBinding, source: 'composition' };
+  const profileBinding = composition.profileBindings[contract];
+  if (profileBinding) {
+    return { contract, instanceId: profileBinding, source: 'composition' };
   }
 
-  const fallback = DEFAULT_BUNDLED_PROVIDERS[contract];
-  if (fallback && isEntryInComposition(fallback)) {
-    return { contract, instanceId: fallback, source: 'default' };
+  const layerDefault = composition.layerBindings[contract];
+  if (layerDefault && isEntryInComposition(layerDefault)) {
+    return { contract, instanceId: layerDefault, source: 'default' };
   }
 
   return { contract, instanceId: null, source: 'none' };
+}
+
+export interface ResolveServiceSelectionParams {
+  contract: string;
+  options?: ResolveServiceSelectionOptions;
+  host: PluginHost;
+  composition: PluginComposition;
+  store?: HarnessMateStore;
+  isInstanceActive: (instanceId: string) => boolean;
+  isInstanceDisabled: (instanceId: string) => boolean;
+}
+
+export function resolveServiceSelection(params: ResolveServiceSelectionParams): ServiceResolutionV1 {
+  const { contract, options, host, composition, store, isInstanceActive, isInstanceDisabled } = params;
+  const requestedRange = options?.versionRange?.trim() || undefined;
+  const callerInstanceId = options?.callerInstanceId?.trim() || undefined;
+  const callerDepRange = callerInstanceId
+    ? host.getInstanceDependencyVersion(callerInstanceId, contract)?.trim() || undefined
+    : undefined;
+
+  if (requestedRange && !semver.validRange(requestedRange)) {
+    throw new PluginApiError('E_INVALID_INPUT', `无效的服务版本范围: ${requestedRange}`);
+  }
+  if (callerDepRange && !semver.validRange(callerDepRange)) {
+    throw new PluginApiError('E_INVALID_INPUT', `无效的依赖版本范围: ${callerDepRange}`);
+  }
+
+  const versionRange = requestedRange ?? callerDepRange ?? '*';
+  const isCompatibleVersion = (version: string): boolean => {
+    if (!semver.valid(version)) return false;
+    if (requestedRange && !semver.satisfies(version, requestedRange)) return false;
+    if (callerDepRange && !semver.satisfies(version, callerDepRange)) return false;
+    return true;
+  };
+
+  const allProviders = host.listServiceProviders(contract);
+  const candidates: ServiceCandidate[] = allProviders
+    .filter((rec) => isInstanceActive(rec.instanceId) && isCompatibleVersion(rec.version))
+    .map(({ instanceId, pluginId, version }) => ({ instanceId, pluginId, version }))
+    .sort((a, b) => a.instanceId.localeCompare(b.instanceId));
+
+  const explicitId = options?.explicitInstanceId?.trim() || undefined;
+  const sessionId = options?.sessionId?.trim() || undefined;
+  const explicitWorkspaceId = options?.workspaceId?.trim() || undefined;
+  const effectiveWorkspaceId = explicitWorkspaceId
+    ?? (sessionId && store ? store.getSession(sessionId)?.workspaceId : undefined);
+
+  let selected: { instanceId: string; source: Exclude<SelectionSource, 'none' | 'single'> } | undefined;
+  if (explicitId) {
+    selected = { instanceId: explicitId, source: 'explicit' };
+  } else if (store && sessionId) {
+    const sessionBinding = store.getCapabilityBinding('session', sessionId, contract);
+    if (sessionBinding?.instanceId) {
+      selected = { instanceId: sessionBinding.instanceId, source: 'session' };
+    }
+  }
+  if (!selected && store && effectiveWorkspaceId) {
+    const workspaceBinding = store.getCapabilityBinding('workspace', effectiveWorkspaceId, contract);
+    if (workspaceBinding?.instanceId) {
+      selected = { instanceId: workspaceBinding.instanceId, source: 'workspace' };
+    }
+  }
+  if (!selected && callerInstanceId) {
+    const depBinding = host.getInstanceBinding(callerInstanceId, contract);
+    if (depBinding) {
+      selected = { instanceId: depBinding, source: 'dependency' };
+    }
+  }
+  if (!selected) {
+    const compBinding = composition.contractBindings[contract];
+    if (compBinding) {
+      selected = { instanceId: compBinding, source: 'composition' };
+    }
+  }
+
+  if (selected) {
+    if (candidates.some((c) => c.instanceId === selected.instanceId)) {
+      return {
+        contract,
+        versionRange,
+        instanceId: selected.instanceId,
+        source: selected.source,
+        status: 'ready',
+        candidates,
+      };
+    }
+    const registered = allProviders.find((p) => p.instanceId === selected.instanceId);
+    if (registered && isInstanceActive(selected.instanceId) && !isCompatibleVersion(registered.version)) {
+      return {
+        contract,
+        versionRange,
+        instanceId: selected.instanceId,
+        source: selected.source,
+        status: 'incompatible',
+        candidates,
+      };
+    }
+    if (isInstanceDisabled(selected.instanceId)) {
+      return {
+        contract,
+        versionRange,
+        instanceId: selected.instanceId,
+        source: selected.source,
+        status: 'disabled',
+        candidates,
+      };
+    }
+    return {
+      contract,
+      versionRange,
+      instanceId: selected.instanceId,
+      source: selected.source,
+      status: 'unavailable',
+      candidates,
+    };
+  }
+
+  if (candidates.length === 0) {
+    return {
+      contract,
+      versionRange,
+      instanceId: null,
+      source: 'none',
+      status: 'unconfigured',
+      candidates: [],
+    };
+  }
+
+  if (candidates.length === 1 && options?.allowSingleCandidate === true) {
+    return {
+      contract,
+      versionRange,
+      instanceId: candidates[0]!.instanceId,
+      source: 'single',
+      status: 'ready',
+      candidates,
+    };
+  }
+
+  return {
+    contract,
+    versionRange,
+    instanceId: null,
+    source: 'none',
+    status: 'selection_required',
+    candidates,
+  };
 }

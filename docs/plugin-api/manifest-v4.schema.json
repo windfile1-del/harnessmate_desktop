@@ -70,7 +70,10 @@
                 "enum": [
                   "browser.v1",
                   "filePreview.v1",
-                  "approval.policy.v1"
+                  "approval.policy.v1",
+                  "history.source.v1",
+                  "history.import.v1",
+                  "session.search.v1"
                 ]
               },
               {

@@ -37,9 +37,12 @@ import {
   type PublicNetStreamHandle,
   type PublicNetStreamInit,
   type PublicSlotRegistration,
+  type ResolveServiceSelectionOptions,
+  type ServiceCallOptions,
   type ServiceImplementation,
   type ServiceProvideMeta,
   type ServiceProviderDescriptor,
+  type ServiceResolutionV1,
   type SpawnCliSpec,
 } from '@harnessmate/plugin-api';
 
@@ -223,7 +226,9 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
       }),
       services: {
         list: (contract?: string) => rpcCall<ServiceProviderDescriptor[]>('services.list', contract ? { contract } : {}),
-        call: <T = unknown>(contract: string, method: string, args: unknown[] = [], opts?: { instanceId?: string }) =>
+        resolve: (contract: string, opts?: ResolveServiceSelectionOptions) =>
+          rpcCall<ServiceResolutionV1>('services.resolve', { contract, ...(opts ?? {}) }),
+        call: <T = unknown>(contract: string, method: string, args: unknown[] = [], opts?: ServiceCallOptions) =>
           rpcCall<T>('services.call', { contract, method, args, ...(opts ?? {}) }),
       },
       routes: {
@@ -234,7 +239,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
             routeHandlers.set(normalized, handler);
             return () => {
               routeHandlers.delete(normalized);
-              rpcNotify('routes.unregister', { pathPrefix: normalized });
+              rpcNotify('routes.unregister', { path: normalized, pathPrefix: normalized });
             };
           }),
       },

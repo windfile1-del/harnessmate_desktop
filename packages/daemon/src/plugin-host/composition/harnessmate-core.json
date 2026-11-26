@@ -1,0 +1,23 @@
+{
+  "bindings": {
+    "browser.v1": "hm.plugin.browser-desktop",
+    "filePreview.v1": "hm.plugin.file-preview-text",
+    "approval.policy.v1": "hm.plugin.approval-policy-default"
+  },
+  "optionalDisabled": [
+    "hm.plugin.multi-harness-orchestrator",
+    "hm.plugin.context-compression",
+    "hm.plugin.terminal-workspace",
+    "hm.plugin.triage-inbox"
+  ],
+  "stableIds": {
+    "core.task-ledger": "ledger",
+    "core.context-bridge": "handoff",
+    "core.git-inspector": "git",
+    "core.account-usage": "usage",
+    "core.harness.codex": "harness-codex",
+    "core.harness.claude": "harness-claude",
+    "core.harness.agy": "harness-agy",
+    "core.harness.acp": "harness-acp"
+  }
+}

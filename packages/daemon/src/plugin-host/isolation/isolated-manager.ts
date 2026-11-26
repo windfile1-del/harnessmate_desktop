@@ -23,6 +23,8 @@ import {
   type PublicCommandResult,
   type PublicHarnessDriverDescriptor,
   type PublicHarnessProbeResult,
+  type ResolveServiceSelectionOptions,
+  type ServiceResolutionV1,
 } from '@harnessmate/plugin-api';
 import type {
   ApprovalDecision,
@@ -94,6 +96,7 @@ export interface ActiveIsolatedPlugin {
   commands: Set<string>;
   routes: Set<string>;
   serviceMeta: Record<string, { version?: string; metadata?: Record<string, unknown> }>;
+  serviceDisposers: Map<string, () => void>;
   tools: Map<string, { name: string; description: string; inputSchema: Record<string, unknown>; readOnly?: boolean }>;
   slots: Map<string, PluginRuntimeSlotDescriptor>;
   sections: Map<string, { id: string; order?: number; text: string }>;
@@ -116,6 +119,7 @@ export interface IsolatedManagerOptions {
   registry?: HarnessRegistry;
   crashPolicy?: CrashPolicy;
   runNativeCommand?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
+  resolveServiceSelection?: (contract: string, options: ResolveServiceSelectionOptions) => ServiceResolutionV1;
 }
 
 export class IsolatedPluginManager {
@@ -214,12 +218,19 @@ export class IsolatedPluginManager {
       onDynamicUnregister: (instanceId, runId, kind, name) => {
         const entry = this.active.get(instanceId);
         if (!entry || entry.runId !== runId) return;
-        if (kind === 'command') entry.commands.delete(name);
+        if (kind === 'service') {
+          const dispose = entry.serviceDisposers.get(name);
+          if (dispose) {
+            entry.serviceDisposers.delete(name);
+            dispose();
+          }
+        } else if (kind === 'command') entry.commands.delete(name);
         else if (kind === 'tool') entry.tools.delete(name);
         else if (kind === 'section') entry.sections.delete(name);
         else if (kind === 'slot') entry.slots.delete(name);
         else if (kind === 'route') entry.routes.delete(name);
       },
+      resolveServiceSelection: opts.resolveServiceSelection,
       runNativeCommand: (sessionId, command, args) => {
         if (!this.nativeCommandRunner) {
           throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用原生命令桥接');
@@ -423,6 +434,7 @@ export class IsolatedPluginManager {
           commands: new Set(),
           routes: new Set(),
           serviceMeta: {},
+          serviceDisposers: new Map(),
           tools: new Map(),
           slots: new Map(),
           sections: new Map(),
@@ -437,6 +449,7 @@ export class IsolatedPluginManager {
         this.active.set(instanceId, placeholder);
 
         ctx.effect(() => () => {
+          placeholder.serviceDisposers.clear();
           this.router.abortNetStreamsForRun(instanceId, proc.runId);
           this.cleanupPluginDrivers(placeholder);
           const cliTask = this.cliProcesses.killAllForRun(instanceId, proc.runId)
@@ -524,11 +537,12 @@ export class IsolatedPluginManager {
               return prop in target ? target[prop] : undefined;
             },
           });
-          ctx.provide(serviceName, serviceProxy, {
+          const disposeService = ctx.provide(serviceName, serviceProxy, {
             version: meta?.version ?? info.version,
             metadata: meta?.metadata,
             runId: capturedRunId,
           });
+          placeholder.serviceDisposers.set(serviceName, disposeService);
         }
       },
     };

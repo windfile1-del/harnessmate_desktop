@@ -690,6 +690,306 @@ export interface ServiceProviderDescriptor {
     version: string;
     metadata?: Record<string, unknown>;
 }
+export type SelectionSource = 'explicit' | 'session' | 'workspace' | 'dependency' | 'composition' | 'single' | 'none';
+export interface ServiceCandidate {
+    instanceId: string;
+    pluginId: string;
+    version: string;
+}
+export type ServiceResolutionV1 = {
+    contract: string;
+    versionRange: string;
+    candidates: ServiceCandidate[];
+} & ({
+    instanceId: string;
+    source: Exclude<SelectionSource, 'none'>;
+    status: 'ready';
+} | {
+    instanceId: string;
+    source: Exclude<SelectionSource, 'none' | 'single'>;
+    status: 'disabled' | 'unavailable' | 'incompatible';
+} | {
+    instanceId: null;
+    source: 'none';
+    status: 'unconfigured' | 'selection_required';
+});
+export interface ResolveServiceSelectionOptions {
+    versionRange?: string;
+    sessionId?: string;
+    workspaceId?: string;
+    callerInstanceId?: string;
+    explicitInstanceId?: string;
+    allowSingleCandidate?: boolean;
+}
+export interface ServiceCallOptions {
+    instanceId?: string;
+    versionRange?: string;
+    sessionId?: string;
+    workspaceId?: string;
+    allowSingleCandidate?: boolean;
+}
+export declare function serviceResolutionErrorCode(status: Exclude<ServiceResolutionV1['status'], 'ready'>): PluginErrorCode;
+export declare const HISTORY_SOURCE_CONTRACT_VERSION = "1.0.0";
+export declare const HISTORY_IMPORT_CONTRACT_VERSION = "1.0.0";
+export declare const SESSION_SEARCH_CONTRACT_VERSION = "1.0.0";
+export declare const PEER_CONTRACT_VERSIONS: {
+    readonly 'history.source.v1': "1.0.0";
+    readonly 'history.import.v1': "1.0.0";
+    readonly 'session.search.v1': "1.0.0";
+};
+export type PeerServiceErrorCode = 'invalid_request' | 'source_unreadable' | 'not_importable' | 'cancelled' | 'conflict';
+export interface PeerServiceError<Code extends string = PeerServiceErrorCode | (string & {})> {
+    code: Code;
+    message: string;
+}
+export type ServiceMethodResult<T, Code extends string = PeerServiceErrorCode | (string & {})> = {
+    ok: true;
+    value: T;
+} | {
+    ok: false;
+    error: PeerServiceError<Code>;
+};
+export interface HistoryRef {
+    sourceInstanceId: string;
+    sourceId: string;
+    nativeSessionId: string;
+}
+export interface HistoryWorkspaceHint {
+    cwd?: string;
+    label?: string;
+}
+export interface HistorySummary {
+    ref: HistoryRef;
+    title: string;
+    harnessKind: string;
+    updatedAt: number;
+    workspaceHint?: HistoryWorkspaceHint;
+}
+export interface HistoryItem {
+    itemId: string;
+    role: 'user' | 'assistant';
+    text: string;
+    timestamp?: number;
+}
+export interface HistorySourceDiscoverRequest {
+    query?: string;
+    workspaceId?: string;
+    fromTs?: number;
+    toTs?: number;
+    cursor?: string;
+    limit?: number;
+    refresh?: boolean;
+    operationId?: string;
+}
+export interface HistorySourceDiscoverResponse {
+    sessions: HistorySummary[];
+    nextCursor: string | null;
+}
+export interface HistorySourceReadRequest {
+    ref: HistoryRef;
+    cursor?: string;
+    limit?: number;
+    operationId?: string;
+}
+export interface HistorySourceReadResponse {
+    ref: HistoryRef;
+    items: HistoryItem[];
+    nextCursor: string | null;
+    readStatus: 'complete' | 'partial';
+    warnings: string[];
+}
+export interface HistorySourceCancelRequest {
+    operationId: string;
+}
+export interface HistorySourceCancelResponse {
+    cancelled: boolean;
+}
+export interface HistorySourceServiceV1 {
+    discover(request: HistorySourceDiscoverRequest): Promise<ServiceMethodResult<HistorySourceDiscoverResponse>>;
+    read(request: HistorySourceReadRequest): Promise<ServiceMethodResult<HistorySourceReadResponse>>;
+    cancel?(request: HistorySourceCancelRequest): Promise<ServiceMethodResult<HistorySourceCancelResponse>>;
+}
+export interface PublicPortableSessionBundleV2 {
+    bundleVersion: 2;
+    exportedAt: number;
+    redacted: boolean;
+    redactionCategories: string[];
+    redactedCount: number;
+    session: {
+        originalId: string;
+        title: string;
+        harnessId: string;
+        harnessKind: string;
+        model?: string | null;
+        actualModel?: string | null;
+        reasoningEffort?: PublicReasoningEffort | null;
+        permissionMode: PublicPermissionMode;
+        cwd: string;
+        participatingHarnesses: string[];
+        createdAt: number;
+        updatedAt: number;
+    };
+    taskState?: {
+        objective: string;
+        steps: Array<{
+            id: string;
+            title: string;
+            status: 'pending' | 'in_progress' | 'done' | 'blocked';
+            ownerHarnessId?: string | null;
+            updatedAt: number;
+        }>;
+        decisions: string[];
+        touchedFiles: string[];
+        verifications: Array<{
+            command: string;
+            status: 'pass' | 'fail' | 'unknown';
+            summary?: string;
+            harnessId?: string | null;
+            timestamp: number;
+        }>;
+        blockers: string[];
+        pinnedFacts: string[];
+        failedAttempts?: Array<{
+            id: string;
+            summary: string;
+            failureReason: string;
+            relatedFiles?: string[];
+            harnessInstanceId?: string | null;
+            recordedAt: number;
+        }>;
+        rollingSummary: string;
+        summarizedUpToSeq: number;
+        version: number;
+        ledgerFilePath?: string | null;
+        updatedAt: number;
+    } | null;
+    items: PublicTurnBlock[];
+    events: Array<{
+        seq: number;
+        type: string;
+        turnId: string | null;
+        createdAt: number;
+        payload: Record<string, unknown>;
+    }>;
+}
+export type ImportInput = {
+    kind: 'native';
+    ref: HistoryRef;
+    mode: 'attach' | 'mirror';
+} | {
+    kind: 'bundle';
+    bundle: PublicPortableSessionBundleV2;
+    titleOverride?: string;
+};
+export interface HistoryImportPreviewRequest {
+    input: ImportInput;
+    workspaceId?: string;
+    operationId?: string;
+}
+export interface HistoryImportPreviewResponse {
+    input: ImportInput;
+    existingSessionId: string | null;
+    targetWorkspaceId: string | null;
+    importable: boolean;
+    items: HistoryItem[];
+    readStatus: 'complete' | 'partial';
+    warnings: string[];
+}
+export interface HistoryImportExecuteRequest {
+    input: ImportInput;
+    workspaceId?: string;
+    requestId: string;
+    operationId?: string;
+}
+export interface HistoryImportExecuteResponse {
+    sessionId: string;
+    disposition: 'created' | 'reused';
+    partial: boolean;
+    warnings: string[];
+}
+export interface HistoryImportCancelRequest {
+    operationId?: string;
+    requestId?: string;
+}
+export interface HistoryImportServiceV1 {
+    preview(request: HistoryImportPreviewRequest): Promise<ServiceMethodResult<HistoryImportPreviewResponse>>;
+    import(request: HistoryImportExecuteRequest): Promise<ServiceMethodResult<HistoryImportExecuteResponse>>;
+    cancel?(request: HistoryImportCancelRequest): Promise<ServiceMethodResult<{
+        cancelled: boolean;
+    }>>;
+}
+export interface PublicSessionSearchHighlight {
+    start: number;
+    end: number;
+}
+export interface PublicSessionSearchHit {
+    sessionId: string;
+    sessionTitle: string;
+    workspaceId: string;
+    turnId: string;
+    turnSeq: number;
+    itemId: string;
+    blockType: string;
+    snippetText: string;
+    snippetHtmlSafe: string;
+    highlights: PublicSessionSearchHighlight[];
+    driverId: string;
+    createdAt: number;
+}
+export interface SessionSearchQueryRequest {
+    q: string;
+    workspaceId?: string;
+    driverId?: string;
+    fromTs?: number;
+    toTs?: number;
+    limit?: number;
+    offset?: number;
+}
+export interface SessionSearchQueryResponse {
+    hits: PublicSessionSearchHit[];
+    nextOffset: number | null;
+    fallbackUsed: boolean;
+    tookMs: number;
+}
+export interface SessionSearchReindexRequest {
+    mode?: 'full' | 'incremental' | 'resume';
+    jobId?: string;
+    workspaceId?: string;
+}
+export interface SessionSearchReindexResponse {
+    jobId: string;
+    status: 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
+    indexedCount?: number;
+    totalCount?: number;
+    cursorSeq?: number;
+    snapshotWatermark?: number;
+    startedAt?: number;
+    updatedAt?: number;
+    finishedAt?: number;
+}
+export interface SessionSearchStatusResponse {
+    instanceId: string;
+    engineKind: string;
+    state: 'idle' | 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
+    cursorSeq: number;
+    latestSourceSeq?: number;
+    indexedItems: number;
+    indexedSessions: number;
+    activeJob: SessionSearchReindexResponse | null;
+    lastJob: SessionSearchReindexResponse | null;
+    lastError?: string;
+}
+export interface SessionSearchServiceV1 {
+    query(request: SessionSearchQueryRequest): Promise<ServiceMethodResult<SessionSearchQueryResponse>>;
+    reindex(request: SessionSearchReindexRequest): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
+    getStatus?(request?: Record<string, never>): Promise<ServiceMethodResult<SessionSearchStatusResponse>>;
+    cancelReindex?(request?: {
+        jobId?: string;
+    }): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
+    resumeReindex?(request?: {
+        jobId?: string;
+    }): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
+}
 export interface PluginRouteRequest {
     method: string;
     path: string;
@@ -720,9 +1020,8 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
     provide(name: string, service: ServiceImplementation, meta?: ServiceProvideMeta): Disposer;
     readonly services: {
         list(contract?: string): Promise<ServiceProviderDescriptor[]>;
-        call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: {
-            instanceId?: string;
-        }): Promise<T>;
+        resolve(contract: string, opts?: ResolveServiceSelectionOptions): Promise<ServiceResolutionV1>;
+        call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: ServiceCallOptions): Promise<T>;
     };
     readonly routes: {
         register(pathPrefix: string, handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse): Disposer;

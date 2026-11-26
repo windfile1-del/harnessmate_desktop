@@ -194,11 +194,15 @@ function buildContext(handshake) {
     },
     services: {
       list: (contract) => rpcCall('services.list', { contract }),
+      resolve: (contract, opts) => rpcCall('services.resolve', {
+        contract,
+        ...(opts && typeof opts === 'object' ? opts : {}),
+      }),
       call: (contract, method, args, opts) => rpcCall('services.call', {
         contract,
         method,
         args: Array.isArray(args) ? args : [],
-        instanceId: opts && opts.instanceId,
+        ...(opts && typeof opts === 'object' ? opts : {}),
       }),
     },
     routes: {

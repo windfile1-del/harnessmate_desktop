@@ -65,7 +65,9 @@ export interface IsolatedProcessOptions {
   onExit: (code: number | null, signal: NodeJS.Signals | null, stderr: string) => void;
 }
 
-export function buildIsolatedChildEnv(): Record<string, string> {
+export function buildIsolatedChildEnv(options?: {
+  declaredPermissions?: readonly string[];
+}): Record<string, string> {
   const env: Record<string, string> = {
     ELECTRON_RUN_AS_NODE: '1',
     NODE_ENV: process.env.NODE_ENV ?? 'production',
@@ -73,6 +75,12 @@ export function buildIsolatedChildEnv(): Record<string, string> {
   if (process.platform === 'win32') {
     if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
     if (process.env.SYSTEMROOT) env.SYSTEMROOT = process.env.SYSTEMROOT;
+  }
+  if (options?.declaredPermissions?.includes('fs:cli_histories:read')) {
+    for (const key of ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'HOME', 'USERPROFILE'] as const) {
+      const value = process.env[key];
+      if (value) env[key] = value;
+    }
   }
   return env;
 }
@@ -112,7 +120,7 @@ export class IsolatedPluginProcess {
     ];
     this.child = spawn(process.execPath, args, {
       cwd: opts.packageRoot,
-      env: buildIsolatedChildEnv(),
+      env: buildIsolatedChildEnv({ declaredPermissions: opts.declaredPermissions }),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
       detached: opts.trustedLocal && process.platform !== 'win32',

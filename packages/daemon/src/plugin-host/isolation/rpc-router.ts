@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   PluginApiError,
+  isReservedServiceName,
   pluginEventContracts,
+  serviceResolutionErrorCode,
   type ContextHandoffPreviewV2,
   type ForkSessionOptions,
   type GetSessionItemOptions,
@@ -26,6 +28,8 @@ import {
   type PublicTaskLedger,
   type PublicTaskLedgerAppend,
   type PublicTurnBlock,
+  type ResolveServiceSelectionOptions,
+  type ServiceResolutionV1,
   type SpawnCliSpec,
   type SwitchSessionInstanceOptions,
 } from '@harnessmate/plugin-api';
@@ -85,6 +89,7 @@ export interface PluginRouterDeps {
   onClipboardWrite?: (pluginId: string, text: string) => void;
   runNativeCommand?: (sessionId: string, command: string, args?: string) => Promise<{ output?: string; notice?: string }>;
   onDynamicUnregister?: (pluginId: string, runId: string, kind: 'service' | 'command' | 'tool' | 'section' | 'slot' | 'route', name: string) => void;
+  resolveServiceSelection?: (contract: string, options: ResolveServiceSelectionOptions) => ServiceResolutionV1;
 }
 
 function toPublicTurnBlock(item: TurnBlockRecord, truncateOmitted = false): PublicTurnBlock {
@@ -260,6 +265,50 @@ export class IsolatedPluginRpcRouter {
     return session;
   }
 
+  private readOptionalString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  }
+
+  private resolveServiceWithFallback(
+    contract: string,
+    options: ResolveServiceSelectionOptions,
+  ): ServiceResolutionV1 {
+    if (this.deps.resolveServiceSelection) {
+      return this.deps.resolveServiceSelection(contract, options);
+    }
+    const versionRange = options.versionRange ?? '*';
+    const providers = this.deps.host.listServiceProviders(contract);
+    const candidates = providers.map(({ instanceId, pluginId, version }) => ({ instanceId, pluginId, version }));
+    const boundId = options.explicitInstanceId
+      ?? (options.callerInstanceId ? this.deps.host.getInstanceBinding(options.callerInstanceId, contract) : undefined)
+      ?? this.deps.host.getDefaultBindings()[contract];
+    const source = options.explicitInstanceId
+      ? 'explicit'
+      : (options.callerInstanceId && this.deps.host.getInstanceBinding(options.callerInstanceId, contract))
+        ? 'dependency'
+        : this.deps.host.getDefaultBindings()[contract]
+          ? 'composition'
+          : undefined;
+    if (boundId && source) {
+      const ready = candidates.some((c) => c.instanceId === boundId);
+      return {
+        contract,
+        versionRange,
+        instanceId: boundId,
+        source,
+        status: ready ? 'ready' : 'unavailable',
+        candidates,
+      };
+    }
+    if (candidates.length === 0) {
+      return { contract, versionRange, instanceId: null, source: 'none', status: 'unconfigured', candidates: [] };
+    }
+    if (candidates.length === 1 && options.allowSingleCandidate) {
+      return { contract, versionRange, instanceId: candidates[0]!.instanceId, source: 'single', status: 'ready', candidates };
+    }
+    return { contract, versionRange, instanceId: null, source: 'none', status: 'selection_required', candidates };
+  }
+
   private getWorkspaceOrThrow(workspaceId: unknown) {
     if (typeof workspaceId !== 'string' || !workspaceId) throw new PluginApiError('E_INVALID_INPUT', '缺少 workspaceId');
     const workspace = this.deps.store.getWorkspace(workspaceId);
@@ -302,27 +351,31 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'service.unprovide':
-        if (typeof params.name === 'string') this.deps.onDynamicUnregister?.(meta.pluginId, meta.runId, 'service', params.name);
+        if (typeof params.name === 'string') this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'service', params.name);
         return { ok: true };
       case 'commands.unregister':
-        if (typeof params.command === 'string') this.deps.onDynamicUnregister?.(meta.pluginId, meta.runId, 'command', params.command);
+        if (typeof params.command === 'string') this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'command', params.command);
         return { ok: true };
       case 'tools.unregister':
-        if (typeof params.name === 'string') this.deps.onDynamicUnregister?.(meta.pluginId, meta.runId, 'tool', params.name);
+        if (typeof params.name === 'string') this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'tool', params.name);
         return { ok: true };
       case 'handoff.section.unregister':
-        if (typeof params.id === 'string') this.deps.onDynamicUnregister?.(meta.pluginId, meta.runId, 'section', params.id);
+        if (typeof params.id === 'string') this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'section', params.id);
         return { ok: true };
       case 'slots.unregister':
         if (typeof params.slot === 'string' && typeof params.id === 'string') {
           this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'slot', `${params.slot}:${params.id}`);
         }
         return { ok: true };
-      case 'routes.unregister':
-        if (typeof params.path === 'string') {
-          this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'route', params.path);
+      case 'routes.unregister': {
+        const routePath = typeof params.path === 'string'
+          ? params.path
+          : (typeof params.pathPrefix === 'string' ? params.pathPrefix : undefined);
+        if (routePath) {
+          this.deps.onDynamicUnregister?.(instanceId, meta.runId, 'route', routePath);
         }
         return { ok: true };
+      }
 
       case 'services.list': {
         const contract = typeof params.contract === 'string' && params.contract.trim() ? params.contract.trim() : undefined;
@@ -335,16 +388,67 @@ export class IsolatedPluginRpcRouter {
         }));
       }
 
+      case 'services.resolve': {
+        const contract = typeof params.contract === 'string' ? params.contract.trim() : '';
+        if (!contract) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名');
+        if (isReservedServiceName(contract)) {
+          throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接解析内部服务 ${contract}`);
+        }
+        return this.resolveServiceWithFallback(contract, {
+          callerInstanceId: instanceId,
+          explicitInstanceId: this.readOptionalString(params.explicitInstanceId) ?? this.readOptionalString(params.instanceId),
+          versionRange: this.readOptionalString(params.versionRange),
+          sessionId: this.readOptionalString(params.sessionId),
+          workspaceId: this.readOptionalString(params.workspaceId),
+          allowSingleCandidate: params.allowSingleCandidate === true,
+        });
+      }
+
       case 'services.call': {
         const contract = String(params.contract ?? '');
         const fnName = String(params.method ?? '');
         const args = Array.isArray(params.args) ? params.args : [];
-        const targetInstanceId = typeof params.instanceId === 'string' && params.instanceId.trim()
-          ? params.instanceId.trim()
-          : undefined;
+        const targetInstanceId = this.readOptionalString(params.instanceId);
+        const explicitInstanceId = this.readOptionalString(params.explicitInstanceId) ?? targetInstanceId;
+        const versionRange = this.readOptionalString(params.versionRange);
+        const sessionId = this.readOptionalString(params.sessionId);
+        const workspaceId = this.readOptionalString(params.workspaceId);
+        const allowSingleCandidate = typeof params.allowSingleCandidate === 'boolean' ? params.allowSingleCandidate : undefined;
+        const useNewResolution =
+          versionRange !== undefined
+          || sessionId !== undefined
+          || workspaceId !== undefined
+          || allowSingleCandidate !== undefined
+          || this.readOptionalString(params.explicitInstanceId) !== undefined;
+
         if (!contract || !fnName) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名或方法名');
-        if (contract === 'harness' || contract.startsWith('harness.') || contract === 'mcpHub' || contract === 'remote') {
+        if (isReservedServiceName(contract)) {
           throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接调用内部服务 ${contract}`);
+        }
+        if (useNewResolution) {
+          const resolution = this.resolveServiceWithFallback(contract, {
+            callerInstanceId: instanceId,
+            explicitInstanceId,
+            versionRange,
+            sessionId,
+            workspaceId,
+            allowSingleCandidate,
+          });
+          if (resolution.status !== 'ready') {
+            throw new PluginApiError(
+              serviceResolutionErrorCode(resolution.status),
+              `服务 ${contract} 不可用 (${resolution.status})`,
+            );
+          }
+          const service = this.deps.host.getServiceByInstance<Record<string, unknown>>(resolution.instanceId, contract);
+          if (!service) {
+            throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${contract}@${resolution.instanceId} 不可用`);
+          }
+          const fn = service[fnName];
+          if (typeof fn !== 'function') {
+            throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${contract}.${fnName} 不存在`);
+          }
+          return await fn(...args);
         }
         const service = this.deps.host.resolveServiceFor<Record<string, unknown>>(instanceId, contract, targetInstanceId);
         if (!service) {
