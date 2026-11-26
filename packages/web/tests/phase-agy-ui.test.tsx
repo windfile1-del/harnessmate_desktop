@@ -8,7 +8,7 @@ import {
 import { AgyComposerControls } from '../src/components/agy/AgyComposerControls';
 import { AgySettingsSlot } from '../src/components/agy/AgySettingsSlot';
 import { AgyStudioBlockCard } from '../src/components/agy/AgyStudioBlocks';
-import { UsageDashboardModal } from '../src/components/StudioModals';
+import { UsageDashboardModal } from '../src/components/HarnessIntegrationViews';
 import { useAppStore } from '../src/stores/app-store';
 
 vi.mock('../src/stores/app-store', async (importOriginal) => {
@@ -352,7 +352,7 @@ describe('Phase AGY-5 UI Components', () => {
       },
     });
 
-    const modalHtml = renderToStaticMarkup(<UsageDashboardModal onClose={() => {}} />);
+    const modalHtml = renderToStaticMarkup(<UsageDashboardModal onClose={() => {}} scope={{}} />);
     expect(modalHtml).toContain('多 AGY Google 账号禁止自动额度轮换，仅支持手动一键切换。');
     expect(modalHtml).toContain('手动切换至该账号');
   });
