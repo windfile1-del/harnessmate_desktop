@@ -14,7 +14,7 @@
     "build": "pnpm -r build",
     "pack:exe": "pnpm build && pnpm --filter @harnessmate/electron pack:exe",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm contracts:check && pnpm -r test",
+    "test": "pnpm contracts:check && pnpm -r --workspace-concurrency=1 test",
     "contracts:generate": "pnpm --filter @harnessmate/plugin-api build && node scripts/plugin-contracts.mjs",
     "contracts:check": "pnpm --filter @harnessmate/plugin-api build && node scripts/plugin-contracts.mjs --check",
     "create:plugin": "node scripts/create-plugin.mjs"

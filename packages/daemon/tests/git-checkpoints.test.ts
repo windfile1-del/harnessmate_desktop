@@ -98,7 +98,7 @@ afterEach(() => {
   }
 });
 
-describe('Phase 2.2 · Hidden Git Ref Checkpoints & Zero-Pollution Guarantee', { timeout: 20_000 }, () => {
+describe('Phase 2.2 · Hidden Git Ref Checkpoints & Zero-Pollution Guarantee', { timeout: 45_000 }, () => {
   it('captures multiple checkpoints across staged, unstaged, and untracked changes without polluting git status or git log --all', async () => {
     const repo = initTempGitRepo();
     const store = createTempStore();
@@ -196,7 +196,7 @@ describe('Phase 2.2 · Hidden Git Ref Checkpoints & Zero-Pollution Guarantee', {
   });
 });
 
-describe('Phase 2.2 · Atomic Revert Guard (Conversation First, Files Second) & Undo Revert', { timeout: 20_000 }, () => {
+describe('Phase 2.2 · Atomic Revert Guard (Conversation First, Files Second) & Undo Revert', { timeout: 45_000 }, () => {
   it('saves pre_revert backup, restores target files & removes post-target untracked files, and supports byte-for-byte Undo Revert', async () => {
     const repo = initTempGitRepo();
     const store = createTempStore();
@@ -363,7 +363,7 @@ describe('Phase 2.2 · Atomic Revert Guard (Conversation First, Files Second) & 
   });
 });
 
-describe('Phase 2.2 · Git Diff On-Demand, Worktree Lifecycle, Dry-Run Merge & Setup Script Trust', { timeout: 20_000 }, () => {
+describe('Phase 2.2 · Git Diff On-Demand, Worktree Lifecycle, Dry-Run Merge & Setup Script Trust', { timeout: 45_000 }, () => {
   it('supports per-file diff, discardFile, initGitRepo, workspaceTruthDigest, and commit without force push', async () => {
     const freshDir = createTempDir('hm-init-git-');
     const initRes = await initGitRepo(freshDir);

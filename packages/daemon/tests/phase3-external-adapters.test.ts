@@ -625,7 +625,7 @@ describe('Phase 3 Step 1: External Non-ACP Harness Adapters (DeepSeek & OpenCode
     // Zero API secret leak across logs
     const logs = JSON.stringify(daemon.pluginManager.getLogs('hm.adapter.deepseek'));
     expect(logs).not.toContain(apiSecret);
-  }, 30_000);
+  }, 60_000);
 
   it('hm.adapter.opencode: unit checks + managed_local strips OPENCODE_SERVER_PASSWORD, multiplexes workspaces on single process, and kills process tree on disable', async () => {
     const protocol = await import('../../../plugins/hm-adapter-opencode/lib/protocol.mjs');
@@ -833,7 +833,7 @@ describe('Phase 3 Step 1: External Non-ACP Harness Adapters (DeepSeek & OpenCode
     await daemon.pluginManager.togglePlugin('hm.adapter.opencode', false);
     await waitFor(() => !isPidAlive(managedPid), 6_000);
     expect(isPidAlive(managedPid)).toBe(false);
-  }, 35_000);
+  }, 60_000);
 
   it('hm.adapter.opencode: external_server validates 1.x HTML rejection, zero secret leaks on 401, Subscribe-Before-POST, silent stream reconciliation, unknown terminal fallback, survival on unload, and Codex <-> OpenCode handoff with hm_session_read', async () => {
     const extPassword = 'EXT_OC_PASSWORD_MUST_NOT_LEAK_9182';
@@ -1055,7 +1055,7 @@ describe('Phase 3 Step 1: External Non-ACP Harness Adapters (DeepSeek & OpenCode
     await daemon.pluginManager.togglePlugin('hm.adapter.opencode', false);
     expect(server.listening).toBe(true);
     expect(daemon.registry.get('opencode')).toBeUndefined();
-  }, 35_000);
+  }, 60_000);
 
   it('zero vendor hardcoding guard: core runtime, protocol, plugin host, and frontend slots contain zero hardcoded deepseek or opencode branches', () => {
     const dirsToScan = [

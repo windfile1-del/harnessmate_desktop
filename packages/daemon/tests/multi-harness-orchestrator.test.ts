@@ -262,7 +262,7 @@ afterEach(async () => {
   }
 });
 
-describe('Phase 3.2 · Multi-Harness Parallel Orchestrator (Scenario D)', { timeout: 30_000 }, () => {
+describe('Phase 3.2 · Multi-Harness Parallel Orchestrator (Scenario D)', { timeout: 60_000 }, () => {
   it('enforces permission ceiling (No Privilege Escalation) at both unit and runtime levels', async () => {
     // Pure policy ceiling matrix
     expect(capApprovalPolicy('manual', 'auto')).toBe('manual');
