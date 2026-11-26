@@ -11,9 +11,12 @@ import {
   isReservedServiceName,
   isThirdPartyCustomServiceName,
   normalizePluginSlotKey,
+  serviceResolutionErrorCode,
   type FilePreviewRequest,
   type FilePreviewResult,
   type PluginEventV4,
+  type ResolveServiceSelectionOptions,
+  type ServiceResolutionV1,
 } from '@harnessmate/plugin-api';
 import {
   HarnessCommandNameSchema,
@@ -40,7 +43,11 @@ import { normalizePluginManifest } from '../plugin-host/manifest/normalize.js';
 import { PluginHost, type HostPlugin } from '../plugin-host/runtime/lifecycle.js';
 import { toPluginEvent } from '../plugin-host/runtime/map-event.js';
 import { PluginComposition, type CompositionEntry, type CompositionLayerEntry } from '../plugin-host/composition/profile.js';
-import { resolveCapabilityBinding, type ResolvedCapabilityBinding } from '../plugin-host/composition/bindings.js';
+import {
+  resolveCapabilityBinding,
+  resolveServiceSelection as resolveServiceSelectionImpl,
+  type ResolvedCapabilityBinding,
+} from '../plugin-host/composition/bindings.js';
 import { BUILTIN_PLUGINS, BUNDLED_PLUGIN_IDS, BUNDLED_TRUSTED_LOCAL_IDS } from '../plugin-host/builtin/manifests.js';
 import { IsolatedPluginManager } from '../plugin-host/isolation/isolated-manager.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
@@ -155,6 +162,7 @@ export class PluginManager {
         getPluginInfo: (id) => this.instances.get(id)?.info ?? this.plugins.get(id)?.info,
         requestRestart: (instanceId) => this.restartIsolatedPlugin(instanceId),
         crashPolicy: options.crashPolicy,
+        resolveServiceSelection: (contract, resolveOpts) => this.resolveServiceSelection(contract, resolveOpts),
       });
     }
   }
@@ -271,6 +279,67 @@ export class PluginManager {
       composition: this.safeComposition ?? this.composition,
       isEntryInComposition: (instanceId) => this.isEntryInComposition(instanceId),
     });
+  }
+
+  private isInstanceServiceActive(instanceId: string): boolean {
+    if (this.host.status(instanceId)?.state !== 'ACTIVE') return false;
+    const inst = this.instances.get(instanceId);
+    if (!inst) return true;
+    if (!inst.info.enabled || inst.runtime?.failed) return false;
+    if (inst.info.main && this.isolated && !this.isolated.getActive(instanceId)?.process.alive) {
+      return false;
+    }
+    return true;
+  }
+
+  private isInstanceKnownDisabled(instanceId: string): boolean {
+    const inst = this.instances.get(instanceId);
+    if (inst) return !inst.info.enabled;
+    const pkg = this.plugins.get(instanceId);
+    if (pkg) return !pkg.info.enabled;
+    const resolved = (this.safeComposition ?? this.composition).resolve(this.installedNames());
+    return Boolean(resolved.entries.find((entry) => entry.id === instanceId)?.disabled);
+  }
+
+  resolveServiceSelection(
+    contract: string,
+    options?: ResolveServiceSelectionOptions,
+  ): ServiceResolutionV1 {
+    return resolveServiceSelectionImpl({
+      contract,
+      options,
+      host: this.host,
+      composition: this.safeComposition ?? this.composition,
+      store: this.store,
+      isInstanceActive: (instanceId) => this.isInstanceServiceActive(instanceId),
+      isInstanceDisabled: (instanceId) => this.isInstanceKnownDisabled(instanceId),
+    });
+  }
+
+  async invokeServiceSelection<T = unknown>(
+    contract: string,
+    method: string,
+    args: unknown[] = [],
+    options?: ResolveServiceSelectionOptions,
+  ): Promise<{ resolution: ServiceResolutionV1; value: T }> {
+    const resolution = this.resolveServiceSelection(contract, options);
+    if (resolution.status !== 'ready') {
+      throw new PluginApiError(
+        serviceResolutionErrorCode(resolution.status),
+        `服务 ${contract} 不可用 (${resolution.status})`,
+      );
+    }
+    const rec = this.host.getServiceRecordByInstance(resolution.instanceId, contract);
+    const service = this.host.getServiceByInstance<Record<string, unknown>>(resolution.instanceId, contract);
+    if (!rec || !service) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${contract}@${resolution.instanceId} 不可用`);
+    }
+    const fn = service[method];
+    if (typeof fn !== 'function') {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', `服务 ${contract}.${method} 不存在`);
+    }
+    const value = (await (fn as (...callArgs: unknown[]) => unknown)(...args)) as T;
+    return { resolution, value };
   }
 
   setCompositionBinding(contract: string, instanceId: string | null): Promise<void> {

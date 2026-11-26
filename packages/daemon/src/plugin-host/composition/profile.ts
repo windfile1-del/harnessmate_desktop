@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { dump, load, JSON_SCHEMA } from 'js-yaml';
 import { z } from 'zod';
 import { PluginApiError } from '@harnessmate/plugin-api';
-import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,95}$/);
 const contractName = z.string().min(1).max(100);
@@ -30,6 +30,17 @@ type ProfileConfig = z.infer<typeof profileSchema>;
 
 export type CompositionLayerEntry = z.infer<typeof entrySchema>;
 type LayerEntry = CompositionLayerEntry;
+const layerObjectSchema = z.object({
+  entries: entriesSchema.optional(),
+  bindings: z.record(contractName, identifier).optional(),
+}).strict();
+const distributionBundleSchema = z.object({
+  entries: entriesSchema.optional(),
+  bindings: z.record(contractName, identifier).optional(),
+  optionalDisabled: z.array(identifier).max(128).optional(),
+  stableIds: z.record(identifier, identifier).optional(),
+}).strict();
+type DistributionBundleData = z.infer<typeof distributionBundleSchema>;
 const recoverySchema = profileSchema.extend({ patch: entriesSchema });
 export interface CompositionEntry {
   id: string;
@@ -43,14 +54,27 @@ export interface PluginProfile extends ProfileConfig {
   entries: CompositionEntry[];
 }
 
+function resolveModuleDir(): string {
+  try {
+    if (typeof import.meta?.url === 'string' && import.meta.url) {
+      return path.dirname(fileURLToPath(import.meta.url));
+    }
+  } catch {
+    // fallback for CommonJS bundle (daemon.cjs)
+  }
+  return typeof __dirname === 'string' ? __dirname : process.cwd();
+}
+
+const MODULE_DIR = resolveModuleDir();
+const REPO_ROOT = path.resolve(MODULE_DIR, '../../../..');
+
 function readFile(file: string, maxBytes = 512 * 1024): string | undefined {
   if (!fs.existsSync(file)) return;
   if (fs.statSync(file).size > maxBytes) throw new PluginApiError('E_LIMIT_EXCEEDED', `组合文件过大 · ${path.basename(file)}`);
   return fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
 }
 
-function parseYaml(content: string): LayerEntry[] {
-  const parsed = load(content, { schema: JSON_SCHEMA });
+function encodeSafeJsonValue(parsed: unknown): unknown {
   const seen = new Set<object>();
   const encoded = JSON.stringify(parsed ?? [], (_, value: unknown) => {
     if (value && typeof value === 'object') {
@@ -59,7 +83,21 @@ function parseYaml(content: string): LayerEntry[] {
     }
     return value;
   });
-  return entriesSchema.parse(JSON.parse(encoded));
+  return JSON.parse(encoded);
+}
+
+function parseYaml(content: string): LayerEntry[] {
+  const parsed = load(content, { schema: JSON_SCHEMA });
+  return entriesSchema.parse(encodeSafeJsonValue(parsed));
+}
+
+function parseLayerYaml(content: string): { entries: LayerEntry[]; bindings: Record<string, string> } {
+  const parsed = encodeSafeJsonValue(load(content, { schema: JSON_SCHEMA }));
+  if (Array.isArray(parsed)) {
+    return { entries: entriesSchema.parse(parsed), bindings: {} };
+  }
+  const obj = layerObjectSchema.parse(parsed);
+  return { entries: obj.entries ?? [], bindings: obj.bindings ?? {} };
 }
 
 function writeAtomic(file: string, content: string): void {
@@ -73,22 +111,28 @@ function writeAtomic(file: string, content: string): void {
 }
 
 export const defaultBundle = 'harnessmate-core';
-const OPTIONAL_BUILTIN_PLUGINS = new Set<string>([
-  'hm.plugin.multi-harness-orchestrator',
-  'hm.plugin.context-compression',
-  'hm.plugin.terminal-workspace',
-  TRIAGE_INBOX_PLUGIN_ID,
-]);
-const stableIds: Record<string, string> = {
-  'core.task-ledger': 'ledger', 'core.context-bridge': 'handoff', 'core.git-inspector': 'git',
-  'core.account-usage': 'usage', 'core.harness.codex': 'harness-codex', 'core.harness.claude': 'harness-claude',
-  'core.harness.agy': 'harness-agy', 'core.harness.acp': 'harness-acp',
-};
-const entryId = (name: string) => stableIds[name] ?? name;
-const defaultBuiltinEntry = (name: string): LayerEntry =>
-  OPTIONAL_BUILTIN_PLUGINS.has(name)
-    ? { name, id: entryId(name), disabled: true }
-    : { name, id: entryId(name) };
+
+function loadDistributionBundle(bundleName: string, extraDir?: string): DistributionBundleData {
+  const resourcesPath = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  const candidates = [
+    extraDir ? path.join(extraDir, `${bundleName}.json`) : undefined,
+    process.env.HARNESSMATE_BUNDLES_DIR
+      ? path.join(process.env.HARNESSMATE_BUNDLES_DIR, `${bundleName}.json`)
+      : undefined,
+    resourcesPath ? path.join(resourcesPath, 'bundles', `${bundleName}.json`) : undefined,
+    resourcesPath ? path.join(resourcesPath, 'daemon', `${bundleName}.json`) : undefined,
+    path.join(MODULE_DIR, `${bundleName}.json`),
+    path.join(REPO_ROOT, 'packages', 'daemon', 'src', 'plugin-host', 'composition', `${bundleName}.json`),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const text = readFile(candidate);
+    if (text !== undefined) {
+      return distributionBundleSchema.parse(JSON.parse(text));
+    }
+  }
+  throw new PluginApiError('E_SERVICE_UNAVAILABLE', `找不到发行组合包 ${bundleName}`);
+}
 
 function sanitizeProfileForWrite(profile: ProfileConfig): ProfileConfig {
   const out: ProfileConfig = { bundles: [...profile.bundles] };
@@ -109,16 +153,58 @@ export class PluginComposition {
   private readonly patchFile: string;
   private readonly recoveryFile: string;
   private readonly pendingRestoreFile: string;
+  private readonly distributionData: DistributionBundleData;
+  private readonly stableIdMap: Record<string, string>;
   private profile: ProfileConfig = { bundles: [defaultBundle] };
-  private layers: Array<{ source: string; entries: LayerEntry[] }> = [];
+  private layers: Array<{ source: string; entries: LayerEntry[]; bindings: Record<string, string> }> = [];
   private patch: LayerEntry[] = [];
 
-  constructor(private readonly directory: string, private readonly builtin: readonly string[]) {
+  constructor(
+    private readonly directory: string,
+    private readonly builtin: readonly string[],
+    private readonly distributionBundlesDir?: string,
+  ) {
     this.profileFile = path.join(directory, 'profile.json');
     this.patchFile = path.join(directory, 'patch.yml');
     this.recoveryFile = path.join(directory, 'plugin-composition.previous.json');
     this.pendingRestoreFile = path.join(directory, 'plugin-composition.restore.json');
-    this.layers = [{ source: defaultBundle, entries: builtin.map(defaultBuiltinEntry) }];
+    this.distributionData = loadDistributionBundle(defaultBundle, distributionBundlesDir);
+    this.stableIdMap = this.distributionData.stableIds ?? {};
+    this.layers = [this.buildDefaultLayer(this.distributionData)];
+  }
+
+  private entryId(name: string): string {
+    return this.stableIdMap[name] ?? name;
+  }
+
+  private buildDefaultLayer(dist: DistributionBundleData): {
+    source: string;
+    entries: LayerEntry[];
+    bindings: Record<string, string>;
+  } {
+    const optionalSet = new Set(dist.optionalDisabled ?? []);
+    const stableMap = dist.stableIds ?? {};
+    const toEntryId = (name: string) => stableMap[name] ?? name;
+    const entries: LayerEntry[] = this.builtin.map((name) =>
+      optionalSet.has(name)
+        ? { name, id: toEntryId(name), disabled: true }
+        : { name, id: toEntryId(name) },
+    );
+    const byId = new Map(entries.map((e) => [e.id, e]));
+    for (const override of dist.entries ?? []) {
+      const existing = byId.get(override.id);
+      if (existing) {
+        Object.assign(existing, override);
+      } else {
+        entries.push(override);
+        byId.set(override.id, override);
+      }
+    }
+    return {
+      source: defaultBundle,
+      entries,
+      bindings: { ...(dist.bindings ?? {}) },
+    };
   }
 
   reload(legacyDisabled: readonly string[], readOnly = false): void {
@@ -131,7 +217,7 @@ export class PluginComposition {
     const layers = this.readLayers(profile.bundles);
     const patchText = readFile(this.patchFile);
     const patch = patchText === undefined
-      ? [...new Set(legacyDisabled)].map((name) => ({ id: entryId(name), disabled: true }))
+      ? [...new Set(legacyDisabled)].map((name) => ({ id: this.entryId(name), disabled: true }))
       : parseYaml(patchText);
     if (!readOnly) {
       if (profileText === undefined) this.writeProfile(profile);
@@ -147,11 +233,13 @@ export class PluginComposition {
     if (new Set(bundles).size !== bundles.length) throw new PluginApiError('E_CONFLICT', '组合包列表含有重复项');
     return bundles.map((bundle) => {
       if (bundle === defaultBundle) {
-        return { source: bundle, entries: this.builtin.map(defaultBuiltinEntry) };
+        const dist = loadDistributionBundle(defaultBundle, this.distributionBundlesDir);
+        return this.buildDefaultLayer(dist);
       }
       const content = readFile(path.join(this.directory, 'bundles', `${bundle}.yml`));
       if (content === undefined) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `找不到组合包 ${bundle}`);
-      return { source: bundle, entries: parseYaml(content) };
+      const parsed = parseLayerYaml(content);
+      return { source: bundle, entries: parsed.entries, bindings: parsed.bindings };
     });
   }
 
@@ -176,12 +264,27 @@ export class PluginComposition {
     return this.profile.extensions;
   }
 
-  get contractBindings(): Record<string, string> {
+  get profileBindings(): Record<string, string> {
     return {
       ...(this.profile.extensions?.filePreviewProvider
         ? { 'filePreview.v1': this.profile.extensions.filePreviewProvider }
         : {}),
       ...(this.profile.bindings ?? {}),
+    };
+  }
+
+  get layerBindings(): Record<string, string> {
+    const merged: Record<string, string> = {};
+    for (const layer of this.layers) {
+      Object.assign(merged, layer.bindings);
+    }
+    return merged;
+  }
+
+  get contractBindings(): Record<string, string> {
+    return {
+      ...this.layerBindings,
+      ...this.profileBindings,
     };
   }
 
@@ -318,7 +421,7 @@ export class PluginComposition {
   setEnabled(idOrName: string, enabled: boolean, installed: readonly string[]): void {
     const entries = this.resolve(installed).entries;
     const entry = entries.find((item) => item.id === idOrName) ?? entries.find((item) => item.name === idOrName);
-    const id = entry?.id ?? entryId(idOrName);
+    const id = entry?.id ?? this.entryId(idOrName);
     const name = entry?.name ?? idOrName;
     const baseline = this.resolve(installed, []).entries.find((item) => item.id === id);
     const existing = this.patch.find((item) => item.id === id) ?? { id };

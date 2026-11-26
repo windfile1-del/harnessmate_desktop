@@ -1,3 +1,4 @@
+import semver from 'semver';
 import {
   HOST_SUPPORTED_FEATURES,
   PLUGIN_API_VERSION, PLUGIN_EVENT_VERSION, PluginApiError,
@@ -119,6 +120,11 @@ export class PluginHost {
     return this.defaultBindings;
   }
 
+  private satisfiesVersion(version: string, range?: string): boolean {
+    if (!range || range === '*') return true;
+    return Boolean(semver.validRange(range) && semver.valid(version) && semver.satisfies(version, range));
+  }
+
   private resolveRecord(
     contract: string,
     callerInstanceId?: string,
@@ -129,15 +135,26 @@ export class PluginHost {
     if (overrideInstanceId) {
       return bucket.get(overrideInstanceId);
     }
+    const depRange = callerInstanceId ? this.getInstanceDependencyVersion(callerInstanceId, contract) : undefined;
     if (callerInstanceId) {
       const caller = this.instances.get(callerInstanceId);
       const boundId = caller?.definition.bindings?.[contract];
-      if (boundId) return bucket.get(boundId);
+      if (boundId) {
+        const bound = bucket.get(boundId);
+        if (!bound) return undefined;
+        return !depRange || this.satisfiesVersion(bound.version, depRange) ? bound : undefined;
+      }
     }
     const defaultId = this.defaultBindings[contract];
     if (defaultId) {
       const preferred = bucket.get(defaultId);
-      if (preferred) return preferred;
+      if (preferred && (!depRange || this.satisfiesVersion(preferred.version, depRange))) return preferred;
+    }
+    if (depRange) {
+      for (const rec of bucket.values()) {
+        if (this.satisfiesVersion(rec.version, depRange)) return rec;
+      }
+      return undefined;
     }
     return bucket.values().next().value;
   }
@@ -148,6 +165,35 @@ export class PluginHost {
 
   getServiceByInstance<Service = unknown>(instanceId: string, contract: string): Service | undefined {
     return this.servicesByContract.get(contract)?.get(instanceId)?.value as Service | undefined;
+  }
+
+  getServiceRecordByInstance(instanceId: string, contract: string): ServiceProviderInfo | undefined {
+    const rec = this.servicesByContract.get(contract)?.get(instanceId);
+    if (!rec) return undefined;
+    return {
+      pluginId: rec.pluginId,
+      instanceId: rec.instanceId,
+      contract: rec.contract,
+      version: rec.version,
+      ...(rec.metadata ? { metadata: rec.metadata } : {}),
+      ...(rec.runId ? { runId: rec.runId } : {}),
+    };
+  }
+
+  getInstanceBinding(callerInstanceId: string, contract: string): string | undefined {
+    const instance = this.instances.get(callerInstanceId);
+    if (!instance || (instance.status.state !== 'ACTIVE' && instance.status.state !== 'LOADING')) {
+      return undefined;
+    }
+    return instance.definition.bindings?.[contract];
+  }
+
+  getInstanceDependencyVersion(callerInstanceId: string, contract: string): string | undefined {
+    const instance = this.instances.get(callerInstanceId);
+    if (!instance || (instance.status.state !== 'ACTIVE' && instance.status.state !== 'LOADING')) {
+      return undefined;
+    }
+    return instance.definition.dependencies?.find((dep) => dep.contract === contract)?.version;
   }
 
   resolveServiceFor<Service = unknown>(
@@ -270,6 +316,7 @@ export class PluginHost {
         || next.error !== instance.definition.error
         || (next.pluginId ?? next.id) !== (instance.definition.pluginId ?? instance.definition.id)
         || JSON.stringify(next.bindings ?? {}) !== JSON.stringify(instance.definition.bindings ?? {})
+        || JSON.stringify(next.dependencies ?? []) !== JSON.stringify(instance.definition.dependencies ?? [])
         || (instance.cycleFailed && next.enabled && !next.error)
       ) {
         this.stop(instance, 'DISPOSED');
@@ -286,12 +333,21 @@ export class PluginHost {
     this.detectCircularDependencies();
   }
 
-  private requiredContracts(definition: HostPlugin): string[] {
-    const set = new Set<string>(definition.inject ?? []);
-    for (const dep of definition.dependencies ?? []) {
-      if (!dep.optional) set.add(dep.contract);
+  private requiredDependencies(definition: HostPlugin): Array<{ contract: string; version?: string }> {
+    const byContract = new Map<string, string | undefined>();
+    for (const contract of definition.inject ?? []) {
+      byContract.set(contract, undefined);
     }
-    return [...set];
+    for (const dep of definition.dependencies ?? []) {
+      if (!dep.optional) {
+        byContract.set(dep.contract, dep.version ?? byContract.get(dep.contract));
+      }
+    }
+    return [...byContract.entries()].map(([contract, version]) => ({ contract, version }));
+  }
+
+  private requiredContracts(definition: HostPlugin): string[] {
+    return this.requiredDependencies(definition).map(({ contract }) => contract);
   }
 
   private ownedContracts(instance: Instance): string[] {
@@ -387,13 +443,20 @@ export class PluginHost {
 
   private missing(instance: Instance): string[] {
     const out: string[] = [];
-    for (const contract of this.requiredContracts(instance.definition)) {
+    for (const { contract, version } of this.requiredDependencies(instance.definition)) {
       const bucket = this.servicesByContract.get(contract);
       const boundId = instance.definition.bindings?.[contract];
       if (boundId) {
-        if (!bucket?.has(boundId)) out.push(`${contract}@${boundId}`);
-      } else if (!bucket || bucket.size === 0) {
-        out.push(contract);
+        const rec = bucket?.get(boundId);
+        if (!rec || (version && !this.satisfiesVersion(rec.version, version))) {
+          out.push(`${contract}@${boundId}`);
+        }
+      } else if (
+        !bucket
+        || bucket.size === 0
+        || (version && ![...bucket.values()].some((rec) => this.satisfiesVersion(rec.version, version)))
+      ) {
+        out.push(version ? `${contract}@${version}` : contract);
       }
     }
     return out;
@@ -524,12 +587,14 @@ export class PluginHost {
     if (contracts.length === 0) return;
     for (const consumer of this.instances.values()) {
       if (consumer.status.state !== 'ACTIVE') continue;
-      const reqs = this.requiredContracts(consumer.definition);
-      const affected = reqs.some((contract) => {
+      const reqs = this.requiredDependencies(consumer.definition);
+      const affected = reqs.some(({ contract, version }) => {
         if (!contracts.includes(contract)) return false;
         const boundId = consumer.definition.bindings?.[contract];
         if (boundId) return boundId === stoppedInstanceId;
-        return !this.servicesByContract.get(contract)?.size;
+        const bucket = this.servicesByContract.get(contract);
+        if (!bucket || bucket.size === 0) return true;
+        return Boolean(version && ![...bucket.values()].some((rec) => this.satisfiesVersion(rec.version, version)));
       });
       if (!affected) continue;
       this.stop(consumer, 'PENDING');

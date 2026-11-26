@@ -10,8 +10,18 @@ export const PEER_CONTRACTS = {
   browser: 'browser.v1',
   filePreview: 'filePreview.v1',
   approvalPolicy: 'approval.policy.v1',
+  historySource: 'history.source.v1',
+  historyImport: 'history.import.v1',
+  sessionSearch: 'session.search.v1',
 } as const;
-export const PEER_CONTRACT_NAMES = ['browser.v1', 'filePreview.v1', 'approval.policy.v1'] as const;
+export const PEER_CONTRACT_NAMES = [
+  'browser.v1',
+  'filePreview.v1',
+  'approval.policy.v1',
+  'history.source.v1',
+  'history.import.v1',
+  'session.search.v1',
+] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 
 export function isPeerContractName(name: string): name is PeerContractName {
