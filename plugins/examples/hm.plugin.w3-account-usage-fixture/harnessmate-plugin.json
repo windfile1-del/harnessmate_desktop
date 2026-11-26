@@ -1,0 +1,21 @@
+{
+  "id": "hm.plugin.w3-account-usage-fixture",
+  "name": "W3 额度夹具",
+  "version": "1.0.0",
+  "description": "用隔离的示例额度验证工作区绑定、旧 API 和插件工作页。",
+  "author": "HarnessMate Examples",
+  "category": "telemetry",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
+  "main": "index.mjs",
+  "provides": ["harness.usage.v1"],
+  "permissions": ["service:provide:harness.usage.v1", "tools:model"],
+  "contributes": {
+    "slots": [{
+      "slot": "workspace.pages",
+      "id": "account-usage",
+      "title": "额度夹具",
+      "ui": "ui/usage.html"
+    }]
+  }
+}

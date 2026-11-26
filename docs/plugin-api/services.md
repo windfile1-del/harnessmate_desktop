@@ -2,13 +2,16 @@
 
 由 `pnpm contracts:generate` 生成。插件 API 4.0.0。
 
-第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。
+第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后提供公共契约或自定义命名空间服务。`harness.*` 下的原生驱动注册保留给第一方，公开契约见下表。
 
 - `approval-center`
+- `approval.policy.v1`
 - `attachments`
+- `browser.v1`
 - `checkpoints`
 - `compressor`
 - `failover`
+- `filePreview.v1`
 - `files`
 - `git`
 - `git.checkpoint.v1`
@@ -18,15 +21,23 @@
 - `harness.agy`
 - `harness.claude`
 - `harness.codex`
+- `harness.mcp-config.v1`
+- `harness.model-catalog.v1`
+- `harness.usage.v1`
+- `history.import.v1`
+- `history.source.v1`
 - `ledger`
 - `native-commands`
 - `orchestrator`
 - `rules`
 - `session-search`
 - `session.attachments.v1`
+- `session.failover.v1`
 - `session.inbox.v1`
 - `session.ledger.v1`
+- `session.model-tools.v1`
 - `session.notifications.v1`
+- `session.search.v1`
 - `session.snooze.v1`
 - `session.studio.v1`
 - `session.summary.v1`

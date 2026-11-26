@@ -4,6 +4,7 @@ import type { InstalledPluginInfo, PluginAction, PluginPermission, PluginProgram
 import type { HarnessMateStore } from '../db/sqlite.js';
 import type { PluginMcpConnection } from '../harnesses/types.js';
 import { PluginPermissionService } from '../plugin-host/permissions/permissions.js';
+import type { ModelToolRouter } from '../plugin-host/builtin/harness-integration.js';
 import type { PluginManager } from './plugin-manager.js';
 import { pluginTextLimit, runPluginProgram } from './plugin-program.js';
 
@@ -24,6 +25,7 @@ export type ToolDescriptor =
       readOnly: boolean;
       inputSchema: Record<string, unknown>;
       pluginId: string;
+      instanceId: string;
       packageDigest: string;
       runId: string;
       toolName: string;
@@ -35,6 +37,9 @@ export interface PluginToolLease {
   readonly harnessId: string;
   readonly connection: PluginMcpConnection;
   readonly tools: ToolDescriptor[];
+  readonly ownerInstanceId?: string;
+  readonly generation?: string;
+  readonly isHarnessCurrent?: () => boolean;
   discovered?: boolean;
   release(): void;
 }
@@ -49,6 +54,7 @@ function makeMcpToolName(pluginId: string, toolId: string): string {
 
 export class PluginCapabilities {
   private readonly leases = new Map<string, PluginToolLease>();
+  private readonly routerGenerations = new Map<string, string>();
   readonly permissions: PluginPermissionService;
 
   constructor(
@@ -58,6 +64,26 @@ export class PluginCapabilities {
     permissions?: PluginPermissionService,
   ) {
     this.permissions = permissions ?? plugins.permissions ?? new PluginPermissionService(store);
+  }
+
+  createToolRouter(instanceId: string) {
+    const generation = randomBytes(16).toString('hex');
+    this.routerGenerations.set(instanceId, generation);
+    return {
+      instanceId,
+      generation,
+      list: this.getTools.bind(this),
+      prepareLease: (session: Session, harnessId: string, tools: ToolDescriptor[], isHarnessCurrent: () => boolean) =>
+        this.openLease(session, harnessId, tools, { instanceId, generation, isHarnessCurrent }),
+      invoke: this.invokeTool.bind(this),
+      release: (lease: PluginToolLease) => lease.release(),
+      stop: () => {
+        if (this.routerGenerations.get(instanceId) === generation) this.routerGenerations.delete(instanceId);
+        for (const lease of this.leases.values()) {
+          if (lease.ownerInstanceId === instanceId && lease.generation === generation) lease.release();
+        }
+      },
+    };
   }
 
   listPermissions(workspaceId: string, pluginId?: string): PluginPermission[] {
@@ -126,11 +152,12 @@ export class PluginCapabilities {
       if (!permission) continue;
       descriptors.push({
         kind: 'isolated',
-        name: makeMcpToolName(isolatedTool.pluginId, isolatedTool.name),
+        name: makeMcpToolName(isolatedTool.instanceId, isolatedTool.name),
         description: isolatedTool.description,
         readOnly: Boolean(isolatedTool.readOnly),
         inputSchema: isolatedTool.inputSchema,
         pluginId: isolatedTool.pluginId,
+        instanceId: isolatedTool.instanceId,
         packageDigest: isolatedTool.packageDigest,
         runId: isolatedTool.runId,
         toolName: isolatedTool.name,
@@ -141,32 +168,67 @@ export class PluginCapabilities {
     return descriptors.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  openLease(session: Session, harnessId: string, tools: ToolDescriptor[]): PluginToolLease {
+  openLease(session: Session, harnessId: string, tools: ToolDescriptor[], owner?: {
+    instanceId: string; generation: string; isHarnessCurrent: () => boolean;
+  }): PluginToolLease {
+    if (owner && this.routerGenerations.get(owner.instanceId) !== owner.generation) {
+      throw new PluginApiError('E_STALE_RUN', '会话工具实例已停止');
+    }
     const token = randomBytes(32).toString('base64url');
     const lease: PluginToolLease = { sessionId: session.id, harnessId, tools, connection: { url: this.getMcpUrl(), token },
+      ownerInstanceId: owner?.instanceId, generation: owner?.generation, isHarnessCurrent: owner?.isHarnessCurrent,
       release: () => { this.leases.delete(token); } };
     this.leases.set(token, lease);
     return lease;
   }
 
   getLease(authorization: string | undefined): PluginToolLease | undefined {
-    return authorization?.startsWith('Bearer ') ? this.leases.get(authorization.slice(7)) : undefined;
+    const lease = authorization?.startsWith('Bearer ') ? this.leases.get(authorization.slice(7)) : undefined;
+    return lease && this.isLeaseActive(lease) ? lease : undefined;
+  }
+
+  isLeaseActive(lease: PluginToolLease): boolean {
+    if (this.leases.get(lease.connection.token) !== lease) return false;
+    if (lease.isHarnessCurrent && !lease.isHarnessCurrent()) return false;
+    if (!lease.ownerInstanceId) return true;
+    if (this.routerGenerations.get(lease.ownerInstanceId) !== lease.generation) return false;
+    if (!this.plugins.resolveServiceSelection) return true;
+    const selection = this.plugins.resolveServiceSelection(PEER_CONTRACTS.sessionModelTools, { sessionId: lease.sessionId });
+    return selection.status === 'ready' && selection.instanceId === lease.ownerInstanceId;
   }
 
   listLeaseTools(lease: PluginToolLease): ToolDescriptor[] {
+    if (!this.isLeaseActive(lease)) return [];
     const session = this.store.getSession(lease.sessionId);
     if (!session || session.harnessId !== lease.harnessId || session.status === 'archived') return [];
-    const current = this.getTools(session);
+    const current = lease.ownerInstanceId
+      ? this.getLeaseRouter(lease)?.list(session) ?? []
+      : this.getTools(session);
     return lease.tools.filter((tool) => current.some((candidate) => {
       if (candidate.kind !== tool.kind) return false;
       if (candidate.permission.pluginId !== tool.permission.pluginId ||
           candidate.permission.capability !== tool.permission.capability ||
           candidate.permission.digest !== tool.permission.digest) return false;
       if (candidate.kind === 'isolated' && tool.kind === 'isolated') {
-        return candidate.runId === tool.runId && candidate.toolName === tool.toolName;
+        return candidate.instanceId === tool.instanceId && candidate.runId === tool.runId && candidate.toolName === tool.toolName;
       }
       return true;
     }));
+  }
+
+  private getLeaseRouter(lease: PluginToolLease): ModelToolRouter | undefined {
+    if (!lease.ownerInstanceId) return undefined;
+    return this.plugins.host.getServiceByInstance<ModelToolRouter>(lease.ownerInstanceId, PEER_CONTRACTS.sessionModelTools);
+  }
+
+  async dispatchLeaseTool(lease: PluginToolLease, name: string, args: Record<string, unknown>): Promise<string> {
+    if (!this.isLeaseActive(lease)) throw new PluginApiError('E_STALE_RUN', '会话工具租约已失效');
+    if (!lease.ownerInstanceId) return this.invokeTool(lease, name, args);
+    const router = this.getLeaseRouter(lease);
+    if (!router || router.generation !== lease.generation) {
+      throw new PluginApiError('E_STALE_RUN', '会话工具实例已换代');
+    }
+    return router.invoke(lease, name, args);
   }
 
   async invokeTool(lease: PluginToolLease, name: string, args: Record<string, unknown>): Promise<string> {
@@ -191,7 +253,7 @@ export class PluginCapabilities {
         sessionId: session.id,
         workspaceId: session.workspaceId,
         pluginId: tool.permission.pluginId,
-        instanceId: tool.permission.pluginId,
+        instanceId: tool.kind === 'isolated' ? tool.instanceId : tool.permission.pluginId,
         toolName: tool.kind === 'isolated' ? tool.toolName : tool.name,
         readOnly: tool.readOnly,
         args,
@@ -204,6 +266,9 @@ export class PluginCapabilities {
       }
     }
 
+    if (!this.isLeaseActive(lease) || !this.listLeaseTools(lease).includes(tool)) {
+      throw new PluginApiError('E_STALE_RUN', '会话工具授权已变更');
+    }
     if (tool.kind === 'program') {
       const text = typeof args.text === 'string' && args.text.length <= pluginTextLimit ? args.text : null;
       if (text === null) throw new Error('Invalid tool arguments');
@@ -216,6 +281,7 @@ export class PluginCapabilities {
       tool.toolName,
       args,
       { sessionId: session.id, workspaceId: session.workspaceId },
+      tool.instanceId,
     );
   }
 }

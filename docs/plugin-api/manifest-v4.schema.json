@@ -80,7 +80,12 @@
                   "terminal.runner.v1",
                   "workspace.files.v1",
                   "session.attachments.v1",
-                  "workspace.rules.v1"
+                  "workspace.rules.v1",
+                  "harness.usage.v1",
+                  "harness.model-catalog.v1",
+                  "session.failover.v1",
+                  "harness.mcp-config.v1",
+                  "session.model-tools.v1"
                 ]
               },
               {

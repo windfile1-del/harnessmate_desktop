@@ -1,9 +1,14 @@
-import type { FailoverPolicy, HarnessAccountUsage, HarnessInfo } from '@harnessmate/protocol';
+import type { FailoverPolicy, FailoverRecommendation, HarnessAccountUsage, HarnessInfo } from '@harnessmate/protocol';
 import { AlertTriangle, Clock, RefreshCw } from 'lucide-react';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { daemonApi } from '../api/client';
 import { formatCountdown, resolveHarnessMeta } from '../lib/harness-meta';
+import { useAppStore } from '../stores/app-store';
+
+// ── 4. Inline Usage Limit & Failover Banner ────────────────────────────
 
 export function FailoverInlineBanner({
+  sessionId,
   failedInstanceId,
   failureClass,
   errorMessage,
@@ -13,6 +18,7 @@ export function FailoverInlineBanner({
   failoverPolicy,
   onFailover,
 }: {
+  sessionId?: string;
   failedInstanceId: string;
   failureClass?: string | null;
   errorMessage: string;
@@ -22,29 +28,45 @@ export function FailoverInlineBanner({
   failoverPolicy?: FailoverPolicy | null;
   onFailover: (targetHarnessId: string) => void;
 }) {
+  const [recommendation, setRecommendation] = useState<FailoverRecommendation>();
+  const plugins = useAppStore((state) => state.plugins);
+  const hasAlternatives = harnesses.length > 0;
+  useEffect(() => {
+    setRecommendation(undefined);
+    if (!sessionId || !hasAlternatives) return;
+    let current = true;
+    void daemonApi.getFailoverRecommendation(sessionId, failedInstanceId, failureClass ?? undefined)
+      .then(({ recommendation }) => { if (current) setRecommendation(recommendation); })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [sessionId, failedInstanceId, failureClass, hasAlternatives, plugins]);
   const isRateLimit =
     failureClass === 'usage_limit' ||
     failureClass === 'rate_limited' ||
     failureClass === 'provider_unavailable' ||
     /rate.?limit|usage.?limit|quota|429|unavailable/i.test(errorMessage);
 
-  // Order ready alternative harnesses by FailoverPolicy priorityChain first
   const orderedAlternatives = useMemo(() => {
     const ready = harnesses.filter((h) => h.id !== failedInstanceId && h.health === 'ready');
+    if (sessionId) return (recommendation?.candidates ?? [])
+      .filter(({ available }) => available)
+      .map(({ instanceId }) => ready.find(({ id }) => id === instanceId))
+      .filter((harness): harness is HarnessInfo => harness !== undefined);
     const chain = failoverPolicy?.priorityChain ?? [];
     if (chain.length === 0) return ready;
     const rank = new Map(chain.map((id, idx) => [id, idx]));
     return [...ready].sort((a, b) => (rank.get(a.id) ?? 999) - (rank.get(b.id) ?? 999));
-  }, [harnesses, failedInstanceId, failoverPolicy]);
+  }, [harnesses, failedInstanceId, failoverPolicy, recommendation, sessionId]);
 
   const effectiveResetsAt = useMemo(() => {
     if (resetsAt) return resetsAt;
+    if (recommendation?.failedResetsAt) return recommendation.failedResetsAt;
     const usage = accountUsage.find(
       (a) => a.instanceId === failedInstanceId || a.harnessId === failedInstanceId,
     );
     const activeWindow = usage?.rateLimits.find((r) => r.usedPercent >= 90 && r.resetsAt);
     return activeWindow?.resetsAt ?? null;
-  }, [resetsAt, accountUsage, failedInstanceId]);
+  }, [resetsAt, accountUsage, failedInstanceId, recommendation]);
 
   const primaryCandidate = orderedAlternatives[0];
   const primaryMeta = primaryCandidate
@@ -79,6 +101,9 @@ export function FailoverInlineBanner({
                 : '本轮执行失败'}
             </div>
             <div className="break-words text-[12px] text-[var(--text-secondary)]">{errorMessage}</div>
+            {recommendation?.downgradedToManualReason && (
+              <div className="text-[11px] text-[var(--text-secondary)]">{recommendation.downgradedToManualReason}</div>
+            )}
             {effectiveResetsAt && (
               <div className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
                 <Clock size={11} />

@@ -32,7 +32,7 @@ export function listHarnessCommands(kind: HarnessKind, agyDesktop: boolean): Har
 
 export class HarnessCommandTools {
   constructor(
-    private readonly getUsageService: () => UsageService | undefined,
+    private readonly getUsageService: (session: Session) => Pick<UsageService, 'collectInstanceUsage'> | undefined,
     private readonly binaryOverrides: Record<string, string>,
     private readonly registry?: HarnessRegistry,
   ) {}
@@ -51,14 +51,14 @@ export class HarnessCommandTools {
   }
 
   async getUsage(session: Session): Promise<string> {
+    const service = this.getUsageService(session);
+    if (!service) throw new Error('额度服务已停用');
     if (session.harnessKind === 'agy') {
       const launchContext = await this.resolveAgyLaunchContext(session.harnessId);
       const binary = await this.getBinary('agy', launchContext?.binaryPath);
       const data = await inspectAgyCommand(binary, session.cwd, '/usage', { launchContext });
       return formatAgyUsageSummary(data);
     }
-    const service = this.getUsageService();
-    if (!service) throw new Error('额度服务已停用');
     const usage = await service.collectInstanceUsage(session.harnessId);
     const windows = usage.rateLimits.map((item) =>
       `${item.label} · 剩余 ${(100 - item.usedPercent).toFixed(1)}%` +

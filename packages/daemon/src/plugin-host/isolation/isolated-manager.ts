@@ -58,6 +58,7 @@ import type { PluginSecretStore } from './plugin-secrets.js';
 import { IsolatedPluginRpcRouter, type PluginLogEntry } from './rpc-router.js';
 
 export interface IsolatedToolDescriptor {
+  instanceId: string;
   pluginId: string;
   pluginName: string;
   packageDigest: string;
@@ -667,6 +668,7 @@ export class IsolatedPluginManager {
       for (const tool of entry.tools.values()) {
         tools.push({
           pluginId: entry.pluginId,
+          instanceId: entry.instanceId,
           pluginName: entry.info.name,
           packageDigest: entry.info.packageDigest,
           runId: entry.runId,

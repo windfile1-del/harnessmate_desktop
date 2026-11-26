@@ -6,13 +6,34 @@ const { createInterface } = require('node:readline');
 const url = process.env.${urlEnv};
 const authorization = 'Bearer ' + process.env.${pluginMcpTokenEnv};
 const input = createInterface({ input: process.stdin });
+const headers = { authorization, 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+let checkingLease = false;
+const checkLease = setInterval(async () => {
+  if (checkingLease) return;
+  checkingLease = true;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'ping' }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (response.status === 403) input.close();
+  } catch {
+    // The CLI transport can recover from a temporary daemon connection failure.
+  } finally {
+    checkingLease = false;
+  }
+}, 2000);
+checkLease.unref();
+input.once('close', () => clearInterval(checkLease));
 input.on('line', async (line) => {
   let request;
   try {
     request = JSON.parse(line);
     const response = await fetch(url, {
       method: 'POST',
-      headers: { authorization, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      headers,
       body: line,
       signal: AbortSignal.timeout(8000),
     });

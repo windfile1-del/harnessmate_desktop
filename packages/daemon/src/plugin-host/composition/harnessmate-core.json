@@ -18,7 +18,12 @@
     "session.summary.v1": "hm.plugin.task-summary",
     "session.inbox.v1": "hm.plugin.triage-inbox",
     "session.snooze.v1": "hm.plugin.session-snooze",
-    "session.notifications.v1": "hm.plugin.desktop-notifications"
+    "session.notifications.v1": "hm.plugin.desktop-notifications",
+    "harness.usage.v1": "usage",
+    "harness.model-catalog.v1": "usage",
+    "session.failover.v1": "core.auto-failover",
+    "harness.mcp-config.v1": "core.mcp-hub",
+    "session.model-tools.v1": "core.session-model-tools"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

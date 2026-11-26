@@ -307,6 +307,19 @@ function sessionAssistanceUrl(sessionId: string, route: string, instanceId?: str
   return '/api/v1/sessions/' + encodeURIComponent(sessionId) + '/' + route + instanceQuery(instanceId);
 }
 
+export interface HarnessServiceScope {
+  sessionId?: string;
+  workspaceId?: string;
+}
+
+function scopedHarnessUrl(path: string, scope?: HarnessServiceScope, refresh = false): string {
+  const query = new URLSearchParams();
+  if (scope?.sessionId) query.set('sessionId', scope.sessionId);
+  if (scope?.workspaceId) query.set('workspaceId', scope.workspaceId);
+  if (refresh) query.set('refresh', '1');
+  return query.size ? `${path}?${query}` : path;
+}
+
 export const daemonApi = {
   health: () =>
     apiFetch<{
@@ -884,50 +897,56 @@ export const daemonApi = {
     ),
 
   // MCP Hub
-  listMcpServers: () =>
+  listMcpServers: (scope?: HarnessServiceScope) =>
     apiFetch<{
       servers: McpServerEntry[];
       presets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
-    }>('/api/v1/mcp/servers'),
+    }>(scopedHarnessUrl('/api/v1/mcp/servers', scope)),
 
-  addMcpServer: (req: AddMcpServerRequest) =>
+  addMcpServer: (req: AddMcpServerRequest, scope?: HarnessServiceScope) =>
     apiFetch<{
       results: Array<{ harnessId: string; ok: boolean; message: string }>;
       servers: McpServerEntry[];
-    }>('/api/v1/mcp/servers', {
+    }>(scopedHarnessUrl('/api/v1/mcp/servers', scope), {
       method: 'POST',
       body: JSON.stringify(req),
     }),
 
-  toggleMcpServer: (req: ToggleMcpServerRequest) =>
+  toggleMcpServer: (req: ToggleMcpServerRequest, scope?: HarnessServiceScope) =>
     apiFetch<{ result: { ok: boolean; message: string }; servers: McpServerEntry[] }>(
-      '/api/v1/mcp/servers/toggle',
+      scopedHarnessUrl('/api/v1/mcp/servers/toggle', scope),
       {
         method: 'PATCH',
         body: JSON.stringify(req),
       },
     ),
 
-  removeMcpServer: (harnessId: 'codex' | 'agy' | 'claude', name: string) =>
+  removeMcpServer: (harnessId: string, name: string, scope?: HarnessServiceScope) =>
     apiFetch<{ result: { ok: boolean; message: string }; servers: McpServerEntry[] }>(
-      `/api/v1/mcp/servers/${encodeURIComponent(harnessId)}/${encodeURIComponent(name)}`,
+      scopedHarnessUrl(`/api/v1/mcp/servers/${encodeURIComponent(harnessId)}/${encodeURIComponent(name)}`, scope),
       { method: 'DELETE' },
     ),
 
   // Accounts & Usage
-  getAccountUsage: (refresh = false) =>
+  getAccountUsage: (refresh = false, scope?: HarnessServiceScope) =>
     apiFetch<{ accounts: HarnessAccountUsage[]; collectedAt: number }>(
-      `/api/v1/usage/accounts${refresh ? '?refresh=1' : ''}`,
+      scopedHarnessUrl('/api/v1/usage/accounts', scope, refresh),
     ),
 
-  getFailoverPolicy: () =>
-    apiFetch<{ policy: FailoverPolicy }>('/api/v1/usage/failover-policy'),
+  getFailoverPolicy: (scope?: HarnessServiceScope) =>
+    apiFetch<{ policy: FailoverPolicy }>(scopedHarnessUrl('/api/v1/usage/failover-policy', scope)),
 
-  updateFailoverPolicy: (policy: FailoverPolicy) =>
-    apiFetch<{ policy: FailoverPolicy }>('/api/v1/usage/failover-policy', {
+  updateFailoverPolicy: (policy: FailoverPolicy, scope?: HarnessServiceScope) =>
+    apiFetch<{ policy: FailoverPolicy }>(scopedHarnessUrl('/api/v1/usage/failover-policy', scope), {
       method: 'PUT',
       body: JSON.stringify(policy),
     }),
+
+  getModelCandidates: (sessionId: string, signal?: AbortSignal) =>
+    apiFetch<Pick<HarnessInfo, 'models' | 'defaultModelId'> & {
+      harnessInstanceId: string;
+      resolution: ServiceResolutionV1;
+    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/model-candidates`, { signal }),
 
   getFailoverRecommendation: (sessionId: string, failedInstanceId?: string, failureClass?: string) => {
     const params = new URLSearchParams();

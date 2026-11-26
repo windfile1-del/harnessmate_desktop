@@ -66,6 +66,10 @@ import type {
 } from '../harnesses/types.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
+import {
+  failoverContract, modelCatalogContract, modelToolsContract, selectedHarnessService,
+  type FailoverContract, type ModelCatalog, type ModelToolRouter,
+} from '../plugin-host/builtin/harness-integration.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
 import { ApprovalCenterService, SECRET_RECEIPT_LABEL, type ExternalApprovalAnnotator } from './approval-center-service.js';
 import {
@@ -86,7 +90,7 @@ import {
 } from './terminal-workspace-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import { PluginApiError } from '@harnessmate/plugin-api';
-import type { FailoverService, GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
+import type { GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
 import { dispatchTurn } from './outbound-gate.js';
 import {
@@ -1329,8 +1333,8 @@ export class SessionManager {
       if (!targetAdapter) throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
       this.assertDispatchTarget(targetAdapter.id, targetAdapter.kind, provenance);
 
-      const failover = this.service<FailoverService>('failover');
-      const retry = req.retryLastFailedTurn === false ? undefined : failover.retryInput(sessionId);
+      const failover = selectedHarnessService<FailoverContract>(this.pluginManager, failoverContract, { sessionId });
+      const retry = req.retryLastFailedTurn === false ? undefined : await failover?.retryInput(sessionId);
 
       if (current.status === 'error') this.setSessionStatus(sessionId, 'idle');
       const { session: switched } = await this.switchHarnessInternal(sessionId, {
@@ -1527,13 +1531,15 @@ export class SessionManager {
   }
 
   getModelPluginTools(session: Session) {
-    const tools = this.pluginCapabilities?.getTools(session) ?? [];
+    const router = this.getModelToolRouter(session.id);
+    const tools = router?.list(session) ?? [];
     const count = tools.length;
     if (!count) return { count, status: 'none' as const };
     if (!this.registry.get(session.harnessId)?.pluginMcpTransport) return { count, status: 'unsupported' as const };
     const handle = this.liveHandles.get(this.handleKey(session.id, session.harnessId));
-    if (!handle || handle.pluginToolKey !== this.pluginToolKey(tools)) return { count, status: 'next_turn' as const };
+    if (!handle || handle.pluginToolKey !== this.pluginToolKey(router, tools)) return { count, status: 'next_turn' as const };
     if (!handle.pluginToolLease) return { count, status: 'unsupported' as const };
+    if (!this.pluginCapabilities?.isLeaseActive(handle.pluginToolLease)) return { count, status: 'next_turn' as const };
     return { count, status: handle.pluginToolLease.discovered ? 'connected' as const : 'configured' as const };
   }
 
@@ -1620,7 +1626,10 @@ export class SessionManager {
     switch (command) {
       case 'model': {
         if (!args) {
-          const info = (await this.registry.probeAll()).find((h) => h.id === session.harnessId);
+          const catalog = selectedHarnessService<ModelCatalog>(this.pluginManager, modelCatalogContract, { sessionId: session.id });
+          const info = catalog
+            ? await catalog.listModels({ sessionId: session.id, harnessInstanceId: session.harnessId })
+            : await this.registry.probeInstance(session.harnessId);
           const models = info?.models.map((model) => `${model.id} · ${model.displayName}`) ?? [];
           return result([`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'));
         }
@@ -2510,10 +2519,17 @@ export class SessionManager {
 
   // ── Warm Multi-Handle Runtime Pool ───────────────────────────────────
 
-  private pluginToolKey(tools: ReturnType<PluginCapabilities['getTools']>): string {
-    return tools.map((tool) => tool.kind === 'isolated'
+  private getModelToolRouter(sessionId: string) {
+    const router = selectedHarnessService<ModelToolRouter>(this.pluginManager, modelToolsContract, { sessionId });
+    // Transport leases hold a callback to the local adapter generation.
+    return typeof router?.generation === 'string' ? router : undefined;
+  }
+
+  private pluginToolKey(router: ModelToolRouter | undefined, tools: ReturnType<PluginCapabilities['getTools']>): string {
+    const toolKey = tools.map((tool) => tool.kind === 'isolated'
       ? `${tool.name}:${tool.permission.digest}:${tool.runId}`
       : `${tool.name}:${tool.permission.digest}`).join(',');
+    return router ? `${router.instanceId}:${router.generation}:${toolKey}` : '';
   }
 
   private async ensureLiveHandle(
@@ -2528,8 +2544,9 @@ export class SessionManager {
 
     const adapter = this.registry.get(harnessId);
     if (!adapter) throw new Error(`Harness adapter not found: ${harnessId}`);
-    const tools = adapter.pluginMcpTransport ? this.pluginCapabilities?.getTools(session) ?? [] : [];
-    const pluginToolKey = this.pluginToolKey(tools);
+    const router = adapter.pluginMcpTransport ? this.getModelToolRouter(sessionId) : undefined;
+    const tools = router?.list(session) ?? [];
+    const pluginToolKey = this.pluginToolKey(router, tools);
     const existing = this.liveHandles.get(key);
     if (existing?.adapter === adapter && (!refreshPluginTools || existing.pluginToolKey === pluginToolKey)) {
       existing.lastUsedAt = Date.now();
@@ -2600,7 +2617,9 @@ export class SessionManager {
     const shouldAttachMcpLease =
       Boolean(adapter.pluginMcpTransport) &&
       (tools.length > 0 || this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID));
-    let lease = shouldAttachMcpLease ? this.pluginCapabilities?.openLease(session, harnessId, tools) : undefined;
+    let lease = shouldAttachMcpLease
+      ? router?.prepareLease(session, harnessId, tools, () => this.registry.get(harnessId) === adapter)
+      : undefined;
     let handle: AdapterSessionHandle;
     try {
       handle = await adapter.createSession({ ...config, pluginMcp: lease?.connection });
@@ -2611,7 +2630,7 @@ export class SessionManager {
       this.emitCanonical(sessionId, 'diagnostic.log', { level: 'warn', stream: 'protocol', message: '插件模型工具挂载失败，使用原会话能力重试' });
       handle = await adapter.createSession(config);
     }
-    if (lease && !handle.pluginMcpAvailable) {
+    if (lease && (!handle.pluginMcpAvailable || !this.pluginCapabilities?.isLeaseActive(lease))) {
       lease.release();
       lease = undefined;
     }
@@ -3072,12 +3091,13 @@ export class SessionManager {
       case 'turn.failed': {
         this.deltaCoalescer.flushSession(sessionId);
         this.cancelSessionApprovals(sessionId, '轮次执行失败');
+        const failoverSvc = selectedHarnessService<FailoverContract>(this.pluginManager, failoverContract, { sessionId });
         const failureClass = ev.failureClass || classifyTerminalFailure(ev.code, ev.message);
         let cooldownResetsAt: number | null = ev.resetAt ?? null;
         if (FAILOVER_TRIGGER_CLASSES.has(failureClass)) {
-          const failoverSvc = this.pluginManager.host.get<FailoverService>('failover');
-          const rec = failoverSvc?.recordFailure?.(eventHarnessId, failureClass, ev.resetAt);
-          cooldownResetsAt = rec?.resetsAt ?? cooldownResetsAt;
+          const receipt = failoverSvc?.recordFailure?.(eventHarnessId, failureClass, ev.resetAt);
+          if (receipt instanceof Promise) void receipt.catch(() => {});
+          else cooldownResetsAt = receipt?.resetsAt ?? cooldownResetsAt;
         }
         if (meta) {
           this.store.finishSessionRun(meta.runId, {

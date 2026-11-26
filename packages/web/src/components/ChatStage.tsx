@@ -108,9 +108,9 @@ import { HarnessSwitcher } from './HarnessSwitcher';
 import { HtmlRenderCard } from './HtmlRenderCard';
 import { InspectorDrawer } from './InspectorDrawer';
 import { MarkdownView } from './MarkdownView';
-import { FailoverInlineBanner } from './FailoverInlineBanner';
 import { StudioExtension, StudioMinimap, StudioScope, StudioWorkGroup } from '../slots/StudioSurfaces';
 import { ModelPicker } from './ModelPicker';
+import { FailoverInlineBanner } from './FailoverInlineBanner';
 import { ComposerPendingTerminalContexts } from './TerminalContextInlineChip';
 import {
   loadSavedTraitValues,
@@ -384,7 +384,6 @@ export function ChatStage() {
         : [],
     [timeline.items, session],
   );
-  const autoFailoverEnabled = isPluginEnabled('core.auto-failover');
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = Boolean(useBoundSessionPlugin('session.ledger.v1', session ?? null));
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
@@ -1465,7 +1464,7 @@ export function ChatStage() {
                       failoverPolicy={failoverPolicy}
                       fallbackHarnessKind={session.harnessKind}
                       fallbackHarnessId={session.harnessId}
-                      allowFailover={autoFailoverEnabled && !isRunning && item.status === 'failed'}
+                      allowFailover={!isRunning && item.status === 'failed'}
                       onFailover={onFailover}
                       onPreviewImage={setLightboxImg}
                       onResolveApproval={resolveApproval}
@@ -1899,6 +1898,8 @@ export function ChatStage() {
                 {harness && harness.models.length > 0 && (
                   <ModelPicker
                     models={harness.models}
+                    sessionId={session.id}
+                    harnessInstanceId={session.harnessId}
                     value={session.model}
                     defaultModelId={harness.defaultModelId}
                     disabled={isRunning}
@@ -2425,6 +2426,7 @@ const TurnBlock = memo(function TurnBlock({
 
         {turn.status === 'failed' && turn.errorMessage && (
           <FailoverInlineBanner
+            sessionId={session.id}
             failedInstanceId={effectiveId}
             failureClass={turn.failureClass}
             errorMessage={turn.errorMessage}

@@ -373,7 +373,7 @@ export const PreviewPluginProgramRequestSchema = z.object({
 export type PreviewPluginProgramRequest = z.infer<typeof PreviewPluginProgramRequestSchema>;
 
 export const AddMcpServerRequestSchema = z.object({
-  targetHarnesses: z.array(z.enum(['codex', 'agy', 'claude'])).min(1),
+  targetHarnesses: z.array(z.string().min(1).max(96)).min(1),
   name: z.string().min(1).max(64).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/),
   transport: z.enum(['stdio', 'http', 'sse']).default('stdio'),
   command: z.string().optional(),
@@ -384,7 +384,7 @@ export const AddMcpServerRequestSchema = z.object({
 export type AddMcpServerRequest = z.infer<typeof AddMcpServerRequestSchema>;
 
 export const ToggleMcpServerRequestSchema = z.object({
-  harnessId: z.enum(['codex', 'agy', 'claude']),
+  harnessId: z.string().min(1).max(96),
   name: z.string().min(1),
   enabled: z.boolean(),
 });

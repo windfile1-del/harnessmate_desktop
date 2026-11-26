@@ -57,8 +57,8 @@ function createFakeAdapter(opts: {
     version: '1.0.0',
     health: 'ready',
     capabilities,
-    models: [{ id: `${opts.driverId}-default`, displayName: `${opts.displayName} Model`, isDefault: true }],
-    defaultModelId: `${opts.driverId}-default`,
+    models: [{ id: `${opts.id}-default`, displayName: `${opts.displayName} Model`, isDefault: true }],
+    defaultModelId: `${opts.id}-default`,
   };
 
   return {
@@ -101,6 +101,40 @@ function createFakeAdapter(opts: {
 }
 
 describe('Multi-Instance UsageService & FailoverCoordinator', () => {
+  it('discards late quota receipts after replacement or disposal', async () => {
+    const store = new HarnessMateStore(':memory:');
+    const registry = new HarnessRegistry();
+    const adapter = (readUsageLimits: () => Promise<AdapterUsageLimitResult>) => createFakeAdapter({
+      id: 'same-id', driverId: 'codex', displayName: 'fixture', readUsageLimits,
+    });
+    const receipt = (accountLabel: string): AdapterUsageLimitResult => ({
+      loggedIn: true, accountLabel, planType: null, authMethod: 'fixture', rateLimits: [],
+    });
+    try {
+      let completeOld!: (value: AdapterUsageLimitResult) => void;
+      registry.register(adapter(() => new Promise((resolve) => { completeOld = resolve; })));
+      const usage = new UsageService(store, registry);
+      const old = usage.collectInstanceUsage('same-id');
+      await Promise.resolve();
+      registry.register(adapter(async () => receipt('replacement')));
+      expect(await usage.collectInstanceUsage('same-id')).toMatchObject({ accountLabel: 'replacement' });
+      completeOld(receipt('old'));
+      expect(await old).toMatchObject({ accountLabel: null });
+      expect(await usage.collectInstanceUsage('same-id')).toMatchObject({ accountLabel: 'replacement', cached: true });
+
+      let completeStopped!: (value: AdapterUsageLimitResult) => void;
+      registry.register(adapter(() => new Promise((resolve) => { completeStopped = resolve; })));
+      const stopped = usage.collectInstanceUsage('same-id');
+      await Promise.resolve();
+      usage.dispose();
+      completeStopped(receipt('stopped'));
+      expect(await stopped).toMatchObject({ accountLabel: null });
+      expect(await usage.collectInstanceUsage('same-id')).toMatchObject({ accountLabel: null, cached: false });
+    } finally {
+      store.close();
+    }
+  });
+
   it('aggregates multiple same-driver and custom-driver instances without hardcoding and enforces 60s TTL cache', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-usage-v2-'));
     const store = new HarnessMateStore(path.join(tmpDir, 'test.sqlite'));
@@ -397,7 +431,7 @@ describe('Multi-Instance UsageService & FailoverCoordinator', () => {
 
     const backupAdapter = createFakeAdapter({
       id: 'vendor-backup',
-      driverId: 'vendor_b',
+      driverId: 'vendor_a',
       displayName: 'Vendor Backup',
       readUsageLimits: async () => ({
         loggedIn: true,
@@ -446,6 +480,18 @@ describe('Multi-Instance UsageService & FailoverCoordinator', () => {
         workspaceId: ws.id,
         harnessId: 'vendor-primary',
         permissionMode: 'auto',
+      });
+      const separateSession = await daemon.sessionManager.createSession({
+        workspaceId: ws.id, harnessId: 'vendor-backup', permissionMode: 'auto',
+      });
+      const [primaryModels, backupModels] = await Promise.all([session, separateSession].map(({ id }) =>
+        daemon.app.inject(`/api/v1/sessions/${id}/model-candidates`)));
+      expect(primaryModels.json()).toMatchObject({
+        harnessInstanceId: 'vendor-primary', models: [{ id: 'vendor-primary-default' }],
+        resolution: { instanceId: 'usage', status: 'ready' },
+      });
+      expect(backupModels.json()).toMatchObject({
+        harnessInstanceId: 'vendor-backup', models: [{ id: 'vendor-backup-default' }],
       });
       await daemon.sessionManager.sendTurn(session.id, 'Run full diagnostic', undefined, {
         turnOptions: { fastMode: true },

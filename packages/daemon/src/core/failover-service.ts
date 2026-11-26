@@ -58,20 +58,22 @@ export class FailoverCoordinator {
   private readonly cooldowns = new Map<string, InstanceCooldownRecord>();
   private readonly autoSwitchesBySession = new Map<string, number>();
   private readonly now: () => number;
+  private readonly storageId: string;
 
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
     private readonly getUsageService: () => UsageService | undefined,
-    opts?: { now?: () => number },
+    opts?: { now?: () => number; storageId?: string },
   ) {
+    this.storageId = opts?.storageId ?? FAILOVER_KV_PLUGIN_ID;
     this.now = opts?.now ?? (() => Date.now());
   }
 
   getPolicy(): FailoverPolicy {
     const raw = this.store.getPluginStorageValue(
       FAILOVER_KV_SCOPE,
-      FAILOVER_KV_PLUGIN_ID,
+      this.storageId,
       FAILOVER_KV_POLICY_KEY,
     );
     const parsed = FailoverPolicySchema.safeParse(raw ?? {});
@@ -86,7 +88,7 @@ export class FailoverCoordinator {
     });
     this.store.setPluginStorageValue(
       FAILOVER_KV_SCOPE,
-      FAILOVER_KV_PLUGIN_ID,
+      this.storageId,
       FAILOVER_KV_POLICY_KEY,
       merged,
     );

@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import {
-  AddMcpServerRequestSchema,
   AddTrustedPublisherRequestSchema,
   AgyAuthCancelRequestSchema,
   AgyAuthLogoutRequestSchema,
@@ -21,7 +20,6 @@ import {
   DelegateSubagentRequestSchema,
   DryRunMergeRequestSchema,
   DryRunSubagentMergeRequestSchema,
-  FailoverPolicySchema,
   FailoverRequestSchema,
   ForkSessionRequestSchema,
   GcCheckpointsRequestSchema,
@@ -51,7 +49,6 @@ import {
   SideChatRequestSchema,
   SwitchHarnessRequestSchema,
   TerminalInputRequestSchema,
-  ToggleMcpServerRequestSchema,
   TogglePluginRequestSchema,
   TrustSetupScriptRequestSchema,
   UpdateCompressionConfigRequestSchema,
@@ -81,20 +78,17 @@ import {
 import { CommandOutputHub } from '../core/command-output-hub.js';
 import { EffectOutboxWorker } from '../core/effect-outbox.js';
 import { DaemonEventBus } from '../core/event-bus.js';
-import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { readSessionLedger, registerSessionAssistanceCompatRoutes } from './routes/session-assistance-compat.js';
 import {
   TerminalWorkspaceService,
 } from '../core/terminal-workspace-service.js';
-import type { UsageService } from '../core/usage-service.js';
-import type { FailoverCoordinator } from '../core/failover-service.js';
 import {
   CONTEXT_COMPRESSION_PLUGIN_ID,
   ContextCompressionError,
 } from '../core/context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
-import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
+import { createBuiltinPlugins, type GitService } from '../plugin-host/builtin/services.js';
 import { GitOperationError } from '../core/git-service.js';
 import { FILE_PREVIEW_PERMISSION, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
@@ -121,6 +115,8 @@ import { PluginBuilderV2 } from '../plugins/plugin-builder-v2.js';
 import { auditPluginPackage } from '../plugins/plugin-static-audit.js';
 import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { PluginCapabilities } from '../plugins/plugin-capabilities.js';
+import { registerHarnessIntegrationCompat } from './routes/harness-integration-compat.js';
+import { invalidateAccountUsage } from '../plugin-host/builtin/harness-integration.js';
 import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
 import { runPluginProgram } from '../plugins/plugin-program.js';
 import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
@@ -240,13 +236,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       paths.agyProfilesDir,
       historyImportAdapter,
       paths.attachmentsDir,
+      () => pluginCapabilities,
+      () => pluginManager,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
-  const mcpService = new McpService(registry, config.binaryOverrides);
 
   let boundPort = config.port;
   const commandOutputHub = new CommandOutputHub();
@@ -282,7 +279,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       }
     },
     onUsageCacheInvalidate: (instanceId) => {
-      pluginManager.host.get<UsageService>('usage')?.invalidateCache(instanceId);
+      invalidateAccountUsage(pluginManager, instanceId);
     },
     onStateChanged: (state) => {
       wsGateway.notifyAgyAuthState(state);
@@ -562,7 +559,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     } else {
       registry.unregister(profile.instanceId);
     }
-    pluginManager.host.get<UsageService>('usage')?.invalidateCache(profile.instanceId);
+    invalidateAccountUsage(pluginManager, profile.instanceId);
 
     const harnesses = await registry.probeAll(true);
     return {
@@ -595,7 +592,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       saveConfig(paths.configPath, config);
     }
     registry.unregister(id);
-    pluginManager.host.get<UsageService>('usage')?.invalidateCache(id);
+    invalidateAccountUsage(pluginManager, id);
 
     if (q.purgeData === '1' || q.purgeData === 'true') {
       const dirs = resolveAgyProfileDirectories(paths.agyProfilesDir, id);
@@ -1440,90 +1437,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  // ── Unified Cross-CLI MCP Hub (/api/v1/mcp/*) ────────────────────────
-
-  app.get('/api/v1/mcp/servers', async () => {
-    const servers = await mcpService.listAllServers();
-    return { servers, presets: pluginManager.listActiveMcpPresets() };
-  });
-
-  app.post('/api/v1/mcp/servers', async (request, reply) => {
-    const parsed = AddMcpServerRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid MCP payload' });
-    }
-    const { results } = await mcpService.addServer(parsed.data);
-    const servers = await mcpService.listAllServers();
-    return { results, servers };
-  });
-
-  app.patch('/api/v1/mcp/servers/toggle', async (request, reply) => {
-    const parsed = ToggleMcpServerRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'Invalid MCP toggle payload' });
-    }
-    const result = await mcpService.toggleServer(parsed.data);
-    const servers = await mcpService.listAllServers();
-    return { result, servers };
-  });
-
-  app.delete('/api/v1/mcp/servers/:harnessId/:name', async (request, reply) => {
-    const { harnessId, name } = request.params as { harnessId: string; name: string };
-    if (harnessId !== 'codex' && harnessId !== 'agy' && harnessId !== 'claude') {
-      return reply.code(400).send({ error: 'Unsupported harness for MCP removal' });
-    }
-    const result = await mcpService.removeServer(harnessId, name);
-    const servers = await mcpService.listAllServers();
-    return { result, servers };
-  });
-
-  // ── Multi-Account & Quota Usage (/api/v1/usage/*) ────────────────────
-
-  app.get('/api/v1/usage/accounts', async (request, reply) => {
-    const usage = pluginManager.host.get<UsageService>('usage');
-    if (!usage) return reply.code(409).send({ error: '额度服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const q = request.query as { refresh?: string };
-    const forceRefresh = q.refresh === '1' || q.refresh === 'true';
-    const accounts = await usage.collectAccountUsage({ forceRefresh });
-    return { accounts, collectedAt: Date.now() };
-  });
-
-  app.get('/api/v1/usage/failover-policy', async (_request, reply) => {
-    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
-    if (!failover || typeof failover.getPolicy !== 'function') {
-      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    }
-    return { policy: failover.getPolicy() };
-  });
-
-  app.put('/api/v1/usage/failover-policy', async (request, reply) => {
-    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
-    if (!failover || typeof failover.setPolicy !== 'function') {
-      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    }
-    const parsed = FailoverPolicySchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid failover policy' });
-    }
-    return { policy: failover.setPolicy(parsed.data) };
-  });
-
-  app.get('/api/v1/sessions/:id/failover-recommendation', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const failover = pluginManager.host.get<FailoverService>('failover') as FailoverCoordinator | undefined;
-    if (!failover || typeof failover.recommendFailover !== 'function') {
-      return reply.code(409).send({ error: 'Failover 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    }
-    const q = request.query as { failedInstanceId?: string; failureClass?: string };
-    const recommendation = failover.recommendFailover(
-      id,
-      q.failedInstanceId || session.harnessId,
-      q.failureClass || 'usage_limit',
-    );
-    return { recommendation };
-  });
+  registerHarnessIntegrationCompat(app, pluginManager, registry, store);
 
   // ── Workspaces ───────────────────────────────────────────────────────
 

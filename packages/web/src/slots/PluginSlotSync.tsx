@@ -641,13 +641,13 @@ export function PluginSlotSync() {
       registry.register({
         slot: 'chat.block',
         id: 'usage-failover-banner',
-        pluginId: 'hm.plugin.usage-failover',
+        pluginId: 'core.auto-failover',
         pluginName: 'Usage & Failover',
         title: '限额接力横幅',
         key: 'ext:failover.banner',
         order: 100,
         sourceKind: 'builtin',
-        render: ({ block, onFailover }) => {
+        render: ({ session, block, onFailover }) => {
           if (block.type !== 'ext:failover.banner' || !('payload' in block)) return null;
           const store = useAppStore.getState();
           const p = block.payload as {
@@ -658,6 +658,7 @@ export function PluginSlotSync() {
           };
           return (
             <FailoverInlineBanner
+              sessionId={session.id}
               failedInstanceId={p.failedInstanceId ?? block.harnessInstanceId}
               failureClass={p.failureClass ?? 'usage_limit'}
               errorMessage={p.errorMessage ?? block.fallbackSummary ?? '达到速率限额'}

@@ -23,15 +23,14 @@ import { useAppStore } from '../stores/app-store';
 import { RiskRulesModal } from './ApprovalCenter';
 import { HarnessBadge } from './BrandMark';
 import { CommandPaletteModal, KeyboardShortcuts } from './CommandPalette';
+import { HarnessIntegrationModal } from './HarnessIntegrationModal';
 import { ModelPicker } from './ModelPicker';
 import { MergeBackReviewModal } from './OrchestratorBoard';
 import { SessionExplorerModal } from './SessionExplorerModal';
 import {
   ContextPreviewModal,
   HandoffModal,
-  McpHubModal,
   PluginStudioModal,
-  UsageDashboardModal,
 } from './StudioModals';
 import { WorktreeManagerModal } from './WorktreeManagerModal';
 
@@ -75,8 +74,9 @@ export function ModalHost() {
         {activeModal === 'harnesses' && <HarnessCenterModal onClose={() => openModal(null)} />}
         {activeModal === 'remote_pairing' && <RemotePairingModal onClose={() => openModal(null)} />}
         {activeModal === 'plugins' && <PluginStudioModal onClose={() => openModal(null)} />}
-        {activeModal === 'mcp' && <McpHubModal onClose={() => openModal(null)} />}
-        {activeModal === 'usage' && <UsageDashboardModal onClose={() => openModal(null)} />}
+        {(activeModal === 'mcp' || activeModal === 'usage') && (
+          <HarnessIntegrationModal key={activeModal} kind={activeModal} onClose={() => openModal(null)} />
+        )}
         {activeModal === 'handoff' && <HandoffModal onClose={() => openModal(null)} />}
         {activeModal === 'context_preview' && (
           <ContextPreviewModal onClose={() => openModal(null)} />

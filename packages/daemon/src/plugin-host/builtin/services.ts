@@ -33,7 +33,7 @@ import {
   type ContextCompressorProvider,
 } from '../../core/context-compression-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
-import { FailoverCoordinator } from '../../core/failover-service.js';
+import type { FailoverCoordinator } from '../../core/failover-service.js';
 import { HistoryImportAdapter } from '../../core/history-import-adapter.js';
 import { OrchestratorService } from '../../core/orchestrator-service.js';
 import { SessionChangeFeedService } from '../../core/session-change-feed.js';
@@ -70,7 +70,10 @@ import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-com
 import { renderTaskLedgerMarkdown } from '../../core/task-ledger-service.js';
 import { registerSessionAssistance, type SessionAssistanceDependencies } from './session-assistance.js';
 import { TerminalWorkspaceService } from '../../core/terminal-workspace-service.js';
-import { UsageService } from '../../core/usage-service.js';
+import type { UsageService } from '../../core/usage-service.js';
+import type { PluginCapabilities } from '../../plugins/plugin-capabilities.js';
+import type { PluginManager } from '../../plugins/plugin-manager.js';
+import { createHarnessIntegrationPlugins, selectedHarnessService, usageContract } from './harness-integration.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { createAgyDriverFactory } from '../../harnesses/agy/agy-driver.js';
 import { ClaudeStreamJsonAdapter } from '../../harnesses/claude-adapter.js';
@@ -422,7 +425,9 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   terminalWorkspace?: TerminalWorkspaceService,
   agyProfilesDir?: string,
   historyImportAdapter?: HistoryImportAdapter,
-  attachmentsDir?: string) {
+  attachmentsDir?: string,
+  getCapabilities?: () => PluginCapabilities,
+  getPluginManager?: () => PluginManager) {
   const resolvedAgyProfilesDir =
     agyProfilesDir ?? path.join(os.homedir(), '.harnessmate-desktop', 'agy-profiles');
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
@@ -656,31 +661,18 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('handoff', compiler);
     },
   });
-  plugins.set('core.account-usage', {
-    provides: ['usage'],
-    apply: (ctx) => {
-      ctx.provide('usage', new UsageService(store, registry));
-    },
-  });
+  for (const [id, plugin] of createHarnessIntegrationPlugins(store, registry, config.binaryOverrides, getCapabilities)) {
+    plugins.set(id, plugin);
+  }
   plugins.set('core.harness-commands', {
     provides: ['native-commands'],
     apply(ctx) {
       ctx.provide('native-commands', {
         list: listHarnessCommands,
-        tools: new HarnessCommandTools(() => ctx.get<UsageService>('usage'), config.binaryOverrides, registry),
+        tools: new HarnessCommandTools((session) => getPluginManager
+          ? selectedHarnessService<UsageService>(getPluginManager(), usageContract, { sessionId: session.id })
+          : ctx.get<UsageService>('usage'), config.binaryOverrides, registry),
       } satisfies NativeCommandsService);
-    },
-  });
-  plugins.set('core.auto-failover', {
-    inject: ['handoff'],
-    provides: ['failover'],
-    apply(ctx) {
-      const coordinator = new FailoverCoordinator(
-        store,
-        registry,
-        () => ctx.get<UsageService>('usage'),
-      );
-      ctx.provide('failover', coordinator);
     },
   });
   const resolvedImportAdapter = historyImportAdapter

@@ -346,6 +346,10 @@ export function registerPluginMcp(
       case 'tools/call': {
         const call = callSchema.safeParse(params);
         if (!call.success) return failure(-32602, 'Invalid tool arguments');
+        const session = resolvedStore?.getSession(lease.sessionId);
+        if (resolvedStore && (!session || session.status === 'archived' || session.harnessId !== lease.harnessId)) {
+          return respond({ content: [{ type: 'text', text: 'Harness lease mismatch' }], isError: true });
+        }
         if (ORCHESTRATOR_TOOL_NAMES.has(call.data.name)) {
           if (!shouldExposeOrchestratorTools(capabilities, opts?.isOrchestratorEnabled)) {
             return respond({
@@ -398,7 +402,7 @@ export function registerPluginMcp(
           }
         }
         try {
-          const text = await capabilities.invokeTool(lease, call.data.name, call.data.arguments);
+          const text = await capabilities.dispatchLeaseTool(lease, call.data.name, call.data.arguments);
           return respond({ content: [{ type: 'text', text }] });
         } catch (error) {
           return respond({ content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }], isError: true });

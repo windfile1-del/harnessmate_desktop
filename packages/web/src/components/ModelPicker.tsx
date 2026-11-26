@@ -1,11 +1,15 @@
 import type { HarnessModelInfo } from '@harnessmate/protocol';
 import { Check, ChevronDown, Search, Sparkles } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { daemonApi } from '../api/client';
+import { useAppStore } from '../stores/app-store';
 
 export function ModelPicker({
-  models,
+  models: driverModels,
   value,
-  defaultModelId,
+  defaultModelId: driverDefaultModelId,
+  sessionId,
+  harnessInstanceId,
   disabled,
   placement = 'top',
   onChange,
@@ -13,13 +17,30 @@ export function ModelPicker({
   models: HarnessModelInfo[];
   value: string | null;
   defaultModelId?: string | null;
+  sessionId?: string;
+  harnessInstanceId?: string;
   disabled?: boolean;
   placement?: 'top' | 'bottom';
   onChange: (modelId: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [catalog, setCatalog] = useState<Awaited<ReturnType<typeof daemonApi.getModelCandidates>>>();
+  const plugins = useAppStore((state) => state.plugins);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setCatalog(undefined);
+    if (!open || !sessionId || !harnessInstanceId) return;
+    const controller = new AbortController();
+    void daemonApi.getModelCandidates(sessionId, controller.signal).then((response) => {
+      if (!controller.signal.aborted && response.harnessInstanceId === harnessInstanceId) setCatalog(response);
+    }).catch(() => {});
+    return () => controller.abort();
+  }, [open, sessionId, harnessInstanceId, plugins]);
+
+  const models = catalog?.models ?? driverModels;
+  const defaultModelId = catalog ? catalog.defaultModelId : driverDefaultModelId;
 
   useEffect(() => {
     if (!open) return;

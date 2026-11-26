@@ -20,6 +20,11 @@ export const PEER_CONTRACTS = {
   workspaceFiles: 'workspace.files.v1',
   sessionAttachments: 'session.attachments.v1',
   workspaceRules: 'workspace.rules.v1',
+  harnessUsage: 'harness.usage.v1',
+  harnessModelCatalog: 'harness.model-catalog.v1',
+  sessionFailover: 'session.failover.v1',
+  harnessMcpConfig: 'harness.mcp-config.v1',
+  sessionModelTools: 'session.model-tools.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
   'browser.v1',
@@ -35,6 +40,11 @@ export const PEER_CONTRACT_NAMES = [
   'workspace.files.v1',
   'session.attachments.v1',
   'workspace.rules.v1',
+  'harness.usage.v1',
+  'harness.model-catalog.v1',
+  'session.failover.v1',
+  'harness.mcp-config.v1',
+  'session.model-tools.v1',
 ] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 
@@ -52,7 +62,8 @@ export const BUILTIN_PUBLIC_SERVICES = ['ledger', 'handoff', 'git', 'usage', 'no
 export type BuiltinPublicServiceName = typeof BUILTIN_PUBLIC_SERVICES[number];
 
 export function isReservedServiceName(name: string): boolean {
-  return name === 'harness' || name.startsWith('harness.') || name === 'mcpHub' || name === 'remote' || name === 'native-commands' || name === 'failover';
+  return name === 'harness' || (name.startsWith('harness.') && !isPeerContractName(name))
+    || name === 'mcpHub' || name === 'remote' || name === 'native-commands' || name === 'failover';
 }
 
 export function isBuiltinPublicService(name: string): name is BuiltinPublicServiceName {

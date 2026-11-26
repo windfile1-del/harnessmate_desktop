@@ -64,7 +64,7 @@ import type {
   Workspace,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
-import { ApiHttpError, DaemonWsClient, daemonApi } from '../api/client';
+import { ApiHttpError, DaemonWsClient, daemonApi, type HarnessServiceScope } from '../api/client';
 import {
   HISTORY_IMPORT_CONTRACT,
   HISTORY_IMPORT_PAGE_SLOT_ID,
@@ -350,14 +350,14 @@ interface AppState {
   rollbackPlugin: (id: string) => Promise<void>;
   uninstallPlugin: (id: string) => Promise<void>;
 
-  refreshMcpServers: () => Promise<void>;
-  addMcpServer: (req: AddMcpServerRequest) => Promise<void>;
-  toggleMcpServer: (req: ToggleMcpServerRequest) => Promise<void>;
-  removeMcpServer: (harnessId: 'codex' | 'agy' | 'claude', name: string) => Promise<void>;
+  refreshMcpServers: (scope?: HarnessServiceScope) => Promise<void>;
+  addMcpServer: (req: AddMcpServerRequest, scope?: HarnessServiceScope) => Promise<Array<{ harnessId: string; ok: boolean; message: string }>>;
+  toggleMcpServer: (req: ToggleMcpServerRequest, scope?: HarnessServiceScope) => Promise<void>;
+  removeMcpServer: (harnessId: string, name: string, scope?: HarnessServiceScope) => Promise<void>;
 
-  refreshAccountUsage: (forceRefresh?: boolean) => Promise<void>;
-  refreshFailoverPolicy: () => Promise<void>;
-  updateFailoverPolicy: (policy: FailoverPolicy) => Promise<void>;
+  refreshAccountUsage: (forceRefresh?: boolean, scope?: HarnessServiceScope) => Promise<void>;
+  refreshFailoverPolicy: (scope?: HarnessServiceScope) => Promise<void>;
+  updateFailoverPolicy: (policy: FailoverPolicy, scope?: HarnessServiceScope) => Promise<void>;
   refreshTurnItems: (sessionId: string) => Promise<void>;
   subscribeCommandOutput: (sessionId: string, toolCallId: string) => () => void;
   setTraitValue: (scopeKey: string, key: string, value: TurnOptionValue | null) => void;
@@ -1766,10 +1766,10 @@ export const useAppStore = create<AppState>((set, get) => {
       get().pushToast({ kind: 'info', title: '已卸载外部插件' });
     },
 
-    refreshMcpServers: async () => {
+    refreshMcpServers: async (scope) => {
       set({ mcpLoading: true });
       try {
-        const res = await daemonApi.listMcpServers();
+        const res = await daemonApi.listMcpServers(scope);
         set({ mcpServers: res.servers, mcpPresets: res.presets, mcpLoading: false });
       } catch (err) {
         set({ mcpLoading: false });
@@ -1781,8 +1781,8 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    addMcpServer: async (req) => {
-      const res = await daemonApi.addMcpServer(req);
+    addMcpServer: async (req, scope) => {
+      const res = await daemonApi.addMcpServer(req, scope);
       set({ mcpServers: res.servers });
       const okTargets = res.results.filter((r) => r.ok).map((r) => r.harnessId);
       const failTargets = res.results.filter((r) => !r.ok);
@@ -1799,10 +1799,11 @@ export const useAppStore = create<AppState>((set, get) => {
           body: failTargets.map((f) => `${f.harnessId}: ${f.message}`).join('\n'),
         });
       }
+      return res.results;
     },
 
-    toggleMcpServer: async (req) => {
-      const res = await daemonApi.toggleMcpServer(req);
+    toggleMcpServer: async (req, scope) => {
+      const res = await daemonApi.toggleMcpServer(req, scope);
       set({ mcpServers: res.servers });
       get().pushToast({
         kind: res.result.ok ? 'success' : 'warning',
@@ -1811,8 +1812,8 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
-    removeMcpServer: async (harnessId, name) => {
-      const res = await daemonApi.removeMcpServer(harnessId, name);
+    removeMcpServer: async (harnessId, name, scope) => {
+      const res = await daemonApi.removeMcpServer(harnessId, name, scope);
       set({ mcpServers: res.servers });
       get().pushToast({
         kind: res.result.ok ? 'info' : 'error',
@@ -1821,10 +1822,10 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
-    refreshAccountUsage: async (forceRefresh = false) => {
+    refreshAccountUsage: async (forceRefresh = false, scope) => {
       set({ usageLoading: true });
       try {
-        const res = await daemonApi.getAccountUsage(forceRefresh);
+        const res = await daemonApi.getAccountUsage(forceRefresh, scope);
         set({ accountUsage: res.accounts, usageCollectedAt: res.collectedAt, usageLoading: false });
       } catch (err) {
         set({ usageLoading: false });
@@ -1836,17 +1837,17 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    refreshFailoverPolicy: async () => {
+    refreshFailoverPolicy: async (scope) => {
       try {
-        const { policy } = await daemonApi.getFailoverPolicy();
+        const { policy } = await daemonApi.getFailoverPolicy(scope);
         set({ failoverPolicy: policy });
       } catch {
         // ignore if failover plugin disabled
       }
     },
 
-    updateFailoverPolicy: async (policy) => {
-      const res = await daemonApi.updateFailoverPolicy(policy);
+    updateFailoverPolicy: async (policy, scope) => {
+      const res = await daemonApi.updateFailoverPolicy(policy, scope);
       set({ failoverPolicy: res.policy });
       get().pushToast({ kind: 'success', title: '已保存 Failover 接力策略' });
     },

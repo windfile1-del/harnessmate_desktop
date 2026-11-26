@@ -203,6 +203,7 @@ export interface ExecCliQuickOptions {
   env?: Record<string, string | undefined>;
   unsetEnv?: readonly string[];
   onStderrChunk?: (chunk: string) => void;
+  waitForTimeoutTermination?: boolean;
 }
 
 export async function execCliQuick(
@@ -243,8 +244,10 @@ export async function execCliQuick(
       if (!settled) {
         settled = true;
         opts.signal?.removeEventListener('abort', abort);
-        void killProcessTree(child);
-        resolve({ stdout, stderr: `${stderr}\n[timeout after ${timeoutMs}ms]`.trim(), exitCode: -1 });
+        const termination = killProcessTree(child);
+        const finish = () => resolve({ stdout, stderr: `${stderr}\n[timeout after ${timeoutMs}ms]`.trim(), exitCode: -1 });
+        if (opts.waitForTimeoutTermination) void termination.then(finish, finish);
+        else finish();
       }
     }, timeoutMs);
 
