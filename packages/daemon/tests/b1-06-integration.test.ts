@@ -407,4 +407,139 @@ describe('B1-06 · Batch 1 Integrated Distribution, Compat Routes & Recovery', (
       (await daemon.app.inject({ method: 'GET', url: '/api/v1/plugins/services/resolve?contract=history.import.v1' })).json(),
     ).toMatchObject({ instanceId: 'hm.plugin.history-import', status: 'ready' });
   }, 60_000);
+
+  it('supports enabled-state instant search/delete without manual reindex and preserves peer workspace changes during scoped reindex', async () => {
+    const dataDir = makeTempDir('hm-b1-06-live-sync-');
+    const wsDir1 = makeTempDir('hm-b1-06-live-ws1-');
+    const wsDir2 = makeTempDir('hm-b1-06-live-ws2-');
+
+    const daemon = createDaemon({
+      dataDir,
+      port: 0,
+      hostOverride: '127.0.0.1',
+      bundledPluginsDir: path.join(repoRoot, 'plugins', 'bundled'),
+      webDistDir: null,
+    });
+    activeDaemons.push(daemon);
+    await daemon.start();
+
+    const ws1 = await daemon.sessionManager.addWorkspace(wsDir1, 'Live WS 1');
+    const ws2 = await daemon.sessionManager.addWorkspace(wsDir2, 'Live WS 2');
+
+    // 1. Enabled-state bundle import is immediately searchable WITHOUT manual reindex
+    const imp1 = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/sessions/import-bundle',
+      payload: {
+        bundle: buildChineseBundle('live-1', wsDir1, '即时索引会话 1', '唯一即时关键词 AlphaLiveTerm', '无需手动重建即可命中'),
+        workspaceId: ws1.id,
+      },
+    });
+    expect(imp1.statusCode).toBe(201);
+    const sid1 = imp1.json().session.id as string;
+
+    const instantHit = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('AlphaLiveTerm')}&workspaceId=${encodeURIComponent(ws1.id)}`,
+    });
+    expect(instantHit.statusCode).toBe(200);
+    expect(instantHit.json().hits.some((h: { sessionId: string }) => h.sessionId === sid1)).toBe(true);
+
+    // 2. Deleting the session removes it from enabled-state search WITHOUT manual reindex
+    const del1 = await daemon.app.inject({
+      method: 'DELETE',
+      url: `/api/v1/sessions/${sid1}`,
+    });
+    expect(del1.statusCode).toBe(200);
+
+    const afterDeleteHit = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('AlphaLiveTerm')}&workspaceId=${encodeURIComponent(ws1.id)}`,
+    });
+    expect(afterDeleteHit.statusCode).toBe(200);
+    expect(afterDeleteHit.json().hits).toHaveLength(0);
+
+    // 3. Scoped workspace 1 reindex while workspace 2 has unconsumed create & delete changes
+    const ws2Initial = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/sessions/import-bundle',
+      payload: {
+        bundle: buildChineseBundle('live-ws2-init', wsDir2, '工作区 2 初始会话', 'Ws2OldToken 删除前词条', '初始文本'),
+        workspaceId: ws2.id,
+      },
+    });
+    expect(ws2Initial.statusCode).toBe(201);
+    const ws2OldId = ws2Initial.json().session.id as string;
+
+    const ws2InitialSearch = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('Ws2OldToken')}`,
+    });
+    expect(ws2InitialSearch.statusCode).toBe(200);
+    expect(ws2InitialSearch.json().hits.some((h: { sessionId: string }) => h.sessionId === ws2OldId)).toBe(true);
+
+    // Pause search engine, mutate ws1 & ws2, re-enable and run scoped reindex on ws1 ONLY
+    expect((await daemon.app.inject({
+      method: 'PATCH',
+      url: '/api/v1/plugins/hm.plugin.session-search-fts',
+      payload: { enabled: false },
+    })).statusCode).toBe(200);
+
+    const ws1New = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/sessions/import-bundle',
+      payload: {
+        bundle: buildChineseBundle('live-ws1-new', wsDir1, '工作区 1 新增', 'Ws1ScopedToken 局部重建目标', '目标回复'),
+        workspaceId: ws1.id,
+      },
+    });
+    expect(ws1New.statusCode).toBe(201);
+    const ws1NewId = ws1New.json().session.id as string;
+
+    const ws2New = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/sessions/import-bundle',
+      payload: {
+        bundle: buildChineseBundle('live-ws2-new', wsDir2, '工作区 2 未消费新增', 'Ws2SurvivingToken 不应被跳过', '保留文本'),
+        workspaceId: ws2.id,
+      },
+    });
+    expect(ws2New.statusCode).toBe(201);
+    const ws2NewId = ws2New.json().session.id as string;
+    expect((await daemon.app.inject({ method: 'DELETE', url: `/api/v1/sessions/${ws2OldId}` })).statusCode).toBe(200);
+
+    expect((await daemon.app.inject({
+      method: 'PATCH',
+      url: '/api/v1/plugins/hm.plugin.session-search-fts',
+      payload: { enabled: true },
+    })).statusCode).toBe(200);
+
+    const scopedReindex = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/search/reindex',
+      payload: { workspaceId: ws1.id },
+    });
+    expect(scopedReindex.statusCode).toBe(200);
+
+    const ws1Res = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('Ws1ScopedToken')}`,
+    });
+    expect(ws1Res.statusCode).toBe(200);
+    expect(ws1Res.json().hits.some((h: { sessionId: string }) => h.sessionId === ws1NewId)).toBe(true);
+
+    const ws2NewRes = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('Ws2SurvivingToken')}`,
+    });
+    expect(ws2NewRes.statusCode).toBe(200);
+    expect(ws2NewRes.json().hits.some((h: { sessionId: string }) => h.sessionId === ws2NewId)).toBe(true);
+
+    const ws2OldRes = await daemon.app.inject({
+      method: 'GET',
+      url: `/api/v1/search/sessions?q=${encodeURIComponent('Ws2OldToken')}`,
+    });
+    expect(ws2OldRes.statusCode).toBe(200);
+    expect(ws2OldRes.json().hits).toHaveLength(0);
+  }, 60_000);
 });
