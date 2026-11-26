@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  PEER_CONTRACTS,
   PluginApiError,
   isReservedServiceName,
   pluginEventContracts,
@@ -9,6 +10,7 @@ import {
   type ContextHandoffPreviewV2,
   type ForkSessionOptions,
   type GetSessionItemOptions,
+  type GitWorkspaceServiceV1,
   type ListSessionItemsOptions,
   type PluginEventName,
   type PluginEventV4,
@@ -663,13 +665,39 @@ export class IsolatedPluginRpcRouter {
         if (opts.createWorktree === true) {
           this.deps.permissions.assertGranted(plugin, 'workspace:git:write', source.workspaceId);
           const workspace = this.deps.store.getWorkspace(source.workspaceId);
-          const git = this.deps.host.get<GitService>('git');
-          if (!workspace || !git?.worktree) {
+          if (!workspace) {
             throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'git worktree 服务不可用');
           }
-          const wt = await git.worktree(workspace.rootPath, `fork-${Date.now()}`);
-          cwd = wt.worktreePath;
-          worktreeBranch = wt.branch;
+          const branchName = `fork-${Date.now()}`;
+          const gitResolution = this.resolveServiceWithFallback(PEER_CONTRACTS.gitWorkspace, {
+            callerInstanceId: instanceId,
+            sessionId: source.id,
+            workspaceId: source.workspaceId,
+            allowSingleCandidate: true,
+          });
+          if (gitResolution.status === 'ready') {
+            const peerGit = this.deps.host.getServiceByInstance<GitWorkspaceServiceV1>(
+              gitResolution.instanceId,
+              PEER_CONTRACTS.gitWorkspace,
+            );
+            if (peerGit && typeof peerGit.createWorktree === 'function') {
+              const wtRes = await peerGit.createWorktree({ repoRoot: workspace.rootPath, branchName });
+              if (!wtRes.ok) {
+                throw new PluginApiError('E_SERVICE_UNAVAILABLE', wtRes.error.message);
+              }
+              cwd = wtRes.value.worktreePath;
+              worktreeBranch = wtRes.value.branch;
+            }
+          }
+          if (cwd === source.cwd) {
+            const git = this.deps.host.get<GitService>('git');
+            if (!git?.worktree) {
+              throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'git worktree 服务不可用');
+            }
+            const wt = await git.worktree(workspace.rootPath, branchName);
+            cwd = wt.worktreePath;
+            worktreeBranch = wt.branch;
+          }
         }
         const now = Date.now();
         const forkedTitle = typeof opts.title === 'string' && opts.title.trim()
@@ -1303,6 +1331,26 @@ export class IsolatedPluginRpcRouter {
     const workspaceId = typeof args[0] === 'string' ? args[0] : undefined;
     const workspace = this.getWorkspaceOrThrow(workspaceId);
     this.deps.permissions.assertGranted(plugin, 'fs:workspace:read', workspace.id);
+    const resolution = this.resolveServiceWithFallback(PEER_CONTRACTS.gitWorkspace, {
+      workspaceId: workspace.id,
+      allowSingleCandidate: true,
+    });
+    if (resolution.status === 'ready') {
+      const peer = this.deps.host.getServiceByInstance<GitWorkspaceServiceV1>(
+        resolution.instanceId,
+        PEER_CONTRACTS.gitWorkspace,
+      );
+      if (peer) {
+        if (fnName === 'status' && typeof peer.getStatus === 'function') {
+          const res = await peer.getStatus({ workspaceId: workspace.id, cwd: workspace.rootPath });
+          if (res.ok && res.value.status) return res.value.status;
+        }
+        if (fnName === 'inspect' && typeof peer.inspect === 'function') {
+          const res = await peer.inspect({ workspaceId: workspace.id, cwd: workspace.rootPath });
+          if (res.ok) return res.value;
+        }
+      }
+    }
     const git = this.deps.host.get<{ status?: (cwd: string) => unknown; inspect?: (cwd: string) => unknown }>('git');
     if (!git) throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'git 服务不可用');
     if (fnName === 'status' && typeof git.status === 'function') return await git.status(workspace.rootPath);

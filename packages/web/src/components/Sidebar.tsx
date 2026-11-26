@@ -16,8 +16,10 @@ import {
   Trash2,
 } from 'lucide-react';
 import {
+  GIT_WORKSPACE_CONTRACT,
   HISTORY_IMPORT_CONTRACT,
   SESSION_SEARCH_CONTRACT,
+  isContractAvailableClientSide,
   pluginProvidesContract,
 } from '../api/peer-contracts';
 import { formatRelativeTime, resolveHarnessMeta } from '../lib/harness-meta';
@@ -51,6 +53,10 @@ export function Sidebar() {
     openSessionSearchPage,
     openHistoryImportPage,
     isPluginEnabled,
+    compositionEntries,
+    compositionBindings,
+    workspaceBindingsByWorkspace,
+    sessionBindingsBySession,
   } = useAppStore(useShallow((state) => ({
     theme: state.theme,
     toggleTheme: state.toggleTheme,
@@ -72,7 +78,23 @@ export function Sidebar() {
     openSessionSearchPage: state.openSessionSearchPage,
     openHistoryImportPage: state.openHistoryImportPage,
     isPluginEnabled: state.isPluginEnabled,
+    compositionEntries: state.compositionEntries,
+    compositionBindings: state.compositionBindings,
+    workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace,
+    sessionBindingsBySession: state.sessionBindingsBySession,
   })));
+
+  const activeSession = selectedSessionId ? sessions.find((s) => s.id === selectedSessionId) : undefined;
+  const activeWorkspaceId = activeSession?.workspaceId ?? selectedWorkspaceId;
+  const gitWorkspaceEnabled = isContractAvailableClientSide({
+    contract: GIT_WORKSPACE_CONTRACT,
+    legacyPluginId: 'core.git-inspector',
+    plugins,
+    sessionBindings: selectedSessionId ? sessionBindingsBySession[selectedSessionId] : undefined,
+    workspaceBindings: activeWorkspaceId ? workspaceBindingsByWorkspace[activeWorkspaceId] : undefined,
+    compositionBindings,
+    compositionEntries,
+  });
 
   const readyCount = harnesses.filter((h) => h.health === 'ready').length;
   const enabledPluginsCount = plugins.filter((p) => p.enabled).length;
@@ -482,7 +504,7 @@ export function Sidebar() {
           onClick={() => openModal('plugins')}
         />
 
-        {isPluginEnabled('core.git-inspector') && (
+        {gitWorkspaceEnabled && (
           <DockTile
             icon={<FolderGit2 size={13.5} style={{ color: 'var(--accent-indigo)' }} />}
             title="Worktree"

@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { parseAnsiSegments, stripAnsiClient } from '../lib/ansi-render';
+import { TERMINAL_WORKSPACE_CONTRACT } from '../api/peer-contracts';
+import { useSlotItems } from '../slots';
 import { useAppStore } from '../stores/app-store';
 
 function normalizeCwd(p: string): string {
@@ -579,7 +581,22 @@ export function TerminalStatusbarBadgeView({
 
 export function TerminalStatusbarBadge({ session }: { session: Session | null }) {
   const terminalsByWorkspace = useAppStore((s) => s.terminalsByWorkspace);
+  const resolveContractLocal = useAppStore((s) => s.resolveContractLocal);
   const openPluginPanel = useAppStore((s) => s.openPluginPanel);
+  const inspectorTabItems = useSlotItems('inspector.tabs');
+  const terminalTabKey = useMemo(() => {
+    const slotMatch = inspectorTabItems.find(
+      (item) => item.key === 'terminal-workspace' || item.id === 'terminal-workspace',
+    );
+    if (slotMatch) return slotMatch.registrationKey;
+    const resolution = resolveContractLocal(TERMINAL_WORKSPACE_CONTRACT, {
+      sessionId: session?.id,
+      workspaceId: session?.workspaceId,
+    });
+    return resolution.instanceId
+      ? `${resolution.instanceId}:terminal-workspace`
+      : 'hm.plugin.terminal-workspace:terminal-workspace';
+  }, [inspectorTabItems, resolveContractLocal, session?.id, session?.workspaceId]);
 
   const runningCount = useMemo(() => {
     if (session) {
@@ -594,7 +611,7 @@ export function TerminalStatusbarBadge({ session }: { session: Session | null })
   return (
     <TerminalStatusbarBadgeView
       runningCount={runningCount}
-      onClick={() => openPluginPanel('hm.plugin.terminal-workspace:terminal-workspace')}
+      onClick={() => openPluginPanel(terminalTabKey)}
     />
   );
 }

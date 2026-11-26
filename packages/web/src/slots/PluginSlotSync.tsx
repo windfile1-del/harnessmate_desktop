@@ -43,8 +43,14 @@ import {
   SESSION_SEARCH_CONTRACT,
   SESSION_SEARCH_PAGE_SLOT_ID,
   getPluginInstanceId,
+  GIT_CHECKPOINT_CONTRACT,
+  GIT_WORKSPACE_CONTRACT,
+  TERMINAL_WORKSPACE_CONTRACT,
+  WORKSPACE_FILES_CONTRACT,
+  WORKSPACE_RULES_CONTRACT,
   isPluginInstanceReady,
   pluginProvidesContract,
+  resolveServiceSelectionClientSide,
 } from '../api/peer-contracts';
 import {
   TerminalStatusbarBadge,
@@ -215,9 +221,16 @@ function ApprovalAnnotationsDetail({ approval }: { approval: ApprovalRequest }) 
   );
 }
 
+const SINGLE_OWNER_W1_SLOTS: Partial<Record<AnyPluginSlotKey, string>> = {
+  'inspector.diff': GIT_WORKSPACE_CONTRACT,
+  'inspector.files': WORKSPACE_FILES_CONTRACT,
+  'inspector.rules': WORKSPACE_RULES_CONTRACT,
+};
+
 export function registerPluginIframeSlots(
   registry: SlotRegistry,
   plugins: InstalledPluginInfo[],
+  preferredSingleSlotOwners?: Partial<Record<AnyPluginSlotKey, string | null>>,
 ): Disposer[] {
   const disposers: Disposer[] = [];
   for (const plugin of plugins) {
@@ -225,6 +238,29 @@ export function registerPluginIframeSlots(
     const instanceId = plugin.instanceId ?? plugin.id;
     const revision = `${plugin.packageDigest ?? plugin.version}:${plugin.runId ?? 'decl'}`;
     for (const slotDef of collectPluginIframeSlots(plugin)) {
+      const slotContract = SINGLE_OWNER_W1_SLOTS[slotDef.slot];
+      const preferredOwner = preferredSingleSlotOwners?.[slotDef.slot];
+      if (
+        slotContract &&
+        preferredOwner &&
+        pluginProvidesContract(plugin, slotContract) &&
+        preferredOwner !== instanceId
+      ) {
+        continue;
+      }
+      if (
+        slotDef.slot === 'inspector.tabs' &&
+        (slotDef.key === 'terminal-workspace' || slotDef.id === 'terminal-workspace') &&
+        preferredOwner &&
+        pluginProvidesContract(plugin, TERMINAL_WORKSPACE_CONTRACT) &&
+        preferredOwner !== instanceId
+      ) {
+        continue;
+      }
+      const resolvedOrder =
+        preferredOwner === instanceId
+          ? Math.min(slotDef.order ?? 500, 50)
+          : (slotDef.order ?? 500);
       const isCompactSlot =
         slotDef.slot === 'statusbar.items' ||
         slotDef.slot === 'composer.actions' ||
@@ -242,7 +278,7 @@ export function registerPluginIframeSlots(
           pluginId: instanceId,
           pluginName: plugin.name,
           title: pageTitle,
-          order: slotDef.order ?? 500,
+          order: resolvedOrder,
           key: slotDef.key,
           sourceKind: 'iframe',
           render: (rawProps) => {
@@ -490,11 +526,49 @@ function AgyNativeInspectorAdapter({ session }: { session: Session }) {
 
 export function PluginSlotSync() {
   const plugins = useAppStore((state) => state.plugins);
+  const sessions = useAppStore((state) => state.sessions);
+  const selectedWorkspaceId = useAppStore((state) => state.selectedWorkspaceId);
+  const selectedSessionId = useAppStore((state) => state.selectedSessionId);
+  const compositionEntries = useAppStore((state) => state.compositionEntries);
+  const compositionBindings = useAppStore((state) => state.compositionBindings);
+  const workspaceBindingsByWorkspace = useAppStore((state) => state.workspaceBindingsByWorkspace);
+  const sessionBindingsBySession = useAppStore((state) => state.sessionBindingsBySession);
   const agyNativeWorkbenchEnabled = useAppStore((state) => state.agyNativeWorkbenchEnabled);
   const registry = useSlotRegistry();
 
   useEffect(() => {
     const disposers: Disposer[] = [];
+    const activeSession = selectedSessionId
+      ? sessions.find((item) => item.id === selectedSessionId) ?? null
+      : null;
+    const activeWorkspaceId = activeSession?.workspaceId ?? selectedWorkspaceId;
+    const workspaceBindings = activeWorkspaceId
+      ? workspaceBindingsByWorkspace[activeWorkspaceId]
+      : undefined;
+    const sessionBindings = selectedSessionId
+      ? sessionBindingsBySession[selectedSessionId]
+      : undefined;
+    const resolveW1Contract = (contract: string) =>
+      resolveServiceSelectionClientSide({
+        contract,
+        plugins,
+        sessionBindings,
+        workspaceBindings,
+        compositionBindings,
+        compositionEntries,
+      });
+    const hasCustomIframeSlot = (
+      plugin: InstalledPluginInfo | undefined,
+      slot: AnyPluginSlotKey,
+      key?: string,
+    ): boolean =>
+      Boolean(
+        plugin &&
+          collectPluginIframeSlots(plugin).some(
+            (entry) => entry.slot === slot && (!key || entry.key === key || entry.id === key),
+          ),
+      );
+
     const triageBadge = registerTriageBadge(registry, plugins);
     if (triageBadge) disposers.push(triageBadge);
 
@@ -599,14 +673,37 @@ export function PluginSlotSync() {
     );
 
     // Built-in V5 Git Checkpoints & Diff Inspector (`inspector.diff` + `chat.block` checkpoint_marker)
+    const gitWorkspaceResolution = resolveW1Contract(GIT_WORKSPACE_CONTRACT);
+    const gitCheckpointResolution = resolveW1Contract(GIT_CHECKPOINT_CONTRACT);
+    const filesResolution = resolveW1Contract(WORKSPACE_FILES_CONTRACT);
+    const rulesResolution = resolveW1Contract(WORKSPACE_RULES_CONTRACT);
+    const hasGitContractDecl = plugins.some((p) => pluginProvidesContract(p, GIT_WORKSPACE_CONTRACT));
+    const hasCheckpointContractDecl = plugins.some((p) => pluginProvidesContract(p, GIT_CHECKPOINT_CONTRACT));
     const gitInspectorPlugin = plugins.find((p) => p.id === 'core.git-inspector');
-    if (!gitInspectorPlugin || isPluginActive(gitInspectorPlugin)) {
+    const legacyGitActive = !gitInspectorPlugin || isPluginActive(gitInspectorPlugin);
+
+    const selectedGitPlugin = gitWorkspaceResolution.instanceId
+      ? plugins.find((p) => getPluginInstanceId(p) === gitWorkspaceResolution.instanceId)
+      : undefined;
+    const selectedCheckpointPlugin = gitCheckpointResolution.instanceId
+      ? plugins.find((p) => getPluginInstanceId(p) === gitCheckpointResolution.instanceId)
+      : undefined;
+
+    const gitDiffEnabled = hasGitContractDecl
+      ? gitWorkspaceResolution.status === 'ready'
+      : legacyGitActive;
+    const checkpointMarkerEnabled = hasCheckpointContractDecl
+      ? gitCheckpointResolution.status === 'ready'
+      : legacyGitActive;
+
+    if (gitDiffEnabled && !hasCustomIframeSlot(selectedGitPlugin, 'inspector.diff')) {
+      const ownerId = selectedGitPlugin ? getPluginInstanceId(selectedGitPlugin) : 'core.git-inspector';
       disposers.push(
         registry.register({
           slot: 'inspector.diff',
           id: 'git-diff-inspector',
-          pluginId: 'core.git-inspector',
-          pluginName: 'Git Checkpoints & Diff',
+          pluginId: ownerId,
+          pluginName: selectedGitPlugin?.name ?? 'Git Checkpoints & Diff',
           title: 'Git 差异与检查点对比',
           order: 100,
           sourceKind: 'builtin',
@@ -615,13 +712,21 @@ export function PluginSlotSync() {
           ),
         }),
       );
+    }
 
+    if (
+      checkpointMarkerEnabled &&
+      !hasCustomIframeSlot(selectedCheckpointPlugin, 'chat.block', 'checkpoint_marker')
+    ) {
+      const ownerId = selectedCheckpointPlugin
+        ? getPluginInstanceId(selectedCheckpointPlugin)
+        : 'core.git-inspector';
       disposers.push(
         registry.register({
           slot: 'chat.block',
           id: 'git-checkpoint-marker',
-          pluginId: 'core.git-inspector',
-          pluginName: 'Git Checkpoints & Diff',
+          pluginId: ownerId,
+          pluginName: selectedCheckpointPlugin?.name ?? 'Git Checkpoints & Diff',
           title: '轮次检查点徽章',
           key: 'checkpoint_marker',
           order: 100,
@@ -816,34 +921,51 @@ export function PluginSlotSync() {
     }
 
     // Built-in V5 Optional Integrated PTY Terminal & Context Chips (`inspector.tabs` key: `terminal-workspace` + `statusbar.items`)
-    const terminalWorkspacePlugin = plugins.find((p) => p.id === 'hm.plugin.terminal-workspace');
-    if (terminalWorkspacePlugin && isPluginActive(terminalWorkspacePlugin)) {
-      disposers.push(
-        registry.register({
-          slot: 'inspector.tabs',
-          id: 'terminal-workspace',
-          pluginId: 'hm.plugin.terminal-workspace',
-          pluginName: 'Integrated Terminal Workspace',
-          title: '集成终端',
-          key: 'terminal-workspace',
-          order: 85,
-          sourceKind: 'builtin',
-          render: ({ session }) => <TerminalWorkspaceDrawer session={session} />,
-        }),
-      );
+    const terminalWorkspaceResolution = resolveW1Contract(TERMINAL_WORKSPACE_CONTRACT);
+    const hasTerminalWorkspaceDecl = plugins.some((p) =>
+      pluginProvidesContract(p, TERMINAL_WORKSPACE_CONTRACT),
+    );
+    const legacyTerminalPlugin = plugins.find((p) => p.id === 'hm.plugin.terminal-workspace');
+    const terminalWorkspaceActive = hasTerminalWorkspaceDecl
+      ? terminalWorkspaceResolution.status === 'ready'
+      : Boolean(legacyTerminalPlugin && isPluginActive(legacyTerminalPlugin));
+    const selectedTerminalPlugin = terminalWorkspaceResolution.instanceId
+      ? plugins.find((p) => getPluginInstanceId(p) === terminalWorkspaceResolution.instanceId)
+      : legacyTerminalPlugin;
+    if (terminalWorkspaceActive) {
+      const terminalOwnerId = selectedTerminalPlugin
+        ? getPluginInstanceId(selectedTerminalPlugin)
+        : 'hm.plugin.terminal-workspace';
+      if (!hasCustomIframeSlot(selectedTerminalPlugin, 'inspector.tabs', 'terminal-workspace')) {
+        disposers.push(
+          registry.register({
+            slot: 'inspector.tabs',
+            id: 'terminal-workspace',
+            pluginId: terminalOwnerId,
+            pluginName: selectedTerminalPlugin?.name ?? 'Integrated Terminal Workspace',
+            title: '集成终端',
+            key: 'terminal-workspace',
+            order: 85,
+            sourceKind: 'builtin',
+            render: ({ session }) => <TerminalWorkspaceDrawer session={session} />,
+          }),
+        );
+      }
 
-      disposers.push(
-        registry.register({
-          slot: 'statusbar.items',
-          id: 'terminal-workspace-count',
-          pluginId: 'hm.plugin.terminal-workspace',
-          pluginName: 'Integrated Terminal Workspace',
-          title: '托管终端计数',
-          order: 100,
-          sourceKind: 'builtin',
-          render: ({ session }) => <TerminalStatusbarBadge session={session} />,
-        }),
-      );
+      if (!hasCustomIframeSlot(selectedTerminalPlugin, 'statusbar.items')) {
+        disposers.push(
+          registry.register({
+            slot: 'statusbar.items',
+            id: 'terminal-workspace-count',
+            pluginId: terminalOwnerId,
+            pluginName: selectedTerminalPlugin?.name ?? 'Integrated Terminal Workspace',
+            title: '托管终端计数',
+            order: 100,
+            sourceKind: 'builtin',
+            render: ({ session }) => <TerminalStatusbarBadge session={session} />,
+          }),
+        );
+      }
     }
 
     // Built-in V5 Antigravity Native Experience & Account Isolation slots
@@ -1095,12 +1217,30 @@ export function PluginSlotSync() {
     }
 
     // 3. V4/V5 manifest contributes.slots & isolated runtimeSlots -> sandboxed iframe
-    disposers.push(...registerPluginIframeSlots(registry, plugins));
+    disposers.push(
+      ...registerPluginIframeSlots(registry, plugins, {
+        'inspector.diff': gitWorkspaceResolution.instanceId,
+        'inspector.files': filesResolution.instanceId,
+        'inspector.rules': rulesResolution.instanceId,
+        'inspector.tabs': terminalWorkspaceResolution.instanceId,
+      }),
+    );
 
     return () => {
       for (const dispose of disposers.reverse()) dispose();
     };
-  }, [plugins, agyNativeWorkbenchEnabled, registry]);
+  }, [
+    plugins,
+    sessions,
+    selectedWorkspaceId,
+    selectedSessionId,
+    compositionEntries,
+    compositionBindings,
+    workspaceBindingsByWorkspace,
+    sessionBindingsBySession,
+    agyNativeWorkbenchEnabled,
+    registry,
+  ]);
 
   return null;
 }

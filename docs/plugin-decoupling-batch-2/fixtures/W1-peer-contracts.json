@@ -1,0 +1,229 @@
+{
+  "version": "1.0.0",
+  "owner": "W1 (codex/b2-w1-workspace)",
+  "generatedFromBaseline": "6099b2c1290f70011eeb64fb2244670bfb3790e2",
+  "contracts": {
+    "git.workspace.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "git",
+      "methods": [
+        "getStatus",
+        "inspect",
+        "getFileDiff",
+        "getTruthDigest",
+        "initRepo",
+        "discardFile",
+        "commit",
+        "push",
+        "pull",
+        "createPr",
+        "listWorktrees",
+        "createWorktree",
+        "removeWorktree",
+        "dryRunMerge",
+        "getSetupScriptInfo",
+        "setSetupScriptTrust",
+        "runSetupScript"
+      ],
+      "legacyRouteMappings": [
+        "/api/v1/sessions/:id/git",
+        "/api/v1/sessions/:id/git/file-diff",
+        "/api/v1/sessions/:id/git/truth",
+        "/api/v1/sessions/:id/git/init",
+        "/api/v1/sessions/:id/git/discard",
+        "/api/v1/sessions/:id/git/commit",
+        "/api/v1/sessions/:id/git/push",
+        "/api/v1/sessions/:id/git/pull",
+        "/api/v1/sessions/:id/git/pr",
+        "/api/v1/workspaces/:id/worktrees",
+        "/api/v1/workspaces/:id/worktrees/dry-run-merge",
+        "/api/v1/workspaces/:id/setup-script",
+        "/api/v1/workspaces/:id/setup-script/trust",
+        "/api/v1/workspaces/:id/setup-script/run"
+      ]
+    },
+    "git.checkpoint.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "git",
+      "methods": ["list", "get", "capture", "diff", "revert", "gc", "deleteSession"],
+      "legacyStorage": {
+        "sqliteTable": "session_checkpoints",
+        "gitRefPrefix": "refs/harnessmate/checkpoints"
+      }
+    },
+    "terminal.workspace.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "hm.plugin.terminal-workspace",
+      "defaultEnabled": false,
+      "methods": [
+        "listTerminals",
+        "openTerminal",
+        "writeInput",
+        "resizeTerminal",
+        "interruptTerminal",
+        "restartTerminal",
+        "closeTerminal",
+        "buildContextChip",
+        "pathUsage",
+        "releasePath",
+        "getOutputSnapshot"
+      ],
+      "legacyRouteMappings": [
+        "/api/v1/workspaces/:id/terminals",
+        "/api/v1/terminals/:terminalId/input",
+        "/api/v1/terminals/:terminalId/interrupt",
+        "/api/v1/terminals/:terminalId/restart",
+        "/api/v1/terminals/:terminalId/context-chip",
+        "/api/v1/terminals/:terminalId",
+        "/api/v1/terminals/release-path"
+      ]
+    },
+    "terminal.runner.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "core.terminal-runner",
+      "methods": ["run"],
+      "legacyRouteMappings": ["/api/v1/sessions/:id/terminal"]
+    },
+    "workspace.files.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "core.terminal-runner",
+      "methods": ["search", "read"],
+      "legacyRouteMappings": [
+        "/api/v1/sessions/:id/files",
+        "/api/v1/sessions/:id/file-content",
+        "/api/v1/sessions/:id/file-preview",
+        "/api/v1/sessions/:id/file-view"
+      ]
+    },
+    "session.attachments.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "core.attachments",
+      "methods": ["save", "resolveRead"],
+      "legacyRouteMappings": [
+        "/api/v1/sessions/:id/attachments",
+        "/api/v1/attachments/:sessionId/:filename"
+      ]
+    },
+    "workspace.rules.v1": {
+      "version": "1.0.0",
+      "defaultInstanceId": "core.workspace-rules",
+      "methods": ["discover"],
+      "legacyRouteMappings": ["/api/v1/sessions/:id/rules"]
+    }
+  },
+  "handoffToW2": {
+    "workspaceGitStatusLookup": {
+      "description": "Optional Git status lookup DTO for W2 TaskLedgerService / session summary without hard dependency on Git plugin.",
+      "requestExample": {
+        "workspaceId": "ws_sample_01",
+        "sessionId": "sess_sample_01"
+      },
+      "responses": {
+        "whenAvailable": {
+          "ok": true,
+          "value": {
+            "available": true,
+            "instanceId": "core.git-inspector",
+            "status": {
+              "isGitRepo": true,
+              "repoRoot": "D:/SampleRepos/project-alpha",
+              "gitCommonDir": "D:/SampleRepos/project-alpha/.git",
+              "branch": "feat/auth-v2",
+              "ahead": 1,
+              "behind": 0,
+              "changes": [
+                {
+                  "path": "src/index.ts",
+                  "indexStatus": "M",
+                  "worktreeStatus": " ",
+                  "untracked": false
+                }
+              ],
+              "stagedCount": 1,
+              "unstagedCount": 0,
+              "untrackedCount": 0,
+              "totalChanged": 1
+            }
+          }
+        },
+        "whenDisabledOrUnavailable": {
+          "ok": true,
+          "value": {
+            "available": false,
+            "reason": "disabled",
+            "instanceId": null,
+            "status": null
+          }
+        },
+        "whenNotGitRepo": {
+          "ok": true,
+          "value": {
+            "available": true,
+            "reason": "not_git_repo",
+            "instanceId": "core.git-inspector",
+            "status": {
+              "isGitRepo": false,
+              "repoRoot": null,
+              "gitCommonDir": null,
+              "branch": null,
+              "ahead": 0,
+              "behind": 0,
+              "changes": [],
+              "stagedCount": 0,
+              "unstagedCount": 0,
+              "untrackedCount": 0,
+              "totalChanged": 0
+            }
+          }
+        }
+      }
+    },
+    "fileSidebarNavigation": {
+      "description": "Unified DTO and UI/Sandbox bridge payload (`window.harnessMate.navigateToFile`) opening target file and optional line in right InspectorDrawer while preserving the current active session.",
+      "requestExamples": {
+        "relativeWithLine": {
+          "workspaceId": "ws_sample_01",
+          "sessionId": "sess_sample_01",
+          "path": "src/auth/login handler.ts",
+          "line": 42,
+          "openInspector": true,
+          "preserveSession": true
+        },
+        "windowsAbsoluteFileUri": {
+          "workspaceId": "ws_sample_01",
+          "sessionId": "sess_sample_01",
+          "path": "file:///D:/SampleRepos/中文目录/notes.md#L18",
+          "openInspector": true,
+          "preserveSession": true
+        }
+      },
+      "responses": {
+        "opened": {
+          "opened": true,
+          "sessionId": "sess_sample_01",
+          "workspaceId": "ws_sample_01",
+          "path": "src/auth/login handler.ts",
+          "line": 42
+        },
+        "whenFilePluginDisabled": {
+          "opened": false,
+          "sessionId": "sess_sample_01",
+          "workspaceId": "ws_sample_01",
+          "path": "src/auth/login handler.ts",
+          "line": 42,
+          "errorCode": "E_PLUGIN_DISABLED",
+          "message": "工作区文件插件（workspace.files.v1）当前已停用；当前会话已保留。"
+        },
+        "whenInvalidOrMissing": {
+          "opened": false,
+          "sessionId": "sess_sample_01",
+          "workspaceId": "ws_sample_01",
+          "path": "does/not/exist.ts",
+          "line": 12,
+          "errorCode": "E_FILE_NOT_FOUND",
+          "message": "找不到目标工作区文件；当前会话已保留。"
+        }
+      }
+    }
+  }
+}

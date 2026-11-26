@@ -11,7 +11,6 @@ import type {
   UpdateTaskStateRequest,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
-import type { getGitStatusSummary } from './git-service.js';
 
 const VERIFICATION_CMD_RE =
   /\b(vitest|jest|pytest|mocha|phpunit|rspec|tsc|eslint|biome|gradle|gradlew)\b|\b(cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build))\b|\b((?:pnpm|npm|yarn|bun)\s+(?:-\S+(?:\s+(?:"[^"]*"|'[^']*'|[^-\s]\S*))?\s+|run\s+)*(?:\S*:)?(?:test|build|typecheck|lint|check)|npm\s+t)\b|\b(make|cmake|ninja|msbuild|dotnet)\s+(?:test|build|check)\b/i;
@@ -89,7 +88,10 @@ interface WorkspaceLedgerMeta {
 
 export class TaskLedgerService {
   constructor(private readonly store: HarnessMateStore,
-    private readonly gitStatus: (cwd: string, session: Session) => Promise<Awaited<ReturnType<typeof getGitStatusSummary>> | undefined> | undefined,
+    private readonly gitStatus: (cwd: string, session: Session) => Promise<{
+      isGitRepo: boolean;
+      changes: ReadonlyArray<{ path: string }>;
+    } | null> | undefined,
     private readonly instanceId = 'core.task-ledger') {}
 
   private get usesLegacyData(): boolean {

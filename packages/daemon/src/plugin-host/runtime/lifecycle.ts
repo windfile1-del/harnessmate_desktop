@@ -2,7 +2,7 @@ import semver from 'semver';
 import {
   HOST_SUPPORTED_FEATURES,
   PLUGIN_API_VERSION, PLUGIN_EVENT_VERSION, PluginApiError,
-  type Disposer, type PluginContext, type PluginState,
+  type Disposer, type PluginContext, type PluginRouteRequest, type PluginRouteResponse, type PluginState,
 } from '@harnessmate/plugin-api';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import { PluginEvents } from './events.js';
@@ -38,10 +38,17 @@ export interface ServiceProviderInfo {
   runId?: string;
 }
 
+export type HostPluginRouteHandler = (
+  req: PluginRouteRequest,
+) => Promise<PluginRouteResponse> | PluginRouteResponse;
+
 export interface HostPluginContext extends PluginContext {
   readonly host?: PluginHost;
   readonly instanceId?: string;
   provide(name: string, value: object, opts?: ServiceProvideOptions): Disposer;
+  readonly routes?: {
+    register(pathPrefix: string, handler: HostPluginRouteHandler): Disposer;
+  };
 }
 
 export interface HostPluginDependency {
@@ -86,6 +93,7 @@ interface ServiceRecord extends ServiceProviderInfo {
 export class PluginHost {
   private readonly instances = new Map<string, Instance>();
   private readonly servicesByContract = new Map<string, Map<string, ServiceRecord>>();
+  private readonly hostRoutes = new Map<string, Array<{ prefix: string; handler: HostPluginRouteHandler }>>();
   private readonly serviceListeners = new Set<(services: string[]) => void>();
   private defaultBindings: Record<string, string> = {};
   private registryBridge?: HarnessRegistry;
@@ -250,6 +258,36 @@ export class PluginHost {
     for (const listener of this.serviceListeners) {
       try { listener(names); } catch (error) { this.report(error); }
     }
+  }
+
+  hasRoutes(instanceId: string): boolean {
+    const entries = this.hostRoutes.get(instanceId);
+    return Boolean(entries && entries.length > 0);
+  }
+
+  async dispatchRoute(instanceId: string, req: PluginRouteRequest): Promise<PluginRouteResponse> {
+    const instance = this.instances.get(instanceId);
+    if (!instance || instance.status.state !== 'ACTIVE') {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', `插件实例 ${instanceId} 未处于活动状态`);
+    }
+    const entries = this.hostRoutes.get(instanceId) ?? [];
+    const reqPath = typeof req.path === 'string' && req.path.trim() ? req.path : '/';
+    let matchedPrefix = '';
+    let matchedHandler: HostPluginRouteHandler | null = null;
+    for (const item of entries) {
+      const prefix = item.prefix;
+      if (
+        (reqPath === prefix || reqPath.startsWith(prefix === '/' ? '/' : `${prefix}/`) || prefix === '/') &&
+        prefix.length >= matchedPrefix.length
+      ) {
+        matchedPrefix = prefix;
+        matchedHandler = item.handler;
+      }
+    }
+    if (!matchedHandler) {
+      return { status: 404, body: { error: '插件路由不存在', path: reqPath } };
+    }
+    return await matchedHandler({ ...req, path: reqPath });
   }
 
   status(id: string): PluginStatus | undefined {
@@ -509,6 +547,27 @@ export class PluginHost {
         return this.resolveServiceFor(instanceId, name);
       },
       on: (name, listener) => effect(() => this.events.on(name, listener)),
+      routes: {
+        register: (pathPrefix, handler) => {
+          assertCurrent();
+          const raw = String(pathPrefix ?? '').trim();
+          const normalized = raw.startsWith('/') ? raw : `/${raw}`;
+          const prefix = normalized === '/' ? '/' : normalized.replace(/\/+$/, '');
+          return effect(() => {
+            const list = this.hostRoutes.get(instanceId) ?? [];
+            const entry = { prefix, handler };
+            list.push(entry);
+            this.hostRoutes.set(instanceId, list);
+            return () => {
+              const current = this.hostRoutes.get(instanceId);
+              if (!current) return;
+              const filtered = current.filter((item) => item !== entry);
+              if (filtered.length === 0) this.hostRoutes.delete(instanceId);
+              else this.hostRoutes.set(instanceId, filtered);
+            };
+          });
+        },
+      },
       provide: (name, value, opts) => {
         assertCurrent();
         if (instance.status.state !== 'LOADING' || !instance.definition.provides?.includes(name)) {

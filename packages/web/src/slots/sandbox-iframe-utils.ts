@@ -218,6 +218,8 @@ export function buildIframeSrcDoc(params: {
     listPlugins: function () { return call('plugins.list', {}); },
     importBundle: function (options) { return call('import.bundle', options || {}); },
     navigateToSession: function (options) { return call('navigateToSession', options || {}); },
+    navigateToFile: function (options) { return call('navigateToFile', options || {}); },
+    openFile: function (options) { return call('navigateToFile', options || {}); },
     refreshSessions: function () { return call('refreshSessions', {}); },
     refreshWorkspaces: function () { return call('refreshWorkspaces', {}); },
     switchInstance: function (options) { return call('switchInstance', options || {}); },

@@ -81,6 +81,12 @@ export interface SlotPropsMap {
     git: GitStatusSummary | null;
     onRefresh: () => void;
   };
+  'inspector.files': {
+    session: Session;
+  };
+  'inspector.rules': {
+    session: Session;
+  };
   'session.sidebar.badge': {
     session: Session;
   };

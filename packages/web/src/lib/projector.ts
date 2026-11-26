@@ -369,19 +369,17 @@ export function mergeTurnBlockRecords(
 
       if (matchIdx !== undefined) {
         const cur = blocks[matchIdx]!;
-        // Enrich existing tool/command block with omitted metadata if record has it
-        if (
-          (cur.type === 'tool_call' || cur.type === 'command_execution') &&
-          rec.outputOmitted &&
-          !cur.outputOmitted
-        ) {
-          blocks[matchIdx] = {
-            ...cur,
-            outputOmitted: true,
-            omittedBytes: rec.omittedBytes,
-          };
-          turnDirty = true;
+        if (converted.type === 'file_change' && (cur.type === 'tool_call' || cur.type === 'file_change')) {
+          blocks[matchIdx] = converted;
+        } else if ((cur.type === 'tool_call' || cur.type === 'command_execution')
+          && (cur.blockId !== rec.itemId || (rec.outputOmitted && !cur.outputOmitted))) {
+          blocks[matchIdx] = { ...cur, blockId: rec.itemId,
+            ...(rec.outputOmitted ? { outputOmitted: true, omittedBytes: rec.omittedBytes } : {}) };
+        } else {
+          continue;
         }
+        blockIdxById.set(rec.itemId, matchIdx);
+        turnDirty = true;
         continue;
       }
 
@@ -397,6 +395,7 @@ export function mergeTurnBlockRecords(
       if (
         rec.blockType.startsWith('ext:') ||
         rec.blockType === 'html_render' ||
+        rec.blockType === 'file_change' ||
         rec.blockType === 'checkpoint_marker' ||
         rec.blockType === 'system_notice' ||
         !KNOWN_STANDARD_RECORD_TYPES.has(rec.blockType) ||

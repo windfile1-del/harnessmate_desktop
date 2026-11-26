@@ -84,17 +84,17 @@ function shouldExposeRenderHtml(
   sessionId: string,
 ): boolean {
   if (!store) return false;
-  // Expose in tools/list when hm.plugin.message-studio is explicitly installed & enabled,
-  // or when the session already contains an html_render block (preserves strict V3/V4 tools/list counts).
+  // Built-in Studio supplies views. Keep the legacy tool listing tied to an explicit installation or an existing HTML block.
+  type StudioInstallation = { id: string; enabled: boolean; builtin?: boolean };
   const cap = capabilities as unknown as {
-    pluginManager?: { listInstalled?: () => Array<{ id: string; enabled: boolean }> };
-    plugins?: { isPluginEnabled?: (id: string) => boolean; listInstalled?: () => Array<{ id: string; enabled: boolean }> };
+    pluginManager?: { listInstalled?: () => StudioInstallation[] };
+    plugins?: { isPluginEnabled?: (id: string) => boolean; listInstalled?: () => StudioInstallation[] };
   };
-  if (cap.plugins?.isPluginEnabled?.('hm.plugin.message-studio')) {
-    return true;
-  }
   const manager = cap.pluginManager ?? cap.plugins;
-  if (manager?.listInstalled?.().some((p) => p.id === 'hm.plugin.message-studio' && p.enabled)) {
+  const installed = manager?.listInstalled?.();
+  if (installed
+    ? installed.some((p) => p.id === 'hm.plugin.message-studio' && p.enabled && !p.builtin)
+    : cap.plugins?.isPluginEnabled?.('hm.plugin.message-studio')) {
     return true;
   }
   return store.listTurnItems(sessionId, { blockTypes: ['html_render'], limit: 1 }).length > 0;

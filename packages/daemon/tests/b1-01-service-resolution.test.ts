@@ -496,6 +496,19 @@ it('loads distribution defaults from harnessmate-core data, preserves legacy pro
     'history.import.v1': 'hm.plugin.history-import',
     'session.search.v1': 'hm.plugin.session-search-fts',
     'hm.session-data.v1': 'core.history-session-data',
+    'git.checkpoint.v1': 'git',
+    'git.workspace.v1': 'git',
+    'session.attachments.v1': 'core.attachments',
+    'session.inbox.v1': 'hm.plugin.triage-inbox',
+    'session.ledger.v1': 'ledger',
+    'session.notifications.v1': 'hm.plugin.desktop-notifications',
+    'session.snooze.v1': 'hm.plugin.session-snooze',
+    'session.studio.v1': 'hm.plugin.message-studio',
+    'session.summary.v1': 'hm.plugin.task-summary',
+    'terminal.runner.v1': 'core.terminal-runner',
+    'terminal.workspace.v1': 'hm.plugin.terminal-workspace',
+    'workspace.files.v1': 'core.terminal-runner',
+    'workspace.rules.v1': 'core.workspace-rules',
   });
 
   // Legacy profile with extensions.filePreviewProvider overrides distribution default

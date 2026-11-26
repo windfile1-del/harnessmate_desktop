@@ -70,13 +70,19 @@ import {
   HISTORY_IMPORT_PAGE_SLOT_ID,
   SESSION_SEARCH_CONTRACT,
   SESSION_SEARCH_PAGE_SLOT_ID,
+  WORKSPACE_FILES_CONTRACT,
   getPluginInstanceId,
+  isContractAvailableClientSide,
   isPluginInstanceReady,
   makeWorkspacePageKey,
   pluginProvidesContract,
+  resolveServiceSelectionClientSide,
+  type NavigateToFileRequest,
+  type NavigateToFileResult,
   type ServiceResolutionV1,
 } from '../api/peer-contracts';
 import { defaultPeerWorkspaceTransport } from '../api/peer-workspace-client';
+import { parseFileLink } from '../lib/file-links';
 import {
   DEFAULT_WORKBENCH_ROUTE,
   type WorkbenchRouteState,
@@ -175,6 +181,13 @@ interface AppState {
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
   inspectorFile: { sessionId: string; path: string; line?: number } | null;
+  inspectorFileError: {
+    sessionId: string | null;
+    path: string;
+    line?: number;
+    code: string;
+    message: string;
+  } | null;
   activeModal: ActiveModal;
   newSessionPresetHarnessId: string | null;
   paletteInitialQuery: string;
@@ -267,7 +280,12 @@ interface AppState {
   setSidebarCollapsed: (collapsed: boolean) => void;
   setInspectorOpen: (open: boolean) => void;
   setInspectorTab: (tab: InspectorTab) => void;
-  openInspectorFile: (sessionId: string, path: string, line?: number) => void;
+  openInspectorFile: (sessionId: string, path: string, line?: number) => NavigateToFileResult;
+  navigateToFile: (req: NavigateToFileRequest) => NavigateToFileResult;
+  resolveContractLocal: (
+    contract: string,
+    opts?: { sessionId?: string; workspaceId?: string; explicitInstanceId?: string; allowSingleCandidate?: boolean },
+  ) => ServiceResolutionV1;
   closeInspectorFile: () => void;
   openModal: (modal: ActiveModal, presetHarnessId?: string | null) => void;
   openCommandPalette: (query?: string) => void;
@@ -990,11 +1008,176 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
     inspectorFile: null,
+    inspectorFileError: null,
     setInspectorTab: (tab) => set({ inspectorTab: tab }),
-    openInspectorFile: (sessionId, path, line) => set({
-      inspectorFile: { sessionId, path, line }, inspectorTab: 'files', inspectorOpen: true,
-    }),
-    closeInspectorFile: () => set({ inspectorFile: null }),
+    resolveContractLocal: (contract, opts) => {
+      const state = get();
+      return resolveServiceSelectionClientSide({
+        contract,
+        explicitInstanceId: opts?.explicitInstanceId,
+        allowSingleCandidate: opts?.allowSingleCandidate ?? true,
+        plugins: state.plugins,
+        sessionBindings: opts?.sessionId ? state.sessionBindingsBySession[opts.sessionId] : undefined,
+        workspaceBindings: opts?.workspaceId ? state.workspaceBindingsByWorkspace[opts.workspaceId] : undefined,
+        compositionBindings: state.compositionBindings,
+        compositionEntries: state.compositionEntries,
+      });
+    },
+    navigateToFile: (req) => {
+      const state = get();
+      const rawPath = typeof req.path === 'string' ? req.path.trim() : '';
+      const explicitLine =
+        typeof req.line === 'number' && Number.isSafeInteger(req.line) && req.line > 0 ? req.line : undefined;
+      const targetSession =
+        (req.sessionId ? state.sessions.find((s) => s.id === req.sessionId) : undefined) ??
+        (state.selectedSessionId ? state.sessions.find((s) => s.id === state.selectedSessionId) : undefined) ??
+        (req.workspaceId ? state.sessions.find((s) => s.workspaceId === req.workspaceId) : undefined);
+      const targetSessionId = req.sessionId ?? targetSession?.id ?? state.selectedSessionId ?? null;
+      const targetWorkspaceId = req.workspaceId ?? targetSession?.workspaceId ?? null;
+
+      if (!rawPath) {
+        const message = '文件路径为空，无法在右侧工作区文件区打开；当前会话已保留。';
+        set({
+          inspectorFileError: {
+            sessionId: targetSessionId,
+            path: rawPath,
+            line: explicitLine,
+            code: 'E_INVALID_INPUT',
+            message,
+          },
+          ...(req.openInspector !== false ? { inspectorTab: 'files', inspectorOpen: true } : {}),
+        });
+        return {
+          opened: false,
+          sessionId: targetSessionId,
+          workspaceId: targetWorkspaceId,
+          path: rawPath,
+          line: explicitLine,
+          errorCode: 'E_INVALID_INPUT',
+          message,
+        };
+      }
+
+      const parsed = parseFileLink(rawPath);
+      if (!parsed) {
+        const message = /^https?:\/\//i.test(rawPath)
+          ? '外部 HTTP 链接不支持在工作区文件预览中打开；当前会话已保留。'
+          : '无效的文件链接路径；当前会话已保留。';
+        set({
+          inspectorFileError: {
+            sessionId: targetSessionId,
+            path: rawPath,
+            line: explicitLine,
+            code: 'E_INVALID_INPUT',
+            message,
+          },
+          ...(req.openInspector !== false ? { inspectorTab: 'files', inspectorOpen: true } : {}),
+        });
+        return {
+          opened: false,
+          sessionId: targetSessionId,
+          workspaceId: targetWorkspaceId,
+          path: rawPath,
+          line: explicitLine,
+          errorCode: 'E_INVALID_INPUT',
+          message,
+        };
+      }
+
+      const normalizedPath = parsed.path;
+      const normalizedLine = explicitLine ?? parsed.line;
+
+      if (!targetSessionId) {
+        const message = '当前没有可定位的工作区会话，无法打开文件；当前会话状态已保留。';
+        set({
+          inspectorFileError: {
+            sessionId: null,
+            path: normalizedPath,
+            line: normalizedLine,
+            code: 'E_SESSION_NOT_FOUND',
+            message,
+          },
+        });
+        return {
+          opened: false,
+          sessionId: null,
+          workspaceId: targetWorkspaceId,
+          path: normalizedPath,
+          line: normalizedLine,
+          errorCode: 'E_SESSION_NOT_FOUND',
+          message,
+        };
+      }
+
+      const filesResolution = resolveServiceSelectionClientSide({
+        contract: WORKSPACE_FILES_CONTRACT,
+        allowSingleCandidate: true,
+        plugins: state.plugins,
+        sessionBindings: state.sessionBindingsBySession[targetSessionId],
+        workspaceBindings: targetWorkspaceId ? state.workspaceBindingsByWorkspace[targetWorkspaceId] : undefined,
+        compositionBindings: state.compositionBindings,
+        compositionEntries: state.compositionEntries,
+      });
+      const filesAvailable = isContractAvailableClientSide({
+        contract: WORKSPACE_FILES_CONTRACT,
+        legacyPluginId: 'core.terminal-runner',
+        allowSingleCandidate: true,
+        plugins: state.plugins,
+        sessionBindings: state.sessionBindingsBySession[targetSessionId],
+        workspaceBindings: targetWorkspaceId ? state.workspaceBindingsByWorkspace[targetWorkspaceId] : undefined,
+        compositionBindings: state.compositionBindings,
+        compositionEntries: state.compositionEntries,
+      });
+
+      const shouldCloseWorkspacePage = Boolean(state.activePluginPage && req.openInspector !== false);
+      if (state.plugins.length > 0 && !filesAvailable) {
+        const errorCode =
+          filesResolution.status === 'disabled' ||
+          filesResolution.status === 'unconfigured' ||
+          filesResolution.status === 'unavailable'
+            ? 'E_PLUGIN_DISABLED'
+            : 'E_SERVICE_UNAVAILABLE';
+        const message = '工作区文件浏览能力当前已停用或不可用；当前会话已保留。';
+        set({
+          inspectorFile: { sessionId: targetSessionId, path: normalizedPath, line: normalizedLine },
+          inspectorFileError: {
+            sessionId: targetSessionId,
+            path: normalizedPath,
+            line: normalizedLine,
+            code: errorCode,
+            message,
+          },
+          ...(req.openInspector !== false ? { inspectorTab: 'files', inspectorOpen: true } : {}),
+          ...(shouldCloseWorkspacePage ? { activePluginPage: null } : {}),
+        });
+        return {
+          opened: false,
+          sessionId: targetSessionId,
+          workspaceId: targetWorkspaceId,
+          path: normalizedPath,
+          line: normalizedLine,
+          errorCode,
+          message,
+        };
+      }
+
+      set({
+        inspectorFile: { sessionId: targetSessionId, path: normalizedPath, line: normalizedLine },
+        inspectorFileError: null,
+        ...(req.openInspector !== false ? { inspectorTab: 'files', inspectorOpen: true } : {}),
+        ...(shouldCloseWorkspacePage ? { activePluginPage: null } : {}),
+      });
+      return {
+        opened: true,
+        sessionId: targetSessionId,
+        workspaceId: targetWorkspaceId,
+        path: normalizedPath,
+        line: normalizedLine,
+      };
+    },
+    openInspectorFile: (sessionId, path, line) =>
+      get().navigateToFile({ sessionId, path, line, openInspector: true, preserveSession: true }),
+    closeInspectorFile: () => set({ inspectorFile: null, inspectorFileError: null }),
     openModal: (modal, presetHarnessId = null) =>
       set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId, paletteInitialQuery: '', explorerInitialQuery: '' }),
     openCommandPalette: (query = '') =>

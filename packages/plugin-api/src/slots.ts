@@ -112,6 +112,16 @@ const workspaceSlots = {
     scope: 'root',
     description: '组合中提供的应用启动页与主工作区布局',
   },
+  'inspector.files': {
+    cardinality: 'single',
+    scope: 'session',
+    description: '接管或增强右侧工作区文件浏览与行号预览视图',
+  },
+  'inspector.rules': {
+    cardinality: 'single',
+    scope: 'session',
+    description: '接管或增强右侧项目规则与 Skills 视图',
+  },
 } as const satisfies Record<string, PluginSlotContract>;
 
 export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
@@ -135,6 +145,8 @@ export const ALL_PLUGIN_SLOT_KEYS = [
   ...PLUGIN_SLOT_KEYS_V5,
   'workspace.pages',
   'workspace.start',
+  'inspector.files',
+  'inspector.rules',
 ] as const satisfies readonly AnyPluginSlotKey[];
 
 const SLOT_ALIASES: Readonly<Record<string, AnyPluginSlotKey>> = {
@@ -183,6 +195,8 @@ export const PluginSlotKeyInputSchema = z.enum([
   'composer.traits',
   'harness.settings',
   'inspector.diff',
+  'inspector.files',
+  'inspector.rules',
   'session.sidebar.badge',
 ]);
 

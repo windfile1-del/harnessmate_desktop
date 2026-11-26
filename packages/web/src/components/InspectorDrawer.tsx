@@ -37,6 +37,15 @@ import {
   type SessionFileViewResponse,
   type TerminalExecResult,
 } from '../api/client';
+import {
+  GIT_CHECKPOINT_CONTRACT,
+  GIT_WORKSPACE_CONTRACT,
+  TERMINAL_RUNNER_CONTRACT,
+  TERMINAL_WORKSPACE_CONTRACT,
+  WORKSPACE_FILES_CONTRACT,
+  WORKSPACE_RULES_CONTRACT,
+  isContractAvailableClientSide,
+} from '../api/peer-contracts';
 import { formatTokenCount, resolveHarnessMeta } from '../lib/harness-meta';
 import type { DiagnosticEntry } from '../lib/projector';
 import type { FileLink } from '../lib/file-links';
@@ -54,11 +63,13 @@ export function InspectorDrawer({
     harnesses,
     inspectorTab,
     inspectorFile,
+    inspectorFileError,
     openInspectorFile,
     closeInspectorFile,
     setInspectorTab,
     setInspectorOpen,
     selectedGit,
+    selectedCheckpoints,
     selectedTaskState,
     selectedPluginPanel,
     openPluginPanel,
@@ -68,17 +79,23 @@ export function InspectorDrawer({
     pushToast,
     isPluginEnabled,
     plugins,
+    compositionEntries,
+    compositionBindings,
+    workspaceBindingsByWorkspace,
+    sessionBindingsBySession,
     pluginPermissionRevision,
     setSessionBinding,
   } = useAppStore(useShallow((state) => ({
     harnesses: state.harnesses,
     inspectorTab: state.inspectorTab,
     inspectorFile: state.inspectorFile,
+    inspectorFileError: state.inspectorFileError,
     openInspectorFile: state.openInspectorFile,
     closeInspectorFile: state.closeInspectorFile,
     setInspectorTab: state.setInspectorTab,
     setInspectorOpen: state.setInspectorOpen,
     selectedGit: state.gitBySession[session.id],
+    selectedCheckpoints: state.checkpointsBySession[session.id],
     selectedTaskState: state.taskStateBySession[session.id],
     selectedPluginPanel: state.selectedPluginPanel,
     openPluginPanel: state.openPluginPanel,
@@ -88,9 +105,53 @@ export function InspectorDrawer({
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
     plugins: state.plugins,
+    compositionEntries: state.compositionEntries,
+    compositionBindings: state.compositionBindings,
+    workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace,
+    sessionBindingsBySession: state.sessionBindingsBySession,
     pluginPermissionRevision: state.pluginPermissionRevision,
     setSessionBinding: state.setSessionBinding,
   })));
+
+  const contractOpts = {
+    plugins,
+    sessionBindings: sessionBindingsBySession[session.id],
+    workspaceBindings: workspaceBindingsByWorkspace[session.workspaceId],
+    compositionBindings,
+    compositionEntries,
+  };
+  const gitWorkspaceEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: GIT_WORKSPACE_CONTRACT,
+    legacyPluginId: 'core.git-inspector',
+  });
+  const gitCheckpointEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: GIT_CHECKPOINT_CONTRACT,
+    legacyPluginId: 'core.git-inspector',
+  });
+  const filesEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: WORKSPACE_FILES_CONTRACT,
+    legacyPluginId: 'core.terminal-runner',
+  });
+  const rulesEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: WORKSPACE_RULES_CONTRACT,
+    legacyPluginId: 'core.workspace-rules',
+  });
+  const terminalRunnerEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: TERMINAL_RUNNER_CONTRACT,
+    legacyPluginId: 'core.terminal-runner',
+  });
+  const terminalWorkspaceEnabled = isContractAvailableClientSide({
+    ...contractOpts,
+    contract: TERMINAL_WORKSPACE_CONTRACT,
+    legacyPluginId: 'hm.plugin.terminal-workspace',
+    optionalDefaultOff: true,
+  });
+  const hasHistoricalCheckpoints = (selectedCheckpoints?.length ?? 0) > 0;
 
   const slotRegistry = useSlotRegistry();
   const [widePluginPanel, setWidePluginPanel] = useState(false);
@@ -143,6 +204,7 @@ export function InspectorDrawer({
     openInspectorFile(session.id, /^(?:\/|[a-z]:\/)/i.test(path) ? path : directory + path, line);
   }, [previewPath, openInspectorFile, session.id]);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [fileReadError, setFileReadError] = useState<string | null>(null);
 
   // Terminal tab state
   const [cmdInput, setCmdInput] = useState('');
@@ -153,24 +215,49 @@ export function InspectorDrawer({
   const [instructions, setInstructions] = useState<ProjectInstructionInfo[]>([]);
 
   useEffect(() => {
-    if (inspectorTab === 'files') {
-      setFilesLoading(true);
-      void daemonApi
-        .searchSessionFiles(session.id, fileQuery)
-        .then((res) => setFiles(res.files))
-        .catch(() => {})
-        .finally(() => setFilesLoading(false));
+    if (inspectorTab !== 'files') return;
+    if (!filesEnabled) {
+      setFiles([]);
+      setFilesLoading(false);
+      return;
     }
-  }, [inspectorTab, session.id, fileQuery]);
+    let cancelled = false;
+    setFilesLoading(true);
+    void daemonApi
+      .searchSessionFiles(session.id, fileQuery)
+      .then((res) => {
+        if (!cancelled) setFiles(res.files);
+      })
+      .catch(() => {
+        if (!cancelled) setFiles([]);
+      })
+      .finally(() => {
+        if (!cancelled) setFilesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectorTab, session.id, fileQuery, filesEnabled]);
 
   useEffect(() => {
-    if (inspectorTab === 'info') {
-      void daemonApi
-        .getSessionRules(session.id)
-        .then((res) => setInstructions(res.instructions))
-        .catch(() => {});
+    if (inspectorTab !== 'info') return;
+    if (!rulesEnabled) {
+      setInstructions([]);
+      return;
     }
-  }, [inspectorTab, session.id]);
+    let cancelled = false;
+    void daemonApi
+      .getSessionRules(session.id)
+      .then((res) => {
+        if (!cancelled) setInstructions(res.instructions);
+      })
+      .catch(() => {
+        if (!cancelled) setInstructions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectorTab, session.id, rulesEnabled]);
 
   useEffect(() => {
     setSelectedViewerId(undefined);
@@ -178,7 +265,12 @@ export function InspectorDrawer({
 
   useEffect(() => {
     if (inspectorTab !== 'files' || inspectorFile?.sessionId !== session.id) return;
+    if (!filesEnabled) {
+      setPreviewFile(null);
+      return;
+    }
     const controller = new AbortController();
+    setFileReadError(null);
     if (typeof daemonApi.getSessionFileView === 'function') {
       void daemonApi.getSessionFileView(
         session.id,
@@ -202,11 +294,16 @@ export function InspectorDrawer({
           ? { source, plugins, permissionRevision: pluginPermissionRevision, viewerId: selectedViewerId, preview: res.preview }
           : undefined);
       }).catch((err: unknown) => {
-        if (!controller.signal.aborted) pushToast({
-          kind: 'error',
-          title: '无法读取文件',
-          body: err instanceof Error ? err.message : String(err),
-        });
+        if (!controller.signal.aborted) {
+          const message = err instanceof Error ? err.message : String(err);
+          setPreviewFile(null);
+          setFileReadError(message);
+          pushToast({
+            kind: 'error',
+            title: '无法读取文件',
+            body: message,
+          });
+        }
       });
     } else {
       void daemonApi.readSessionFile(session.id, inspectorFile.path, controller.signal).then((res) => {
@@ -215,15 +312,20 @@ export function InspectorDrawer({
           setPreviewFile({ ...res, target: inspectorFile });
         }
       }).catch((err: unknown) => {
-        if (!controller.signal.aborted) pushToast({
-          kind: 'error',
-          title: '无法读取文件',
-          body: err instanceof Error ? err.message : String(err),
-        });
+        if (!controller.signal.aborted) {
+          const message = err instanceof Error ? err.message : String(err);
+          setPreviewFile(null);
+          setFileReadError(message);
+          pushToast({
+            kind: 'error',
+            title: '无法读取文件',
+            body: message,
+          });
+        }
       });
     }
     return () => controller.abort();
-  }, [inspectorFile, inspectorTab, session.id, selectedViewerId, plugins, pluginPermissionRevision, pushToast]);
+  }, [inspectorFile, inspectorTab, session.id, selectedViewerId, plugins, pluginPermissionRevision, pushToast, filesEnabled]);
 
   useEffect(() => {
     if (typeof daemonApi.getSessionFileView === 'function') return;
@@ -294,7 +396,7 @@ export function InspectorDrawer({
               onClick={() => setInspectorTab('task')}
             />
           )}
-          {isPluginEnabled('core.git-inspector') && (
+          {(gitWorkspaceEnabled || gitCheckpointEnabled || hasHistoricalCheckpoints) && (
             <TabBtn
               active={inspectorTab === 'git'}
               icon={<GitBranch size={12.5} />}
@@ -303,21 +405,21 @@ export function InspectorDrawer({
               onClick={() => setInspectorTab('git')}
             />
           )}
-          {isPluginEnabled('core.terminal-runner') && (
-            <>
-              <TabBtn
-                active={inspectorTab === 'files'}
-                icon={<FolderTree size={12.5} />}
-                label="文件"
-                onClick={() => setInspectorTab('files')}
-              />
-              <TabBtn
-                active={inspectorTab === 'terminal'}
-                icon={<Terminal size={12.5} />}
-                label="终端"
-                onClick={() => setInspectorTab('terminal')}
-              />
-            </>
+          {(filesEnabled || Boolean(inspectorFileError) || Boolean(fileReadError) || inspectorTab === 'files' || Boolean(activePreview)) && (
+            <TabBtn
+              active={inspectorTab === 'files'}
+              icon={<FolderTree size={12.5} />}
+              label="文件"
+              onClick={() => setInspectorTab('files')}
+            />
+          )}
+          {(terminalRunnerEnabled || terminalWorkspaceEnabled) && (
+            <TabBtn
+              active={inspectorTab === 'terminal'}
+              icon={<Terminal size={12.5} />}
+              label="终端"
+              onClick={() => setInspectorTab('terminal')}
+            />
           )}
           <TabBtn
             active={inspectorTab === 'diagnostics'}
@@ -502,169 +604,218 @@ export function InspectorDrawer({
         )}
 
         {inspectorTab === 'files' && (
-          <div className="space-y-3">
-            <div
-              className="flex items-center gap-2 rounded-xl px-2.5 py-1.5"
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-hairline)',
-              }}
-            >
-              <Search size={13} className="shrink-0 text-[var(--text-muted)]" />
-              <input
-                value={fileQuery}
-                onChange={(e) => setFileQuery(e.target.value)}
-                placeholder="筛选工作区文件..."
-                className="w-full bg-transparent text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-              />
-            </div>
-
-            {activePreview && (
-              <div
-                className="overflow-hidden rounded-xl"
-                style={{
-                  backgroundColor: 'var(--code-bg)',
-                  border: '1px solid var(--border-strong)',
-                }}
-              >
-                <div
-                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px]"
-                  style={{ borderBottom: '1px solid var(--border-hairline)' }}
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="font-mono-code truncate text-[var(--accent-indigo)]">
-                      {activePreview.relativePath}{activePreview.target.line ? `:${activePreview.target.line}` : ''}
-                    </span>
-                    {pluginPreview && <span className="truncate text-[var(--text-muted)]">{pluginPreview.pluginName}</span>}
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    {fileViewMeta && fileViewMeta.availableViewers.length > 0 && (
-                      <>
-                        <select
-                          aria-label="选择文件查看器"
-                          value={selectedViewerId ?? fileViewMeta.resolvedInstanceId ?? fileViewMeta.boundInstanceId ?? ''}
-                          onChange={(event) => {
-                            const nextId = event.target.value || undefined;
-                            setSelectedViewerId(nextId);
-                          }}
-                          className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[10.5px] text-[var(--text-secondary)]"
-                        >
-                          {fileViewMeta.availableViewers.map((viewer: FilePreviewViewerDto) => (
-                            <option key={viewer.instanceId} value={viewer.instanceId} disabled={!viewer.ready || !viewer.authorized}>
-                              {viewer.name}{!viewer.ready ? '（未就绪）' : !viewer.authorized ? '（待授权）' : ''}
-                            </option>
-                          ))}
-                        </select>
-                        {(selectedViewerId ?? fileViewMeta.resolvedInstanceId) &&
-                          (selectedViewerId ?? fileViewMeta.resolvedInstanceId) !== fileViewMeta.boundInstanceId && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const targetViewer = selectedViewerId ?? fileViewMeta.resolvedInstanceId;
-                              if (targetViewer) void setSessionBinding(session.id, 'filePreview.v1', targetViewer);
-                            }}
-                            className="cursor-pointer rounded border border-[var(--border-hairline)] px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
-                          >
-                            设为会话默认
-                          </button>
-                        )}
-                      </>
-                    )}
+          <Slot
+            name="inspector.files"
+            slotProps={{ session }}
+            fallback={
+              <div className="space-y-3">
+                {(inspectorFileError || fileReadError) && (
+                  <div
+                    role="alert"
+                    data-testid="inspector-file-error"
+                    className="flex items-start justify-between gap-2 rounded-xl px-3 py-2 text-[11.5px] text-[var(--accent-rose)]"
+                    style={{
+                      backgroundColor: 'var(--accent-rose-soft)',
+                      border: '1px solid color-mix(in srgb, var(--accent-rose) 35%, transparent)',
+                    }}
+                  >
+                    <div className="min-w-0 space-y-0.5">
+                      <p className="font-medium">
+                        {inspectorFileError?.message ?? fileReadError}
+                      </p>
+                      {inspectorFileError?.path && (
+                        <p className="font-mono-code truncate text-[10.5px] opacity-85">
+                          {inspectorFileError.path}
+                        </p>
+                      )}
+                    </div>
                     <button
                       type="button"
-                      aria-label="关闭文件预览"
-                      onClick={closeInspectorFile}
-                      className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                      aria-label="关闭文件错误提示"
+                      onClick={() => {
+                        setFileReadError(null);
+                        closeInspectorFile();
+                      }}
+                      className="shrink-0 cursor-pointer text-[var(--accent-rose)] hover:opacity-75"
                     >
                       <X size={13} />
                     </button>
                   </div>
-                </div>
-                {fileViewMeta && (fileViewMeta.dependencyStatus === 'unavailable' || fileViewMeta.dependencyStatus === 'unauthorized' || fileViewMeta.dependencyStatus === 'failed') && (
-                  <div
-                    role="status"
-                    className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px] text-[var(--accent-rose)]"
-                    style={{
-                      backgroundColor: 'var(--accent-rose-soft)',
-                      borderBottom: '1px solid color-mix(in srgb, var(--accent-rose) 28%, transparent)',
-                    }}
-                  >
-                    <span>{fileViewMeta.dependencyMessage ?? '当前文件查看器暂不可用，已回落纯文本内容。'}</span>
-                    <div className="flex flex-wrap items-center gap-1">
-                      {fileViewMeta.availableViewers
-                        .filter((viewer) => viewer.ready && viewer.authorized)
-                        .map((viewer) => (
-                          <button
-                            key={viewer.instanceId}
-                            type="button"
-                            onClick={() => {
-                              setSelectedViewerId(viewer.instanceId);
-                              void setSessionBinding(session.id, 'filePreview.v1', viewer.instanceId);
-                            }}
-                            className="cursor-pointer rounded bg-[var(--bg-surface)] px-2 py-0.5 text-[10.5px] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
-                          >
-                            切换到{viewer.name}
-                          </button>
-                        ))}
-                    </div>
-                  </div>
                 )}
-                <FilePreviewBody
-                  key={activePreview.target.path}
-                  content={activePreview.content}
-                  line={activePreview.target.line}
-                  truncated={activePreview.truncated}
-                  preview={pluginPreview}
-                  onOpenFile={openPreviewLink}
-                  onRenderError={clearRenderedPreview}
-                />
-              </div>
-            )}
 
-            {filesLoading ? (
-              <div className="py-6 text-center text-[12px] text-[var(--text-muted)]">
-                <Loader2 size={14} className="mx-auto animate-spin" />
-              </div>
-            ) : files.length === 0 ? (
-              <EmptyBox text="未匹配到工作区文件" />
-            ) : (
-              <div
-                className="overflow-hidden rounded-xl"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  border: '1px solid var(--border-hairline)',
-                }}
-              >
-                {files.slice(0, 80).map((f) => (
-                  <div
-                    key={f.relativePath}
-                    className="group flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11.5px] transition-colors hover:bg-[var(--bg-hover)]"
-                    style={{ borderBottom: '1px solid var(--border-hairline)' }}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => openInspectorFile(session.id, f.relativePath)}
-                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+                {!filesEnabled ? (
+                  <EmptyBox text="工作区文件插件已停用，请先启用提供 workspace.files.v1 的插件后再浏览文件。" />
+                ) : (
+                  <>
+                    <div
+                      className="flex items-center gap-2 rounded-xl px-2.5 py-1.5"
+                      style={{
+                        backgroundColor: 'var(--bg-surface)',
+                        border: '1px solid var(--border-hairline)',
+                      }}
                     >
-                      <FileCode2 size={12} className="shrink-0 text-[var(--text-muted)]" />
-                      <span className="font-mono-code truncate text-[var(--text-primary)]">
-                        {f.relativePath}
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      title="引用此文件到输入框"
-                      onClick={() => handleAttachFile(f)}
-                      className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] opacity-75 hover:bg-[var(--bg-active)] hover:opacity-100"
-                    >
-                      <AtSign size={10.5} />
-                      引用
-                    </button>
-                  </div>
-                ))}
+                      <Search size={13} className="shrink-0 text-[var(--text-muted)]" />
+                      <input
+                        value={fileQuery}
+                        onChange={(e) => setFileQuery(e.target.value)}
+                        placeholder="筛选工作区文件..."
+                        className="w-full bg-transparent text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
+                      />
+                    </div>
+
+                    {activePreview && (
+                      <div
+                        className="overflow-hidden rounded-xl"
+                        style={{
+                          backgroundColor: 'var(--code-bg)',
+                          border: '1px solid var(--border-strong)',
+                        }}
+                      >
+                        <div
+                          className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px]"
+                          style={{ borderBottom: '1px solid var(--border-hairline)' }}
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="font-mono-code truncate text-[var(--accent-indigo)]">
+                              {activePreview.relativePath}{activePreview.target.line ? `:${activePreview.target.line}` : ''}
+                            </span>
+                            {pluginPreview && <span className="truncate text-[var(--text-muted)]">{pluginPreview.pluginName}</span>}
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            {fileViewMeta && fileViewMeta.availableViewers.length > 0 && (
+                              <>
+                                <select
+                                  aria-label="选择文件查看器"
+                                  value={selectedViewerId ?? fileViewMeta.resolvedInstanceId ?? fileViewMeta.boundInstanceId ?? ''}
+                                  onChange={(event) => {
+                                    const nextId = event.target.value || undefined;
+                                    setSelectedViewerId(nextId);
+                                  }}
+                                  className="rounded border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-1.5 py-0.5 text-[10.5px] text-[var(--text-secondary)]"
+                                >
+                                  {fileViewMeta.availableViewers.map((viewer: FilePreviewViewerDto) => (
+                                    <option key={viewer.instanceId} value={viewer.instanceId} disabled={!viewer.ready || !viewer.authorized}>
+                                      {viewer.name}{!viewer.ready ? '（未就绪）' : !viewer.authorized ? '（待授权）' : ''}
+                                    </option>
+                                  ))}
+                                </select>
+                                {(selectedViewerId ?? fileViewMeta.resolvedInstanceId) &&
+                                  (selectedViewerId ?? fileViewMeta.resolvedInstanceId) !== fileViewMeta.boundInstanceId && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const targetViewer = selectedViewerId ?? fileViewMeta.resolvedInstanceId;
+                                      if (targetViewer) void setSessionBinding(session.id, 'filePreview.v1', targetViewer);
+                                    }}
+                                    className="cursor-pointer rounded border border-[var(--border-hairline)] px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+                                  >
+                                    设为会话默认
+                                  </button>
+                                )}
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              aria-label="关闭文件预览"
+                              onClick={() => {
+                                setFileReadError(null);
+                                closeInspectorFile();
+                              }}
+                              className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                            >
+                              <X size={13} />
+                            </button>
+                          </div>
+                        </div>
+                        {fileViewMeta && (fileViewMeta.dependencyStatus === 'unavailable' || fileViewMeta.dependencyStatus === 'unauthorized' || fileViewMeta.dependencyStatus === 'failed') && (
+                          <div
+                            role="status"
+                            className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px] text-[var(--accent-rose)]"
+                            style={{
+                              backgroundColor: 'var(--accent-rose-soft)',
+                              borderBottom: '1px solid color-mix(in srgb, var(--accent-rose) 28%, transparent)',
+                            }}
+                          >
+                            <span>{fileViewMeta.dependencyMessage ?? '当前文件查看器暂不可用，已回落纯文本内容。'}</span>
+                            <div className="flex flex-wrap items-center gap-1">
+                              {fileViewMeta.availableViewers
+                                .filter((viewer) => viewer.ready && viewer.authorized)
+                                .map((viewer) => (
+                                  <button
+                                    key={viewer.instanceId}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedViewerId(viewer.instanceId);
+                                      void setSessionBinding(session.id, 'filePreview.v1', viewer.instanceId);
+                                    }}
+                                    className="cursor-pointer rounded bg-[var(--bg-surface)] px-2 py-0.5 text-[10.5px] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+                                  >
+                                    切换到{viewer.name}
+                                  </button>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                        <FilePreviewBody
+                          key={activePreview.target.path}
+                          content={activePreview.content}
+                          line={activePreview.target.line}
+                          truncated={activePreview.truncated}
+                          preview={pluginPreview}
+                          onOpenFile={openPreviewLink}
+                          onRenderError={clearRenderedPreview}
+                        />
+                      </div>
+                    )}
+
+                    {filesLoading ? (
+                      <div className="py-6 text-center text-[12px] text-[var(--text-muted)]">
+                        <Loader2 size={14} className="mx-auto animate-spin" />
+                      </div>
+                    ) : files.length === 0 ? (
+                      <EmptyBox text="未匹配到工作区文件" />
+                    ) : (
+                      <div
+                        className="overflow-hidden rounded-xl"
+                        style={{
+                          backgroundColor: 'var(--bg-surface)',
+                          border: '1px solid var(--border-hairline)',
+                        }}
+                      >
+                        {files.slice(0, 80).map((f) => (
+                          <div
+                            key={f.relativePath}
+                            className="group flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11.5px] transition-colors hover:bg-[var(--bg-hover)]"
+                            style={{ borderBottom: '1px solid var(--border-hairline)' }}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => openInspectorFile(session.id, f.relativePath)}
+                              className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+                            >
+                              <FileCode2 size={12} className="shrink-0 text-[var(--text-muted)]" />
+                              <span className="font-mono-code truncate text-[var(--text-primary)]">
+                                {f.relativePath}
+                              </span>
+                            </button>
+                            <button
+                              type="button"
+                              title="引用此文件到输入框"
+                              onClick={() => handleAttachFile(f)}
+                              className="inline-flex shrink-0 cursor-pointer items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10.5px] text-[var(--accent-indigo)] opacity-75 hover:bg-[var(--bg-active)] hover:opacity-100"
+                            >
+                              <AtSign size={10.5} />
+                              引用
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
-            )}
-          </div>
+            }
+          />
         )}
 
         {inspectorTab === 'terminal' && (
@@ -821,46 +972,58 @@ export function InspectorDrawer({
             </div>
 
             {/* Auto-discovered Project Rules & Skills */}
-            <div
-              className="rounded-xl p-3.5"
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                border: '1px solid var(--border-hairline)',
-              }}
-            >
-              <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                <BookOpen size={12} className="text-[var(--accent-star)]" />
-                <span>工作区规则与 Skills ({instructions.length})</span>
-              </div>
-              {instructions.length === 0 ? (
-                <p className="text-[11.5px] text-[var(--text-muted)]">
-                  未检测到 AGENTS.md / CLAUDE.md / Skills 目录
-                </p>
-              ) : (
-                <div className="space-y-1.5">
-                  {instructions.map((ins) => (
-                    <div
-                      key={ins.relativePath}
-                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1 text-[11.5px]"
-                      style={{ backgroundColor: 'var(--bg-elevated)' }}
-                    >
-                      <span className="font-mono-code truncate text-[var(--text-primary)]">
-                        {ins.relativePath}
-                      </span>
-                      <span
-                        className="shrink-0 rounded px-1.5 py-0.5 text-[9.5px] uppercase"
-                        style={{
-                          color: ins.kind === 'skill' ? 'var(--accent-indigo)' : 'var(--accent-star)',
-                          backgroundColor: 'var(--bg-surface)',
-                        }}
-                      >
-                        {ins.kind}
-                      </span>
+            <Slot
+              name="inspector.rules"
+              slotProps={{ session }}
+              fallback={
+                <div
+                  className="rounded-xl p-3.5"
+                  style={{
+                    backgroundColor: 'var(--bg-surface)',
+                    border: '1px solid var(--border-hairline)',
+                  }}
+                >
+                  <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    <BookOpen size={12} className="text-[var(--accent-star)]" />
+                    <span>工作区规则与 Skills ({instructions.length})</span>
+                  </div>
+                  {!rulesEnabled ? (
+                    <p className="text-[11.5px] text-[var(--text-muted)]">
+                      工作区规则发现插件已停用
+                    </p>
+                  ) : instructions.length === 0 ? (
+                    <p className="text-[11.5px] text-[var(--text-muted)]">
+                      未检测到 AGENTS.md / CLAUDE.md / Skills 目录
+                    </p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {instructions.map((ins) => (
+                        <button
+                          key={ins.relativePath}
+                          type="button"
+                          onClick={() => openInspectorFile(session.id, ins.relativePath)}
+                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1 text-left text-[11.5px] transition-colors hover:bg-[var(--bg-hover)]"
+                          style={{ backgroundColor: 'var(--bg-elevated)' }}
+                        >
+                          <span className="font-mono-code truncate text-[var(--text-primary)]">
+                            {ins.relativePath}
+                          </span>
+                          <span
+                            className="shrink-0 rounded px-1.5 py-0.5 text-[9.5px] uppercase"
+                            style={{
+                              color: ins.kind === 'skill' ? 'var(--accent-indigo)' : 'var(--accent-star)',
+                              backgroundColor: 'var(--bg-surface)',
+                            }}
+                          >
+                            {ins.kind}
+                          </span>
+                        </button>
+                      ))}
                     </div>
-                  ))}
+                  )}
                 </div>
-              )}
-            </div>
+              }
+            />
           </div>
         )}
       </div>

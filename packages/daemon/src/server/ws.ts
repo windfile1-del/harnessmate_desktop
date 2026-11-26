@@ -7,9 +7,12 @@ import {
   type WsServerFrame,
 } from '@harnessmate/protocol';
 import { WebSocket, WebSocketServer } from 'ws';
+import { PEER_CONTRACTS } from '@harnessmate/plugin-api';
 import type { DaemonEventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { TerminalWorkspaceService } from '../core/terminal-workspace-service.js';
+import { resolveTerminalProviderForTerminalIdAsync } from '../core/w1-service-helpers.js';
+import type { PluginManager } from '../plugins/plugin-manager.js';
 import { isLocalBrowserRequest, isLoopbackAddress, type RemoteAuthService } from './auth.js';
 
 export interface WsGatewayDeps {
@@ -19,6 +22,7 @@ export interface WsGatewayDeps {
   eventBus: DaemonEventBus;
   sessionManager: SessionManager;
   terminalWorkspace?: TerminalWorkspaceService;
+  pluginManager?: PluginManager;
 }
 
 export class WsGateway {
@@ -89,12 +93,59 @@ export class WsGateway {
     const commandOutputUnsubs = new Map<string, () => void>();
     const terminalOutputUnsubs = new Map<string, () => void>();
     let attentionUnsub: (() => void) | null = null;
-    const terminalStatusUnsub = this.deps.terminalWorkspace?.subscribeStatus((ev) => {
-      this.send(ws, {
-        op: 'terminal_status',
-        terminal: ev.terminal,
-        event: ev.event,
-      });
+    const statusUnsubsByInstance = new Map<string, () => void>();
+    const syncTerminalStatusListeners = () => {
+      const seen = new Set<string>();
+      const pm = this.deps.pluginManager;
+      if (pm) {
+        const candidates = [
+          ...pm.host.listServiceProviders(PEER_CONTRACTS.terminalWorkspace),
+          ...pm.host.listServiceProviders('terminal-workspace'),
+        ];
+        for (const prov of candidates) {
+          seen.add(prov.instanceId);
+          if (statusUnsubsByInstance.has(prov.instanceId)) continue;
+          const legacy =
+            pm.host.getServiceByInstance<TerminalWorkspaceService>(prov.instanceId, 'terminal-workspace') ??
+            pm.host.getServiceByInstance<TerminalWorkspaceService>(prov.instanceId, PEER_CONTRACTS.terminalWorkspace);
+          if (legacy && typeof legacy.subscribeStatus === 'function') {
+            statusUnsubsByInstance.set(
+              prov.instanceId,
+              legacy.subscribeStatus((ev) => {
+                this.send(ws, {
+                  op: 'terminal_status',
+                  terminal: ev.terminal,
+                  event: ev.event,
+                });
+              }),
+            );
+          }
+        }
+      } else if (this.deps.terminalWorkspace) {
+        seen.add('__default__');
+        if (!statusUnsubsByInstance.has('__default__')) {
+          statusUnsubsByInstance.set(
+            '__default__',
+            this.deps.terminalWorkspace.subscribeStatus((ev) => {
+              this.send(ws, {
+                op: 'terminal_status',
+                terminal: ev.terminal,
+                event: ev.event,
+              });
+            }),
+          );
+        }
+      }
+      for (const [instId, unsub] of statusUnsubsByInstance) {
+        if (!seen.has(instId)) {
+          unsub();
+          statusUnsubsByInstance.delete(instId);
+        }
+      }
+    };
+    syncTerminalStatusListeners();
+    const pluginStateUnsub = this.deps.pluginManager?.host.events.on('plugin.state', () => {
+      syncTerminalStatusListeners();
     });
 
     this.send(ws, {
@@ -104,7 +155,7 @@ export class WsGateway {
       desktopName: this.deps.desktopName,
     });
 
-    ws.on('message', (raw) => {
+    ws.on('message', async (raw) => {
       let parsedJson: unknown;
       try {
         parsedJson = JSON.parse(raw.toString('utf8'));
@@ -216,20 +267,74 @@ export class WsGateway {
         }
 
         case 'subscribe_terminal': {
-          if (!this.deps.terminalWorkspace) break;
           terminalOutputUnsubs.get(frame.terminalId)?.();
-          const unsub = this.deps.terminalWorkspace.subscribeOutput(frame.terminalId, (chunk) => {
-            this.send(ws, {
-              op: 'terminal_output',
-              terminalId: chunk.terminalId,
-              chunk: chunk.chunk,
-              snapshot: chunk.snapshot,
-              truncated: chunk.truncated,
-              ringBufferBytes: chunk.ringBufferBytes,
-              timestamp: chunk.timestamp,
+          terminalOutputUnsubs.delete(frame.terminalId);
+          const owner = this.deps.pluginManager
+            ? await resolveTerminalProviderForTerminalIdAsync(this.deps.pluginManager, frame.terminalId)
+            : null;
+          const localSvc = owner?.legacy ?? (!this.deps.pluginManager ? this.deps.terminalWorkspace : undefined);
+          if (localSvc && typeof localSvc.subscribeOutput === 'function') {
+            const unsub = localSvc.subscribeOutput(frame.terminalId, (chunk) => {
+              this.send(ws, {
+                op: 'terminal_output',
+                terminalId: chunk.terminalId,
+                chunk: chunk.chunk,
+                snapshot: chunk.snapshot,
+                truncated: chunk.truncated,
+                ringBufferBytes: chunk.ringBufferBytes,
+                timestamp: chunk.timestamp,
+              });
             });
-          });
-          terminalOutputUnsubs.set(frame.terminalId, unsub);
+            terminalOutputUnsubs.set(frame.terminalId, unsub);
+            break;
+          }
+          if (owner?.peer && typeof owner.peer.getOutputSnapshot === 'function') {
+            let lastLen = 0;
+            let stopped = false;
+            const emitSnap = async (initial: boolean) => {
+              if (stopped || ws.readyState !== WebSocket.OPEN) return;
+              try {
+                const res = await owner.peer!.getOutputSnapshot({ terminalId: frame.terminalId });
+                if (stopped || !res.ok) return;
+                const full = res.value.snapshot ?? '';
+                if (initial) {
+                  lastLen = full.length;
+                  this.send(ws, {
+                    op: 'terminal_output',
+                    terminalId: frame.terminalId,
+                    chunk: full,
+                    snapshot: true,
+                    truncated: res.value.truncated,
+                    ringBufferBytes: Buffer.byteLength(full, 'utf8'),
+                    timestamp: Date.now(),
+                  });
+                } else if (full.length > lastLen) {
+                  const delta = full.slice(lastLen);
+                  lastLen = full.length;
+                  this.send(ws, {
+                    op: 'terminal_output',
+                    terminalId: frame.terminalId,
+                    chunk: delta,
+                    snapshot: false,
+                    truncated: res.value.truncated,
+                    ringBufferBytes: Buffer.byteLength(full, 'utf8'),
+                    timestamp: Date.now(),
+                  });
+                }
+              } catch {
+                // ignore transient stop
+              }
+            };
+            void emitSnap(true);
+            const timer = setInterval(() => {
+              void emitSnap(false);
+            }, 150);
+            timer.unref?.();
+            terminalOutputUnsubs.set(frame.terminalId, () => {
+              stopped = true;
+              clearInterval(timer);
+            });
+          }
           break;
         }
 
@@ -240,25 +345,39 @@ export class WsGateway {
         }
 
         case 'terminal_input': {
-          if (!this.deps.terminalWorkspace) break;
-          try {
-            this.deps.terminalWorkspace.writeInput(frame.terminalId, frame.data);
-          } catch (err) {
-            this.send(ws, {
-              op: 'error',
-              code: 'TERMINAL_INPUT_ERROR',
-              message: err instanceof Error ? err.message : String(err),
-            });
+          const owner = this.deps.pluginManager
+            ? await resolveTerminalProviderForTerminalIdAsync(this.deps.pluginManager, frame.terminalId)
+            : null;
+          const localSvc = owner?.legacy ?? (!this.deps.pluginManager ? this.deps.terminalWorkspace : undefined);
+          if (localSvc) {
+            try {
+              localSvc.writeInput(frame.terminalId, frame.data);
+            } catch (err) {
+              this.send(ws, {
+                op: 'error',
+                code: 'TERMINAL_INPUT_ERROR',
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          } else if (owner?.peer) {
+            void owner.peer.writeInput({ terminalId: frame.terminalId, data: frame.data }).catch(() => {});
           }
           break;
         }
 
         case 'terminal_resize': {
-          if (!this.deps.terminalWorkspace) break;
-          try {
-            this.deps.terminalWorkspace.resizeTerminal(frame.terminalId, frame.cols, frame.rows);
-          } catch {
-            // ignore stale terminal resize
+          const owner = this.deps.pluginManager
+            ? await resolveTerminalProviderForTerminalIdAsync(this.deps.pluginManager, frame.terminalId)
+            : null;
+          const localSvc = owner?.legacy ?? (!this.deps.pluginManager ? this.deps.terminalWorkspace : undefined);
+          if (localSvc) {
+            try {
+              localSvc.resizeTerminal(frame.terminalId, frame.cols, frame.rows);
+            } catch {
+              // ignore stale terminal resize
+            }
+          } else if (owner?.peer) {
+            void owner.peer.resizeTerminal({ terminalId: frame.terminalId, cols: frame.cols, rows: frame.rows }).catch(() => {});
           }
           break;
         }
@@ -272,9 +391,11 @@ export class WsGateway {
       commandOutputUnsubs.clear();
       for (const unsub of terminalOutputUnsubs.values()) unsub();
       terminalOutputUnsubs.clear();
+      for (const unsub of statusUnsubsByInstance.values()) unsub();
+      statusUnsubsByInstance.clear();
+      pluginStateUnsub?.();
       attentionUnsub?.();
       attentionUnsub = null;
-      terminalStatusUnsub?.();
     });
   }
 

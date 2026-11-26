@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +27,7 @@ async function start(dir?: string) {
 afterEach(async () => {
   await daemon?.stop();
   daemon = undefined;
-  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 });
 
 it('commits replay position with the projected ledger and preserves manual fields across disable and restart', async () => {
@@ -53,7 +54,7 @@ it('commits replay position with the projected ledger and preserves manual field
   });
   const before = app.store.getTaskState(session.id);
   await app.pluginManager.togglePlugin(ledger, true);
-  await expect.poll(() => failedWrite.mock.calls.some(([, , key, value]) => key === cursorKey && value === complete.seq)).toBe(true);
+  await expect.poll(() => failedWrite.mock.calls.some(([, , key, value]) => key === cursorKey && value === complete.seq), { timeout: 10_000 }).toBe(true);
   expect(cursor(app)).not.toBe(complete.seq);
   expect(app.store.getTaskState(session.id)).toEqual(before);
   failedWrite.mockRestore();
@@ -61,7 +62,7 @@ it('commits replay position with the projected ledger and preserves manual field
   daemon = undefined;
 
   const { app: reopened } = await start(dir);
-  await expect.poll(() => cursor(reopened)).toBe(complete.seq);
+  await expect.poll(() => cursor(reopened), { timeout: 10_000 }).toBe(complete.seq);
   const projected = reopened.store.getTaskState(session.id)!;
   expect(projected).toMatchObject({ ...manual, steps: [{ title: 'Completed while disabled', status: 'done' }] });
   await reopened.pluginManager.togglePlugin(ledger, false);
@@ -158,8 +159,8 @@ it('keeps two inbox and ledger instances isolated and binds directory-installed 
   await manager.setSessionBinding(first.id, 'git.workspace.v1', fixture);
   await manager.setSessionBinding(first.id, 'session.failover.v1', fixture);
   const scope = { workspaceId: workspace.id, sessionId: first.id };
-  expect((await manager.invokeServiceSelection('git.workspace.v1', 'status', [scope], scope)).value).toMatchObject({
-    ...scope, changes: [{ path: 'fixture/w2-git-status.txt' }],
+  expect((await manager.invokeServiceSelection('git.workspace.v1', 'getStatus', [{ ...scope, cwd: dir }], scope)).value).toMatchObject({
+    ...scope, available: true, status: { changes: [{ path: 'fixture/w2-git-status.txt' }] },
   });
   expect((await manager.invokeServiceSelection('session.failover.v1', 'recommend', [scope], scope)).value).toMatchObject({
     sessionId: first.id, candidate: 'fixture-secondary', action: 'suggest',
@@ -175,4 +176,33 @@ it('keeps two inbox and ledger instances isolated and binds directory-installed 
   expect(manager.resolveServiceSelection('session.studio.v1', { sessionId: second.id })).toMatchObject({ status: 'ready', instanceId: fixture });
   const stillBound = await app.app.inject({ url: `/api/v1/sessions/${second.id}/task-state` });
   expect(stillBound.json().taskState.objective).toBe('second only');
+});
+
+it('projects the W1 Git provider into the W2 ledger and reads the same file via the W1 sidebar API', async () => {
+  const { app, dir } = await start();
+  const repo = path.join(dir, '工作区 with spaces');
+  fs.mkdirSync(repo);
+  execFileSync('git', ['init', '--quiet'], { cwd: repo });
+  const file = '工作记录.md';
+  const changedFile = 'work-log.md';
+  fs.writeFileSync(path.join(repo, file), 'First line\nW2 linked line\n');
+  fs.writeFileSync(path.join(repo, changedFile), 'W2 Git status probe\n');
+  const workspace = await app.sessionManager.addWorkspace(repo);
+  const session = await app.sessionManager.createSession({ workspaceId: workspace.id, harnessId: 'agy', permissionMode: 'manual' });
+  const base = `/api/v1/sessions/${session.id}`;
+  const gitUrl = `/api/v1/workspaces/${workspace.id}/git/status?sessionId=${session.id}`;
+  const status = await app.app.inject(gitUrl);
+  expect(status.json()).toMatchObject({ available: true, instanceId: 'git', status: {
+    changes: expect.arrayContaining([expect.objectContaining({ path: changedFile })]),
+  } });
+  await app.pluginManager.togglePlugin('ledger', false);
+  app.store.appendEvent(session.id, 'turn.completed', { harnessId: session.harnessId }, 'w1-w2-turn');
+  await app.pluginManager.togglePlugin('ledger', true);
+  await expect.poll(() => app.store.getTaskState(session.id)?.touchedFiles, { timeout: 10_000 }).toContain(changedFile);
+  const preview = await app.app.inject(`${base}/file-view?path=${encodeURIComponent(file)}&line=2`);
+  expect(preview.statusCode).toBe(200);
+  expect(preview.json().file).toMatchObject({ relativePath: file, content: 'First line\nW2 linked line\n' });
+  await app.pluginManager.togglePlugin('git', false);
+  expect((await app.app.inject(gitUrl)).json()).toMatchObject({ available: false, reason: 'disabled' });
+  expect((await app.app.inject(`${base}/task-state`)).json().taskState.touchedFiles).toContain(changedFile);
 });

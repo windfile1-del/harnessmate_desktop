@@ -13,6 +13,7 @@ const { createDaemon } = await import(pathToFileURL(path.join(root, 'packages/da
 const candidateWeb = path.join(root, 'packages/web/dist');
 const bundledPluginsDir = path.join(root, 'plugins/bundled');
 const result = {};
+const linkedFile = '工作记录.md';
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -75,6 +76,15 @@ function seed(daemon, session) {
         outputOmitted: false, omittedBytes: 0, createdAt: event.createdAt, updatedAt: event.createdAt,
       });
     }
+    if (recording) {
+      const item = daemon.store.appendEvent(session.id, 'checkpoint.captured', {}, turnId);
+      daemon.store.upsertTurnItem({
+        itemId: 'w2-file-link', schemaVersion: 2, sessionId: session.id, turnId, seq: item.seq,
+        instanceId: 'agy', driverId: 'agy', blockType: 'file_change', status: 'completed',
+        title: 'W2 linked file', textBody: '', payload: { files: [{ path: linkedFile, line: 2, changeKind: 'update' }] },
+        outputOmitted: false, omittedBytes: 0, createdAt: item.createdAt, updatedAt: item.createdAt,
+      });
+    }
     if (!recording) {
       daemon.store.appendEvent(session.id, 'tool.call.completed', { toolCallId, toolName: 'shell', status: 'success', output: 'complete' }, turnId);
       daemon.store.appendEvent(session.id, 'turn.completed', {}, turnId);
@@ -86,11 +96,15 @@ const instrumentation = String.raw`
 window.w2Replay = { first: null, selectedAt: null, long: [], subscriptions: [] };
 const fetchFromDaemon = window.fetch;
 window.w2Requests = [];
+window.w2FileReads = [];
 window.fetch = async function (...args) {
   const response = await fetchFromDaemon.apply(this, args);
   const url = new URL(response.url, location.href);
   if (url.pathname.startsWith('/api/v1/') && !response.ok) {
     window.w2Requests.push({ path: url.pathname, status: response.status });
+  }
+  if (url.pathname.endsWith('/file-view')) {
+    window.w2FileReads.push({ status: response.status, path: url.searchParams.get('path'), line: url.searchParams.get('line') });
   }
   return response;
 };
@@ -120,6 +134,7 @@ for (const [name, webDistDir] of [['b1', baselineWeb], ['w2', candidateWeb]]) {
   const dir = path.join(run, 'data');
   const project = path.join(run, 'workspace');
   fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, linkedFile), 'First line\nW2 linked line\n');
   const daemon = createDaemon({ dataDir: dir, webDistDir, port: 0, hostOverride: '127.0.0.1', bundledPluginsDir });
   let browser;
   let cdp;
@@ -197,6 +212,36 @@ for (const [name, webDistDir] of [['b1', baselineWeb], ['w2', candidateWeb]]) {
       if (outputOps.map(({ op }) => op).join(',') !== 'subscribe_command_output,unsubscribe_command_output') {
         throw new Error('Expected one subscribe and one unsubscribe for the opened tool');
       }
+
+      await until(() => evaluate(`(() => {
+        const details = document.querySelector('details[data-item-id="w2-file-link"]');
+        if (!details) {
+          const groups = [...document.querySelectorAll('[data-testid="work-group-row"]')];
+          const group = groups.findLast((node) => node.firstElementChild?.textContent.includes('改 1 文件'));
+          group?.querySelector('button[aria-expanded="false"]')?.click();
+          return false;
+        }
+        details.scrollIntoView({ block: 'center' });
+        details.open = true;
+        return true;
+      })()`), 'Studio file change block');
+      const { x, y } = await until(() => evaluate(`(() => {
+        const frame = document.querySelector('details[data-item-id="w2-file-link"] iframe');
+        if (!frame) return false;
+        frame.scrollIntoView({ block: 'center' });
+        const bounds = frame.getBoundingClientRect();
+        if (bounds.height < 45) return false;
+        return { x: bounds.left + 30, y: bounds.top + 39 };
+      })()`), 'file link in the sandboxed Studio tool');
+      const linkScreenshot = await cdp.call('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(run, 'file-link.png'), Buffer.from(linkScreenshot.data, 'base64'));
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await cdp.call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+      }
+      result[name].fileNavigation = await until(() => evaluate(`window.w2FileReads.find(({ path, line, status }) =>
+        path === ${JSON.stringify(linkedFile)} && line === '2' && status === 200)`), 'W1 file preview at line 2');
+      const fileScreenshot = await cdp.call('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(run, 'file-navigation.png'), Buffer.from(fileScreenshot.data, 'base64'));
     }
     result[name].openedLastTool = opened;
     const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png' });

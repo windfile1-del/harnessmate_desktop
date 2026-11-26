@@ -1,6 +1,5 @@
 import {
   TRIAGE_INBOX_PLUGIN_ID,
-  type GitStatusSummary,
   type Session,
   type SessionTaskState,
   type SessionTriageState,
@@ -12,6 +11,7 @@ import type { SessionChangeFeedService } from '../../core/session-change-feed.js
 import { startTaskLedgerProjection } from '../../core/task-ledger-projection.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
 import { TriageInboxService } from '../../core/triage-inbox-service.js';
+import { lookupOptionalGitStatus } from '../../core/w1-service-helpers.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import type { PluginManager } from '../../plugins/plugin-manager.js';
 import type { HostPlugin } from '../runtime/lifecycle.js';
@@ -67,14 +67,9 @@ export function registerSessionAssistance(
     apply(ctx) {
       const instanceId = ctx.instanceId ?? 'ledger';
       const dataId = instanceId === 'ledger' ? 'core.task-ledger' : `ledger-instance:${instanceId}`;
-      const ledger = new TaskLedgerService(store, async (_cwd, session) => {
-        const selection = selected('git.workspace.v1', session);
-        if (selection.status !== 'ready') return undefined;
-        const { value } = await plugins().invokeServiceSelection<GitStatusSummary | { status: GitStatusSummary }>(
-          'git.workspace.v1', 'status', [{ workspaceId: session.workspaceId, sessionId: session.id }],
-          { explicitInstanceId: selection.instanceId },
-        );
-        return 'status' in value ? value.status : value;
+      const ledger = new TaskLedgerService(store, async (cwd, session) => {
+        const result = await lookupOptionalGitStatus(plugins(), { cwd, workspaceId: session.workspaceId, sessionId: session.id });
+        return result.status;
       }, dataId);
       ctx.provide('ledger', ledger);
       const requireSession = (id: string) => {

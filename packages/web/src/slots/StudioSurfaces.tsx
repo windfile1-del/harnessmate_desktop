@@ -59,8 +59,11 @@ function WorkStep({ session, block, plugin }: { session: Session; block: WorkSte
             && block.files.some(({ path }) => path === params.path)) {
             const line = typeof params.line === 'number' && Number.isSafeInteger(params.line) && params.line > 0
               ? params.line : undefined;
-            useAppStore.getState().openInspectorFile(session.id, params.path, line);
-            return { ok: true };
+            const result = useAppStore.getState().navigateToFile({
+              workspaceId: session.workspaceId, sessionId: session.id, path: params.path, line, preserveSession: true,
+            });
+            if (!result.opened) throw new Error(result.message ?? '无法打开此文件');
+            return result;
           }
           throw new Error('此条目不支持该操作');
         }}

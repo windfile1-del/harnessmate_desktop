@@ -804,11 +804,32 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
             </div>
             <div className="space-y-2 rounded-xl border border-[var(--border-hairline)] p-3">
               <p className="font-medium text-[var(--text-primary)]">能力依赖绑定（平级实例选择）</p>
-              {(['browser.v1', 'filePreview.v1', 'approval.policy.v1'] as const).map((contract) => {
+              {([
+                'browser.v1',
+                'filePreview.v1',
+                'approval.policy.v1',
+                'git.workspace.v1',
+                'git.checkpoint.v1',
+                'terminal.workspace.v1',
+                'terminal.runner.v1',
+                'workspace.files.v1',
+                'session.attachments.v1',
+                'workspace.rules.v1',
+              ] as const).map((contract) => {
                 const providers = (composition.serviceProviders ?? []).filter((item) => item.contract === contract);
-                const label = contract === 'browser.v1' ? '浏览器实现 (browser.v1)'
-                  : contract === 'filePreview.v1' ? '文件查看器 (filePreview.v1)'
-                  : '工具审批策略 (approval.policy.v1)';
+                const labelMap: Record<string, string> = {
+                  'browser.v1': '浏览器实现 (browser.v1)',
+                  'filePreview.v1': '文件查看器 (filePreview.v1)',
+                  'approval.policy.v1': '工具审批策略 (approval.policy.v1)',
+                  'git.workspace.v1': 'Git 与工作树 (git.workspace.v1)',
+                  'git.checkpoint.v1': 'Git 检查点 (git.checkpoint.v1)',
+                  'terminal.workspace.v1': '交互工作区终端 (terminal.workspace.v1)',
+                  'terminal.runner.v1': '单次命令终端 (terminal.runner.v1)',
+                  'workspace.files.v1': '工作区文件浏览 (workspace.files.v1)',
+                  'session.attachments.v1': '会话附件上传 (session.attachments.v1)',
+                  'workspace.rules.v1': '规则与 Skills 发现 (workspace.rules.v1)',
+                };
+                const label = labelMap[contract] ?? contract;
                 const sessionValue = selectedSessionId ? (sessionBindingsBySession[selectedSessionId]?.[contract] ?? '') : '';
                 return (
                   <div key={contract} className="space-y-1 border-t border-[var(--border-hairline)] pt-2 first:border-t-0 first:pt-0">

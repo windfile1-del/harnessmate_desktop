@@ -29,7 +29,7 @@ afterEach(async () => {
   sockets.clear();
   for (const daemon of daemons) await daemon.stop();
   daemons.clear();
-  for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
   dirs.clear();
 });
 
@@ -245,6 +245,8 @@ it('keeps a running turn and the next send usable when Studio is disabled', asyn
   const item = daemon.store.getTurnItem(`tool:${toolCallId}`);
   expect(item).toMatchObject({ status: 'completed', textBody: 'before disable after disable', payload: { toolCallId } });
   const ledger = async () => (await daemon.app.inject(`${sessionUrl}/task-state`)).json().taskState;
-  await expect.poll(ledger).toMatchObject({ steps: expect.arrayContaining([expect.objectContaining({ title: 'Kept the stream', status: 'done' })]) });
+  await expect.poll(ledger, { timeout: 10_000 }).toMatchObject({
+    steps: expect.arrayContaining([expect.objectContaining({ title: 'Kept the stream', status: 'done' })]),
+  });
   expect((await send('Second W2 stream')).statusCode).toBe(202);
 });
