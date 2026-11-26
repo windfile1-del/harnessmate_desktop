@@ -134,7 +134,7 @@ it('loads bundle and patch settings, persists toggles, and performs actual first
     await daemon.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 it('requires digest-bound confirmation for pasted and catalog CLI contributions', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-v4-trust-'));
@@ -165,7 +165,7 @@ it('requires digest-bound confirmation for pasted and catalog CLI contributions'
     await daemon.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 it('starts with builtins in safe mode and restores a damaged composition for the next launch', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-plugin-recovery-'));

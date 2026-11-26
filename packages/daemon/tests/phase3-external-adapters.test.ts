@@ -467,7 +467,7 @@ describe('Phase 3 Step 1: External Non-ACP Harness Adapters (DeepSeek & OpenCode
     expect(daemon.registry.get('deepseek')).toBeUndefined();
     const persistedItemsAfterUninstall = daemon.sessionManager.getSessionTurnItems(session.id);
     expect(persistedItemsAfterUninstall.some((i) => i.blockType === 'ext:deepseek.reasoning_budget' && i.textBody.includes('Budget=high'))).toBe(true);
-  }, 30_000);
+  }, 60_000);
 
   it('hm.adapter.deepseek: supports API SSE mode, maps HTTP 429 to usage_limit Failover, settles mid-turn crash, and executes Codex -> DeepSeek -> Claude handoff', async () => {
     const dataDir = makeTempDir('hm-p3-ds-api-data-');

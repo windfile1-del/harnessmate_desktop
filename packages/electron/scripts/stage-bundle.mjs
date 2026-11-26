@@ -40,11 +40,20 @@ await esbuild.build({
   logLevel: 'info',
 });
 
-// 1b. Stage AI Plugin Builder v2 runtime assets alongside daemon.cjs
+// 1b. Stage AI Plugin Builder v2 runtime assets & distribution bundle alongside daemon.cjs
 const builderContextSrc = path.join(repoDesktopRoot, 'docs/plugin-api/ai-builder-context.md');
 if (fs.existsSync(builderContextSrc)) {
   fs.copyFileSync(builderContextSrc, path.join(daemonOutDir, 'ai-builder-context.md'));
 }
+
+const distBundleSrc = path.join(repoDesktopRoot, 'packages/daemon/src/plugin-host/composition/harnessmate-core.json');
+if (!fs.existsSync(distBundleSrc)) {
+  throw new Error(`Missing distribution composition bundle at ${distBundleSrc}.`);
+}
+fs.copyFileSync(distBundleSrc, path.join(daemonOutDir, 'harnessmate-core.json'));
+const bundlesOutDir = path.join(resourcesDir, 'bundles');
+fs.mkdirSync(bundlesOutDir, { recursive: true });
+fs.copyFileSync(distBundleSrc, path.join(bundlesOutDir, 'harnessmate-core.json'));
 
 const sdkTestingSrc = path.join(repoDesktopRoot, 'packages/plugin-sdk/dist/testing.js');
 if (fs.existsSync(sdkTestingSrc)) {

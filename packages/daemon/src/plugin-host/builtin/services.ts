@@ -12,8 +12,14 @@ import {
 } from '../../core/context-compression-service.js';
 import { ContextCompiler } from '../../core/context-compiler.js';
 import { FailoverCoordinator } from '../../core/failover-service.js';
+import { HistoryImportAdapter } from '../../core/history-import-adapter.js';
 import { OrchestratorService } from '../../core/orchestrator-service.js';
+import { SessionChangeFeedService } from '../../core/session-change-feed.js';
 import { SessionExplorerService } from '../../core/session-explorer-service.js';
+import {
+  createHistorySessionDataHostPlugin,
+  HISTORY_SESSION_DATA_PLUGIN_ID,
+} from '../../server/routes/history-import-compat.js';
 import {
   commitWorktreeChangesIfDirty,
   computeBranchDiffStat,
@@ -103,7 +109,8 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
   terminalWorkspace?: TerminalWorkspaceService,
   triage?: { service: TriageInboxService; bus: DaemonEventBus },
-  agyProfilesDir?: string) {
+  agyProfilesDir?: string,
+  historyImportAdapter?: HistoryImportAdapter) {
   const resolvedAgyProfilesDir =
     agyProfilesDir ?? path.join(os.homedir(), '.harnessmate-desktop', 'agy-profiles');
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
@@ -355,23 +362,17 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('failover', coordinator);
     },
   });
+  const resolvedImportAdapter = historyImportAdapter
+    ?? new HistoryImportAdapter(store, registry, new SessionChangeFeedService(store));
+  plugins.set(HISTORY_SESSION_DATA_PLUGIN_ID, createHistorySessionDataHostPlugin(resolvedImportAdapter));
+  // Batch-1 temporary session adapter retained solely for Fork / MergeBack / SideChat / Export (and legacy unit tests).
+  // Search indexing and HTTP search/import routes are owned by hm.plugin.session-search-fts & hm.plugin.history-import.
   plugins.set('hm.plugin.session-explorer', {
     provides: ['session-search'],
     apply(ctx) {
       const explorer = new SessionExplorerService(store, registry);
       ctx.provide('session-search', explorer);
-      ctx.on('turn.completed', ({ sessionId, turnId }) => {
-        if (sessionId && turnId) {
-          explorer.indexSessionTurn(sessionId, turnId);
-        }
-      });
-      // Non-blocking low-priority background FTS5 backfill
-      const timer = setTimeout(() => {
-        void explorer.rebuildBacklogIndex(20).catch(() => {});
-      }, 250);
-      timer.unref?.();
       ctx.effect(() => () => {
-        clearTimeout(timer);
         explorer.dispose();
       });
     },

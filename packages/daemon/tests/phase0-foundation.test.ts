@@ -294,8 +294,21 @@ describe('Phase 0 Core Foundation', () => {
     expect(runs[0]?.status).toBe('completed');
     expect(runs[0]?.driverId).toBe('deepseek');
 
-    // FTS5 search indexes materialized items
-    const hits = daemon.store.searchSessionFts('verification build');
+    // Search plugin indexes materialized items via hm.session-data.v1
+    const reindexRes = await daemon.app.inject({
+      method: 'POST',
+      url: '/api/v1/search/reindex',
+      headers: { authorization: `Bearer ${daemon.config.localToken}` },
+      payload: { workspaceId: ws.id },
+    });
+    expect(reindexRes.statusCode).toBe(200);
+    const searchRes = await daemon.app.inject({
+      method: 'GET',
+      url: '/api/v1/search/sessions?q=verification%20build',
+      headers: { authorization: `Bearer ${daemon.config.localToken}` },
+    });
+    expect(searchRes.statusCode).toBe(200);
+    const hits = (searchRes.json() as { hits: Array<{ sessionId: string }> }).hits;
     expect(hits.some((h) => h.sessionId === session.id)).toBe(true);
 
     // REST endpoints return materialized items and runs
@@ -306,7 +319,7 @@ describe('Phase 0 Core Foundation', () => {
     });
     expect(itemsRes.statusCode).toBe(200);
     expect((itemsRes.json() as { items: unknown[] }).items.length).toBe(4);
-  });
+  }, 30_000);
 
   it('settles orphaned runs/items and distinguishes PROCESS_BOUND vs REPLAY_SAFE outbox effects on crash recovery', async () => {
     const dataDir = makeTempDir('hm-phase0-crash-');

@@ -1844,14 +1844,6 @@ export class SessionManager {
       createdAt: userEvent.createdAt,
       updatedAt: userEvent.createdAt,
     });
-    this.store.indexSearchItem({
-      sessionId,
-      itemId: userItemId,
-      turnId,
-      driverId: session.harnessKind,
-      title: session.title,
-      body: text,
-    });
     this.setSessionStatus(sessionId, 'running');
 
     // Capture turn_pre hidden Git checkpoint (non-blocking, timeout-protected, skips non-Git)
@@ -3124,14 +3116,6 @@ export class SessionManager {
           omittedBytes: 0,
           createdAt: completed.createdAt,
           updatedAt: completed.createdAt,
-        });
-        this.store.indexSearchItem({
-          sessionId,
-          itemId,
-          turnId: ev.turnId,
-          driverId: eventHarnessKind,
-          title: session.title,
-          body: ev.text,
         });
         break;
       }

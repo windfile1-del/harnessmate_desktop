@@ -2,7 +2,10 @@
   "bindings": {
     "browser.v1": "hm.plugin.browser-desktop",
     "filePreview.v1": "hm.plugin.file-preview-text",
-    "approval.policy.v1": "hm.plugin.approval-policy-default"
+    "approval.policy.v1": "hm.plugin.approval-policy-default",
+    "history.import.v1": "hm.plugin.history-import",
+    "session.search.v1": "hm.plugin.session-search-fts",
+    "hm.session-data.v1": "core.history-session-data"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

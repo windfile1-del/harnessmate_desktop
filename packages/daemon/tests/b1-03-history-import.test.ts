@@ -138,7 +138,13 @@ async function setupImportHarness(opts?: {
   const pluginManager = new PluginManager(
     pluginsDir,
     registry,
-    () => [],
+    () => [
+      'hm.plugin.history-source-codex',
+      'hm.plugin.history-source-claude',
+      'hm.plugin.history-source-agy-cli',
+      'hm.plugin.history-source-agy-desktop',
+      'hm.plugin.session-search-fts',
+    ],
     firstParty,
     {
       store,
@@ -196,15 +202,21 @@ async function setupImportHarness(opts?: {
   return { dataDir, store, registry, changeFeed, importAdapter, pluginManager, installSource };
 }
 
+let pushedHistoryManifest = false;
+
 beforeAll(() => {
   if (!BUILTIN_PLUGINS.some((p) => p.id === HISTORY_SESSION_DATA_PLUGIN_ID)) {
     BUILTIN_PLUGINS.push(HISTORY_SESSION_DATA_MANIFEST);
+    pushedHistoryManifest = true;
   }
 });
 
 afterAll(() => {
-  const idx = BUILTIN_PLUGINS.findIndex((p) => p.id === HISTORY_SESSION_DATA_PLUGIN_ID);
-  if (idx >= 0) BUILTIN_PLUGINS.splice(idx, 1);
+  if (pushedHistoryManifest) {
+    const idx = BUILTIN_PLUGINS.findIndex((p) => p.id === HISTORY_SESSION_DATA_PLUGIN_ID);
+    if (idx >= 0) BUILTIN_PLUGINS.splice(idx, 1);
+    pushedHistoryManifest = false;
+  }
 });
 
 afterEach(async () => {
@@ -978,21 +990,10 @@ export function apply(ctx) {
     expect(bundleRes2.statusCode).toBe(201);
     expect(bundleRes2.json().session.id).not.toBe(bundleSid1);
 
-    // 6. Disable hm.plugin.history-import -> compat import endpoints fail closed (503) while archived sessions stay readable & exportable!
+    // 6. Disable hm.plugin.history-import -> compat import endpoints fail closed (503) preserving composition binding (`disabled`) while archived sessions stay readable & exportable!
     await pluginManager.togglePlugin('hm.plugin.history-import', false);
 
-    const disabledImpUnbound = await app.inject({
-      method: 'POST',
-      url: '/api/v1/harnesses/import-session',
-      remoteAddress: '127.0.0.1',
-      payload: { source: 'codex_cli', nativeSessionId: 'compat-sid-1', mode: 'attach' },
-    });
-    expect(disabledImpUnbound.statusCode).toBe(503);
-    expect(disabledImpUnbound.json().code).toBe('E_SERVICE_UNAVAILABLE');
-    expect(disabledImpUnbound.json().resolution.status).toBe('unconfigured');
-
-    // When bound via composition/workspace binding, disabled instance preserves binding and reports status='disabled'
-    await pluginManager.setCompositionBinding('history.import.v1', 'hm.plugin.history-import');
+    // When bound via distribution/composition binding, disabled instance preserves binding and reports status='disabled'
     const disabledImp = await app.inject({
       method: 'POST',
       url: '/api/v1/harnesses/import-session',

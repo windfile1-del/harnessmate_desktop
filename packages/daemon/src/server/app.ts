@@ -31,8 +31,6 @@ import {
   GitDiscardFileRequestSchema,
   GitPullRequestSchema,
   GitPushRequestSchema,
-  ImportNativeSessionRequestSchema,
-  ImportSessionBundleRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
   MarkSessionViewedRequestSchema,
@@ -146,6 +144,11 @@ import { authorizeLegacyPluginBrowserView, renderLegacyFilePreview } from '../pl
 import { PluginSecretStore } from '../plugin-host/isolation/plugin-secrets.js';
 import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './auth.js';
 import { WsGateway } from './ws.js';
+import { SessionChangeFeedService } from '../core/session-change-feed.js';
+import { HistoryImportAdapter } from '../core/history-import-adapter.js';
+import { registerServiceResolutionRoute } from '../plugin-host/composition/resolve-route.js';
+import { registerHistoryImportCompatRoutes } from './routes/history-import-compat.js';
+import { registerSessionSearchCompatRoutes } from './routes/session-search-compat.js';
 
 export interface CreateDaemonOptions {
   dataDir?: string;
@@ -214,6 +217,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
   const terminalSessionOwners = new Map<string, string>();
+  const sessionChangeFeed = new SessionChangeFeedService(store);
+  const historyImportAdapter = new HistoryImportAdapter(store, registry, sessionChangeFeed);
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
@@ -236,6 +241,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       terminalWorkspace,
       { service: triageInbox, bus: eventBus },
       paths.agyProfilesDir,
+      historyImportAdapter,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
@@ -251,6 +257,19 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const nativeRegistry = new AgyNativeRuntimeRegistry(store, opts.nativeFeatureFlags);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
   const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
+  historyImportAdapter.attachHooks({
+    addWorkspace: (rootPath, name) => sessionManager.addWorkspace(rootPath, name),
+    onSessionImported: (importedSession, meta) => {
+      eventBus.publishAttention({
+        kind: 'session_updated',
+        sessionId: importedSession.id,
+        sessionTitle: importedSession.title,
+        harnessId: importedSession.harnessId,
+        summary: `Imported session (${String(meta.mode ?? 'attach')})`,
+        timestamp: Date.now(),
+      });
+    },
+  });
   const disposeNativeRuntime = wireAgyNativeRuntime(nativeRegistry, sessionManager, registry, config.binaryOverrides);
   const agyAuthService = new AgyAuthService({
     getAdapter: (instanceId) => {
@@ -435,28 +454,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { harnesses };
   });
 
-  app.get('/api/v1/harnesses/discovered-sessions', async (request, reply) => {
-    const { limit: rawLimit, refresh } = request.query as { limit?: string; refresh?: string };
-    const limit = Number(rawLimit ?? 20);
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
-      return reply.code(400).send({ error: 'Invalid history list limit' });
-    }
-    const forceRefresh = refresh === '1' || refresh === 'true';
-    return sessionManager.discoverExternalSessions({ limit, forceRefresh });
-  });
-
-  app.post('/api/v1/harnesses/import-session', async (request, reply) => {
-    if (!isLoopbackAddress(request.socket.remoteAddress)) {
-      return reply.code(403).send({ error: 'Native history import is local only' });
-    }
-    const parsed = ImportNativeSessionRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid history import request' });
-    try {
-      const result = await sessionManager.importExternalSession(parsed.data);
-      return result;
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
+  registerHistoryImportCompatRoutes(app, {
+    store,
+    pluginManager,
+    adapter: historyImportAdapter,
   });
 
   // ── Phase AGY-2: Multi-Account Profiles & Official Auth Endpoints ────
@@ -656,49 +657,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  // ── Session Explorer: Global FTS5 Search, Bundle Import ──────────────
+  // ── Session Search (Peer Plugin Compat Routes) ───────────────────────
 
-  app.get('/api/v1/search/sessions', async (request) => {
-    const q = request.query as {
-      q?: string;
-      workspaceId?: string;
-      driverId?: string;
-      fromTs?: string;
-      toTs?: string;
-      limit?: string;
-      offset?: string;
-    };
-    const fromTs = q.fromTs !== undefined && q.fromTs !== '' ? Number(q.fromTs) : undefined;
-    const toTs = q.toTs !== undefined && q.toTs !== '' ? Number(q.toTs) : undefined;
-    const limit = q.limit !== undefined && q.limit !== '' ? Number(q.limit) : 25;
-    const offset = q.offset !== undefined && q.offset !== '' ? Number(q.offset) : 0;
-    return sessionManager.searchSessions({
-      q: q.q ?? '',
-      workspaceId: q.workspaceId || undefined,
-      driverId: q.driverId || undefined,
-      fromTs: Number.isFinite(fromTs) ? fromTs : undefined,
-      toTs: Number.isFinite(toTs) ? toTs : undefined,
-      limit: Number.isFinite(limit) ? limit : 25,
-      offset: Number.isFinite(offset) ? offset : 0,
-    });
-  });
-
-  app.post('/api/v1/search/reindex', async () => {
-    const result = await sessionManager.rebuildSearchIndex();
-    return result;
-  });
-
-  app.post('/api/v1/sessions/import-bundle', async (request, reply) => {
-    const parsed = ImportSessionBundleRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid session bundle payload' });
-    }
-    try {
-      const session = await sessionManager.importSessionBundle(parsed.data);
-      return reply.code(201).send({ session });
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
+  registerSessionSearchCompatRoutes(app, {
+    pluginManager,
+    sessionManager,
+    allowLegacyFallback: false,
   });
 
   // ── Modular Plugin Studio (/api/v1/plugins/*) ────────────────────────
@@ -717,6 +681,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { contract } = request.query as { contract?: string };
     return { providers: pluginManager.listServiceProviders(typeof contract === 'string' && contract.trim() ? contract.trim() : undefined) };
   });
+  registerServiceResolutionRoute(app, pluginManager);
   app.get('/api/v1/plugins/composition', async (request) => {
     const { workspaceId } = request.query as { workspaceId?: string };
     const workspace = typeof workspaceId === 'string' ? store.getWorkspace(workspaceId) : undefined;
@@ -1173,6 +1138,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { workspaceId: id }),
         'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { workspaceId: id }),
         'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { workspaceId: id }),
+        'history.import.v1': pluginManager.resolveCapabilityBinding('history.import.v1', { workspaceId: id }),
+        'session.search.v1': pluginManager.resolveCapabilityBinding('session.search.v1', { workspaceId: id }),
       },
     };
   });

@@ -454,6 +454,7 @@ describe('B1-04 · Session Search Engine & Peer Plugins', () => {
     );
     const bridgePreview = await installTrustedDir(daemon, bridgePluginDir);
     await grantPermission(daemon, 'user.session-data-bridge', bridgePreview.digest!, 'net:127.0.0.1');
+    await daemon.pluginManager.setCompositionBinding('hm.session-data.v1', 'user.session-data-bridge');
 
     // Verify bundled FTS plugin was discovered in plugins/bundled
     expect(fs.existsSync(path.join(ftsBundledDir, 'harnessmate-plugin.json'))).toBe(true);

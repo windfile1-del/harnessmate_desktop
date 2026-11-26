@@ -1,5 +1,6 @@
 import type { PluginManifest } from '@harnessmate/plugin-api';
 import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
+import { HISTORY_SESSION_DATA_MANIFEST } from '../../server/routes/history-import-compat.js';
 
 export const BUNDLED_PLUGIN_IDS = [
   'hm.plugin.browser-desktop',
@@ -7,10 +8,20 @@ export const BUNDLED_PLUGIN_IDS = [
   'hm.plugin.file-preview-text',
   'hm.plugin.file-preview-markdown',
   'hm.plugin.approval-policy-default',
+  'hm.plugin.history-source-codex',
+  'hm.plugin.history-source-claude',
+  'hm.plugin.history-source-agy-cli',
+  'hm.plugin.history-source-agy-desktop',
+  'hm.plugin.history-import',
+  'hm.plugin.session-search-fts',
 ] as const;
 
 export const BUNDLED_TRUSTED_LOCAL_IDS = new Set<string>([
   'hm.plugin.browser-headless',
+  'hm.plugin.history-source-codex',
+  'hm.plugin.history-source-claude',
+  'hm.plugin.history-source-agy-cli',
+  'hm.plugin.history-source-agy-desktop',
 ]);
 
 export const BUILTIN_PLUGINS: PluginManifest[] = [
@@ -188,6 +199,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     category: 'workflow',
     contributes: { uiSlots: ['composer_action'] },
   },
+  HISTORY_SESSION_DATA_MANIFEST,
   {
     id: 'hm.plugin.session-explorer',
     name: '会话检索、导入与分叉中心',

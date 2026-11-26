@@ -235,6 +235,14 @@ export function apply(ctx) {
     const dataDir = createTempDir(`hm-b1-01-${order[0]}-`);
     const wsDir = createTempDir('hm-b1-01-ws-');
     const daemon = await createTestDaemon(dataDir);
+    for (const bundledSourceId of [
+      'hm.plugin.history-source-codex',
+      'hm.plugin.history-source-claude',
+      'hm.plugin.history-source-agy-cli',
+      'hm.plugin.history-source-agy-desktop',
+    ]) {
+      await daemon.pluginManager.togglePlugin(bundledSourceId, false);
+    }
     const ws = await daemon.sessionManager.addWorkspace(wsDir, 'WS');
     const session = await daemon.sessionManager.createSession({ workspaceId: ws.id, harnessId: 'codex', permissionMode: 'manual' });
 
@@ -485,6 +493,9 @@ it('loads distribution defaults from harnessmate-core data, preserves legacy pro
     'browser.v1': 'hm.plugin.browser-desktop',
     'filePreview.v1': 'hm.plugin.file-preview-text',
     'approval.policy.v1': 'hm.plugin.approval-policy-default',
+    'history.import.v1': 'hm.plugin.history-import',
+    'session.search.v1': 'hm.plugin.session-search-fts',
+    'hm.session-data.v1': 'core.history-session-data',
   });
 
   // Legacy profile with extensions.filePreviewProvider overrides distribution default
@@ -654,21 +665,20 @@ export function apply(ctx) {
     },
   );
   await daemon.pluginManager.linkDevPlugin(devDir, 'user.trusted-search');
+  await daemon.pluginManager.setCompositionBinding('session.search.v1', 'user.trusted-search');
   const resolution = daemon.pluginManager.resolveServiceSelection('session.search.v1', {
     versionRange: '^1.0.0',
-    allowSingleCandidate: true,
   });
   expect(resolution).toMatchObject({
     contract: 'session.search.v1',
     instanceId: 'user.trusted-search',
-    source: 'single',
+    source: 'composition',
     status: 'ready',
   });
   const invokeRes = await daemon.pluginManager.invokeServiceSelection<{ ok: boolean; value: { jobId: string } }>(
     'session.search.v1',
     'reindex',
     [{}],
-    { allowSingleCandidate: true },
   );
   expect(invokeRes.value).toEqual({ ok: true, value: { jobId: 'j1', status: 'queued' } });
   const routeRes = await daemon.app.inject({
