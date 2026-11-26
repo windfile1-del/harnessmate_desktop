@@ -224,9 +224,72 @@ export interface NativeRuntimeSchemaStatus {
   newerThanReader: boolean;
 }
 
+export type SessionChangeKind = 'upsert_item' | 'upsert_session' | 'delete_session' | 'delete_item';
+
+export interface HistoryImportMappingRecord {
+  sourceId: string;
+  nativeSessionId: string;
+  sessionId: string;
+  legacySource?: string | null;
+  sourceInstanceId?: string | null;
+  sourcePath?: string | null;
+  harnessKind?: string | null;
+  createdAt: number;
+}
+
+export interface HistoryImportReceiptRecord {
+  requestId: string;
+  requestHash: string;
+  sessionId: string;
+  disposition: 'created' | 'reused';
+  partial: boolean;
+  warnings: string[];
+  createdAt: number;
+}
+
+export interface SnapshotTurnItemRow {
+  sessionId: string;
+  sessionTitle: string;
+  workspaceId: string;
+  itemId: string;
+  turnId: string;
+  turnSeq: number;
+  driverId: string;
+  blockType: string;
+  textBody: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CommittedChangeRawRow {
+  changeSeq: number;
+  kind: SessionChangeKind;
+  sessionId: string;
+  workspaceId: string;
+  itemId: string | null;
+  committedAt: number;
+  payloadJson: string | null;
+  turnId: string | null;
+  turnSeq: number | null;
+  driverId: string | null;
+  blockType: string | null;
+  textBody: string | null;
+  itemPayloadJson: string | null;
+  itemCreatedAt: number | null;
+  itemUpdatedAt: number | null;
+  sessionTitle: string | null;
+  harnessId: string | null;
+  harnessKind: string | null;
+  sessionStatus: string | null;
+  sessionUpdatedAt: number | null;
+}
+
 export class HarnessMateStore {
   private readonly db: DatabaseSync;
   private closed = false;
+  private txDepth = 0;
+  private pendingCommitSeq: number | null = null;
+  private readonly commitListeners = new Set<(latestSeq: number) => void>();
   private nativeSchemaStatus: NativeRuntimeSchemaStatus = {
     component: AGY_NATIVE_MIGRATION_COMPONENT,
     supportedVersion: AGY_NATIVE_MIGRATION_VERSION,
@@ -240,6 +303,7 @@ export class HarnessMateStore {
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
     this.db.exec('PRAGMA synchronous = NORMAL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
     this.migrate();
   }
 
@@ -558,6 +622,46 @@ export class HarnessMateStore {
         title,
         body
       );
+
+      CREATE TABLE IF NOT EXISTS history_import_mappings (
+        source_id TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        legacy_source TEXT,
+        source_instance_id TEXT,
+        source_path TEXT,
+        harness_kind TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (source_id, native_session_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_history_import_mappings_session
+        ON history_import_mappings(session_id);
+
+      CREATE TABLE IF NOT EXISTS history_import_receipts (
+        request_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        disposition TEXT NOT NULL,
+        partial INTEGER NOT NULL DEFAULT 0,
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS session_change_log (
+        change_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        item_id TEXT,
+        payload_json TEXT,
+        committed_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_change_log_ws_seq
+        ON session_change_log(workspace_id, change_seq ASC);
+      CREATE INDEX IF NOT EXISTS idx_session_change_log_session
+        ON session_change_log(session_id, change_seq ASC);
     `);
 
     // Safe additive column migrations for existing user databases
@@ -887,8 +991,75 @@ export class HarnessMateStore {
     return { ...this.nativeSchemaStatus };
   }
 
+  onSessionChangeCommitted(listener: (latestSeq: number) => void): () => void {
+    this.commitListeners.add(listener);
+    return () => {
+      this.commitListeners.delete(listener);
+    };
+  }
+
+  private isSecretTurnBlock(blockType: string, payload?: Record<string, unknown>): boolean {
+    return blockType === 'secret_request' || (blockType === 'runtime_request' && payload?.kind === 'secret_request');
+  }
+
+  private appendSessionChangeInTx(
+    kind: SessionChangeKind,
+    sessionId: string,
+    workspaceId: string,
+    itemId: string | null = null,
+    payload?: Record<string, unknown>,
+    committedAt = Date.now(),
+  ): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO session_change_log (kind, session_id, workspace_id, item_id, payload_json, committed_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(kind, sessionId, workspaceId, itemId, payload ? JSON.stringify(payload) : null, committedAt);
+    const seq = Number(res.lastInsertRowid);
+    this.pendingCommitSeq = this.pendingCommitSeq === null ? seq : Math.max(this.pendingCommitSeq, seq);
+    return seq;
+  }
+
   runInImmediateTransaction<T>(fn: (db: DatabaseSync) => T): T {
+    if (this.txDepth > 0) {
+      return fn(this.db);
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.txDepth += 1;
+    try {
+      const result = fn(this.db);
+      this.db.exec('COMMIT');
+      this.txDepth -= 1;
+      const committedSeq = this.pendingCommitSeq;
+      this.pendingCommitSeq = null;
+      if (committedSeq !== null) {
+        for (const listener of [...this.commitListeners]) {
+          try {
+            listener(committedSeq);
+          } catch {
+            // Isolate listener errors from committed DB mutations
+          }
+        }
+      }
+      return result;
+    } catch (err) {
+      this.pendingCommitSeq = null;
+      this.txDepth -= 1;
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
+  runInReadTransaction<T>(fn: (db: DatabaseSync) => T): T {
+    if (this.txDepth > 0) {
+      return fn(this.db);
+    }
+    this.db.exec('BEGIN');
     try {
       const result = fn(this.db);
       this.db.exec('COMMIT');
@@ -954,8 +1125,20 @@ export class HarnessMateStore {
   }
 
   deleteWorkspace(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM workspaces WHERE id = ?').run(id);
-    return Number(res.changes) > 0;
+    return this.runInImmediateTransaction(() => {
+      const sessions = this.db
+        .prepare('SELECT id FROM sessions WHERE workspace_id = ?')
+        .all(id) as unknown as Array<{ id: string }>;
+      const res = this.db.prepare('DELETE FROM workspaces WHERE id = ?').run(id);
+      const deleted = Number(res.changes) > 0;
+      if (deleted) {
+        const now = Date.now();
+        for (const s of sessions) {
+          this.appendSessionChangeInTx('delete_session', s.id, id, null, undefined, now);
+        }
+      }
+      return deleted;
+    });
   }
 
   // ── Sessions ─────────────────────────────────────────────────────────
@@ -1019,79 +1202,88 @@ export class HarnessMateStore {
   }
 
   createSession(session: Session): Session {
-    const participating =
-      session.participatingHarnesses && session.participatingHarnesses.length > 0
-        ? session.participatingHarnesses
-        : [session.harnessId];
-    this.db
-      .prepare(
-        `INSERT INTO sessions (
-          id, workspace_id, harness_id, harness_kind, native_session_id,
-          parent_session_id, forked_from_turn_seq, fork_mode, import_mode, import_source,
-          participating_harnesses_json, context_sync_mode,
-          cwd, worktree_branch,
-          title, status, model, actual_model, model_rerouted_reason, reasoning_effort, permission_mode,
-          last_seq, usage_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        session.id,
-        session.workspaceId,
-        session.harnessId,
-        session.harnessKind,
-        session.nativeSessionId,
-        session.parentSessionId ?? null,
-        session.forkedFromTurnSeq ?? null,
-        session.forkMode ?? null,
-        session.importMode ?? null,
-        session.importSource ?? null,
-        JSON.stringify(participating),
-        session.contextSyncMode ?? 'auto',
-        session.cwd,
-        session.worktreeBranch ?? null,
-        session.title,
-        session.status,
-        session.model,
-        session.actualModel ?? null,
-        session.modelReroutedReason ?? null,
-        session.reasoningEffort,
-        session.permissionMode,
-        session.lastSeq,
-        session.usage ? JSON.stringify(session.usage) : null,
-        session.createdAt,
-        session.updatedAt,
-      );
+    return this.runInImmediateTransaction(() => {
+      const participating =
+        session.participatingHarnesses && session.participatingHarnesses.length > 0
+          ? session.participatingHarnesses
+          : [session.harnessId];
+      this.db
+        .prepare(
+          `INSERT INTO sessions (
+            id, workspace_id, harness_id, harness_kind, native_session_id,
+            parent_session_id, forked_from_turn_seq, fork_mode, import_mode, import_source,
+            participating_harnesses_json, context_sync_mode,
+            cwd, worktree_branch,
+            title, status, model, actual_model, model_rerouted_reason, reasoning_effort, permission_mode,
+            last_seq, usage_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          session.id,
+          session.workspaceId,
+          session.harnessId,
+          session.harnessKind,
+          session.nativeSessionId,
+          session.parentSessionId ?? null,
+          session.forkedFromTurnSeq ?? null,
+          session.forkMode ?? null,
+          session.importMode ?? null,
+          session.importSource ?? null,
+          JSON.stringify(participating),
+          session.contextSyncMode ?? 'auto',
+          session.cwd,
+          session.worktreeBranch ?? null,
+          session.title,
+          session.status,
+          session.model,
+          session.actualModel ?? null,
+          session.modelReroutedReason ?? null,
+          session.reasoningEffort,
+          session.permissionMode,
+          session.lastSeq,
+          session.usage ? JSON.stringify(session.usage) : null,
+          session.createdAt,
+          session.updatedAt,
+        );
 
-    this.upsertSessionBinding({
-      sessionId: session.id,
-      harnessId: session.harnessId,
-      harnessKind: session.harnessKind,
-      nativeSessionId: session.nativeSessionId,
-      lastModel: session.model,
-      lastActualModel: session.actualModel ?? null,
-      lastEffort: session.reasoningEffort,
-      syncedUpToSeq: session.lastSeq,
-      driverUsed: null,
-      updatedAt: session.updatedAt,
+      this.upsertSessionBinding({
+        sessionId: session.id,
+        harnessId: session.harnessId,
+        harnessKind: session.harnessKind,
+        nativeSessionId: session.nativeSessionId,
+        lastModel: session.model,
+        lastActualModel: session.actualModel ?? null,
+        lastEffort: session.reasoningEffort,
+        syncedUpToSeq: session.lastSeq,
+        driverUsed: null,
+        updatedAt: session.updatedAt,
+      });
+
+      this.upsertTaskState({
+        sessionId: session.id,
+        objective: '',
+        steps: [],
+        decisions: [],
+        touchedFiles: [],
+        verifications: [],
+        blockers: [],
+        pinnedFacts: [],
+        rollingSummary: '',
+        summarizedUpToSeq: 0,
+        version: 1,
+        ledgerFilePath: null,
+        updatedAt: session.updatedAt,
+      });
+
+      this.appendSessionChangeInTx('upsert_session', session.id, session.workspaceId, null, {
+        title: session.title,
+        status: session.status,
+        harnessId: session.harnessId,
+        harnessKind: session.harnessKind,
+      });
+
+      return this.getSession(session.id)!;
     });
-
-    this.upsertTaskState({
-      sessionId: session.id,
-      objective: '',
-      steps: [],
-      decisions: [],
-      touchedFiles: [],
-      verifications: [],
-      blockers: [],
-      pinnedFacts: [],
-      rollingSummary: '',
-      summarizedUpToSeq: 0,
-      version: 1,
-      ledgerFilePath: null,
-      updatedAt: session.updatedAt,
-    });
-
-    return this.getSession(session.id)!;
   }
 
   getImportedSession(
@@ -1103,15 +1295,112 @@ export class HarnessMateStore {
     return typeof row?.session_id === 'string' ? this.getSession(row.session_id) : null;
   }
 
+  getImportedSessionBySourceId(
+    sourceId: string,
+    nativeSessionId: string,
+    compatLegacySources: readonly string[] = [],
+  ): { session: Session; matchedVia: 'mapping' | 'legacy' } | null {
+    const mapped = this.db
+      .prepare('SELECT session_id FROM history_import_mappings WHERE source_id = ? AND native_session_id = ?')
+      .get(sourceId, nativeSessionId) as { session_id?: string } | undefined;
+    if (typeof mapped?.session_id === 'string') {
+      const session = this.getSession(mapped.session_id);
+      if (session) return { session, matchedVia: 'mapping' };
+    }
+    for (const legacySource of compatLegacySources) {
+      const legacy = this.db
+        .prepare('SELECT session_id FROM native_history_imports WHERE source = ? AND native_session_id = ?')
+        .get(legacySource, nativeSessionId) as { session_id?: string } | undefined;
+      if (typeof legacy?.session_id === 'string') {
+        const session = this.getSession(legacy.session_id);
+        if (session) return { session, matchedVia: 'legacy' };
+      }
+    }
+    return null;
+  }
+
+  getHistoryImportReceipt(requestId: string): HistoryImportReceiptRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM history_import_receipts WHERE request_id = ?')
+      .get(requestId) as
+      | {
+          request_id: string;
+          request_hash: string;
+          session_id: string;
+          disposition: string;
+          partial: number;
+          warnings_json: string;
+          created_at: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      requestId: row.request_id,
+      requestHash: row.request_hash,
+      sessionId: row.session_id,
+      disposition: row.disposition === 'created' ? 'created' : 'reused',
+      partial: row.partial === 1,
+      warnings: safeJsonParse<string[]>(row.warnings_json, []),
+      createdAt: row.created_at,
+    };
+  }
+
+  recordHistoryImportReceipt(receipt: HistoryImportReceiptRecord): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO history_import_receipts (
+          request_id, request_hash, session_id, disposition, partial, warnings_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        receipt.requestId,
+        receipt.requestHash,
+        receipt.sessionId,
+        receipt.disposition,
+        receipt.partial ? 1 : 0,
+        JSON.stringify(receipt.warnings ?? []),
+        receipt.createdAt,
+      );
+  }
+
+  upsertHistoryImportMapping(mapping: HistoryImportMappingRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO history_import_mappings (
+          source_id, native_session_id, session_id, legacy_source, source_instance_id, source_path, harness_kind, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id, native_session_id) DO NOTHING`,
+      )
+      .run(
+        mapping.sourceId,
+        mapping.nativeSessionId,
+        mapping.sessionId,
+        mapping.legacySource ?? null,
+        mapping.sourceInstanceId ?? null,
+        mapping.sourcePath ?? null,
+        mapping.harnessKind ?? null,
+        mapping.createdAt,
+      );
+  }
+
   getNativeHistory(sessionId: string, nativeSessionId: string): {
     source: DiscoveredCliSession['source']; sourcePath?: string;
   } | undefined {
     const row = this.db.prepare(
       'SELECT source, source_path FROM native_history_imports WHERE session_id = ? AND native_session_id = ?',
     ).get(sessionId, nativeSessionId);
-    if (!row) return undefined;
-    return { source: row.source as DiscoveredCliSession['source'],
-      sourcePath: typeof row.source_path === 'string' ? row.source_path : undefined };
+    if (row) {
+      return { source: row.source as DiscoveredCliSession['source'],
+        sourcePath: typeof row.source_path === 'string' ? row.source_path : undefined };
+    }
+    const mapped = this.db.prepare(
+      'SELECT legacy_source, source_id, source_path FROM history_import_mappings WHERE session_id = ? AND native_session_id = ?',
+    ).get(sessionId, nativeSessionId) as { legacy_source?: string | null; source_id?: string; source_path?: string | null } | undefined;
+    if (!mapped) return undefined;
+    return {
+      source: (mapped.legacy_source || mapped.source_id || 'custom') as DiscoveredCliSession['source'],
+      sourcePath: typeof mapped.source_path === 'string' ? mapped.source_path : undefined,
+    };
   }
 
   importSession(
@@ -1120,11 +1409,9 @@ export class HarnessMateStore {
     sourcePath: string | undefined,
     events: Array<Omit<CanonicalEvent, 'sessionId' | 'seq'>>,
   ): Session {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runInImmediateTransaction(() => {
       const existing = this.getImportedSession(source, session.nativeSessionId!);
       if (existing) {
-        this.db.exec('COMMIT');
         return existing;
       }
       const imported = this.createSession({ ...session, lastSeq: events.length });
@@ -1135,12 +1422,17 @@ export class HarnessMateStore {
       }
       this.db.prepare(`INSERT INTO native_history_imports (source, native_session_id, session_id, source_path)
         VALUES (?, ?, ?, ?)`).run(source, session.nativeSessionId, session.id, sourcePath ?? null);
-      this.db.exec('COMMIT');
+      this.upsertHistoryImportMapping({
+        sourceId: source,
+        nativeSessionId: session.nativeSessionId!,
+        sessionId: session.id,
+        legacySource: source,
+        sourcePath: sourcePath ?? null,
+        harnessKind: session.harnessKind,
+        createdAt: session.createdAt,
+      });
       return imported;
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
-    }
+    });
   }
 
   updateSession(
@@ -1162,78 +1454,106 @@ export class HarnessMateStore {
       updatedAt: number;
     }>,
   ): Session | null {
-    const sets: string[] = [];
-    const params: (string | number | null)[] = [];
+    return this.runInImmediateTransaction(() => {
+      const sets: string[] = [];
+      const params: (string | number | null)[] = [];
 
-    if (patch.harnessId !== undefined) {
-      sets.push('harness_id = ?');
-      params.push(patch.harnessId);
-    }
-    if (patch.harnessKind !== undefined) {
-      sets.push('harness_kind = ?');
-      params.push(patch.harnessKind);
-    }
-    if (patch.nativeSessionId !== undefined) {
-      sets.push('native_session_id = ?');
-      params.push(patch.nativeSessionId);
-    }
-    if (patch.participatingHarnesses !== undefined) {
-      sets.push('participating_harnesses_json = ?');
-      params.push(JSON.stringify(patch.participatingHarnesses));
-    }
-    if (patch.contextSyncMode !== undefined) {
-      sets.push('context_sync_mode = ?');
-      params.push(patch.contextSyncMode);
-    }
-    if (patch.title !== undefined) {
-      sets.push('title = ?');
-      params.push(patch.title);
-    }
-    if (patch.status !== undefined) {
-      sets.push('status = ?');
-      params.push(patch.status);
-    }
-    if (patch.model !== undefined) {
-      sets.push('model = ?');
-      params.push(patch.model);
-    }
-    if (patch.actualModel !== undefined) {
-      sets.push('actual_model = ?');
-      params.push(patch.actualModel);
-    }
-    if (patch.modelReroutedReason !== undefined) {
-      sets.push('model_rerouted_reason = ?');
-      params.push(patch.modelReroutedReason);
-    }
-    if (patch.reasoningEffort !== undefined) {
-      sets.push('reasoning_effort = ?');
-      params.push(patch.reasoningEffort);
-    }
-    if (patch.permissionMode !== undefined) {
-      sets.push('permission_mode = ?');
-      params.push(patch.permissionMode);
-    }
-    if (patch.usage !== undefined) {
-      sets.push('usage_json = ?');
-      params.push(patch.usage ? JSON.stringify(patch.usage) : null);
-    }
+      if (patch.harnessId !== undefined) {
+        sets.push('harness_id = ?');
+        params.push(patch.harnessId);
+      }
+      if (patch.harnessKind !== undefined) {
+        sets.push('harness_kind = ?');
+        params.push(patch.harnessKind);
+      }
+      if (patch.nativeSessionId !== undefined) {
+        sets.push('native_session_id = ?');
+        params.push(patch.nativeSessionId);
+      }
+      if (patch.participatingHarnesses !== undefined) {
+        sets.push('participating_harnesses_json = ?');
+        params.push(JSON.stringify(patch.participatingHarnesses));
+      }
+      if (patch.contextSyncMode !== undefined) {
+        sets.push('context_sync_mode = ?');
+        params.push(patch.contextSyncMode);
+      }
+      if (patch.title !== undefined) {
+        sets.push('title = ?');
+        params.push(patch.title);
+      }
+      if (patch.status !== undefined) {
+        sets.push('status = ?');
+        params.push(patch.status);
+      }
+      if (patch.model !== undefined) {
+        sets.push('model = ?');
+        params.push(patch.model);
+      }
+      if (patch.actualModel !== undefined) {
+        sets.push('actual_model = ?');
+        params.push(patch.actualModel);
+      }
+      if (patch.modelReroutedReason !== undefined) {
+        sets.push('model_rerouted_reason = ?');
+        params.push(patch.modelReroutedReason);
+      }
+      if (patch.reasoningEffort !== undefined) {
+        sets.push('reasoning_effort = ?');
+        params.push(patch.reasoningEffort);
+      }
+      if (patch.permissionMode !== undefined) {
+        sets.push('permission_mode = ?');
+        params.push(patch.permissionMode);
+      }
+      if (patch.usage !== undefined) {
+        sets.push('usage_json = ?');
+        params.push(patch.usage ? JSON.stringify(patch.usage) : null);
+      }
 
-    sets.push('updated_at = ?');
-    params.push(patch.updatedAt ?? Date.now());
-    params.push(id);
+      const updatedAt = patch.updatedAt ?? Date.now();
+      sets.push('updated_at = ?');
+      params.push(updatedAt);
+      params.push(id);
 
-    this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...params);
-    return this.getSession(id);
+      const res = this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+      const updated = this.getSession(id);
+      if (Number(res.changes) > 0 && updated) {
+        this.appendSessionChangeInTx(
+          'upsert_session',
+          updated.id,
+          updated.workspaceId,
+          null,
+          {
+            title: updated.title,
+            status: updated.status,
+            harnessId: updated.harnessId,
+            harnessKind: updated.harnessKind,
+          },
+          updatedAt,
+        );
+      }
+      return updated;
+    });
   }
 
   deleteSession(id: string): boolean {
-    try {
-      this.db.prepare('DELETE FROM session_search_fts WHERE session_id = ?').run(id);
-    } catch {
-      // ignore if FTS table is unavailable
-    }
-    const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
-    return Number(res.changes) > 0;
+    return this.runInImmediateTransaction(() => {
+      const existing = this.db
+        .prepare('SELECT workspace_id FROM sessions WHERE id = ?')
+        .get(id) as { workspace_id?: string } | undefined;
+      try {
+        this.db.prepare('DELETE FROM session_search_fts WHERE session_id = ?').run(id);
+      } catch {
+        // ignore if FTS table is unavailable
+      }
+      const res = this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      const deleted = Number(res.changes) > 0;
+      if (deleted && existing?.workspace_id) {
+        this.appendSessionChangeInTx('delete_session', id, existing.workspace_id, null);
+      }
+      return deleted;
+    });
   }
 
   updateSessionForkMeta(
@@ -1408,8 +1728,7 @@ export class HarnessMateStore {
     turnId: string | null = null,
     createdAt: number = Date.now(),
   ): CanonicalEvent {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runInImmediateTransaction(() => {
       const row = this.db
         .prepare('SELECT last_seq FROM sessions WHERE id = ?')
         .get(sessionId) as unknown as { last_seq: number } | undefined;
@@ -1426,7 +1745,6 @@ export class HarnessMateStore {
       this.db
         .prepare('UPDATE sessions SET last_seq = ?, updated_at = ? WHERE id = ?')
         .run(nextSeq, createdAt, sessionId);
-      this.db.exec('COMMIT');
 
       return {
         sessionId,
@@ -1436,10 +1754,39 @@ export class HarnessMateStore {
         createdAt,
         payload,
       };
-    } catch (err) {
-      this.db.exec('ROLLBACK');
-      throw err;
+    });
+  }
+
+  insertEventsBatchInTx(
+    sessionId: string,
+    events: Array<Omit<CanonicalEvent, 'sessionId' | 'seq'>>,
+    startingSeq = 0,
+  ): number {
+    const insert = this.db.prepare(
+      `INSERT INTO session_events (session_id, seq, type, turn_id, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    let seq = startingSeq;
+    for (const ev of events) {
+      seq += 1;
+      insert.run(sessionId, seq, ev.type, ev.turnId ?? null, JSON.stringify(ev.payload), ev.createdAt);
     }
+    this.db.prepare('UPDATE sessions SET last_seq = ? WHERE id = ?').run(seq, sessionId);
+    return seq;
+  }
+
+  insertLegacyNativeImportIgnore(
+    source: string,
+    nativeSessionId: string,
+    sessionId: string,
+    sourcePath?: string | null,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO native_history_imports (source, native_session_id, session_id, source_path)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(source, nativeSessionId, sessionId, sourcePath ?? null);
   }
 
   getEventsAfter(sessionId: string, afterSeq = 0, limit = 1000): CanonicalEvent[] {
@@ -2146,42 +2493,211 @@ export class HarnessMateStore {
   // ── Phase 0 V2 Materialized Turn Items, Runs, Outbox, Handoffs, Checkpoints & FTS5 ──
 
   upsertTurnItem(item: TurnBlockRecord): TurnBlockRecord {
-    this.db
-      .prepare(
-        `INSERT INTO session_turn_items (
-          item_id, session_id, turn_id, seq, instance_id, driver_id, block_type,
-          status, title, text_body, payload_json, output_omitted, omitted_bytes,
-          raw_ref_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(item_id) DO UPDATE SET
-          status = excluded.status,
-          title = CASE WHEN excluded.title != '' THEN excluded.title ELSE session_turn_items.title END,
-          text_body = excluded.text_body,
-          payload_json = excluded.payload_json,
-          output_omitted = excluded.output_omitted,
-          omitted_bytes = excluded.omitted_bytes,
-          raw_ref_json = COALESCE(excluded.raw_ref_json, session_turn_items.raw_ref_json),
-          updated_at = excluded.updated_at`,
-      )
-      .run(
-        item.itemId,
-        item.sessionId,
-        item.turnId ?? null,
-        item.seq,
-        item.instanceId,
-        item.driverId,
-        item.blockType,
-        item.status,
-        item.title ?? '',
-        item.textBody ?? '',
-        JSON.stringify(item.payload ?? {}),
-        item.outputOmitted ? 1 : 0,
-        item.omittedBytes ?? 0,
-        item.rawRef ? JSON.stringify(item.rawRef) : null,
-        item.createdAt,
-        item.updatedAt,
-      );
-    return this.getTurnItem(item.itemId)!;
+    return this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO session_turn_items (
+            item_id, session_id, turn_id, seq, instance_id, driver_id, block_type,
+            status, title, text_body, payload_json, output_omitted, omitted_bytes,
+            raw_ref_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(item_id) DO UPDATE SET
+            status = excluded.status,
+            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE session_turn_items.title END,
+            text_body = excluded.text_body,
+            payload_json = excluded.payload_json,
+            output_omitted = excluded.output_omitted,
+            omitted_bytes = excluded.omitted_bytes,
+            raw_ref_json = COALESCE(excluded.raw_ref_json, session_turn_items.raw_ref_json),
+            updated_at = excluded.updated_at`,
+        )
+        .run(
+          item.itemId,
+          item.sessionId,
+          item.turnId ?? null,
+          item.seq,
+          item.instanceId,
+          item.driverId,
+          item.blockType,
+          item.status,
+          item.title ?? '',
+          item.textBody ?? '',
+          JSON.stringify(item.payload ?? {}),
+          item.outputOmitted ? 1 : 0,
+          item.omittedBytes ?? 0,
+          item.rawRef ? JSON.stringify(item.rawRef) : null,
+          item.createdAt,
+          item.updatedAt,
+        );
+      if (!this.isSecretTurnBlock(item.blockType, item.payload) && (item.textBody ?? '').trim()) {
+        const row = this.db
+          .prepare('SELECT workspace_id FROM sessions WHERE id = ?')
+          .get(item.sessionId) as { workspace_id?: string } | undefined;
+        if (row?.workspace_id) {
+          this.appendSessionChangeInTx(
+            'upsert_item',
+            item.sessionId,
+            row.workspace_id,
+            item.itemId,
+            undefined,
+            item.updatedAt,
+          );
+        }
+      }
+      return this.getTurnItem(item.itemId)!;
+    });
+  }
+
+  deleteTurnItem(sessionId: string, itemId: string): boolean {
+    return this.runInImmediateTransaction(() => {
+      const row = this.db
+        .prepare('SELECT workspace_id FROM sessions WHERE id = ?')
+        .get(sessionId) as { workspace_id?: string } | undefined;
+      const res = this.db
+        .prepare('DELETE FROM session_turn_items WHERE session_id = ? AND item_id = ?')
+        .run(sessionId, itemId);
+      const deleted = Number(res.changes) > 0;
+      if (deleted && row?.workspace_id) {
+        this.appendSessionChangeInTx('delete_item', sessionId, row.workspace_id, itemId);
+      }
+      return deleted;
+    });
+  }
+
+  getLatestSessionChangeSeq(): number {
+    const row = this.db
+      .prepare('SELECT COALESCE(MAX(change_seq), 0) AS latest_seq FROM session_change_log')
+      .get() as { latest_seq?: number } | undefined;
+    return typeof row?.latest_seq === 'number' ? row.latest_seq : 0;
+  }
+
+  listSnapshotTurnItems(workspaceId?: string): { watermarkSeq: number; items: SnapshotTurnItemRow[] } {
+    return this.runInReadTransaction(() => {
+      const watermarkSeq = this.getLatestSessionChangeSeq();
+      const sql = `SELECT ti.session_id, s.title AS session_title, s.workspace_id,
+                          ti.item_id, COALESCE(ti.turn_id, '') AS turn_id, ti.seq AS turn_seq,
+                          ti.driver_id, ti.block_type, ti.text_body, ti.payload_json,
+                          ti.created_at, ti.updated_at
+                   FROM session_turn_items ti
+                   JOIN sessions s ON s.id = ti.session_id
+                   WHERE ti.text_body != ''
+                     AND ti.block_type != 'secret_request'
+                     ${workspaceId ? 'AND s.workspace_id = ?' : ''}
+                   ORDER BY ti.session_id ASC, ti.seq ASC, ti.item_id ASC`;
+      const rows = (workspaceId
+        ? this.db.prepare(sql).all(workspaceId)
+        : this.db.prepare(sql).all()) as unknown as Array<{
+        session_id: string;
+        session_title: string;
+        workspace_id: string;
+        item_id: string;
+        turn_id: string;
+        turn_seq: number;
+        driver_id: string;
+        block_type: string;
+        text_body: string;
+        payload_json: string;
+        created_at: number;
+        updated_at: number;
+      }>;
+
+      const items: SnapshotTurnItemRow[] = [];
+      for (const row of rows) {
+        if (!row.text_body.trim()) continue;
+        const payload = safeJsonParse<Record<string, unknown>>(row.payload_json, {});
+        if (this.isSecretTurnBlock(row.block_type, payload)) continue;
+        items.push({
+          sessionId: row.session_id,
+          sessionTitle: row.session_title,
+          workspaceId: row.workspace_id,
+          itemId: row.item_id,
+          turnId: row.turn_id,
+          turnSeq: row.turn_seq,
+          driverId: row.driver_id,
+          blockType: row.block_type,
+          textBody: row.text_body,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        });
+      }
+      return { watermarkSeq, items };
+    });
+  }
+
+  listCommittedSessionChanges(opts: {
+    afterSeq: number;
+    limit: number;
+    workspaceId?: string;
+  }): { latestSeq: number; rows: CommittedChangeRawRow[]; hasMore: boolean } {
+    return this.runInReadTransaction(() => {
+      const latestSeq = this.getLatestSessionChangeSeq();
+      const safeAfter = Math.max(0, Math.floor(opts.afterSeq));
+      const safeLimit = Math.min(1000, Math.max(1, Math.floor(opts.limit)));
+      const sql = `SELECT l.change_seq, l.kind, l.session_id, l.workspace_id, l.item_id, l.payload_json, l.committed_at,
+                          ti.turn_id, ti.seq AS turn_seq, ti.driver_id, ti.block_type, ti.text_body,
+                          ti.payload_json AS item_payload_json, ti.created_at AS item_created_at, ti.updated_at AS item_updated_at,
+                          s.title AS session_title, s.harness_id, s.harness_kind, s.status AS session_status, s.updated_at AS session_updated_at
+                   FROM session_change_log l
+                   LEFT JOIN session_turn_items ti ON ti.item_id = l.item_id
+                   LEFT JOIN sessions s ON s.id = l.session_id
+                   WHERE l.change_seq > ?
+                     ${opts.workspaceId ? 'AND l.workspace_id = ?' : ''}
+                   ORDER BY l.change_seq ASC
+                   LIMIT ?`;
+      const params: Array<string | number> = opts.workspaceId
+        ? [safeAfter, opts.workspaceId, safeLimit + 1]
+        : [safeAfter, safeLimit + 1];
+      const raw = this.db.prepare(sql).all(...params) as unknown as Array<{
+        change_seq: number;
+        kind: string;
+        session_id: string;
+        workspace_id: string;
+        item_id: string | null;
+        payload_json: string | null;
+        committed_at: number;
+        turn_id: string | null;
+        turn_seq: number | null;
+        driver_id: string | null;
+        block_type: string | null;
+        text_body: string | null;
+        item_payload_json: string | null;
+        item_created_at: number | null;
+        item_updated_at: number | null;
+        session_title: string | null;
+        harness_id: string | null;
+        harness_kind: string | null;
+        session_status: string | null;
+        session_updated_at: number | null;
+      }>;
+      const hasMore = raw.length > safeLimit;
+      const sliced = hasMore ? raw.slice(0, safeLimit) : raw;
+      return {
+        latestSeq,
+        hasMore,
+        rows: sliced.map((r) => ({
+          changeSeq: r.change_seq,
+          kind: r.kind as SessionChangeKind,
+          sessionId: r.session_id,
+          workspaceId: r.workspace_id,
+          itemId: r.item_id,
+          committedAt: r.committed_at,
+          payloadJson: r.payload_json,
+          turnId: r.turn_id,
+          turnSeq: r.turn_seq,
+          driverId: r.driver_id,
+          blockType: r.block_type,
+          textBody: r.text_body,
+          itemPayloadJson: r.item_payload_json,
+          itemCreatedAt: r.item_created_at,
+          itemUpdatedAt: r.item_updated_at,
+          sessionTitle: r.session_title,
+          harnessId: r.harness_id,
+          harnessKind: r.harness_kind,
+          sessionStatus: r.session_status,
+          sessionUpdatedAt: r.session_updated_at,
+        })),
+      };
+    });
   }
 
   getTurnItem(itemId: string): TurnBlockRecord | null {

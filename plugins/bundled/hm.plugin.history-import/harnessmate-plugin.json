@@ -1,0 +1,33 @@
+{
+  "id": "hm.plugin.history-import",
+  "name": "历史会话导入",
+  "version": "1.0.0",
+  "description": "协调本机历史来源发现、预览、目标工作区选择与原子化会话及归档包导入。",
+  "author": "HarnessMate Core",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "history.import.v1"
+  ],
+  "dependencies": {
+    "sessionData": {
+      "contract": "hm.session-data.v1",
+      "optional": true
+    }
+  },
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "history-import",
+        "title": "历史会话导入",
+        "ui": "ui/panel.html",
+        "order": 30
+      }
+    ]
+  }
+}
