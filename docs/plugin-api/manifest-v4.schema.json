@@ -73,7 +73,14 @@
                   "approval.policy.v1",
                   "history.source.v1",
                   "history.import.v1",
-                  "session.search.v1"
+                  "session.search.v1",
+                  "git.workspace.v1",
+                  "git.checkpoint.v1",
+                  "terminal.workspace.v1",
+                  "terminal.runner.v1",
+                  "workspace.files.v1",
+                  "session.attachments.v1",
+                  "workspace.rules.v1"
                 ]
               },
               {
@@ -765,6 +772,8 @@
                       "composer.traits",
                       "harness.settings",
                       "inspector.diff",
+                      "inspector.files",
+                      "inspector.rules",
                       "session.sidebar.badge"
                     ]
                   },

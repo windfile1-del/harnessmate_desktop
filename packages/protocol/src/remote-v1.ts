@@ -216,6 +216,7 @@ export type CreateWorktreeRequest = z.infer<typeof CreateWorktreeRequestSchema>;
 export const RemoveWorktreeRequestSchema = z.object({
   worktreePath: z.string().trim().min(1),
   force: z.boolean().optional(),
+  releaseTerminals: z.boolean().optional(),
 });
 export type RemoveWorktreeRequest = z.infer<typeof RemoveWorktreeRequestSchema>;
 

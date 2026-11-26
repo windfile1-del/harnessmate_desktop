@@ -32,7 +32,7 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 ```
 
 ## 3. Public Events & Host Services
-- Host services: `approval-center`, `checkpoints`, `compressor`, `failover`, `git`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `ledger`, `native-commands`, `orchestrator`, `session-search`, `terminal-workspace`, `triage-inbox`, `usage`.
+- Host services: `approval-center`, `attachments`, `checkpoints`, `compressor`, `failover`, `files`, `git`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `ledger`, `native-commands`, `orchestrator`, `rules`, `rules`, `session-search`, `terminal`, `terminal-workspace`, `triage-inbox`, `usage`.
 - Replaceable public services (with `service:provide:<name>`): `ledger`, `handoff`, `git`, `usage`, `notify`.
 
 | Event / Hook | Mode | Permission |
@@ -75,13 +75,15 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 | `session.sidebar.badge` | `list` | `session-maybe` | 侧栏会话行轻量状态徽标 |
 | `workspace.pages` | `list` | `root` | 在侧栏提供入口并在主工作区打开独立插件页面 |
 | `workspace.start` | `single` | `root` | 组合中提供的应用启动页与主工作区布局 |
+| `inspector.files` | `single` | `session` | 接管或增强右侧工作区文件浏览与行号预览视图 |
+| `inspector.rules` | `single` | `session` | 接管或增强右侧项目规则与 Skills 视图 |
 
 - Sandbox iframe CSP: `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'`.
 - Bridge API inside HTML: `window.harnessMate.{ session, props, onContext(cb), sendToPlugin(payload), setDraft(text), toast(title, body, level) }`.
 - Styling: use host CSS vars (`--bg-surface`, `--bg-elevated`, `--text-primary`, `--text-secondary`, `--border-hairline`, `--accent-indigo`).
 
 ## 5. Error Codes & Permission Risk Matrix
-- Error codes: `E_PERMISSION_DENIED`, `E_SERVICE_UNAVAILABLE`, `E_NOT_SUPPORTED`, `E_TIMEOUT`, `E_INVALID_INPUT`, `E_LIMIT_EXCEEDED`, `E_CONFLICT`, `E_STALE_RUN`, `E_CIRCULAR_DEPENDENCY`.
+- Error codes: `E_PERMISSION_DENIED`, `E_SERVICE_UNAVAILABLE`, `E_NOT_SUPPORTED`, `E_TIMEOUT`, `E_INVALID_INPUT`, `E_LIMIT_EXCEEDED`, `E_CONFLICT`, `E_STALE_RUN`, `E_CIRCULAR_DEPENDENCY`, `E_PLUGIN_DISABLED`.
 - Static permissions (29): `events:turn`, `events:message`, `events:tool`, `events:approval`, `session:read`, `session:command`, `session:send`, `session:fork`, `session:switch`, `session:orchestrate`, `composer:suggest`, `handoff:section`, `handoff:redact`, `context:compressor`, `approvals:annotate`, `storage:plugin`, `storage:workspace`, `fs:workspace:read`, `fs:workspace:write`, `fs:cli_histories:read`, `workspace:git:read`, `workspace:git:write`, `process:pty:workspace`, `harness:driver:register`, `notify`, `clipboard:write`, `browser:preview`, `file:preview`, `tools:model`.
 - Dynamic permissions: `net:<host>` (medium), `service:provide:<name>` (medium), `process:spawn:<bin>` (high), `secrets:read:<ns>` (high).
 - High-risk permissions requiring explicit review: `harness:driver:register`, `process:spawn:*`, `secrets:read:*`, `fs:workspace:write`, `workspace:git:write`, `process:pty:workspace`, `handoff:redact`.

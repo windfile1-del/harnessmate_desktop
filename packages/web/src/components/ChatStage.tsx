@@ -58,6 +58,11 @@ import {
 } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { daemonApi, resolveAttachmentUrl } from '../api/client';
+import {
+  SESSION_ATTACHMENTS_CONTRACT,
+  WORKSPACE_FILES_CONTRACT,
+  isContractAvailableClientSide,
+} from '../api/peer-contracts';
 import { formatPluginSummary, listPluginPanels } from '../lib/plugin-panels';
 import {
   formatTokenCount,
@@ -216,6 +221,10 @@ export function ChatStage() {
     clearDraft,
     pushToast,
     isPluginEnabled,
+    compositionEntries,
+    compositionBindings,
+    workspaceBindingsByWorkspace,
+    sessionBindingsBySession,
     agyNativeWorkbenchEnabled,
     selectedNativeRuntime,
     agyAuthStates,
@@ -273,6 +282,10 @@ export function ChatStage() {
     clearDraft: state.clearDraft,
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
+    compositionEntries: state.compositionEntries,
+    compositionBindings: state.compositionBindings,
+    workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace,
+    sessionBindingsBySession: state.sessionBindingsBySession,
     agyNativeWorkbenchEnabled: state.agyNativeWorkbenchEnabled,
     selectedNativeRuntime: state.selectedSessionId ? state.nativeRuntimeBySession[state.selectedSessionId] : undefined,
     agyAuthStates: state.agyAuthStates,
@@ -575,16 +588,39 @@ export function ChatStage() {
   }, [inputText, selectedSessionId]);
 
   // Trigger workspace file search when @file picker is open
+  const filesEnabled = useMemo(
+    () =>
+      isContractAvailableClientSide({
+        contract: WORKSPACE_FILES_CONTRACT,
+        legacyPluginId: 'core.terminal-runner',
+        plugins,
+        sessionBindings: session ? sessionBindingsBySession[session.id] : undefined,
+        workspaceBindings: session ? workspaceBindingsByWorkspace[session.workspaceId] : undefined,
+        compositionBindings,
+        compositionEntries,
+      }),
+    [plugins, session, sessionBindingsBySession, workspaceBindingsByWorkspace, compositionBindings, compositionEntries],
+  );
+
   useEffect(() => {
-    if (!filePickerOpen || !session) return;
+    if (!filePickerOpen || !session || !filesEnabled) {
+      if (!filesEnabled) setFilePickerItems([]);
+      return;
+    }
+    let cancelled = false;
     const timer = window.setTimeout(() => {
       void daemonApi
         .searchSessionFiles(session.id, filePickerQuery)
-        .then((res) => setFilePickerItems(res.files.slice(0, 14)))
+        .then((res) => {
+          if (!cancelled) setFilePickerItems(res.files.slice(0, 14));
+        })
         .catch(() => {});
     }, 100);
-    return () => window.clearTimeout(timer);
-  }, [filePickerOpen, filePickerQuery, session]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [filePickerOpen, filePickerQuery, session, filesEnabled]);
 
   const nativeCommands = nativeCommandsEnabled && commandCatalog?.key === commandCatalogKey
     ? commandCatalog.commands : [];
@@ -631,7 +667,15 @@ export function ChatStage() {
   const isRunning = session.status === 'running' || session.status === 'awaiting_approval';
   const permissionModes = new Set<PermissionMode>(harness?.capabilities.permissionModes ?? ['plan', 'accept_edits', 'auto']);
   permissionModes.add(session.permissionMode);
-  const attachmentsEnabled = isPluginEnabled('core.attachments');
+  const attachmentsEnabled = isContractAvailableClientSide({
+    contract: SESSION_ATTACHMENTS_CONTRACT,
+    legacyPluginId: 'core.attachments',
+    plugins,
+    sessionBindings: session ? sessionBindingsBySession[session.id] : undefined,
+    workspaceBindings: session ? workspaceBindingsByWorkspace[session.workspaceId] : undefined,
+    compositionBindings,
+    compositionEntries,
+  });
   const commandMatch = pluginMode ? null : /^\/([\w-]+)(?:\s+([\s\S]*))?$/.exec(inputText.trim());
   const typedCommand = commandMatch?.[1]?.toLowerCase();
   const commandArgs = commandMatch?.[2]?.trim() ?? '';

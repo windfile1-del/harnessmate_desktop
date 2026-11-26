@@ -15,6 +15,8 @@ import {
   type FilePreviewRequest,
   type FilePreviewResult,
   type PluginEventV4,
+  type PluginRouteRequest,
+  type PluginRouteResponse,
   type ResolveServiceSelectionOptions,
   type ServiceResolutionV1,
 } from '@harnessmate/plugin-api';
@@ -340,6 +342,30 @@ export class PluginManager {
     }
     const value = (await (fn as (...callArgs: unknown[]) => unknown)(...args)) as T;
     return { resolution, value };
+  }
+
+  hasInstanceRoutes(instanceId: string): boolean {
+    return this.host.hasRoutes(instanceId) || Boolean(this.isolated?.listRoutes(instanceId).length);
+  }
+
+  async dispatchPluginRoute(instanceId: string, req: PluginRouteRequest): Promise<PluginRouteResponse> {
+    if (this.host.hasRoutes(instanceId)) {
+      return this.host.dispatchRoute(instanceId, req);
+    }
+    if (this.isInstanceKnownDisabled(instanceId)) {
+      throw new PluginApiError('E_PLUGIN_DISABLED', `插件实例 ${instanceId} 当前已停用`);
+    }
+    if (this.isolated?.getActive(instanceId)) {
+      return this.isolated.dispatchRoute(instanceId, req);
+    }
+    const inst = this.instances.get(instanceId);
+    if (inst && !inst.info.main) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', `插件实例 ${instanceId} 未注册路由或未就绪`);
+    }
+    if (!this.isolated) {
+      throw new PluginApiError('E_NOT_SUPPORTED', '隔离插件运行时不可用');
+    }
+    return this.isolated.dispatchRoute(instanceId, req);
   }
 
   setCompositionBinding(contract: string, instanceId: string | null): Promise<void> {

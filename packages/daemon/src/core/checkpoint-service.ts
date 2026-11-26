@@ -9,6 +9,7 @@ import type {
   SessionCheckpointRecord,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
+import { sharedGitRepoCoordinator } from './git-repo-lock.js';
 import { inspectGitRepo, runGitFull } from './git-service.js';
 
 export const CHECKPOINT_REF_PREFIX = 'refs/harnessmate/checkpoints';
@@ -226,6 +227,17 @@ export class CheckpointService {
    * matches the newly captured tree SHA.
    */
   async capture(params: {
+    sessionId: string;
+    cwd: string;
+    turnSeq: number;
+    phase: SessionCheckpointRecord['phase'];
+    skipIfUnchangedFromTreeSha?: string | null;
+    compareAgainstTreeSha?: string | null;
+  }): Promise<SessionCheckpointRecord | null> {
+    return sharedGitRepoCoordinator.runExclusive(params.cwd, () => this.captureUnlocked(params));
+  }
+
+  private async captureUnlocked(params: {
     sessionId: string;
     cwd: string;
     turnSeq: number;
@@ -526,96 +538,98 @@ export class CheckpointService {
     mode: CheckpointRevertMode;
     hooks: CheckpointRevertHooks;
   }): Promise<CheckpointRevertResult> {
-    const records = this.list(params.sessionId, 500);
-    let target: SessionCheckpointRecord | null = null;
-    if (params.checkpointId) {
-      target = this.get(params.checkpointId);
-      if (target && target.sessionId !== params.sessionId) target = null;
-    } else if (params.targetTurnSeq !== undefined) {
-      const matching = records.filter((r) => r.turnSeq === params.targetTurnSeq);
-      // Reverting to a turn restores the state BEFORE that turn ran (`turn_pre`), falling back to any record for that seq
-      target =
-        matching.find((r) => r.phase === 'turn_pre') ??
-        matching.find((r) => r.phase === 'pre_revert') ??
-        matching[0] ??
-        null;
-    }
+    return sharedGitRepoCoordinator.runExclusive(params.cwd, async () => {
+      const records = this.list(params.sessionId, 500);
+      let target: SessionCheckpointRecord | null = null;
+      if (params.checkpointId) {
+        target = this.get(params.checkpointId);
+        if (target && target.sessionId !== params.sessionId) target = null;
+      } else if (params.targetTurnSeq !== undefined) {
+        const matching = records.filter((r) => r.turnSeq === params.targetTurnSeq);
+        // Reverting to a turn restores the state BEFORE that turn ran (`turn_pre`), falling back to any record for that seq
+        target =
+          matching.find((r) => r.phase === 'turn_pre') ??
+          matching.find((r) => r.phase === 'pre_revert') ??
+          matching[0] ??
+          null;
+      }
 
-    if (!target) {
-      throw new CheckpointError('E_CHECKPOINT_NOT_FOUND', '未找到目标检查点记录');
-    }
+      if (!target) {
+        throw new CheckpointError('E_CHECKPOINT_NOT_FOUND', '未找到目标检查点记录');
+      }
 
-    // Step 1: Verify Git object health BEFORE touching anything
-    const alive = await this.verifyTreeAlive(params.cwd, target.treeSha);
-    if (!alive) {
-      throw new CheckpointError(
-        'E_CHECKPOINT_MISSING',
-        `检查点 Git 对象已丢失 (${target.treeSha.slice(0, 10)})，无法安全回滚（可能已被外部 git gc 清理），未修改任何工作区文件。`,
+      // Step 1: Verify Git object health BEFORE touching anything
+      const alive = await this.verifyTreeAlive(params.cwd, target.treeSha);
+      if (!alive) {
+        throw new CheckpointError(
+          'E_CHECKPOINT_MISSING',
+          `检查点 Git 对象已丢失 (${target.treeSha.slice(0, 10)})，无法安全回滚（可能已被外部 git gc 清理），未修改任何工作区文件。`,
+        );
+      }
+
+      // Step 2: Conversation Rollback First Guard (strictly before any disk write)
+      let nativeRolledBack = false;
+      let newNativeBindingReset = false;
+
+      if (params.mode === 'native_and_files') {
+        if (!params.hooks.supportsNativeRollback) {
+          throw new CheckpointError(
+            'E_NATIVE_ROLLBACK_UNSUPPORTED',
+            '当前 Harness 驱动不支持原生对话回滚，严禁静默伪造。请明确选择“仅还原文件 (files_only)”或“还原文件并开启新原生分支 (fork_new_branch)”。',
+          );
+        }
+        if (!params.hooks.performNativeRollback) {
+          throw new CheckpointError(
+            'E_NATIVE_ROLLBACK_FAILED',
+            '当前会话未绑定可回滚的原生对话句柄',
+          );
+        }
+        // If this throws, we abort BEFORE modifying any files on disk
+        await params.hooks.performNativeRollback(Math.max(1, params.hooks.turnsToRollback ?? 1));
+        nativeRolledBack = true;
+      } else if (params.mode === 'fork_new_branch') {
+        if (params.hooks.resetNativeBinding) {
+          await params.hooks.resetNativeBinding();
+          newNativeBindingReset = true;
+        }
+      }
+
+      // Step 3: Mandatory `pre_revert` protective checkpoint for byte-for-byte Undo Revert
+      const preRevert = await this.captureUnlocked({
+        sessionId: params.sessionId,
+        cwd: params.cwd,
+        turnSeq: target.turnSeq,
+        phase: 'pre_revert',
+        compareAgainstTreeSha: target.treeSha,
+      });
+      if (!preRevert) {
+        throw new CheckpointError('E_PRE_REVERT_FAILED', '无法在回滚前保存 pre_revert 保护性快照，已中止回滚');
+      }
+
+      // Step 4: Restore working tree from target.treeSha using isolated temp GIT_INDEX_FILE
+      const { filesRestored, untrackedRemoved } = await this.restoreTreeToWorkingDir(
+        params.cwd,
+        target.treeSha,
+        new Set([...(preRevert.skippedLargeFiles ?? []), ...(target.skippedLargeFiles ?? [])]),
       );
-    }
 
-    // Step 2: Conversation Rollback First Guard (strictly before any disk write)
-    let nativeRolledBack = false;
-    let newNativeBindingReset = false;
+      const result: CheckpointRevertResult = {
+        revertedToCheckpointId: target.checkpointId,
+        targetTurnSeq: target.turnSeq,
+        preRevertCheckpointId: preRevert.checkpointId,
+        modeUsed: params.mode,
+        nativeRolledBack,
+        newNativeBindingReset,
+        filesRestored,
+        untrackedRemoved,
+        skippedLargeFiles: target.skippedLargeFiles ?? [],
+      };
 
-    if (params.mode === 'native_and_files') {
-      if (!params.hooks.supportsNativeRollback) {
-        throw new CheckpointError(
-          'E_NATIVE_ROLLBACK_UNSUPPORTED',
-          '当前 Harness 驱动不支持原生对话回滚，严禁静默伪造。请明确选择“仅还原文件 (files_only)”或“还原文件并开启新原生分支 (fork_new_branch)”。',
-        );
-      }
-      if (!params.hooks.performNativeRollback) {
-        throw new CheckpointError(
-          'E_NATIVE_ROLLBACK_FAILED',
-          '当前会话未绑定可回滚的原生对话句柄',
-        );
-      }
-      // If this throws, we abort BEFORE modifying any files on disk
-      await params.hooks.performNativeRollback(Math.max(1, params.hooks.turnsToRollback ?? 1));
-      nativeRolledBack = true;
-    } else if (params.mode === 'fork_new_branch') {
-      if (params.hooks.resetNativeBinding) {
-        await params.hooks.resetNativeBinding();
-        newNativeBindingReset = true;
-      }
-    }
+      // Step 5: Emit checkpoint.reverted & notify downstream
+      await params.hooks.onReverted?.(result, target);
 
-    // Step 3: Mandatory `pre_revert` protective checkpoint for byte-for-byte Undo Revert
-    const preRevert = await this.capture({
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      turnSeq: target.turnSeq,
-      phase: 'pre_revert',
-      compareAgainstTreeSha: target.treeSha,
+      return result;
     });
-    if (!preRevert) {
-      throw new CheckpointError('E_PRE_REVERT_FAILED', '无法在回滚前保存 pre_revert 保护性快照，已中止回滚');
-    }
-
-    // Step 4: Restore working tree from target.treeSha using isolated temp GIT_INDEX_FILE
-    const { filesRestored, untrackedRemoved } = await this.restoreTreeToWorkingDir(
-      params.cwd,
-      target.treeSha,
-      new Set([...(preRevert.skippedLargeFiles ?? []), ...(target.skippedLargeFiles ?? [])]),
-    );
-
-    const result: CheckpointRevertResult = {
-      revertedToCheckpointId: target.checkpointId,
-      targetTurnSeq: target.turnSeq,
-      preRevertCheckpointId: preRevert.checkpointId,
-      modeUsed: params.mode,
-      nativeRolledBack,
-      newNativeBindingReset,
-      filesRestored,
-      untrackedRemoved,
-      skippedLargeFiles: target.skippedLargeFiles ?? [],
-    };
-
-    // Step 5: Emit checkpoint.reverted & notify downstream
-    await params.hooks.onReverted?.(result, target);
-
-    return result;
   }
 
   /**
@@ -628,38 +642,40 @@ export class CheckpointService {
     keepLast?: number;
     olderThanDays?: number;
   }): Promise<{ deletedCount: number; deletedRefs: string[] }> {
-    const keepLast = Math.max(0, params.keepLast ?? 20);
-    const cutoffTs =
-      params.olderThanDays !== undefined
-        ? Date.now() - params.olderThanDays * 86_400_000
-        : null;
+    return sharedGitRepoCoordinator.runExclusive(params.cwd, async () => {
+      const keepLast = Math.max(0, params.keepLast ?? 20);
+      const cutoffTs =
+        params.olderThanDays !== undefined
+          ? Date.now() - params.olderThanDays * 86_400_000
+          : null;
 
-    const all = this.list(params.sessionId, 2000);
-    const toDelete: SessionCheckpointRecord[] = [];
-    for (let i = 0; i < all.length; i += 1) {
-      const rec = all[i]!;
-      const beyondKeep = i >= keepLast;
-      const tooOld = cutoffTs !== null && rec.createdAt < cutoffTs;
-      if (beyondKeep || tooOld) {
-        toDelete.push(rec);
+      const all = this.list(params.sessionId, 2000);
+      const toDelete: SessionCheckpointRecord[] = [];
+      for (let i = 0; i < all.length; i += 1) {
+        const rec = all[i]!;
+        const beyondKeep = i >= keepLast;
+        const tooOld = cutoffTs !== null && rec.createdAt < cutoffTs;
+        if (beyondKeep || tooOld) {
+          toDelete.push(rec);
+        }
       }
-    }
 
-    if (toDelete.length === 0) {
-      return { deletedCount: 0, deletedRefs: [] };
-    }
+      if (toDelete.length === 0) {
+        return { deletedCount: 0, deletedRefs: [] };
+      }
 
-    const deletedRefs: string[] = [];
-    for (const rec of toDelete) {
-      await runGitFull(params.cwd, ['update-ref', '-d', rec.gitRef], { timeoutMs: 4000 });
-      deletedRefs.push(rec.gitRef);
-    }
+      const deletedRefs: string[] = [];
+      for (const rec of toDelete) {
+        await runGitFull(params.cwd, ['update-ref', '-d', rec.gitRef], { timeoutMs: 4000 });
+        deletedRefs.push(rec.gitRef);
+      }
 
-    const deletedCount = this.store.deleteCheckpointRecords(
-      params.sessionId,
-      toDelete.map((r) => r.checkpointId),
-    );
-    return { deletedCount, deletedRefs };
+      const deletedCount = this.store.deleteCheckpointRecords(
+        params.sessionId,
+        toDelete.map((r) => r.checkpointId),
+      );
+      return { deletedCount, deletedRefs };
+    });
   }
 
   private async buildEphemeralTree(cwd: string): Promise<string> {

@@ -5,7 +5,14 @@
     "approval.policy.v1": "hm.plugin.approval-policy-default",
     "history.import.v1": "hm.plugin.history-import",
     "session.search.v1": "hm.plugin.session-search-fts",
-    "hm.session-data.v1": "core.history-session-data"
+    "hm.session-data.v1": "core.history-session-data",
+    "git.workspace.v1": "git",
+    "git.checkpoint.v1": "git",
+    "terminal.workspace.v1": "hm.plugin.terminal-workspace",
+    "terminal.runner.v1": "core.terminal-runner",
+    "workspace.files.v1": "core.terminal-runner",
+    "session.attachments.v1": "core.attachments",
+    "workspace.rules.v1": "core.workspace-rules"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

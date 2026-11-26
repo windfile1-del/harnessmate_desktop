@@ -75,7 +75,7 @@ import {
   ContextCompressionService,
 } from './context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorService } from './orchestrator-service.js';
-import { CheckpointError, type CheckpointDiffResult, type CheckpointService } from './checkpoint-service.js';
+import { CheckpointError, type CheckpointDiffResult, type CheckpointRevertHooks, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
 import type { DaemonEventBus } from './event-bus.js';
@@ -91,6 +91,12 @@ import { PluginApiError } from '@harnessmate/plugin-api';
 import type { FailoverService, GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
 import { dispatchTurn } from './outbound-gate.js';
+import {
+  releaseTerminalsUsingPath,
+  resolveGitCheckpointProvider,
+  resolveGitWorkspaceProvider,
+  resolveOptionalGitWorkspaceProvider,
+} from './w1-service-helpers.js';
 
 interface LiveHandleEntry {
   key: string;
@@ -280,12 +286,28 @@ export class SessionManager {
     return this.store.listCheckpointRecords(sessionId, limit);
   }
 
+  async listSessionCheckpointsAsync(sessionId: string, limit = 100): Promise<SessionCheckpointRecord[]> {
+    const session = this.store.getSession(sessionId);
+    try {
+      const { provider } = resolveGitCheckpointProvider(this.pluginManager, {
+        sessionId,
+        workspaceId: session?.workspaceId,
+      });
+      return await provider.list(sessionId, limit);
+    } catch {
+      return this.store.listCheckpointRecords(sessionId, limit);
+    }
+  }
+
   async captureManualCheckpoint(sessionId: string): Promise<SessionCheckpointRecord> {
     const session = this.store.getSession(sessionId);
     if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
-    const svc = this.service<CheckpointService>('checkpoints');
-    const latest = svc.list(sessionId, 1)[0];
-    const record = await svc.capture({
+    const { provider } = resolveGitCheckpointProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: session.workspaceId,
+    });
+    const latest = (await provider.list(sessionId, 1))[0];
+    const record = await provider.capture({
       sessionId,
       cwd: session.cwd,
       turnSeq: session.lastSeq,
@@ -308,8 +330,11 @@ export class SessionManager {
   ): Promise<CheckpointDiffResult> {
     const session = this.store.getSession(sessionId);
     if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
-    const svc = this.service<CheckpointService>('checkpoints');
-    return svc.diff({
+    const { provider } = resolveGitCheckpointProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: session.workspaceId,
+    });
+    return provider.diff({
       sessionId,
       cwd: session.cwd,
       ...opts,
@@ -326,106 +351,149 @@ export class SessionManager {
       throw new CheckpointError('E_SESSION_BUSY', '请先等待或中止当前运行中的轮次后再执行回滚');
     }
 
-    const svc = this.service<CheckpointService>('checkpoints');
+    const { provider } = resolveGitCheckpointProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: session.workspaceId,
+    });
     const adapter = this.registry.get(session.harnessId);
     const supportsNativeRollback = Boolean(adapter?.capabilitiesV2?.supportsNativeRollback);
 
     // Estimate how many turns have occurred since targetTurnSeq for native rollback
-    const allCheckpoints = svc.list(sessionId, 500);
+    const allCheckpoints = await provider.list(sessionId, 500);
+    const targetRecord = req.checkpointId ? await provider.get(req.checkpointId) : undefined;
     const targetSeq =
       req.targetTurnSeq ??
-      (req.checkpointId ? svc.get(req.checkpointId)?.turnSeq : undefined) ??
+      targetRecord?.turnSeq ??
       0;
     const turnsSinceTarget = Math.max(
       1,
       allCheckpoints.filter((c) => c.phase === 'turn_pre' && c.turnSeq >= targetSeq).length,
     );
 
-    const result = await svc.revert({
+    const hooks: CheckpointRevertHooks = {
+      supportsNativeRollback,
+      turnsToRollback: turnsSinceTarget,
+      performNativeRollback: async (numTurns: number) => {
+        const key = this.handleKey(sessionId, session.harnessId);
+        const existing = this.liveHandles.get(key);
+        const entry = existing ?? (await this.ensureLiveHandle(sessionId, session.harnessId, false));
+        if (!entry.handle.runNativeCommand) {
+          throw new CheckpointError(
+            'E_NATIVE_ROLLBACK_FAILED',
+            `当前驱动 (${session.harnessId}) 未暴露原生回滚接口，已中止回滚且未修改任何工作区文件`,
+          );
+        }
+        try {
+          await entry.handle.runNativeCommand('rollback', String(numTurns));
+        } catch (err) {
+          throw new CheckpointError(
+            'E_NATIVE_ROLLBACK_FAILED',
+            `原生对话回滚失败，已中止回滚且未修改任何工作区文件：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+      resetNativeBinding: async () => {
+        await this.disposeLiveHandle(sessionId, session.harnessId);
+        this.store.updateSession(sessionId, { nativeSessionId: null });
+        const existingBinding = this.store.getSessionBinding(sessionId, session.harnessId);
+        this.store.upsertSessionBinding({
+          sessionId,
+          harnessId: session.harnessId,
+          harnessKind: session.harnessKind,
+          nativeSessionId: null,
+          lastModel: existingBinding?.lastModel ?? session.model,
+          lastActualModel: existingBinding?.lastActualModel ?? session.actualModel ?? null,
+          lastEffort: existingBinding?.lastEffort ?? session.reasoningEffort,
+          syncedUpToSeq: targetSeq,
+          driverUsed: null,
+          updatedAt: Date.now(),
+        });
+      },
+      onReverted: (revertResult: CheckpointRevertResult, target: SessionCheckpointRecord) => {
+        const ev = this.emitCanonical(sessionId, 'checkpoint.reverted', {
+          ...revertResult,
+          checkpointId: target.checkpointId,
+          gitRef: target.gitRef,
+          treeSha: target.treeSha,
+          harnessId: session.harnessId,
+        });
+        const modeLabel =
+          revertResult.modeUsed === 'native_and_files'
+            ? '原生对话与工作区文件已同步回滚'
+            : revertResult.modeUsed === 'fork_new_branch'
+              ? '工作区文件已还原，并已重置原生会话绑定以新分支续跑'
+              : '仅还原了工作区文件（对话上下文保留原状，未伪造对话回滚）';
+        this.store.upsertTurnItem({
+          itemId: `revert:${ev.seq}`,
+          schemaVersion: 2,
+          sessionId,
+          turnId: `revert_${ev.seq}`,
+          seq: ev.seq,
+          instanceId: session.harnessId,
+          driverId: session.harnessKind,
+          blockType: 'system_notice',
+          status: 'completed',
+          title: '检查点回滚完成',
+          textBody: `${modeLabel}（还原 ${revertResult.filesRestored} 个文件，清理 ${revertResult.untrackedRemoved} 个新增文件；已自动保存撤销点 ${revertResult.preRevertCheckpointId}）。`,
+          payload: { ...revertResult },
+          outputOmitted: false,
+          omittedBytes: 0,
+          createdAt: ev.createdAt,
+          updatedAt: ev.createdAt,
+        });
+        const refreshed = this.store.getSession(sessionId);
+        if (refreshed) {
+          this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(refreshed);
+        }
+      },
+    };
+
+    if (this.pluginManager.host.getServiceByInstance(provider.instanceId, 'checkpoints')) {
+      return await provider.revert({
+        sessionId,
+        cwd: session.cwd,
+        checkpointId: req.checkpointId,
+        targetTurnSeq: req.targetTurnSeq,
+        mode: req.mode,
+        hooks,
+      });
+    }
+
+    // External isolated git.checkpoint.v1 provider: enforce conversation rollback guard before calling peer revert
+    if (req.mode === 'native_and_files') {
+      if (!hooks.supportsNativeRollback) {
+        throw new CheckpointError(
+          'E_NATIVE_ROLLBACK_UNSUPPORTED',
+          '当前 Harness 驱动不支持原生对话回滚，严禁静默伪造。请明确选择“仅还原文件 (files_only)”或“还原文件并开启新原生分支 (fork_new_branch)”。',
+        );
+      }
+      await hooks.performNativeRollback?.(turnsSinceTarget);
+    } else if (req.mode === 'fork_new_branch') {
+      await hooks.resetNativeBinding?.();
+    }
+    const result = await provider.revert({
       sessionId,
       cwd: session.cwd,
       checkpointId: req.checkpointId,
       targetTurnSeq: req.targetTurnSeq,
       mode: req.mode,
-      hooks: {
-        supportsNativeRollback,
-        turnsToRollback: turnsSinceTarget,
-        performNativeRollback: async (numTurns) => {
-          const key = this.handleKey(sessionId, session.harnessId);
-          const existing = this.liveHandles.get(key);
-          const entry = existing ?? (await this.ensureLiveHandle(sessionId, session.harnessId, false));
-          if (!entry.handle.runNativeCommand) {
-            throw new CheckpointError(
-              'E_NATIVE_ROLLBACK_FAILED',
-              `当前驱动 (${session.harnessId}) 未暴露原生回滚接口，已中止回滚且未修改任何工作区文件`,
-            );
-          }
-          try {
-            await entry.handle.runNativeCommand('rollback', String(numTurns));
-          } catch (err) {
-            throw new CheckpointError(
-              'E_NATIVE_ROLLBACK_FAILED',
-              `原生对话回滚失败，已中止回滚且未修改任何工作区文件：${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-        resetNativeBinding: async () => {
-          await this.disposeLiveHandle(sessionId, session.harnessId);
-          this.store.updateSession(sessionId, { nativeSessionId: null });
-          const existingBinding = this.store.getSessionBinding(sessionId, session.harnessId);
-          this.store.upsertSessionBinding({
-            sessionId,
-            harnessId: session.harnessId,
-            harnessKind: session.harnessKind,
-            nativeSessionId: null,
-            lastModel: existingBinding?.lastModel ?? session.model,
-            lastActualModel: existingBinding?.lastActualModel ?? session.actualModel ?? null,
-            lastEffort: existingBinding?.lastEffort ?? session.reasoningEffort,
-            syncedUpToSeq: targetSeq,
-            driverUsed: null,
-            updatedAt: Date.now(),
-          });
-        },
-        onReverted: (revertResult, target) => {
-          const ev = this.emitCanonical(sessionId, 'checkpoint.reverted', {
-            ...revertResult,
-            checkpointId: target.checkpointId,
-            gitRef: target.gitRef,
-            treeSha: target.treeSha,
-            harnessId: session.harnessId,
-          });
-          const modeLabel =
-            revertResult.modeUsed === 'native_and_files'
-              ? '原生对话与工作区文件已同步回滚'
-              : revertResult.modeUsed === 'fork_new_branch'
-                ? '工作区文件已还原，并已重置原生会话绑定以新分支续跑'
-                : '仅还原了工作区文件（对话上下文保留原状，未伪造对话回滚）';
-          this.store.upsertTurnItem({
-            itemId: `revert:${ev.seq}`,
-            schemaVersion: 2,
-            sessionId,
-            turnId: `revert_${ev.seq}`,
-            seq: ev.seq,
-            instanceId: session.harnessId,
-            driverId: session.harnessKind,
-            blockType: 'system_notice',
-            status: 'completed',
-            title: '检查点回滚完成',
-            textBody: `${modeLabel}（还原 ${revertResult.filesRestored} 个文件，清理 ${revertResult.untrackedRemoved} 个新增文件；已自动保存撤销点 ${revertResult.preRevertCheckpointId}）。`,
-            payload: { ...revertResult },
-            outputOmitted: false,
-            omittedBytes: 0,
-            createdAt: ev.createdAt,
-            updatedAt: ev.createdAt,
-          });
-          const refreshed = this.store.getSession(sessionId);
-          if (refreshed) {
-            this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(refreshed);
-          }
-        },
-      },
+      hooks,
     });
-
+    const fallbackTarget = targetRecord ?? (await provider.get(result.revertedToCheckpointId)) ?? {
+      checkpointId: result.revertedToCheckpointId,
+      sessionId,
+      turnSeq: result.targetTurnSeq,
+      phase: 'turn_pre' as const,
+      gitRef: `refs/harnessmate/checkpoints/${sessionId}/${result.revertedToCheckpointId}`,
+      treeSha: '',
+      baseHeadSha: null,
+      filesChanged: result.filesRestored,
+      insertions: 0,
+      deletions: 0,
+      skippedLargeFiles: result.skippedLargeFiles ?? [],
+      createdAt: Date.now(),
+    };
+    await hooks.onReverted?.(result, fallbackTarget);
     return result;
   }
 
@@ -435,8 +503,11 @@ export class SessionManager {
   ): Promise<{ deletedCount: number; deletedRefs: string[] }> {
     const session = this.store.getSession(sessionId);
     if (!session) throw new CheckpointError('E_SESSION_NOT_FOUND', `Session not found: ${sessionId}`);
-    const svc = this.service<CheckpointService>('checkpoints');
-    return svc.gcCheckpoints({
+    const { provider } = resolveGitCheckpointProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: session.workspaceId,
+    });
+    return provider.gcCheckpoints({
       sessionId,
       cwd: session.cwd,
       keepLast: req.keepLast,
@@ -450,10 +521,17 @@ export class SessionManager {
     turnId: string,
   ): Promise<void> {
     if (meta.maintenance || meta.turnSeq === undefined) return;
-    const svc = this.pluginManager.host.get<CheckpointService>('checkpoints');
-    if (!svc) return;
+    let provider;
     try {
-      const record = await svc.capture({
+      provider = resolveGitCheckpointProvider(this.pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+      }).provider;
+    } catch {
+      return;
+    }
+    try {
+      const record = await provider.capture({
         sessionId: session.id,
         cwd: session.cwd,
         turnSeq: meta.turnSeq,
@@ -628,7 +706,12 @@ export class SessionManager {
       emitCanonical: (sessionId, type, payload, turnId) =>
         this.emitCanonical(sessionId, type, payload, turnId ?? null),
       publishAttention: (item) => this.eventBus.publishAttention(item),
-      getGitService: () => this.pluginManager.host.get<GitService>('git'),
+      getGitService: () => {
+        const provider = resolveOptionalGitWorkspaceProvider(this.pluginManager, {
+          workspaceId: undefined,
+        });
+        return provider as unknown as GitService | undefined;
+      },
       getTaskLedger: () => this.pluginManager.host.get<TaskLedgerService>('ledger'),
       isOrchestratorEnabled: () => this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID),
     });
@@ -734,12 +817,14 @@ export class SessionManager {
 
     const existing = this.store.getWorkspaceByPath(resolved);
     if (existing) {
-      const git = await this.pluginManager.host.get<GitService>('git')?.inspect(resolved);
+      const gitProvider = resolveOptionalGitWorkspaceProvider(this.pluginManager, { workspaceId: existing.id });
+      const git = await gitProvider?.inspect(resolved, existing.id).catch(() => undefined);
       if (git) this.store.updateWorkspaceGit(existing.id, git.isGitRepo, git.branch);
       return this.store.getWorkspace(existing.id)!;
     }
 
-    const git = await this.pluginManager.host.get<GitService>('git')?.inspect(resolved) ?? { isGitRepo: false, branch: null };
+    const gitProvider = resolveOptionalGitWorkspaceProvider(this.pluginManager);
+    const git = (await gitProvider?.inspect(resolved).catch(() => undefined)) ?? { isGitRepo: false, branch: null };
     const registeredWhileInspecting = this.store.getWorkspaceByPath(resolved);
     if (registeredWhileInspecting) return registeredWhileInspecting;
     const ws: Workspace = {
@@ -758,9 +843,16 @@ export class SessionManager {
   }
 
   async deleteWorkspace(id: string): Promise<boolean> {
+    const ws = this.store.getWorkspace(id);
     await this.terminalWorkspace?.closeWorkspaceTerminals(id);
+    if (ws) {
+      await releaseTerminalsUsingPath(this.pluginManager, ws.rootPath, id).catch(() => {});
+    }
     const sessions = this.store.listSessions({ workspaceId: id, includeArchived: true });
     for (const s of sessions) {
+      if (s.cwd) {
+        await releaseTerminalsUsingPath(this.pluginManager, s.cwd, id).catch(() => {});
+      }
       await this.disposeSessionHandles(s.id);
     }
     return this.store.deleteWorkspace(id);
@@ -928,7 +1020,9 @@ export class SessionManager {
     let worktreeBranch: string | null = null;
     if (req.createWorktree && ws.isGitRepo) {
       const branch = req.worktreeBranch?.trim() || `hm/task-${Date.now().toString(36)}`;
-      const wt = await this.service<GitService>('git').worktree(ws.rootPath, branch);
+      const wt = await resolveGitWorkspaceProvider(this.pluginManager, {
+        workspaceId: ws.id,
+      }).provider.createWorktree(ws.rootPath, branch);
       cwd = wt.worktreePath;
       worktreeBranch = wt.branch;
     }
@@ -1158,7 +1252,14 @@ export class SessionManager {
     // Capture lightweight Git anchor for timeline switch divider
     let gitAnchor: string | null = null;
     try {
-      const git = await this.pluginManager.host.get<GitService>('git')?.status(updated.cwd);
+      const gitProvider = resolveOptionalGitWorkspaceProvider(this.pluginManager, {
+        workspaceId: updated.workspaceId,
+        sessionId: updated.id,
+      });
+      const git = await gitProvider?.status(updated.cwd, {
+        workspaceId: updated.workspaceId,
+        sessionId: updated.id,
+      });
       if (git?.isGitRepo) {
         const dirty = git.changes.filter((c) => !c.path.startsWith('.harnessmate/')).length;
         gitAnchor = `${git.branch || 'detached'}${dirty > 0 ? ` · ${dirty} 个改动文件` : ' · clean'}`;
@@ -1852,10 +1953,18 @@ export class SessionManager {
       if (turnMeta) {
         turnMeta.turnSeq = userEvent.seq;
       }
-      const checkpointSvc = this.pluginManager.host.get<CheckpointService>('checkpoints');
-      if (checkpointSvc) {
+      let ckptProvider;
+      try {
+        ckptProvider = resolveGitCheckpointProvider(this.pluginManager, {
+          sessionId,
+          workspaceId: session.workspaceId,
+        }).provider;
+      } catch {
+        ckptProvider = undefined;
+      }
+      if (ckptProvider) {
         try {
-          const preRecord = await checkpointSvc.capture({
+          const preRecord = await ckptProvider.capture({
             sessionId,
             cwd: session.cwd,
             turnSeq: userEvent.seq,

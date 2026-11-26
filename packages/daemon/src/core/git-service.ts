@@ -15,6 +15,7 @@ import type {
   WorkspaceSetupScriptInfo,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
+import { sharedGitRepoCoordinator } from './git-repo-lock.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -127,19 +128,21 @@ export async function inspectGitRepo(cwd: string): Promise<{ isGitRepo: boolean;
 }
 
 export async function initGitRepo(cwd: string): Promise<GitActionResult> {
-  if (!fs.existsSync(cwd)) {
-    throw new GitOperationError('E_NOT_FOUND', `Directory does not exist: ${cwd}`);
-  }
-  const res = await runGitFull(cwd, ['init'], { timeoutMs: 8000 });
-  if (!res.ok) {
-    throw new GitOperationError('E_GIT_INIT_FAILED', res.stderr.trim() || 'git init failed');
-  }
-  return {
-    ok: true,
-    stdout: res.stdout.trim(),
-    stderr: res.stderr.trim(),
-    message: '已成功初始化 Git 仓库',
-  };
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    if (!fs.existsSync(cwd)) {
+      throw new GitOperationError('E_NOT_FOUND', `Directory does not exist: ${cwd}`);
+    }
+    const res = await runGitFull(cwd, ['init'], { timeoutMs: 8000 });
+    if (!res.ok) {
+      throw new GitOperationError('E_GIT_INIT_FAILED', res.stderr.trim() || 'git init failed');
+    }
+    return {
+      ok: true,
+      stdout: res.stdout.trim(),
+      stderr: res.stderr.trim(),
+      message: '已成功初始化 Git 仓库',
+    };
+  });
 }
 
 export async function getGitStatusSummary(cwd: string): Promise<GitStatusSummary> {
@@ -321,40 +324,42 @@ export async function getFileDiff(
  * Discards working-tree (and staged) changes for a single file safely.
  */
 export async function discardFile(cwd: string, filePath: string): Promise<GitActionResult> {
-  const safePath = normalizeSafeRelPath(cwd, filePath);
-  const repo = await inspectGitRepo(cwd);
-  if (!repo.isGitRepo) {
-    throw new GitOperationError('E_NOT_GIT_REPO', 'Current directory is not a Git repository');
-  }
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    const safePath = normalizeSafeRelPath(cwd, filePath);
+    const repo = await inspectGitRepo(cwd);
+    if (!repo.isGitRepo) {
+      throw new GitOperationError('E_NOT_GIT_REPO', 'Current directory is not a Git repository');
+    }
 
-  const inHead = await runGitFull(cwd, ['cat-file', '-e', `HEAD:${safePath}`], { timeoutMs: 3000 });
-  if (inHead.ok) {
-    // Restore both index and working tree from HEAD for this single path
-    await runGitFull(cwd, ['reset', 'HEAD', '--', safePath], { timeoutMs: 5000 });
-    const checkout = await runGitFull(cwd, ['checkout', '--', safePath], { timeoutMs: 5000 });
-    if (!checkout.ok) {
-      throw new GitOperationError('E_DISCARD_FAILED', checkout.stderr.trim() || `Failed to discard ${safePath}`);
+    const inHead = await runGitFull(cwd, ['cat-file', '-e', `HEAD:${safePath}`], { timeoutMs: 3000 });
+    if (inHead.ok) {
+      // Restore both index and working tree from HEAD for this single path
+      await runGitFull(cwd, ['reset', 'HEAD', '--', safePath], { timeoutMs: 5000 });
+      const checkout = await runGitFull(cwd, ['checkout', '--', safePath], { timeoutMs: 5000 });
+      if (!checkout.ok) {
+        throw new GitOperationError('E_DISCARD_FAILED', checkout.stderr.trim() || `Failed to discard ${safePath}`);
+      }
+      return {
+        ok: true,
+        stdout: checkout.stdout,
+        stderr: checkout.stderr,
+        message: `已还原文件 ${safePath}`,
+      };
+    }
+
+    // Untracked or newly staged file not present in HEAD: unstage (if staged) and remove from disk
+    await runGitFull(cwd, ['rm', '--cached', '--ignore-unmatch', '-f', '--', safePath], { timeoutMs: 5000 });
+    const fullPath = path.join(cwd, safePath);
+    if (fs.existsSync(fullPath)) {
+      fs.rmSync(fullPath, { force: true });
     }
     return {
       ok: true,
-      stdout: checkout.stdout,
-      stderr: checkout.stderr,
-      message: `已还原文件 ${safePath}`,
+      stdout: '',
+      stderr: '',
+      message: `已移除未追踪文件 ${safePath}`,
     };
-  }
-
-  // Untracked or newly staged file not present in HEAD: unstage (if staged) and remove from disk
-  await runGitFull(cwd, ['rm', '--cached', '--ignore-unmatch', '-f', '--', safePath], { timeoutMs: 5000 });
-  const fullPath = path.join(cwd, safePath);
-  if (fs.existsSync(fullPath)) {
-    fs.rmSync(fullPath, { force: true });
-  }
-  return {
-    ok: true,
-    stdout: '',
-    stderr: '',
-    message: `已移除未追踪文件 ${safePath}`,
-  };
+  });
 }
 
 /**
@@ -410,26 +415,28 @@ export async function createGitWorktree(
   branchName: string,
   opts?: { baseBranch?: string },
 ): Promise<{ worktreePath: string; branch: string }> {
-  const sanitized = branchName.replace(/[^a-zA-Z0-9._/-]/g, '-').slice(0, 60);
-  const worktreesDir = path.join(path.dirname(repoRoot), '.harnessmate-worktrees');
-  fs.mkdirSync(worktreesDir, { recursive: true });
-  const folderName = `${path.basename(repoRoot)}-${sanitized.replace(/\//g, '-')}-${Date.now().toString(36)}`;
-  const worktreePath = path.join(worktreesDir, folderName);
+  return sharedGitRepoCoordinator.runExclusive(repoRoot, async () => {
+    const sanitized = branchName.replace(/[^a-zA-Z0-9._/-]/g, '-').slice(0, 60);
+    const worktreesDir = path.join(path.dirname(repoRoot), '.harnessmate-worktrees');
+    fs.mkdirSync(worktreesDir, { recursive: true });
+    const folderName = `${path.basename(repoRoot)}-${sanitized.replace(/\//g, '-')}-${Date.now().toString(36)}`;
+    const worktreePath = path.join(worktreesDir, folderName);
 
-  const args = ['worktree', 'add', '-b', sanitized, worktreePath];
-  if (opts?.baseBranch?.trim()) {
-    args.push(opts.baseBranch.trim());
-  }
+    const args = ['worktree', 'add', '-b', sanitized, worktreePath];
+    if (opts?.baseBranch?.trim()) {
+      args.push(opts.baseBranch.trim());
+    }
 
-  const res = await runGitFull(repoRoot, args, { timeoutMs: 15_000 });
-  if (!res.ok) {
-    throw new GitOperationError(
-      'E_WORKTREE_CREATE_FAILED',
-      res.stderr.trim() || `Failed to create git worktree for branch "${sanitized}"`,
-    );
-  }
+    const res = await runGitFull(repoRoot, args, { timeoutMs: 15_000 });
+    if (!res.ok) {
+      throw new GitOperationError(
+        'E_WORKTREE_CREATE_FAILED',
+        res.stderr.trim() || `Failed to create git worktree for branch "${sanitized}"`,
+      );
+    }
 
-  return { worktreePath, branch: sanitized };
+    return { worktreePath, branch: sanitized };
+  });
 }
 
 export async function listGitWorktrees(
@@ -514,47 +521,49 @@ export async function removeGitWorktree(
   worktreePath: string,
   opts?: { force?: boolean },
 ): Promise<GitActionResult> {
-  const resolvedTarget = path.resolve(worktreePath);
-  const resolvedMain = path.resolve(repoRoot);
-  if (resolvedTarget.toLowerCase() === resolvedMain.toLowerCase()) {
-    throw new GitOperationError('E_WORKTREE_MAIN', '不能删除主仓库工作区，仅支持删除隔离 Worktree');
-  }
+  return sharedGitRepoCoordinator.runExclusive(repoRoot, async () => {
+    const resolvedTarget = path.resolve(worktreePath);
+    const resolvedMain = path.resolve(repoRoot);
+    if (resolvedTarget.toLowerCase() === resolvedMain.toLowerCase()) {
+      throw new GitOperationError('E_WORKTREE_MAIN', '不能删除主仓库工作区，仅支持删除隔离 Worktree');
+    }
 
-  const args = ['worktree', 'remove'];
-  if (opts?.force) args.push('--force');
-  args.push(resolvedTarget);
+    const args = ['worktree', 'remove'];
+    if (opts?.force) args.push('--force');
+    args.push(resolvedTarget);
 
-  const res = await runGitFull(repoRoot, args, { timeoutMs: 12_000 });
-  if (!res.ok) {
-    const combined = `${res.stderr}\n${res.stdout}`;
-    // Always run safe metadata prune without destructive rm -rf
-    await runGitFull(repoRoot, ['worktree', 'prune'], { timeoutMs: 5000 });
+    const res = await runGitFull(repoRoot, args, { timeoutMs: 12_000 });
+    if (!res.ok) {
+      const combined = `${res.stderr}\n${res.stdout}`;
+      // Always run safe metadata prune without destructive rm -rf
+      await runGitFull(repoRoot, ['worktree', 'prune'], { timeoutMs: 5000 });
 
-    if (
-      res.errorCode === 'EBUSY' ||
-      res.errorCode === 'EPERM' ||
-      /EBUSY|EPERM|Permission denied|Directory not empty|cannot remove|Device or resource busy|failed to delete/i.test(
-        combined,
-      )
-    ) {
+      if (
+        res.errorCode === 'EBUSY' ||
+        res.errorCode === 'EPERM' ||
+        /EBUSY|EPERM|Permission denied|Directory not empty|cannot remove|Device or resource busy|failed to delete/i.test(
+          combined,
+        )
+      ) {
+        throw new GitOperationError(
+          'E_WORKTREE_BUSY',
+          `Worktree 目录正被终端或 Agent 进程占用，无法安全移除 (${resolvedTarget})。请先关闭占用该目录的会话或终端后重试；已执行安全 git worktree prune 且未破坏 .git/worktrees。`,
+        );
+      }
       throw new GitOperationError(
-        'E_WORKTREE_BUSY',
-        `Worktree 目录正被终端或 Agent 进程占用，无法安全移除 (${resolvedTarget})。请先关闭占用该目录的会话或终端后重试；已执行安全 git worktree prune 且未破坏 .git/worktrees。`,
+        'E_WORKTREE_REMOVE_FAILED',
+        res.stderr.trim() || `移除 Worktree 失败: ${resolvedTarget}`,
       );
     }
-    throw new GitOperationError(
-      'E_WORKTREE_REMOVE_FAILED',
-      res.stderr.trim() || `移除 Worktree 失败: ${resolvedTarget}`,
-    );
-  }
 
-  await runGitFull(repoRoot, ['worktree', 'prune'], { timeoutMs: 5000 });
-  return {
-    ok: true,
-    stdout: res.stdout.trim(),
-    stderr: res.stderr.trim(),
-    message: `已安全移除 Worktree 并清理元数据 (${path.basename(resolvedTarget)})`,
-  };
+    await runGitFull(repoRoot, ['worktree', 'prune'], { timeoutMs: 5000 });
+    return {
+      ok: true,
+      stdout: res.stdout.trim(),
+      stderr: res.stderr.trim(),
+      message: `已安全移除 Worktree 并清理元数据 (${path.basename(resolvedTarget)})`,
+    };
+  });
 }
 
 /**
@@ -789,41 +798,43 @@ export async function gitCommit(
   cwd: string,
   opts: { message: string; files?: string[]; stageAll?: boolean },
 ): Promise<GitActionResult> {
-  const repo = await inspectGitRepo(cwd);
-  if (!repo.isGitRepo) {
-    throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
-  }
-  const msg = opts.message.trim();
-  if (!msg) {
-    throw new GitOperationError('E_INVALID_INPUT', '提交信息不能为空');
-  }
-
-  if (opts.files && opts.files.length > 0) {
-    const safeFiles = opts.files.map((f) => normalizeSafeRelPath(cwd, f));
-    const addRes = await runGitFull(cwd, ['add', '--', ...safeFiles], { timeoutMs: 10_000 });
-    if (!addRes.ok) {
-      throw new GitOperationError('E_GIT_ADD_FAILED', addRes.stderr.trim() || '暂存文件失败');
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    const repo = await inspectGitRepo(cwd);
+    if (!repo.isGitRepo) {
+      throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
     }
-  } else if (opts.stageAll !== false) {
-    const addRes = await runGitFull(cwd, ['add', '-A'], { timeoutMs: 10_000 });
-    if (!addRes.ok) {
-      throw new GitOperationError('E_GIT_ADD_FAILED', addRes.stderr.trim() || '暂存工作区变更失败');
+    const msg = opts.message.trim();
+    if (!msg) {
+      throw new GitOperationError('E_INVALID_INPUT', '提交信息不能为空');
     }
-  }
 
-  const commitRes = await runGitFull(cwd, ['commit', '-m', msg], { timeoutMs: 15_000 });
-  if (!commitRes.ok) {
-    throw new GitOperationError(
-      'E_GIT_COMMIT_FAILED',
-      commitRes.stderr.trim() || commitRes.stdout.trim() || 'Git commit 失败',
-    );
-  }
-  return {
-    ok: true,
-    stdout: commitRes.stdout.trim(),
-    stderr: commitRes.stderr.trim(),
-    message: '提交成功',
-  };
+    if (opts.files && opts.files.length > 0) {
+      const safeFiles = opts.files.map((f) => normalizeSafeRelPath(cwd, f));
+      const addRes = await runGitFull(cwd, ['add', '--', ...safeFiles], { timeoutMs: 10_000 });
+      if (!addRes.ok) {
+        throw new GitOperationError('E_GIT_ADD_FAILED', addRes.stderr.trim() || '暂存文件失败');
+      }
+    } else if (opts.stageAll !== false) {
+      const addRes = await runGitFull(cwd, ['add', '-A'], { timeoutMs: 10_000 });
+      if (!addRes.ok) {
+        throw new GitOperationError('E_GIT_ADD_FAILED', addRes.stderr.trim() || '暂存工作区变更失败');
+      }
+    }
+
+    const commitRes = await runGitFull(cwd, ['commit', '-m', msg], { timeoutMs: 15_000 });
+    if (!commitRes.ok) {
+      throw new GitOperationError(
+        'E_GIT_COMMIT_FAILED',
+        commitRes.stderr.trim() || commitRes.stdout.trim() || 'Git commit 失败',
+      );
+    }
+    return {
+      ok: true,
+      stdout: commitRes.stdout.trim(),
+      stderr: commitRes.stderr.trim(),
+      message: '提交成功',
+    };
+  });
 }
 
 /**
@@ -833,98 +844,104 @@ export async function gitPush(
   cwd: string,
   opts?: { remote?: string; branch?: string; setUpstream?: boolean },
 ): Promise<GitActionResult> {
-  const repo = await inspectGitRepo(cwd);
-  if (!repo.isGitRepo) {
-    throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
-  }
-  const args = ['push'];
-  if (opts?.setUpstream) args.push('-u');
-  if (opts?.remote) args.push(opts.remote);
-  if (opts?.branch) args.push(opts.branch);
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    const repo = await inspectGitRepo(cwd);
+    if (!repo.isGitRepo) {
+      throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
+    }
+    const args = ['push'];
+    if (opts?.setUpstream) args.push('-u');
+    if (opts?.remote) args.push(opts.remote);
+    if (opts?.branch) args.push(opts.branch);
 
-  // Defense-in-depth: never allow force flags
-  if (args.some((a) => a === '--force' || a === '-f' || a.startsWith('--force'))) {
-    throw new GitOperationError('E_FORBIDDEN_FORCE_PUSH', '禁止执行强制推送 (--force)');
-  }
+    // Defense-in-depth: never allow force flags
+    if (args.some((a) => a === '--force' || a === '-f' || a.startsWith('--force'))) {
+      throw new GitOperationError('E_FORBIDDEN_FORCE_PUSH', '禁止执行强制推送 (--force)');
+    }
 
-  const res = await runGitFull(cwd, args, { timeoutMs: 30_000 });
-  if (!res.ok) {
-    throw new GitOperationError('E_GIT_PUSH_FAILED', res.stderr.trim() || res.stdout.trim() || 'Git push 失败');
-  }
-  return {
-    ok: true,
-    stdout: res.stdout.trim(),
-    stderr: res.stderr.trim(),
-    message: '推送成功',
-  };
+    const res = await runGitFull(cwd, args, { timeoutMs: 30_000 });
+    if (!res.ok) {
+      throw new GitOperationError('E_GIT_PUSH_FAILED', res.stderr.trim() || res.stdout.trim() || 'Git push 失败');
+    }
+    return {
+      ok: true,
+      stdout: res.stdout.trim(),
+      stderr: res.stderr.trim(),
+      message: '推送成功',
+    };
+  });
 }
 
 export async function gitPull(
   cwd: string,
   opts?: { remote?: string; branch?: string },
 ): Promise<GitActionResult> {
-  const repo = await inspectGitRepo(cwd);
-  if (!repo.isGitRepo) {
-    throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
-  }
-  const args = ['pull'];
-  if (opts?.remote) args.push(opts.remote);
-  if (opts?.branch) args.push(opts.branch);
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    const repo = await inspectGitRepo(cwd);
+    if (!repo.isGitRepo) {
+      throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
+    }
+    const args = ['pull'];
+    if (opts?.remote) args.push(opts.remote);
+    if (opts?.branch) args.push(opts.branch);
 
-  const res = await runGitFull(cwd, args, { timeoutMs: 30_000 });
-  if (!res.ok) {
-    throw new GitOperationError('E_GIT_PULL_FAILED', res.stderr.trim() || res.stdout.trim() || 'Git pull 失败');
-  }
-  return {
-    ok: true,
-    stdout: res.stdout.trim(),
-    stderr: res.stderr.trim(),
-    message: '拉取成功',
-  };
+    const res = await runGitFull(cwd, args, { timeoutMs: 30_000 });
+    if (!res.ok) {
+      throw new GitOperationError('E_GIT_PULL_FAILED', res.stderr.trim() || res.stdout.trim() || 'Git pull 失败');
+    }
+    return {
+      ok: true,
+      stdout: res.stdout.trim(),
+      stderr: res.stderr.trim(),
+      message: '拉取成功',
+    };
+  });
 }
 
 export async function gitCreatePr(
   cwd: string,
   opts: { title: string; body?: string; base?: string; draft?: boolean },
 ): Promise<GitActionResult> {
-  const repo = await inspectGitRepo(cwd);
-  if (!repo.isGitRepo) {
-    throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
-  }
+  return sharedGitRepoCoordinator.runExclusive(cwd, async () => {
+    const repo = await inspectGitRepo(cwd);
+    if (!repo.isGitRepo) {
+      throw new GitOperationError('E_NOT_GIT_REPO', '当前目录不是 Git 仓库');
+    }
 
-  const args = ['pr', 'create', '--title', opts.title, '--body', opts.body ?? ''];
-  if (opts.base) args.push('--base', opts.base);
-  if (opts.draft) args.push('--draft');
+    const args = ['pr', 'create', '--title', opts.title, '--body', opts.body ?? ''];
+    if (opts.base) args.push('--base', opts.base);
+    if (opts.draft) args.push('--draft');
 
-  try {
-    const { stdout, stderr } = await execFileAsync('gh', args, {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 4 * 1024 * 1024,
-      windowsHide: true,
-    });
-    const outStr = String(stdout ?? '').trim();
-    const urlMatch = outStr.match(/https?:\/\/\S+/);
-    return {
-      ok: true,
-      stdout: outStr,
-      stderr: String(stderr ?? '').trim(),
-      message: '已创建 Pull Request',
-      prUrl: urlMatch?.[0] ?? null,
-    };
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
-    if (e.code === 'ENOENT') {
+    try {
+      const { stdout, stderr } = await execFileAsync('gh', args, {
+        cwd,
+        timeout: 30_000,
+        maxBuffer: 4 * 1024 * 1024,
+        windowsHide: true,
+      });
+      const outStr = String(stdout ?? '').trim();
+      const urlMatch = outStr.match(/https?:\/\/\S+/);
+      return {
+        ok: true,
+        stdout: outStr,
+        stderr: String(stderr ?? '').trim(),
+        message: '已创建 Pull Request',
+        prUrl: urlMatch?.[0] ?? null,
+      };
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+      if (e.code === 'ENOENT') {
+        throw new GitOperationError(
+          'E_GH_NOT_INSTALLED',
+          '未检测到 GitHub CLI (`gh`)。请先安装 `gh`（https://cli.github.com/）并运行 `gh auth login` 后重试创建 PR。',
+        );
+      }
       throw new GitOperationError(
-        'E_GH_NOT_INSTALLED',
-        '未检测到 GitHub CLI (`gh`)。请先安装 `gh`（https://cli.github.com/）并运行 `gh auth login` 后重试创建 PR。',
+        'E_PR_CREATE_FAILED',
+        String(e.stderr || e.stdout || e.message || '创建 PR 失败').trim(),
       );
     }
-    throw new GitOperationError(
-      'E_PR_CREATE_FAILED',
-      String(e.stderr || e.stdout || e.message || '创建 PR 失败').trim(),
-    );
-  }
+  });
 }
 
 // ── Subagent Worktree Commit, DiffStat & Explicit Human-Confirmed Merge ─
@@ -938,45 +955,47 @@ export async function commitWorktreeChangesIfDirty(
   worktreePath: string,
   message: string,
 ): Promise<{ committed: boolean; commitSha: string | null }> {
-  if (!fs.existsSync(worktreePath)) {
-    return { committed: false, commitSha: null };
-  }
-  // Exclude HarnessMate's own internal runtime metadata (.harnessmate/) so parallel subagents
-  // never pollute feature branches or spuriously conflict on task-ledger files.
-  const pathspec = ['--', '.', ':!.harnessmate', ':!.harnessmate/'];
-  const porcelain = await runGit(worktreePath, ['status', '--porcelain=v1', ...pathspec], 5000);
-  if (porcelain && porcelain.trim().length > 0) {
-    const addRes = await runGitFull(worktreePath, ['add', '-A', ...pathspec], { timeoutMs: 10_000 });
-    if (!addRes.ok) {
-      throw new GitOperationError(
-        'E_GIT_ADD_FAILED',
-        addRes.stderr.trim() || `暂存子任务 Worktree 变更失败: ${worktreePath}`,
-      );
+  return sharedGitRepoCoordinator.runExclusive(worktreePath, async () => {
+    if (!fs.existsSync(worktreePath)) {
+      return { committed: false, commitSha: null };
     }
-    const commitRes = await runGitFull(
-      worktreePath,
-      [
-        '-c',
-        'user.name=HarnessMate Orchestrator',
-        '-c',
-        'user.email=orchestrator@harnessmate.local',
-        'commit',
-        '-m',
-        message.trim() || 'chore(subagent): snapshot isolated worktree edits',
-      ],
-      { timeoutMs: 15_000 },
-    );
-    if (!commitRes.ok && !/nothing to commit/i.test(`${commitRes.stdout}\n${commitRes.stderr}`)) {
-      throw new GitOperationError(
-        'E_GIT_COMMIT_FAILED',
-        commitRes.stderr.trim() || commitRes.stdout.trim() || '子任务 Worktree 自动提交失败',
+    // Exclude HarnessMate's own internal runtime metadata (.harnessmate/) so parallel subagents
+    // never pollute feature branches or spuriously conflict on task-ledger files.
+    const pathspec = ['--', '.', ':!.harnessmate', ':!.harnessmate/'];
+    const porcelain = await runGit(worktreePath, ['status', '--porcelain=v1', ...pathspec], 5000);
+    if (porcelain && porcelain.trim().length > 0) {
+      const addRes = await runGitFull(worktreePath, ['add', '-A', ...pathspec], { timeoutMs: 10_000 });
+      if (!addRes.ok) {
+        throw new GitOperationError(
+          'E_GIT_ADD_FAILED',
+          addRes.stderr.trim() || `暂存子任务 Worktree 变更失败: ${worktreePath}`,
+        );
+      }
+      const commitRes = await runGitFull(
+        worktreePath,
+        [
+          '-c',
+          'user.name=HarnessMate Orchestrator',
+          '-c',
+          'user.email=orchestrator@harnessmate.local',
+          'commit',
+          '-m',
+          message.trim() || 'chore(subagent): snapshot isolated worktree edits',
+        ],
+        { timeoutMs: 15_000 },
       );
+      if (!commitRes.ok && !/nothing to commit/i.test(`${commitRes.stdout}\n${commitRes.stderr}`)) {
+        throw new GitOperationError(
+          'E_GIT_COMMIT_FAILED',
+          commitRes.stderr.trim() || commitRes.stdout.trim() || '子任务 Worktree 自动提交失败',
+        );
+      }
+      const sha = (await runGit(worktreePath, ['rev-parse', 'HEAD'], 3000))?.trim();
+      return { committed: true, commitSha: sha || null };
     }
     const sha = (await runGit(worktreePath, ['rev-parse', 'HEAD'], 3000))?.trim();
-    return { committed: true, commitSha: sha || null };
-  }
-  const sha = (await runGit(worktreePath, ['rev-parse', 'HEAD'], 3000))?.trim();
-  return { committed: false, commitSha: sha || null };
+    return { committed: false, commitSha: sha || null };
+  });
 }
 
 /**
@@ -1025,53 +1044,57 @@ export async function mergeBranchExplicit(
   headBranch: string,
   opts?: { commitMessage?: string },
 ): Promise<{ commitSha: string | null; dryRun: GitDryRunMergeResult }> {
-  const dryRun = await dryRunMerge(repoRoot, baseBranch, headBranch);
-  if (dryRun.hasConflicts) {
-    throw new GitOperationError(
-      'E_MERGE_CONFLICT',
-      `检测到 ${dryRun.conflictFiles.length} 个合并冲突文件，已阻止合并以保护主工作区: ${dryRun.conflictFiles.join(', ')}`,
+  return sharedGitRepoCoordinator.runExclusive(repoRoot, async () => {
+    const dryRun = await dryRunMerge(repoRoot, baseBranch, headBranch);
+    if (dryRun.hasConflicts) {
+      throw new GitOperationError(
+        'E_MERGE_CONFLICT',
+        `检测到 ${dryRun.conflictFiles.length} 个合并冲突文件，已阻止合并以保护主工作区: ${dryRun.conflictFiles.join(', ')}`,
+      );
+    }
+
+    const currentBranch = (await runGit(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], 3000))?.trim();
+    if (currentBranch && currentBranch !== baseBranch) {
+      throw new GitOperationError(
+        'E_BASE_BRANCH_MISMATCH',
+        `主工作区当前分支为 ${currentBranch}，与目标合回分支 ${baseBranch} 不一致，请先切换分支后重试`,
+      );
+    }
+
+    const msg = opts?.commitMessage?.trim() || `Merge subagent branch '${headBranch}' into ${baseBranch}`;
+    const mergeRes = await runGitFull(
+      repoRoot,
+      [
+        '-c',
+        'user.name=HarnessMate Orchestrator',
+        '-c',
+        'user.email=orchestrator@harnessmate.local',
+        'merge',
+        '--no-ff',
+        '-m',
+        msg,
+        headBranch,
+      ],
+      { timeoutMs: 15_000 },
     );
-  }
 
-  const currentBranch = (await runGit(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'], 3000))?.trim();
-  if (currentBranch && currentBranch !== baseBranch) {
-    throw new GitOperationError(
-      'E_BASE_BRANCH_MISMATCH',
-      `主工作区当前分支为 ${currentBranch}，与目标合回分支 ${baseBranch} 不一致，请先切换分支后重试`,
-    );
-  }
+    if (!mergeRes.ok) {
+      // Guarantee main working tree is never left in a conflicted/half-merged state
+      await runGitFull(repoRoot, ['merge', '--abort'], { timeoutMs: 5000 });
+      throw new GitOperationError(
+        'E_MERGE_FAILED',
+        mergeRes.stderr.trim() || mergeRes.stdout.trim() || `合并分支 ${headBranch} 失败，已自动回滚合并状态`,
+      );
+    }
 
-  const msg = opts?.commitMessage?.trim() || `Merge subagent branch '${headBranch}' into ${baseBranch}`;
-  const mergeRes = await runGitFull(
-    repoRoot,
-    [
-      '-c',
-      'user.name=HarnessMate Orchestrator',
-      '-c',
-      'user.email=orchestrator@harnessmate.local',
-      'merge',
-      '--no-ff',
-      '-m',
-      msg,
-      headBranch,
-    ],
-    { timeoutMs: 15_000 },
-  );
-
-  if (!mergeRes.ok) {
-    // Guarantee main working tree is never left in a conflicted/half-merged state
-    await runGitFull(repoRoot, ['merge', '--abort'], { timeoutMs: 5000 });
-    throw new GitOperationError(
-      'E_MERGE_FAILED',
-      mergeRes.stderr.trim() || mergeRes.stdout.trim() || `合并分支 ${headBranch} 失败，已自动回滚合并状态`,
-    );
-  }
-
-  const commitSha = (await runGit(repoRoot, ['rev-parse', 'HEAD'], 3000))?.trim();
-  return { commitSha: commitSha || null, dryRun };
+    const commitSha = (await runGit(repoRoot, ['rev-parse', 'HEAD'], 3000))?.trim();
+    return { commitSha: commitSha || null, dryRun };
+  });
 }
 
 export async function deleteLocalBranch(repoRoot: string, branchName: string): Promise<boolean> {
-  const res = await runGitFull(repoRoot, ['branch', '-d', branchName], { timeoutMs: 5000 });
-  return res.ok;
+  return sharedGitRepoCoordinator.runExclusive(repoRoot, async () => {
+    const res = await runGitFull(repoRoot, ['branch', '-d', branchName], { timeoutMs: 5000 });
+    return res.ok;
+  });
 }

@@ -1,0 +1,52 @@
+{
+  "id": "user.workspace-tools-lite",
+  "name": "Workspace Tools Lite (第三方工作区替代样例)",
+  "version": "1.0.0",
+  "description": "使用 W1 Peer 契约与自定义检视插槽实现的可独立安装工作区工具替代插件（Git/Diff、文件浏览、规则发现与命令执行）。",
+  "author": "HarnessMate Community Example",
+  "category": "tool",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "git.workspace.v1",
+    "workspace.files.v1",
+    "workspace.rules.v1",
+    "terminal.runner.v1"
+  ],
+  "permissions": [
+    "fs:workspace:read",
+    "workspace:git:read",
+    "workspace:git:write",
+    "process:spawn:git",
+    "process:spawn:node",
+    "storage:workspace"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "inspector.diff",
+        "id": "lite-diff-panel",
+        "title": "Workspace Tools Lite · Diff",
+        "ui": "ui/diff.html",
+        "order": 90
+      },
+      {
+        "slot": "inspector.files",
+        "id": "lite-files-panel",
+        "title": "Workspace Tools Lite · 文件",
+        "ui": "ui/files.html",
+        "order": 90
+      },
+      {
+        "slot": "inspector.rules",
+        "id": "lite-rules-panel",
+        "title": "Workspace Tools Lite · 规则",
+        "ui": "ui/rules.html",
+        "order": 90
+      }
+    ]
+  }
+}

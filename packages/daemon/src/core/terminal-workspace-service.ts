@@ -697,6 +697,7 @@ export interface TerminalWorkspaceServiceOptions {
   batchFlushMs?: number;
   initialActive?: boolean;
   getGitService?: () => GitService | undefined;
+  getWorktrees?: (repoRoot: string) => Promise<Array<{ path: string }>>;
   backendFactory?: (params: TerminalBackendSpawnParams) => TerminalBackend;
 }
 
@@ -725,6 +726,7 @@ export class TerminalWorkspaceService {
   private readonly batchFlushMs: number;
   private pluginActive: boolean;
   private getGitService?: () => GitService | undefined;
+  private getWorktrees?: (repoRoot: string) => Promise<Array<{ path: string }>>;
   private readonly backendFactory: (params: TerminalBackendSpawnParams) => TerminalBackend;
   private titleCounter = 0;
 
@@ -736,6 +738,7 @@ export class TerminalWorkspaceService {
     this.batchFlushMs = Math.max(4, opts.batchFlushMs ?? DEFAULT_BATCH_FLUSH_MS);
     this.pluginActive = opts.initialActive ?? true;
     this.getGitService = opts.getGitService;
+    this.getWorktrees = opts.getWorktrees;
     this.backendFactory =
       opts.backendFactory ??
       ((params) => {
@@ -753,6 +756,10 @@ export class TerminalWorkspaceService {
 
   attachGitService(getGitService: () => GitService | undefined): void {
     this.getGitService = getGitService;
+  }
+
+  attachWorktreeLister(getWorktrees: (repoRoot: string) => Promise<Array<{ path: string }>>): void {
+    this.getWorktrees = getWorktrees;
   }
 
   setPluginActive(active: boolean): void {
@@ -799,7 +806,16 @@ export class TerminalWorkspaceService {
       if (s.cwd) allowedRoots.add(path.resolve(s.cwd));
     }
     const git = this.getGitService?.();
-    if (workspace.isGitRepo && git) {
+    if (this.getWorktrees) {
+      try {
+        const worktrees = await this.getWorktrees(workspace.rootPath);
+        for (const wt of worktrees) {
+          if (wt.path) allowedRoots.add(path.resolve(wt.path));
+        }
+      } catch {
+        // Fallback cleanly to workspace root and session CWDs if git inspection fails
+      }
+    } else if (workspace.isGitRepo && git) {
       try {
         const worktrees = await git.listWorktrees(workspace.rootPath);
         for (const wt of worktrees) {
@@ -1017,6 +1033,7 @@ export class TerminalWorkspaceService {
     this.terminals.delete(terminalId);
     await entry.backend.kill();
     entry.outputListeners.clear();
+    entry.ringBuffer.clear();
     this.emitStatus(entry, 'closed');
     return true;
   }

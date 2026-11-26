@@ -81,25 +81,13 @@ import {
   type DaemonPersistedConfig,
   type DaemonRuntimePaths,
 } from '../config.js';
-import {
-  AttachmentService,
-  discoverProjectRulesAndSkills,
-  inferMimeType,
-  readWorkspaceFilePreview,
-  searchWorkspaceFiles,
-} from '../core/attachment-service.js';
 import { CommandOutputHub } from '../core/command-output-hub.js';
-import { CheckpointError } from '../core/checkpoint-service.js';
 import { EffectOutboxWorker } from '../core/effect-outbox.js';
 import { DaemonEventBus } from '../core/event-bus.js';
-import { GitOperationError } from '../core/git-service.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
-import { runWorkspaceCommand } from '../core/terminal-service.js';
 import { TriageInboxService } from '../core/triage-inbox-service.js';
 import {
-  TERMINAL_WORKSPACE_PLUGIN_ID,
-  TerminalWorkspaceError,
   TerminalWorkspaceService,
 } from '../core/terminal-workspace-service.js';
 import type { UsageService } from '../core/usage-service.js';
@@ -110,6 +98,7 @@ import {
 } from '../core/context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
+import { GitOperationError } from '../core/git-service.js';
 import { FILE_PREVIEW_PERMISSION, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
@@ -149,6 +138,11 @@ import { HistoryImportAdapter } from '../core/history-import-adapter.js';
 import { registerServiceResolutionRoute } from '../plugin-host/composition/resolve-route.js';
 import { registerHistoryImportCompatRoutes } from './routes/history-import-compat.js';
 import { registerSessionSearchCompatRoutes } from './routes/session-search-compat.js';
+import { registerGitWorktreesCompatRoutes } from './routes/git-worktrees-compat.js';
+import { registerCheckpointsCompatRoutes } from './routes/checkpoints-compat.js';
+import { registerTerminalCompatRoutes } from './routes/terminal-compat.js';
+import { registerFilesAttachmentsRulesCompatRoutes } from './routes/files-attachments-rules-compat.js';
+import { PEER_CONTRACTS } from '@harnessmate/plugin-api';
 
 export interface CreateDaemonOptions {
   dataDir?: string;
@@ -242,13 +236,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       { service: triageInbox, bus: eventBus },
       paths.agyProfilesDir,
       historyImportAdapter,
+      paths.attachmentsDir,
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
   const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
-  const attachmentService = new AttachmentService(paths.attachmentsDir);
   const mcpService = new McpService(registry, config.binaryOverrides);
 
   let boundPort = config.port;
@@ -291,20 +285,47 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       wsGateway.notifyAgyAuthState(state);
     },
   });
-  terminalWorkspace.subscribeStatus(({ terminal, event }) => {
-    const ownerSessionId = terminalSessionOwners.get(terminal.terminalId);
-    if (ownerSessionId && event === 'exited') {
-      sessionManager.recordTerminalEvent(ownerSessionId, 'terminal.exited', {
-        terminalId: terminal.terminalId,
-        title: terminal.title,
-        cwd: terminal.cwd,
-        exitCode: terminal.exitCode ?? null,
-      });
+  const terminalOwnerStatusUnsubs = new Map<string, () => void>();
+  const syncTerminalOwnerListeners = () => {
+    const activeIds = new Set<string>();
+    const candidates = [
+      ...pluginManager.host.listServiceProviders(PEER_CONTRACTS.terminalWorkspace),
+      ...pluginManager.host.listServiceProviders('terminal-workspace'),
+    ];
+    for (const prov of candidates) {
+      activeIds.add(prov.instanceId);
+      if (terminalOwnerStatusUnsubs.has(prov.instanceId)) continue;
+      const svc =
+        pluginManager.host.getServiceByInstance<TerminalWorkspaceService>(prov.instanceId, 'terminal-workspace') ??
+        pluginManager.host.getServiceByInstance<TerminalWorkspaceService>(prov.instanceId, PEER_CONTRACTS.terminalWorkspace);
+      if (svc && typeof svc.subscribeStatus === 'function') {
+        terminalOwnerStatusUnsubs.set(
+          prov.instanceId,
+          svc.subscribeStatus(({ terminal, event }) => {
+            const ownerSessionId = terminalSessionOwners.get(terminal.terminalId);
+            if (ownerSessionId && event === 'exited') {
+              sessionManager.recordTerminalEvent(ownerSessionId, 'terminal.exited', {
+                terminalId: terminal.terminalId,
+                title: terminal.title,
+                cwd: terminal.cwd,
+                exitCode: terminal.exitCode ?? null,
+              });
+            }
+            if (event === 'closed') {
+              terminalSessionOwners.delete(terminal.terminalId);
+            }
+          }),
+        );
+      }
     }
-    if (event === 'closed') {
-      terminalSessionOwners.delete(terminal.terminalId);
+    for (const [instId, unsub] of terminalOwnerStatusUnsubs) {
+      if (!activeIds.has(instId)) {
+        unsub();
+        terminalOwnerStatusUnsubs.delete(instId);
+      }
     }
-  });
+  };
+  syncTerminalOwnerListeners();
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
     const session = store.getSession(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
@@ -328,8 +349,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     eventBus,
     sessionManager,
     terminalWorkspace,
+    pluginManager,
   });
   pluginManager.host.events.on('plugin.state', ({ data }) => {
+    syncTerminalOwnerListeners();
     if (data.pluginId === pluginManager.filePreviewProviderId) wsGateway.notifyPluginsChanged();
   });
   pluginPermissions.onChange(({ capability }) => {
@@ -970,9 +993,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: '插件本地路由仅允许本机访问', code: 'E_PERMISSION_DENIED' });
     }
     const { instanceId, '*': wildcardPath } = request.params as { instanceId: string; '*': string };
-    if (!pluginManager.isolated) {
-      return reply.code(400).send({ error: '隔离插件运行时不可用', code: 'E_NOT_SUPPORTED' });
-    }
     try {
       const routePath = `/${(wildcardPath ?? '').replace(/^\/+/, '')}`;
       const query: Record<string, string> = {};
@@ -985,7 +1005,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       for (const [k, v] of Object.entries(request.headers)) {
         if (typeof v === 'string') headers[k] = v;
       }
-      const res = await pluginManager.isolated.dispatchRoute(instanceId, {
+      const res = await pluginManager.dispatchPluginRoute(instanceId, {
         method: request.method,
         path: routePath,
         query,
@@ -998,7 +1018,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(res?.status ?? 200).send(res?.body ?? { ok: true });
     } catch (error) {
       const code = error instanceof PluginApiError ? error.code : 'E_INTERNAL';
-      const status = code === 'E_SERVICE_UNAVAILABLE' || code === 'E_STALE_RUN' ? 503 : code === 'E_TIMEOUT' ? 504 : 400;
+      const status =
+        code === 'E_PERMISSION_DENIED'
+          ? 403
+          : code === 'E_PLUGIN_DISABLED' || code === 'E_SERVICE_UNAVAILABLE' || code === 'E_STALE_RUN'
+            ? 503
+            : code === 'E_TIMEOUT'
+              ? 504
+              : 400;
       return reply.code(status).send({ error: error instanceof Error ? error.message : String(error), code });
     }
   });
@@ -1140,6 +1167,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { workspaceId: id }),
         'history.import.v1': pluginManager.resolveCapabilityBinding('history.import.v1', { workspaceId: id }),
         'session.search.v1': pluginManager.resolveCapabilityBinding('session.search.v1', { workspaceId: id }),
+        'git.workspace.v1': pluginManager.resolveCapabilityBinding('git.workspace.v1', { workspaceId: id }),
+        'git.checkpoint.v1': pluginManager.resolveCapabilityBinding('git.checkpoint.v1', { workspaceId: id }),
+        'terminal.workspace.v1': pluginManager.resolveCapabilityBinding('terminal.workspace.v1', { workspaceId: id }),
+        'terminal.runner.v1': pluginManager.resolveCapabilityBinding('terminal.runner.v1', { workspaceId: id }),
+        'workspace.files.v1': pluginManager.resolveCapabilityBinding('workspace.files.v1', { workspaceId: id }),
+        'session.attachments.v1': pluginManager.resolveCapabilityBinding('session.attachments.v1', { workspaceId: id }),
+        'workspace.rules.v1': pluginManager.resolveCapabilityBinding('workspace.rules.v1', { workspaceId: id }),
       },
     };
   });
@@ -1174,6 +1208,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { sessionId: id, workspaceId: session.workspaceId }),
         'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { sessionId: id, workspaceId: session.workspaceId }),
         'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'git.workspace.v1': pluginManager.resolveCapabilityBinding('git.workspace.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'git.checkpoint.v1': pluginManager.resolveCapabilityBinding('git.checkpoint.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'terminal.workspace.v1': pluginManager.resolveCapabilityBinding('terminal.workspace.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'terminal.runner.v1': pluginManager.resolveCapabilityBinding('terminal.runner.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'workspace.files.v1': pluginManager.resolveCapabilityBinding('workspace.files.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'session.attachments.v1': pluginManager.resolveCapabilityBinding('session.attachments.v1', { sessionId: id, workspaceId: session.workspaceId }),
+        'workspace.rules.v1': pluginManager.resolveCapabilityBinding('workspace.rules.v1', { sessionId: id, workspaceId: session.workspaceId }),
       },
     };
   });
@@ -1769,99 +1810,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { interrupted: true };
   });
 
-  app.post('/api/v1/sessions/:id/attachments', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    if (!sessionManager.getSession(id)) {
-      return reply.code(404).send({ error: 'Session not found' });
-    }
-    const parsed = UploadAttachmentRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid attachment' });
-    }
-    try {
-      const attachment = attachmentService.saveSessionAttachment(id, parsed.data);
-      return reply.code(201).send({ attachment });
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.get('/api/v1/attachments/:sessionId/:filename', async (request, reply) => {
-    const { sessionId, filename } = request.params as { sessionId: string; filename: string };
-    const filePath = attachmentService.resolveAttachmentFile(sessionId, filename);
-    if (!filePath) return reply.code(404).send({ error: 'Attachment not found' });
-    reply.header('Content-Type', inferMimeType(filePath));
-    reply.header('Cache-Control', 'private, max-age=3600');
-    return reply.send(fs.createReadStream(filePath));
-  });
-
-  app.get('/api/v1/sessions/:id/files', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const q = request.query as { q?: string };
-    return { files: searchWorkspaceFiles(session.cwd, q.q ?? '', 120) };
-  });
-
-  app.get('/api/v1/sessions/:id/file-content', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const q = request.query as { path?: string };
-    if (!q.path) return reply.code(400).send({ error: 'Missing path parameter' });
-    try {
-      return readWorkspaceFilePreview(session.cwd, q.path);
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.get('/api/v1/sessions/:id/file-preview', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const q = request.query as { path?: string; line?: string };
-    if (typeof q.path !== 'string' || !q.path) return reply.code(400).send({ error: 'Missing path parameter' });
-    reply.header('Cache-Control', 'no-store');
-    if (!pluginManager.filePreviewProviderId) return { preview: null };
-    const line = Number(q.line);
-    try {
-      const file = readWorkspaceFilePreview(session.cwd, q.path);
-      const preview = await renderLegacyFilePreview(pluginManager, session.workspaceId, {
-        ...file, version: 1, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}),
-      });
-      return { preview };
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
-    }
-  });
-
-  app.get('/api/v1/sessions/:id/file-view', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const q = request.query as { path?: string; line?: string; instanceId?: string };
-    if (typeof q.path !== 'string' || !q.path) return reply.code(400).send({ error: 'Missing path parameter' });
-    reply.header('Cache-Control', 'no-store');
-    const line = Number(q.line);
-    try {
-      const file = readWorkspaceFilePreview(session.cwd, q.path);
-      const rendered = await pluginManager.renderPeerFilePreview(
-        session.workspaceId,
-        { ...file, version: 1, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}) },
-        {
-          sessionId: session.id,
-          explicitInstanceId: typeof q.instanceId === 'string' && q.instanceId.trim() ? q.instanceId.trim() : undefined,
-        },
-      );
-      return {
-        file,
-        ...rendered,
-        availableViewers: pluginManager.listFilePreviewViewers(session.workspaceId),
-      };
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
-    }
+  registerFilesAttachmentsRulesCompatRoutes(app, {
+    store,
+    pluginManager,
+    sessionManager,
+    attachmentsRoot: paths.attachmentsDir,
   });
 
   app.post('/api/v1/sessions/:id/browser/open', async (request, reply) => {
@@ -1929,154 +1882,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  app.get('/api/v1/sessions/:id/rules', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { instructions: discoverProjectRulesAndSkills(session.cwd) };
-  });
-
-  app.post('/api/v1/sessions/:id/terminal', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const body = request.body as { command?: string };
-    if (!body?.command?.trim()) {
-      return reply.code(400).send({ error: 'Command is required' });
-    }
-    try {
-      const result = await runWorkspaceCommand(session.cwd, body.command);
-      return { result };
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  // ── Integrated PTY Terminal Workspace & Context Chips ─────────────────
-
-  app.get('/api/v1/workspaces/:id/terminals', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
-    const q = request.query as { cwd?: string };
-    return {
-      enabled: pluginManager.isPluginEnabled(TERMINAL_WORKSPACE_PLUGIN_ID),
-      ptyAvailable: terminalWorkspace.isPtyAvailable(),
-      terminals: terminalWorkspace.listTerminals(id, q.cwd || undefined),
-    };
-  });
-
-  app.post('/api/v1/workspaces/:id/terminals', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
-    if (!pluginManager.isPluginEnabled(TERMINAL_WORKSPACE_PLUGIN_ID)) {
-      return reply.code(409).send({
-        error: '集成终端与上下文插件当前未启用，请先在插件管理中启用。',
-        code: 'E_PLUGIN_DISABLED',
-      });
-    }
-    const parsed = OpenTerminalRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid open terminal payload' });
-    }
-    try {
-      const created = await terminalWorkspace.openTerminal(id, {
-        cwd: parsed.data.cwd,
-        title: parsed.data.title,
-        cols: parsed.data.cols,
-        rows: parsed.data.rows,
-        initialCommand: parsed.data.initialCommand,
-      });
-      if (parsed.data.sessionId && sessionManager.getSession(parsed.data.sessionId)) {
-        terminalSessionOwners.set(created.terminal.terminalId, parsed.data.sessionId);
-        sessionManager.recordTerminalEvent(parsed.data.sessionId, 'terminal.opened', {
-          terminalId: created.terminal.terminalId,
-          title: created.terminal.title,
-          cwd: created.terminal.cwd,
-          backend: created.terminal.backend,
-        });
-      }
-      return reply.code(201).send(created);
-    } catch (err) {
-      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_OPEN_FAILED';
-      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_WORKSPACE_NOT_FOUND' ? 404 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/terminals/:terminalId/input', async (request, reply) => {
-    const { terminalId } = request.params as { terminalId: string };
-    const parsed = TerminalInputRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid terminal input payload' });
-    }
-    try {
-      terminalWorkspace.writeInput(terminalId, parsed.data.data);
-      return { ok: true };
-    } catch (err) {
-      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_INPUT_FAILED';
-      const status = code === 'E_TERMINAL_NOT_FOUND' ? 404 : code === 'E_PLUGIN_DISABLED' || code === 'E_TERMINAL_EXITED' ? 409 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/terminals/:terminalId/interrupt', async (request, reply) => {
-    const { terminalId } = request.params as { terminalId: string };
-    try {
-      const terminal = await terminalWorkspace.interruptTerminal(terminalId);
-      return { terminal };
-    } catch (err) {
-      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_INTERRUPT_FAILED';
-      return reply.code(code === 'E_TERMINAL_NOT_FOUND' ? 404 : 400).send({
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-    }
-  });
-
-  app.post('/api/v1/terminals/:terminalId/restart', async (request, reply) => {
-    const { terminalId } = request.params as { terminalId: string };
-    try {
-      const terminal = await terminalWorkspace.restartTerminal(terminalId);
-      return { terminal };
-    } catch (err) {
-      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_TERMINAL_RESTART_FAILED';
-      const status = code === 'E_TERMINAL_NOT_FOUND' ? 404 : code === 'E_PLUGIN_DISABLED' ? 409 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/terminals/:terminalId/context-chip', async (request, reply) => {
-    const { terminalId } = request.params as { terminalId: string };
-    const parsed = CreateTerminalContextChipRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid context chip request' });
-    }
-    try {
-      const chip = terminalWorkspace.createContextChip(terminalId, parsed.data);
-      return { chip };
-    } catch (err) {
-      const code = err instanceof TerminalWorkspaceError ? err.code : 'E_CONTEXT_CHIP_FAILED';
-      return reply.code(code === 'E_TERMINAL_NOT_FOUND' ? 404 : 400).send({
-        error: err instanceof Error ? err.message : String(err),
-        code,
-      });
-    }
-  });
-
-  app.delete('/api/v1/terminals/:terminalId', async (request, reply) => {
-    const { terminalId } = request.params as { terminalId: string };
-    const closed = await terminalWorkspace.closeTerminal(terminalId);
-    if (!closed) return reply.code(404).send({ error: 'Terminal not found' });
-    return { closed: true };
-  });
-
-  app.post('/api/v1/terminals/release-path', async (request, reply) => {
-    const parsed = ReleaseTerminalsPathRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid release-path payload' });
-    }
-    const result = await terminalWorkspace.releaseTerminalsUnderPath(parsed.data.targetPath);
-    return result;
+  registerTerminalCompatRoutes(app, {
+    store,
+    pluginManager,
+    sessionManager,
+    terminalSessionOwners,
   });
 
   app.post('/api/v1/sessions/:id/handoff', async (request, reply) => {
@@ -2382,389 +2192,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  app.get('/api/v1/sessions/:id/git', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const git = await service.status(session.cwd);
-    return { git };
-  });
-
-  app.get('/api/v1/sessions/:id/git/file-diff', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const q = request.query as { path?: string; staged?: string };
-    if (!q.path) return reply.code(400).send({ error: 'Missing path parameter' });
-    try {
-      const result = await service.fileDiff(session.cwd, q.path, q.staged === '1' || q.staged === 'true');
-      return result;
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_GIT_DIFF_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.get('/api/v1/sessions/:id/git/truth', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const digest = await service.workspaceTruthDigest(session.cwd);
-    return { digest };
-  });
-
-  app.post('/api/v1/sessions/:id/git/init', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    try {
-      const result = await service.init(session.cwd);
-      const git = await service.status(session.cwd);
-      return { result, git };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_GIT_INIT_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/git/discard', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = GitDiscardFileRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid filePath' });
-    try {
-      const result = await service.discardFile(session.cwd, parsed.data.filePath);
-      const git = await service.status(session.cwd);
-      return { result, git };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_DISCARD_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/git/commit', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = GitCommitRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid commit payload' });
-    try {
-      const result = await service.commit(session.cwd, parsed.data);
-      const git = await service.status(session.cwd);
-      return { result, git };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_GIT_COMMIT_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/git/push', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = GitPushRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid push payload' });
-    try {
-      const result = await service.push(session.cwd, parsed.data);
-      const git = await service.status(session.cwd);
-      return { result, git };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_GIT_PUSH_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/git/pull', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = GitPullRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid pull payload' });
-    try {
-      const result = await service.pull(session.cwd, parsed.data);
-      const git = await service.status(session.cwd);
-      return { result, git };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_GIT_PULL_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/git/pr', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = GitCreatePrRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid PR payload' });
-    try {
-      const result = await service.createPr(session.cwd, parsed.data);
-      return { result };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_PR_CREATE_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  // ── Session Checkpoints & Atomic Revert ──────────────────────────────
-
-  app.get('/api/v1/sessions/:id/checkpoints', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const checkpoints = sessionManager.listSessionCheckpoints(id);
-    const adapter = registry.get(session.harnessId);
-    const supportsNativeRollback = Boolean(adapter?.capabilitiesV2?.supportsNativeRollback);
-    return { checkpoints, supportsNativeRollback };
-  });
-
-  app.post('/api/v1/sessions/:id/checkpoints', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    try {
-      const checkpoint = await sessionManager.captureManualCheckpoint(id);
-      return reply.code(201).send({ checkpoint });
-    } catch (err) {
-      const code = err instanceof CheckpointError ? err.code : 'E_CHECKPOINT_CAPTURE_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.get('/api/v1/sessions/:id/checkpoints/diff', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const q = request.query as {
-      fromCheckpointId?: string;
-      toCheckpointId?: string;
-      fromSeq?: string;
-      toSeq?: string;
-    };
-    try {
-      const diff = await sessionManager.diffSessionCheckpoints(id, {
-        fromCheckpointId: q.fromCheckpointId || undefined,
-        toCheckpointId: q.toCheckpointId || undefined,
-        fromSeq: q.fromSeq !== undefined ? Number(q.fromSeq) : undefined,
-        toSeq: q.toSeq !== undefined ? Number(q.toSeq) : undefined,
-      });
-      return diff;
-    } catch (err) {
-      const code = err instanceof CheckpointError ? err.code : 'E_CHECKPOINT_DIFF_FAILED';
-      const status = code === 'E_CHECKPOINT_MISSING' || code === 'E_CHECKPOINT_NOT_FOUND' ? 404 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/checkpoints/revert', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const parsed = RevertCheckpointRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid revert payload' });
-    }
-    try {
-      const result = await sessionManager.revertSessionCheckpoint(id, parsed.data);
-      return {
-        result,
-        session: sessionManager.getSession(id),
-        checkpoints: sessionManager.listSessionCheckpoints(id),
-      };
-    } catch (err) {
-      const code = err instanceof CheckpointError ? err.code : 'E_REVERT_FAILED';
-      const status = code === 'E_CHECKPOINT_MISSING' || code === 'E_CHECKPOINT_NOT_FOUND' ? 404 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/checkpoints/gc', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const parsed = GcCheckpointsRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid GC payload' });
-    try {
-      const result = await sessionManager.gcSessionCheckpoints(id, parsed.data);
-      return { ...result, checkpoints: sessionManager.listSessionCheckpoints(id) };
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  // ── Workspace Worktrees, Dry-Run Merge & .harnessmate/setup Trust ────
-
-  app.get('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
-    const worktrees = await service.listWorktrees(
-      workspace.rootPath,
-      sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
-    );
-    const setupScript = service.inspectSetupScript(workspace.rootPath, store);
-    const blockingTerminalsByPath: Record<string, ReturnType<typeof terminalWorkspace.listTerminalsUsingPath>> = {};
-    for (const wt of worktrees) {
-      const blocking = terminalWorkspace.listTerminalsUsingPath(wt.path);
-      if (blocking.length > 0) {
-        blockingTerminalsByPath[wt.path] = blocking;
-      }
-    }
-    return { worktrees, setupScript, blockingTerminalsByPath };
-  });
-
-  app.post('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = CreateWorktreeRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid worktree payload' });
-    try {
-      const created = await service.createWorktree(workspace.rootPath, parsed.data.branchName, {
-        baseBranch: parsed.data.baseBranch,
-      });
-      const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
-      const worktrees = await service.listWorktrees(
-        workspace.rootPath,
-        sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
-      );
-      return reply.code(201).send({ created, worktrees });
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_WORKTREE_CREATE_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.delete('/api/v1/workspaces/:id/worktrees', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const q = request.query as { worktreePath?: string; force?: string };
-    const rawBody = request.body && typeof request.body === 'object' ? request.body : {
-      worktreePath: q.worktreePath,
-      force: q.force === '1' || q.force === 'true',
-    };
-    const parsed = RemoveWorktreeRequestSchema.safeParse(rawBody);
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid worktreePath' });
-    const blockingTerminals = terminalWorkspace.listTerminalsUsingPath(parsed.data.worktreePath);
-    if (blockingTerminals.length > 0) {
-      return reply.code(409).send({
-        error: `Worktree 目录正被 ${blockingTerminals.length} 个运行中终端占用，请先关闭或一键释放占用终端后重试 (${blockingTerminals.map((t) => t.title).join(', ')})`,
-        code: 'E_WORKTREE_BUSY',
-        blockingTerminals,
-      });
-    }
-    try {
-      const result = await service.removeWorktree(workspace.rootPath, parsed.data.worktreePath, {
-        force: parsed.data.force,
-      });
-      const sessions = sessionManager.listSessions({ workspaceId: id, includeArchived: true });
-      const worktrees = await service.listWorktrees(
-        workspace.rootPath,
-        sessions.map((s) => ({ sessionId: s.id, cwd: s.cwd })),
-      );
-      return { result, worktrees };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_WORKTREE_REMOVE_FAILED';
-      const status = code === 'E_WORKTREE_BUSY' ? 409 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/workspaces/:id/worktrees/dry-run-merge', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = DryRunMergeRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid merge pre-check payload' });
-    try {
-      const result = await service.dryRunMerge(
-        workspace.rootPath,
-        parsed.data.baseBranch,
-        parsed.data.headBranch,
-      );
-      return result;
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_MERGE_PRECHECK_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.get('/api/v1/workspaces/:id/setup-script', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    return { setupScript: service.inspectSetupScript(workspace.rootPath, store) };
-  });
-
-  app.put('/api/v1/workspaces/:id/setup-script/trust', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const parsed = TrustSetupScriptRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: 'Invalid setup script trust payload' });
-    try {
-      const setupScript = service.setSetupScriptTrust(
-        workspace.rootPath,
-        store,
-        parsed.data.sha256,
-        parsed.data.trusted,
-      );
-      return { setupScript };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_SETUP_TRUST_FAILED';
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
-
-  app.post('/api/v1/workspaces/:id/setup-script/run', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const workspace = store.getWorkspace(id);
-    if (!workspace) return reply.code(404).send({ error: 'Workspace not found' });
-    const service = pluginManager.host.get<GitService>('git');
-    if (!service) return reply.code(409).send({ error: 'Git 服务已停用', code: 'E_SERVICE_UNAVAILABLE' });
-    const body = (request.body ?? {}) as { worktreePath?: string };
-    const targetDir = body.worktreePath?.trim() || workspace.rootPath;
-    try {
-      const result = await service.executeTrustedSetupScript(workspace.rootPath, targetDir, store);
-      return { result };
-    } catch (err) {
-      const code = err instanceof GitOperationError ? err.code : 'E_SETUP_EXEC_FAILED';
-      const status = code === 'E_SETUP_SCRIPT_UNTRUSTED' ? 403 : 400;
-      return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
-    }
-  });
+  registerGitWorktreesCompatRoutes(app, { store, pluginManager, sessionManager });
+  registerCheckpointsCompatRoutes(app, { store, registry, pluginManager, sessionManager });
 
   // ── Approvals, Questions, Secret Requests & Risk Rules ───────────────
 

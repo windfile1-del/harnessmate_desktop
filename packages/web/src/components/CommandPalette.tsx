@@ -4,9 +4,14 @@ import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } fro
 import { useShallow } from 'zustand/react/shallow';
 import { daemonApi } from '../api/client';
 import {
+  GIT_WORKSPACE_CONTRACT,
   HISTORY_IMPORT_CONTRACT,
   SESSION_SEARCH_CONTRACT,
+  TERMINAL_RUNNER_CONTRACT,
+  TERMINAL_WORKSPACE_CONTRACT,
+  WORKSPACE_FILES_CONTRACT,
   getPluginInstanceId,
+  isContractAvailableClientSide,
   pluginProvidesContract,
 } from '../api/peer-contracts';
 import {
@@ -80,14 +85,33 @@ export function createFullTextCommand(query: string, enabled: boolean, openSearc
 }
 
 export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: string; onClose: () => void }) {
-  const { sessions, triage, workspaces, harnesses, selectedId, plugins, theme, permissionRevision } =
+  const {
+    sessions,
+    triage,
+    workspaces,
+    harnesses,
+    selectedId,
+    selectedWorkspaceId,
+    plugins,
+    compositionEntries,
+    compositionBindings,
+    workspaceBindingsByWorkspace,
+    sessionBindingsBySession,
+    theme,
+    permissionRevision,
+  } =
     useAppStore(useShallow((state) => ({
       sessions: state.sessions,
       triage: state.triageBySession,
       workspaces: state.workspaces,
       harnesses: state.harnesses,
       selectedId: state.selectedSessionId,
+      selectedWorkspaceId: state.selectedWorkspaceId,
       plugins: state.plugins,
+      compositionEntries: state.compositionEntries,
+      compositionBindings: state.compositionBindings,
+      workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace,
+      sessionBindingsBySession: state.sessionBindingsBySession,
       theme: state.theme,
       permissionRevision: state.pluginPermissionRevision,
     })));
@@ -129,6 +153,37 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
   const entries = useMemo(() => {
     const get = useAppStore.getState;
     const commands: CommandPaletteEntry[] = [];
+    const activeWorkspaceId = currentSession?.workspaceId ?? selectedWorkspaceId;
+    const contractOpts = {
+      plugins,
+      sessionBindings: selectedId ? sessionBindingsBySession[selectedId] : undefined,
+      workspaceBindings: activeWorkspaceId ? workspaceBindingsByWorkspace[activeWorkspaceId] : undefined,
+      compositionBindings,
+      compositionEntries,
+    };
+    const gitWorkspaceEnabled = isContractAvailableClientSide({
+      ...contractOpts,
+      contract: GIT_WORKSPACE_CONTRACT,
+      legacyPluginId: 'core.git-inspector',
+    });
+    const filesEnabled = isContractAvailableClientSide({
+      ...contractOpts,
+      contract: WORKSPACE_FILES_CONTRACT,
+      legacyPluginId: 'core.terminal-runner',
+    });
+    const terminalEnabled =
+      isContractAvailableClientSide({
+        ...contractOpts,
+        contract: TERMINAL_RUNNER_CONTRACT,
+        legacyPluginId: 'core.terminal-runner',
+      }) ||
+      isContractAvailableClientSide({
+        ...contractOpts,
+        contract: TERMINAL_WORKSPACE_CONTRACT,
+        legacyPluginId: 'hm.plugin.terminal-workspace',
+        optionalDefaultOff: true,
+      });
+
     const add = (id: string, sourcePluginId: string, category: CommandPaletteEntry['category'], title: string,
       execute: CommandPaletteEntry['execute'], keywords: string[] = []) => {
       commands.push({ id, sourcePluginId, category, title, execute, keywords });
@@ -138,9 +193,13 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
       add(String(name), pluginId ?? 'core', pluginId ? 'plugin_action' : 'navigation',
         title, () => get().openModal(name), keywords);
     };
-    const inspector = (tab: InspectorTab, title: string, pluginId: string) => {
-      if (!selectedId || !activePlugins.has(pluginId)) return;
-      add(tab, pluginId, 'plugin_action', title, () => {
+    const modalByAvailable = (name: ActiveModal, title: string, enabled: boolean, sourcePluginId: string, keywords: string[] = []) => {
+      if (!enabled) return;
+      add(String(name), sourcePluginId, 'plugin_action', title, () => get().openModal(name), keywords);
+    };
+    const inspector = (tab: InspectorTab, title: string, enabled: boolean, sourcePluginId: string) => {
+      if (!selectedId || !enabled) return;
+      add(tab, sourcePluginId, 'plugin_action', title, () => {
         get().setInspectorTab(tab);
         get().setInspectorOpen(true);
       });
@@ -186,9 +245,9 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
       }
       modal('handoff', '会话交接与引擎切换', 'core.context-bridge', ['handoff']);
       modal('context_preview', '预览交接包', 'core.context-bridge', ['context bridge', 'handoff']);
-      inspector('git', '打开 Git Diff', 'core.git-inspector');
-      inspector('terminal', '工作区终端', 'core.terminal-runner');
-      inspector('files', '工作区文件', 'core.terminal-runner');
+      inspector('git', '打开 Git Diff', gitWorkspaceEnabled, GIT_WORKSPACE_CONTRACT);
+      inspector('terminal', '工作区终端', terminalEnabled, TERMINAL_RUNNER_CONTRACT);
+      inspector('files', '工作区文件', filesEnabled, WORKSPACE_FILES_CONTRACT);
       for (const item of inspectorItems) {
         if (!activePlugins.has(item.pluginId)) continue;
         add(`panel:${item.id}`, item.pluginId, 'plugin_action', item.title ?? item.pluginName,
@@ -244,7 +303,7 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
     modal('plugins', '打开插件中心', undefined, ['plugin studio']);
     modal('keyboard_shortcuts', '快捷键速查', undefined, ['shortcuts', 'keyboard']);
     modal('harnesses', '管理本机 CLI 引擎', undefined, ['harness']);
-    modal('worktrees', '打开 Worktree 管理', 'core.git-inspector', ['Git 分支']);
+    modalByAvailable('worktrees', '打开 Worktree 管理', gitWorkspaceEnabled, GIT_WORKSPACE_CONTRACT, ['Git 分支']);
     modal('mcp', '打开 MCP 管理中心', 'core.mcp-hub');
     modal('usage', '打开用量看板', 'core.account-usage', ['usage', 'quota']);
     modal('remote_pairing', '移动端扫码联动', 'core.remote-mobile');
@@ -278,7 +337,26 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
       () => get().toggleTheme(), ['theme', 'dark', 'light']);
     return [...new Map([...commands, ...registered.filter(({ sourcePluginId }) => activePlugins.has(sourcePluginId))]
       .map((entry) => [commandKey(entry), entry])).values()];
-  }, [activePlugins, catalog, currentSession, harnesses, inspectorItems, plugins, registered, scope, selectedId, sessions, theme, triage, workspaces]);
+  }, [
+    activePlugins,
+    catalog,
+    compositionEntries,
+    compositionBindings,
+    currentSession,
+    harnesses,
+    inspectorItems,
+    plugins,
+    registered,
+    scope,
+    selectedId,
+    selectedWorkspaceId,
+    sessionBindingsBySession,
+    sessions,
+    theme,
+    triage,
+    workspaceBindingsByWorkspace,
+    workspaces,
+  ]);
   const index = useMemo(() => indexCommands(entries), [entries]);
   const delegated = delegatedSearchQuery(query);
   const fullTextAvailable = useMemo(

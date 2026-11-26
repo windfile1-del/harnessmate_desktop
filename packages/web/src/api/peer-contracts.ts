@@ -7,10 +7,42 @@ import type {
 export const HISTORY_SOURCE_CONTRACT = 'history.source.v1';
 export const HISTORY_IMPORT_CONTRACT = 'history.import.v1';
 export const SESSION_SEARCH_CONTRACT = 'session.search.v1';
+export const GIT_WORKSPACE_CONTRACT = 'git.workspace.v1';
+export const GIT_CHECKPOINT_CONTRACT = 'git.checkpoint.v1';
+export const TERMINAL_WORKSPACE_CONTRACT = 'terminal.workspace.v1';
+export const TERMINAL_RUNNER_CONTRACT = 'terminal.runner.v1';
+export const WORKSPACE_FILES_CONTRACT = 'workspace.files.v1';
+export const SESSION_ATTACHMENTS_CONTRACT = 'session.attachments.v1';
+export const WORKSPACE_RULES_CONTRACT = 'workspace.rules.v1';
 
 export const HISTORY_IMPORT_PAGE_SLOT_ID = 'history-import';
 export const SESSION_SEARCH_PAGE_SLOT_ID = 'session-search';
 export const LEGACY_EXPLORER_PLUGIN_ID = 'hm.plugin.session-explorer';
+
+export interface WorkspaceGitStatusLookupRequest {
+  workspaceId: string;
+  sessionId?: string;
+  cwd?: string;
+}
+
+export interface NavigateToFileRequest {
+  workspaceId?: string;
+  sessionId?: string;
+  path: string;
+  line?: number;
+  openInspector?: boolean;
+  preserveSession?: boolean;
+}
+
+export interface NavigateToFileResult {
+  opened: boolean;
+  sessionId: string | null;
+  workspaceId?: string | null;
+  path: string;
+  line?: number;
+  errorCode?: string;
+  message?: string;
+}
 
 export type SelectionSource =
   | 'explicit'
@@ -485,4 +517,30 @@ export function resolveServiceSelectionClientSide(
     source: 'none',
     status: 'selection_required',
   };
+}
+
+export interface ClientContractAvailabilityOptions extends ClientResolveServiceOptions {
+  legacyPluginId?: string;
+  optionalDefaultOff?: boolean;
+}
+
+export function isContractAvailableClientSide(
+  opts: ClientContractAvailabilityOptions,
+): boolean {
+  const hasContractProvider = opts.plugins.some((plugin) =>
+    pluginProvidesContract(plugin, opts.contract),
+  );
+  if (hasContractProvider) {
+    return resolveServiceSelectionClientSide(opts).status === 'ready';
+  }
+  if (!opts.legacyPluginId) {
+    return !opts.optionalDefaultOff && opts.plugins.length === 0;
+  }
+  const legacyPlugin = opts.plugins.find(
+    (plugin) => getPluginInstanceId(plugin) === opts.legacyPluginId || plugin.id === opts.legacyPluginId,
+  );
+  if (!legacyPlugin) {
+    return !opts.optionalDefaultOff;
+  }
+  return isPluginInstanceReady(legacyPlugin);
 }

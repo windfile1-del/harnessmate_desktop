@@ -9,7 +9,7 @@ import type { ApprovalAnnotateEvent, HandoffComposeEvent, HandoffComposeSection,
 import type { PLUGIN_API_VERSION } from './manifest.js';
 import type { PublicSlotRegistration } from './slots.js';
 import type { FilePreviewRenderer } from './file-preview.js';
-export declare const pluginErrorCodes: readonly ["E_PERMISSION_DENIED", "E_SERVICE_UNAVAILABLE", "E_NOT_SUPPORTED", "E_TIMEOUT", "E_INVALID_INPUT", "E_LIMIT_EXCEEDED", "E_CONFLICT", "E_STALE_RUN", "E_CIRCULAR_DEPENDENCY"];
+export declare const pluginErrorCodes: readonly ["E_PERMISSION_DENIED", "E_SERVICE_UNAVAILABLE", "E_NOT_SUPPORTED", "E_TIMEOUT", "E_INVALID_INPUT", "E_LIMIT_EXCEEDED", "E_CONFLICT", "E_STALE_RUN", "E_CIRCULAR_DEPENDENCY", "E_PLUGIN_DISABLED"];
 export type PluginErrorCode = typeof pluginErrorCodes[number];
 export declare class PluginApiError extends Error {
     readonly code: PluginErrorCode;
@@ -732,12 +732,26 @@ export declare function serviceResolutionErrorCode(status: Exclude<ServiceResolu
 export declare const HISTORY_SOURCE_CONTRACT_VERSION = "1.0.0";
 export declare const HISTORY_IMPORT_CONTRACT_VERSION = "1.0.0";
 export declare const SESSION_SEARCH_CONTRACT_VERSION = "1.0.0";
+export declare const GIT_WORKSPACE_CONTRACT_VERSION = "1.0.0";
+export declare const GIT_CHECKPOINT_CONTRACT_VERSION = "1.0.0";
+export declare const TERMINAL_WORKSPACE_CONTRACT_VERSION = "1.0.0";
+export declare const TERMINAL_RUNNER_CONTRACT_VERSION = "1.0.0";
+export declare const WORKSPACE_FILES_CONTRACT_VERSION = "1.0.0";
+export declare const SESSION_ATTACHMENTS_CONTRACT_VERSION = "1.0.0";
+export declare const WORKSPACE_RULES_CONTRACT_VERSION = "1.0.0";
 export declare const PEER_CONTRACT_VERSIONS: {
     readonly 'history.source.v1': "1.0.0";
     readonly 'history.import.v1': "1.0.0";
     readonly 'session.search.v1': "1.0.0";
+    readonly 'git.workspace.v1': "1.0.0";
+    readonly 'git.checkpoint.v1': "1.0.0";
+    readonly 'terminal.workspace.v1': "1.0.0";
+    readonly 'terminal.runner.v1': "1.0.0";
+    readonly 'workspace.files.v1': "1.0.0";
+    readonly 'session.attachments.v1': "1.0.0";
+    readonly 'workspace.rules.v1': "1.0.0";
 };
-export type PeerServiceErrorCode = 'invalid_request' | 'source_unreadable' | 'not_importable' | 'cancelled' | 'conflict';
+export type PeerServiceErrorCode = 'invalid_request' | 'source_unreadable' | 'not_importable' | 'cancelled' | 'conflict' | 'not_found' | 'busy' | 'plugin_disabled' | 'permission_denied' | 'git_required' | 'not_supported';
 export interface PeerServiceError<Code extends string = PeerServiceErrorCode | (string & {})> {
     code: Code;
     message: string;
@@ -989,6 +1003,368 @@ export interface SessionSearchServiceV1 {
     resumeReindex?(request?: {
         jobId?: string;
     }): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
+}
+export interface PublicGitChangeEntry {
+    path: string;
+    indexStatus: string;
+    worktreeStatus: string;
+    untracked: boolean;
+}
+export interface PublicGitStatusSummary {
+    isGitRepo: boolean;
+    repoRoot: string | null;
+    gitCommonDir?: string | null;
+    branch: string | null;
+    ahead: number;
+    behind: number;
+    changes: PublicGitChangeEntry[];
+    stagedCount: number;
+    unstagedCount: number;
+    untrackedCount: number;
+    totalChanged: number;
+}
+export interface WorkspaceGitStatusLookupRequest {
+    workspaceId: string;
+    sessionId?: string;
+    cwd?: string;
+}
+export interface WorkspaceGitStatusLookupResult {
+    available: boolean;
+    reason?: 'disabled' | 'unavailable' | 'unconfigured' | 'not_git_repo';
+    instanceId: string | null;
+    status: PublicGitStatusSummary | null;
+}
+export interface NavigateToFileRequest {
+    workspaceId?: string;
+    sessionId?: string;
+    path: string;
+    line?: number;
+    openInspector?: boolean;
+    preserveSession?: boolean;
+}
+export interface NavigateToFileResult {
+    opened: boolean;
+    sessionId: string | null;
+    workspaceId?: string | null;
+    path: string;
+    line?: number;
+    errorCode?: string;
+    message?: string;
+}
+export interface GitWorktreeEntryDto {
+    path: string;
+    branch: string | null;
+    headSha: string;
+    isMain: boolean;
+    dirtyCount: number;
+    isLocked: boolean;
+}
+export interface SetupScriptInfoDto {
+    exists: boolean;
+    relativePath: string | null;
+    scriptPath?: string | null;
+    sha256: string | null;
+    trusted: boolean;
+    trustedAt?: number | null;
+    content?: string | null;
+}
+export interface GitWorkspaceServiceV1 {
+    getStatus(request: WorkspaceGitStatusLookupRequest): Promise<ServiceMethodResult<WorkspaceGitStatusLookupResult>>;
+    inspect(request: {
+        cwd: string;
+        workspaceId?: string;
+    }): Promise<ServiceMethodResult<{
+        isGitRepo: boolean;
+        branch: string | null;
+        repoRoot: string | null;
+        gitCommonDir?: string | null;
+    }>>;
+    getFileDiff(request: {
+        cwd: string;
+        filePath: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    getTruthDigest(request: {
+        cwd: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    initRepo(request: {
+        cwd: string;
+        initialCommit?: boolean;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    discardFile(request: {
+        cwd: string;
+        filePath: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    commit(request: {
+        cwd: string;
+        message: string;
+        stageAll?: boolean;
+        files?: string[];
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    push(request: {
+        cwd: string;
+        remote?: string;
+        branch?: string;
+        setUpstream?: boolean;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    pull(request: {
+        cwd: string;
+        remote?: string;
+        branch?: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    createPr(request: {
+        cwd: string;
+        title: string;
+        body?: string;
+        baseBranch?: string;
+        draft?: boolean;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    listWorktrees(request: {
+        repoRoot: string;
+        workspaceId?: string;
+    }): Promise<ServiceMethodResult<{
+        worktrees: GitWorktreeEntryDto[];
+    }>>;
+    createWorktree(request: {
+        repoRoot: string;
+        branchName: string;
+        baseBranch?: string;
+        workspaceId?: string;
+    }): Promise<ServiceMethodResult<{
+        worktreePath: string;
+        branch: string;
+    }>>;
+    removeWorktree(request: {
+        repoRoot: string;
+        worktreePath: string;
+        force?: boolean;
+        prune?: boolean;
+        deleteBranch?: boolean;
+        releaseTerminals?: boolean;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    dryRunMerge(request: {
+        repoRoot: string;
+        sourceBranch: string;
+        targetBranch?: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    getSetupScriptInfo(request: {
+        repoRoot: string;
+    }): Promise<ServiceMethodResult<SetupScriptInfoDto>>;
+    setSetupScriptTrust(request: {
+        repoRoot: string;
+        trusted: boolean;
+    }): Promise<ServiceMethodResult<SetupScriptInfoDto>>;
+    runSetupScript(request: {
+        repoRoot: string;
+        targetDir: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+}
+export interface GitCheckpointServiceV1 {
+    list(request: {
+        sessionId: string;
+        limit?: number;
+    }): Promise<ServiceMethodResult<{
+        checkpoints: Record<string, unknown>[];
+    }>>;
+    get(request: {
+        checkpointId: string;
+    }): Promise<ServiceMethodResult<{
+        checkpoint: Record<string, unknown> | null;
+    }>>;
+    capture(request: {
+        sessionId: string;
+        cwd: string;
+        turnSeq: number;
+        phase: string;
+    }): Promise<ServiceMethodResult<{
+        checkpoint: Record<string, unknown> | null;
+    }>>;
+    diff(request: {
+        sessionId: string;
+        cwd: string;
+        fromCheckpointId: string;
+        toCheckpointId?: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    revert(request: {
+        sessionId: string;
+        cwd: string;
+        checkpointId: string;
+        mode: string;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    gc(request: {
+        sessionId: string;
+        cwd: string;
+        keepLatestTurns?: number;
+    }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+    deleteSession(request: {
+        sessionId: string;
+        cwd?: string;
+    }): Promise<ServiceMethodResult<{
+        removed: number;
+    }>>;
+}
+export interface TerminalPathUsageEntry {
+    terminalId: string;
+    title: string;
+    cwd: string;
+    pid?: number;
+    instanceId?: string;
+}
+export interface TerminalPathUsageResult {
+    busy: boolean;
+    terminals: TerminalPathUsageEntry[];
+}
+export interface TerminalWorkspaceServiceV1 {
+    listTerminals(request: {
+        workspaceId: string;
+        cwd?: string;
+    }): Promise<ServiceMethodResult<{
+        terminals: Record<string, unknown>[];
+        ptyAvailable: boolean;
+    }>>;
+    openTerminal(request: {
+        workspaceId: string;
+        cwd: string;
+        sessionId?: string;
+        cols?: number;
+        rows?: number;
+        shell?: string;
+        title?: string;
+    }): Promise<ServiceMethodResult<{
+        terminal: Record<string, unknown>;
+    }>>;
+    writeInput(request: {
+        terminalId: string;
+        data: string;
+    }): Promise<ServiceMethodResult<{
+        ok: boolean;
+    }>>;
+    resizeTerminal(request: {
+        terminalId: string;
+        cols: number;
+        rows: number;
+    }): Promise<ServiceMethodResult<{
+        ok: boolean;
+    }>>;
+    interruptTerminal(request: {
+        terminalId: string;
+    }): Promise<ServiceMethodResult<{
+        ok: boolean;
+    }>>;
+    restartTerminal(request: {
+        terminalId: string;
+    }): Promise<ServiceMethodResult<{
+        terminal: Record<string, unknown>;
+    }>>;
+    closeTerminal(request: {
+        terminalId: string;
+    }): Promise<ServiceMethodResult<{
+        closed: boolean;
+    }>>;
+    buildContextChip(request: {
+        terminalId: string;
+        selectedText?: string;
+        lineStart?: number;
+        lineEnd?: number;
+        recentLines?: number;
+    }): Promise<ServiceMethodResult<{
+        chip: Record<string, unknown>;
+    }>>;
+    pathUsage(request: {
+        targetPath: string;
+    }): Promise<ServiceMethodResult<TerminalPathUsageResult>>;
+    releasePath(request: {
+        targetPath: string;
+        workspaceId?: string;
+    }): Promise<ServiceMethodResult<{
+        closedCount: number;
+        terminalIds: string[];
+    }>>;
+    getOutputSnapshot(request: {
+        terminalId: string;
+    }): Promise<ServiceMethodResult<{
+        snapshot: string;
+        truncated: boolean;
+        status: string;
+        exitCode: number | null;
+    }>>;
+}
+export interface TerminalRunnerServiceV1 {
+    run(request: {
+        sessionId?: string;
+        workspaceId?: string;
+        cwd: string;
+        command: string;
+        timeoutMs?: number;
+        toolCallId?: string;
+    }): Promise<ServiceMethodResult<{
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+        output: string;
+        durationMs: number;
+        timedOut?: boolean;
+        backend?: string;
+    }>>;
+}
+export interface WorkspaceFilesServiceV1 {
+    search(request: {
+        workspaceId?: string;
+        cwd: string;
+        query?: string;
+        limit?: number;
+    }): Promise<ServiceMethodResult<{
+        files: Array<{
+            path?: string;
+            fullPath?: string;
+            name?: string;
+            relativePath: string;
+            sizeBytes: number;
+        }>;
+    }>>;
+    read(request: {
+        workspaceId?: string;
+        cwd: string;
+        path: string;
+        line?: number;
+    }): Promise<ServiceMethodResult<{
+        path?: string;
+        relativePath: string;
+        sizeBytes: number;
+        lineCount?: number;
+        content: string;
+        truncated: boolean;
+        isBinary?: boolean;
+        previewable?: boolean;
+    }>>;
+}
+export interface SessionAttachmentsServiceV1 {
+    save(request: {
+        sessionId: string;
+        workspaceId?: string;
+        name: string;
+        mimeType: string;
+        base64: string;
+    }): Promise<ServiceMethodResult<{
+        attachment: Record<string, unknown>;
+    }>>;
+    resolveRead(request: {
+        sessionId: string;
+        filename: string;
+    }): Promise<ServiceMethodResult<{
+        filePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        legacy?: boolean;
+    }>>;
+}
+export interface WorkspaceRulesServiceV1 {
+    discover(request: {
+        workspaceId?: string;
+        cwd: string;
+        sessionId?: string;
+    }): Promise<ServiceMethodResult<{
+        instructions: Array<Record<string, unknown>>;
+    }>>;
 }
 export interface PluginRouteRequest {
     method: string;
@@ -1451,6 +1827,16 @@ declare const workspaceSlots: {
         readonly scope: "root";
         readonly description: "组合中提供的应用启动页与主工作区布局";
     };
+    readonly 'inspector.files': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧工作区文件浏览与行号预览视图";
+    };
+    readonly 'inspector.rules': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧项目规则与 Skills 视图";
+    };
 };
 export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
 export declare const PLUGIN_SLOT_KEYS_V5: readonly ["chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
@@ -1464,6 +1850,16 @@ export declare const ALL_PLUGIN_UI_SLOTS: {
         readonly cardinality: "single";
         readonly scope: "root";
         readonly description: "组合中提供的应用启动页与主工作区布局";
+    };
+    readonly 'inspector.files': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧工作区文件浏览与行号预览视图";
+    };
+    readonly 'inspector.rules': {
+        readonly cardinality: "single";
+        readonly scope: "session";
+        readonly description: "接管或增强右侧项目规则与 Skills 视图";
     };
     readonly 'chat.block': {
         readonly cardinality: "keyed";
@@ -1536,14 +1932,14 @@ export declare const ALL_PLUGIN_UI_SLOTS: {
         readonly description: "包裹聊天消息内容的容器组件";
     };
 };
-export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge", "workspace.pages", "workspace.start"];
+export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge", "workspace.pages", "workspace.start", "inspector.files", "inspector.rules"];
 export declare function normalizePluginSlotKey(key: string): PluginSlotKey;
 export declare function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey;
 export declare function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey;
 export declare function isSafePluginUiPath(value: string): boolean;
-export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "inspector.files", "inspector.rules", "session.sidebar.badge"]>;
 export declare const PluginSlotContributionSchema: z.ZodObject<{
-    slot: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+    slot: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "inspector.files", "inspector.rules", "session.sidebar.badge"]>;
     id: z.ZodString;
     title: z.ZodString;
     ui: z.ZodEffects<z.ZodString, string, string>;
@@ -1553,7 +1949,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.files" | "inspector.rules" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -1561,7 +1957,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "workspace.start" | "inspector.files" | "inspector.rules" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;

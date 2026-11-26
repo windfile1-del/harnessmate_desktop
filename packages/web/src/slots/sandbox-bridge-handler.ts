@@ -164,6 +164,30 @@ export async function executeSandboxedBridgeMethod(
     return { ok: true, sessionId, turnId: turnId ?? null, itemId: itemId ?? null };
   }
 
+  if (method === 'navigateToFile' || method === 'openFile' || method === 'file.navigate') {
+    const rawPath = typeof params?.path === 'string' ? params.path : '';
+    const lineRaw = params?.line;
+    const line = typeof lineRaw === 'number' && Number.isFinite(lineRaw) && lineRaw > 0
+      ? Math.floor(lineRaw)
+      : undefined;
+    const sessionId =
+      typeof params?.sessionId === 'string' && params.sessionId.trim()
+        ? params.sessionId.trim()
+        : currentSession?.id;
+    const workspaceId =
+      typeof params?.workspaceId === 'string' && params.workspaceId.trim()
+        ? params.workspaceId.trim()
+        : undefined;
+    return useAppStore.getState().navigateToFile({
+      workspaceId,
+      sessionId,
+      path: rawPath,
+      line,
+      openInspector: params?.openInspector !== false,
+      preserveSession: params?.preserveSession !== false,
+    });
+  }
+
   if (method === 'refreshSessions') {
     const { sessions } = await daemonApi.listSessions();
     if (!signal.aborted && !isDisposed()) {

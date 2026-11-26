@@ -13,6 +13,13 @@ export const PEER_CONTRACTS = {
   historySource: 'history.source.v1',
   historyImport: 'history.import.v1',
   sessionSearch: 'session.search.v1',
+  gitWorkspace: 'git.workspace.v1',
+  gitCheckpoint: 'git.checkpoint.v1',
+  terminalWorkspace: 'terminal.workspace.v1',
+  terminalRunner: 'terminal.runner.v1',
+  workspaceFiles: 'workspace.files.v1',
+  sessionAttachments: 'session.attachments.v1',
+  workspaceRules: 'workspace.rules.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
   'browser.v1',
@@ -21,6 +28,13 @@ export const PEER_CONTRACT_NAMES = [
   'history.source.v1',
   'history.import.v1',
   'session.search.v1',
+  'git.workspace.v1',
+  'git.checkpoint.v1',
+  'terminal.workspace.v1',
+  'terminal.runner.v1',
+  'workspace.files.v1',
+  'session.attachments.v1',
+  'workspace.rules.v1',
 ] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 

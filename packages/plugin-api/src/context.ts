@@ -16,7 +16,7 @@ import type { FilePreviewRenderer } from './file-preview.js';
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
   'E_INVALID_INPUT', 'E_LIMIT_EXCEEDED', 'E_CONFLICT', 'E_STALE_RUN',
-  'E_CIRCULAR_DEPENDENCY',
+  'E_CIRCULAR_DEPENDENCY', 'E_PLUGIN_DISABLED',
 ] as const;
 export type PluginErrorCode = typeof pluginErrorCodes[number];
 
@@ -709,11 +709,25 @@ export function serviceResolutionErrorCode(
 export const HISTORY_SOURCE_CONTRACT_VERSION = '1.0.0';
 export const HISTORY_IMPORT_CONTRACT_VERSION = '1.0.0';
 export const SESSION_SEARCH_CONTRACT_VERSION = '1.0.0';
+export const GIT_WORKSPACE_CONTRACT_VERSION = '1.0.0';
+export const GIT_CHECKPOINT_CONTRACT_VERSION = '1.0.0';
+export const TERMINAL_WORKSPACE_CONTRACT_VERSION = '1.0.0';
+export const TERMINAL_RUNNER_CONTRACT_VERSION = '1.0.0';
+export const WORKSPACE_FILES_CONTRACT_VERSION = '1.0.0';
+export const SESSION_ATTACHMENTS_CONTRACT_VERSION = '1.0.0';
+export const WORKSPACE_RULES_CONTRACT_VERSION = '1.0.0';
 
 export const PEER_CONTRACT_VERSIONS = {
   'history.source.v1': HISTORY_SOURCE_CONTRACT_VERSION,
   'history.import.v1': HISTORY_IMPORT_CONTRACT_VERSION,
   'session.search.v1': SESSION_SEARCH_CONTRACT_VERSION,
+  'git.workspace.v1': GIT_WORKSPACE_CONTRACT_VERSION,
+  'git.checkpoint.v1': GIT_CHECKPOINT_CONTRACT_VERSION,
+  'terminal.workspace.v1': TERMINAL_WORKSPACE_CONTRACT_VERSION,
+  'terminal.runner.v1': TERMINAL_RUNNER_CONTRACT_VERSION,
+  'workspace.files.v1': WORKSPACE_FILES_CONTRACT_VERSION,
+  'session.attachments.v1': SESSION_ATTACHMENTS_CONTRACT_VERSION,
+  'workspace.rules.v1': WORKSPACE_RULES_CONTRACT_VERSION,
 } as const;
 
 export type PeerServiceErrorCode =
@@ -721,7 +735,13 @@ export type PeerServiceErrorCode =
   | 'source_unreadable'
   | 'not_importable'
   | 'cancelled'
-  | 'conflict';
+  | 'conflict'
+  | 'not_found'
+  | 'busy'
+  | 'plugin_disabled'
+  | 'permission_denied'
+  | 'git_required'
+  | 'not_supported';
 
 export interface PeerServiceError<Code extends string = PeerServiceErrorCode | (string & {})> {
   code: Code;
@@ -967,6 +987,178 @@ export interface SessionSearchServiceV1 {
   getStatus?(request?: Record<string, never>): Promise<ServiceMethodResult<SessionSearchStatusResponse>>;
   cancelReindex?(request?: { jobId?: string }): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
   resumeReindex?(request?: { jobId?: string }): Promise<ServiceMethodResult<SessionSearchReindexResponse>>;
+}
+
+// ── Batch 2 W1 Workspace Tools Contracts ─────────────────────────────────
+
+export interface PublicGitChangeEntry {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  untracked: boolean;
+}
+
+export interface PublicGitStatusSummary {
+  isGitRepo: boolean;
+  repoRoot: string | null;
+  gitCommonDir?: string | null;
+  branch: string | null;
+  ahead: number;
+  behind: number;
+  changes: PublicGitChangeEntry[];
+  stagedCount: number;
+  unstagedCount: number;
+  untrackedCount: number;
+  totalChanged: number;
+}
+
+export interface WorkspaceGitStatusLookupRequest {
+  workspaceId: string;
+  sessionId?: string;
+  cwd?: string;
+}
+
+export interface WorkspaceGitStatusLookupResult {
+  available: boolean;
+  reason?: 'disabled' | 'unavailable' | 'unconfigured' | 'not_git_repo';
+  instanceId: string | null;
+  status: PublicGitStatusSummary | null;
+}
+
+export interface NavigateToFileRequest {
+  workspaceId?: string;
+  sessionId?: string;
+  path: string;
+  line?: number;
+  openInspector?: boolean;
+  preserveSession?: boolean;
+}
+
+export interface NavigateToFileResult {
+  opened: boolean;
+  sessionId: string | null;
+  workspaceId?: string | null;
+  path: string;
+  line?: number;
+  errorCode?: string;
+  message?: string;
+}
+
+export interface GitWorktreeEntryDto {
+  path: string;
+  branch: string | null;
+  headSha: string;
+  isMain: boolean;
+  dirtyCount: number;
+  isLocked: boolean;
+}
+
+export interface SetupScriptInfoDto {
+  exists: boolean;
+  relativePath: string | null;
+  scriptPath?: string | null;
+  sha256: string | null;
+  trusted: boolean;
+  trustedAt?: number | null;
+  content?: string | null;
+}
+
+export interface GitWorkspaceServiceV1 {
+  getStatus(request: WorkspaceGitStatusLookupRequest): Promise<ServiceMethodResult<WorkspaceGitStatusLookupResult>>;
+  inspect(request: { cwd: string; workspaceId?: string }): Promise<
+    ServiceMethodResult<{ isGitRepo: boolean; branch: string | null; repoRoot: string | null; gitCommonDir?: string | null }>
+  >;
+  getFileDiff(request: { cwd: string; filePath: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  getTruthDigest(request: { cwd: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  initRepo(request: { cwd: string; initialCommit?: boolean }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  discardFile(request: { cwd: string; filePath: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  commit(request: { cwd: string; message: string; stageAll?: boolean; files?: string[] }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  push(request: { cwd: string; remote?: string; branch?: string; setUpstream?: boolean }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  pull(request: { cwd: string; remote?: string; branch?: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  createPr(request: { cwd: string; title: string; body?: string; baseBranch?: string; draft?: boolean }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  listWorktrees(request: { repoRoot: string; workspaceId?: string }): Promise<ServiceMethodResult<{ worktrees: GitWorktreeEntryDto[] }>>;
+  createWorktree(request: { repoRoot: string; branchName: string; baseBranch?: string; workspaceId?: string }): Promise<ServiceMethodResult<{ worktreePath: string; branch: string }>>;
+  removeWorktree(request: { repoRoot: string; worktreePath: string; force?: boolean; prune?: boolean; deleteBranch?: boolean; releaseTerminals?: boolean }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  dryRunMerge(request: { repoRoot: string; sourceBranch: string; targetBranch?: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  getSetupScriptInfo(request: { repoRoot: string }): Promise<ServiceMethodResult<SetupScriptInfoDto>>;
+  setSetupScriptTrust(request: { repoRoot: string; trusted: boolean }): Promise<ServiceMethodResult<SetupScriptInfoDto>>;
+  runSetupScript(request: { repoRoot: string; targetDir: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+}
+
+export interface GitCheckpointServiceV1 {
+  list(request: { sessionId: string; limit?: number }): Promise<ServiceMethodResult<{ checkpoints: Record<string, unknown>[] }>>;
+  get(request: { checkpointId: string }): Promise<ServiceMethodResult<{ checkpoint: Record<string, unknown> | null }>>;
+  capture(request: { sessionId: string; cwd: string; turnSeq: number; phase: string }): Promise<ServiceMethodResult<{ checkpoint: Record<string, unknown> | null }>>;
+  diff(request: { sessionId: string; cwd: string; fromCheckpointId: string; toCheckpointId?: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  revert(request: { sessionId: string; cwd: string; checkpointId: string; mode: string }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  gc(request: { sessionId: string; cwd: string; keepLatestTurns?: number }): Promise<ServiceMethodResult<Record<string, unknown>>>;
+  deleteSession(request: { sessionId: string; cwd?: string }): Promise<ServiceMethodResult<{ removed: number }>>;
+}
+
+export interface TerminalPathUsageEntry {
+  terminalId: string;
+  title: string;
+  cwd: string;
+  pid?: number;
+  instanceId?: string;
+}
+
+export interface TerminalPathUsageResult {
+  busy: boolean;
+  terminals: TerminalPathUsageEntry[];
+}
+
+export interface TerminalWorkspaceServiceV1 {
+  listTerminals(request: { workspaceId: string; cwd?: string }): Promise<ServiceMethodResult<{ terminals: Record<string, unknown>[]; ptyAvailable: boolean }>>;
+  openTerminal(request: { workspaceId: string; cwd: string; sessionId?: string; cols?: number; rows?: number; shell?: string; title?: string }): Promise<ServiceMethodResult<{ terminal: Record<string, unknown> }>>;
+  writeInput(request: { terminalId: string; data: string }): Promise<ServiceMethodResult<{ ok: boolean }>>;
+  resizeTerminal(request: { terminalId: string; cols: number; rows: number }): Promise<ServiceMethodResult<{ ok: boolean }>>;
+  interruptTerminal(request: { terminalId: string }): Promise<ServiceMethodResult<{ ok: boolean }>>;
+  restartTerminal(request: { terminalId: string }): Promise<ServiceMethodResult<{ terminal: Record<string, unknown> }>>;
+  closeTerminal(request: { terminalId: string }): Promise<ServiceMethodResult<{ closed: boolean }>>;
+  buildContextChip(request: { terminalId: string; selectedText?: string; lineStart?: number; lineEnd?: number; recentLines?: number }): Promise<ServiceMethodResult<{ chip: Record<string, unknown> }>>;
+  pathUsage(request: { targetPath: string }): Promise<ServiceMethodResult<TerminalPathUsageResult>>;
+  releasePath(request: { targetPath: string; workspaceId?: string }): Promise<ServiceMethodResult<{ closedCount: number; terminalIds: string[] }>>;
+  getOutputSnapshot(request: { terminalId: string }): Promise<ServiceMethodResult<{ snapshot: string; truncated: boolean; status: string; exitCode: number | null }>>;
+}
+
+export interface TerminalRunnerServiceV1 {
+  run(request: { sessionId?: string; workspaceId?: string; cwd: string; command: string; timeoutMs?: number; toolCallId?: string }): Promise<
+    ServiceMethodResult<{ exitCode: number; stdout: string; stderr: string; output: string; durationMs: number; timedOut?: boolean; backend?: string }>
+  >;
+}
+
+export interface WorkspaceFilesServiceV1 {
+  search(request: { workspaceId?: string; cwd: string; query?: string; limit?: number }): Promise<
+    ServiceMethodResult<{ files: Array<{ path?: string; fullPath?: string; name?: string; relativePath: string; sizeBytes: number }> }>
+  >;
+  read(request: { workspaceId?: string; cwd: string; path: string; line?: number }): Promise<
+    ServiceMethodResult<{
+      path?: string;
+      relativePath: string;
+      sizeBytes: number;
+      lineCount?: number;
+      content: string;
+      truncated: boolean;
+      isBinary?: boolean;
+      previewable?: boolean;
+    }>
+  >;
+}
+
+export interface SessionAttachmentsServiceV1 {
+  save(request: { sessionId: string; workspaceId?: string; name: string; mimeType: string; base64: string }): Promise<
+    ServiceMethodResult<{ attachment: Record<string, unknown> }>
+  >;
+  resolveRead(request: { sessionId: string; filename: string }): Promise<
+    ServiceMethodResult<{ filePath: string; mimeType: string; sizeBytes: number; legacy?: boolean }>
+  >;
+}
+
+export interface WorkspaceRulesServiceV1 {
+  discover(request: { workspaceId?: string; cwd: string; sessionId?: string }): Promise<
+    ServiceMethodResult<{ instructions: Array<Record<string, unknown>> }>
+  >;
 }
 
 export interface PluginRouteRequest {

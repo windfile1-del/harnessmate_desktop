@@ -1,0 +1,31 @@
+{
+  "id": "user.terminal-lite",
+  "name": "Terminal Lite (第三方交互终端样例)",
+  "version": "1.0.0",
+  "description": "使用 terminal.workspace.v1 契约与受控 spawnCli 实现的多实例替代终端插件样例。",
+  "author": "HarnessMate Community Example",
+  "category": "tool",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "terminal.workspace.v1"
+  ],
+  "permissions": [
+    "process:spawn:node"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "inspector.tabs",
+        "id": "terminal-workspace",
+        "key": "terminal-workspace",
+        "title": "Lite 交互终端",
+        "ui": "ui/terminal.html",
+        "order": 85
+      }
+    ]
+  }
+}
