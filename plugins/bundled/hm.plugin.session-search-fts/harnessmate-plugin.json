@@ -1,0 +1,34 @@
+{
+  "id": "hm.plugin.session-search-fts",
+  "name": "FTS5 会话全文检索",
+  "version": "1.0.0",
+  "description": "基于 SQLite FTS5 与中文 LIKE 降级的默认会话全文检索插件，支持每实例独立索引文件、增量同步水位、全量快照重建、取消与断点续跑。",
+  "author": "HarnessMate Core",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "session.search.v1"
+  ],
+  "permissions": [
+    "session:read",
+    "events:turn",
+    "events:message",
+    "storage:plugin",
+    "storage:workspace"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "session-search",
+        "title": "会话搜索 (FTS5)",
+        "ui": "ui/panel.html",
+        "order": 30
+      }
+    ]
+  }
+}

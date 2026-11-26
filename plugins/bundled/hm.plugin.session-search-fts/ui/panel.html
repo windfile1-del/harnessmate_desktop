@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>会话搜索 (FTS5)</title>
+  <link rel="stylesheet" href="./panel.css">
+</head>
+<body>
+  <div class="header-row">
+    <span class="badge" id="instance-badge">session-search-fts</span>
+    <span id="status" role="status">就绪</span>
+  </div>
+  <div class="search-row">
+    <input id="query" type="search" placeholder="输入关键词（支持中文与 FTS5 语法安全转义）" aria-label="搜索关键词">
+    <button id="run-search" type="button">搜索</button>
+    <button id="run-reindex" type="button">重建索引</button>
+    <button id="cancel-reindex" type="button" hidden>取消</button>
+    <button id="resume-reindex" type="button" hidden>续跑</button>
+  </div>
+  <div id="results" class="results"></div>
+  <script src="./panel.js"></script>
+</body>
+</html>
