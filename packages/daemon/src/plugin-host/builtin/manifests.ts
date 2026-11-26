@@ -79,6 +79,15 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     contributes: { uiSlots: ['sidebar_tool', 'modal'] },
   },
   {
+    id: 'core.session-model-tools',
+    name: '会话模型工具',
+    version: '1.0.0',
+    description: '按会话为驱动提供已授权的插件模型工具。',
+    author: 'HarnessMate Core',
+    category: 'mcp',
+    contributes: {},
+  },
+  {
     id: 'core.account-usage',
     name: '多账号与配额用量看板',
     version: '1.0.0',

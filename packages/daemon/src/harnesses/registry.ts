@@ -173,54 +173,56 @@ export class HarnessRegistry {
 
   async probeAll(forceRefresh = false): Promise<HarnessInfo[]> {
     const list = this.listAdapters();
-    const results = await Promise.all(
-      list.map(async (adapter) => {
-        if (!forceRefresh && this.cachedProbes.has(adapter.id)) {
-          return this.cachedProbes.get(adapter.id)!;
-        }
-        const instance = this.instances.get(adapter.id);
-        const override = this.metadataOverrides.get(adapter.id);
-        try {
-          const raw = !forceRefresh && adapter.probePassive
-            ? await adapter.probePassive()
-            : await adapter.probe();
-          const info: HarnessInfo = {
-            ...raw,
-            driverId: raw.driverId ?? adapter.driverId ?? adapter.kind,
-            instanceId: raw.instanceId ?? adapter.id,
-            continuationKey: raw.continuationKey ?? instance?.continuationKey ?? adapter.continuationKey,
-            displayName: override?.displayName ?? raw.displayName,
-            description: override?.description ?? raw.description,
-            capabilitiesV2: raw.capabilitiesV2 ?? adapter.capabilitiesV2,
-            presentation: raw.presentation ?? adapter.presentation,
-          };
-          if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, info);
-          return info;
-        } catch (err) {
-          const fallback: HarnessInfo = {
-            id: adapter.id,
-            kind: adapter.kind,
-            driverId: adapter.driverId ?? adapter.kind,
-            instanceId: adapter.id,
-            continuationKey: instance?.continuationKey ?? adapter.continuationKey,
-            displayName: override?.displayName ?? adapter.displayName,
-            description: override?.description ?? adapter.description,
-            protocolLabel: adapter.protocolLabel,
-            binaryPath: null,
-            version: null,
-            health: 'unavailable',
-            healthMessage: err instanceof Error ? err.message : String(err),
-            capabilities: adapter.capabilities,
-            capabilitiesV2: adapter.capabilitiesV2,
-            presentation: adapter.presentation,
-            models: [],
-            isCustom: adapter.isCustom,
-          };
-          if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, fallback);
-          return fallback;
-        }
-      }),
-    );
-    return results;
+    const results = await Promise.all(list.map(({ id }) => this.probeInstance(id, forceRefresh)));
+    return results.filter((info): info is HarnessInfo => info !== undefined);
+  }
+
+  async probeInstance(instanceId: string, forceRefresh = false): Promise<HarnessInfo | undefined> {
+    const adapter = this.get(instanceId);
+    if (!adapter) return undefined;
+    if (!forceRefresh && this.cachedProbes.has(adapter.id)) {
+      return this.cachedProbes.get(adapter.id)!;
+    }
+    const instance = this.instances.get(adapter.id);
+    const override = this.metadataOverrides.get(adapter.id);
+    try {
+      const raw = !forceRefresh && adapter.probePassive
+        ? await adapter.probePassive()
+        : await adapter.probe();
+      const info: HarnessInfo = {
+        ...raw,
+        driverId: raw.driverId ?? adapter.driverId ?? adapter.kind,
+        instanceId: raw.instanceId ?? adapter.id,
+        continuationKey: raw.continuationKey ?? instance?.continuationKey ?? adapter.continuationKey,
+        displayName: override?.displayName ?? raw.displayName,
+        description: override?.description ?? raw.description,
+        capabilitiesV2: raw.capabilitiesV2 ?? adapter.capabilitiesV2,
+        presentation: raw.presentation ?? adapter.presentation,
+      };
+      if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, info);
+      return info;
+    } catch (err) {
+      const fallback: HarnessInfo = {
+        id: adapter.id,
+        kind: adapter.kind,
+        driverId: adapter.driverId ?? adapter.kind,
+        instanceId: adapter.id,
+        continuationKey: instance?.continuationKey ?? adapter.continuationKey,
+        displayName: override?.displayName ?? adapter.displayName,
+        description: override?.description ?? adapter.description,
+        protocolLabel: adapter.protocolLabel,
+        binaryPath: null,
+        version: null,
+        health: 'unavailable',
+        healthMessage: err instanceof Error ? err.message : String(err),
+        capabilities: adapter.capabilities,
+        capabilitiesV2: adapter.capabilitiesV2,
+        presentation: adapter.presentation,
+        models: [],
+        isCustom: adapter.isCustom,
+      };
+      if (this.get(adapter.id) === adapter) this.cachedProbes.set(adapter.id, fallback);
+      return fallback;
+    }
   }
 }

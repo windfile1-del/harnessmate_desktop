@@ -104,12 +104,12 @@ import { HtmlRenderCard } from './HtmlRenderCard';
 import { InspectorDrawer } from './InspectorDrawer';
 import { MarkdownView } from './MarkdownView';
 import {
-  FailoverInlineBanner,
   GenericExtBlockCard,
   TimelineMinimap,
   WorkGroupRow,
 } from './MessageStudio';
 import { ModelPicker } from './ModelPicker';
+import { FailoverInlineBanner } from './FailoverInlineBanner';
 import { ComposerPendingTerminalContexts } from './TerminalContextInlineChip';
 import {
   loadSavedTraitValues,
@@ -375,7 +375,6 @@ export function ChatStage() {
         : [],
     [timeline.items, session],
   );
-  const autoFailoverEnabled = isPluginEnabled('core.auto-failover');
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = isPluginEnabled('core.task-ledger');
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
@@ -1424,7 +1423,7 @@ export function ChatStage() {
                       failoverPolicy={failoverPolicy}
                       fallbackHarnessKind={session.harnessKind}
                       fallbackHarnessId={session.harnessId}
-                      allowFailover={autoFailoverEnabled && !isRunning && item.status === 'failed'}
+                      allowFailover={!isRunning && item.status === 'failed'}
                       onFailover={onFailover}
                       onPreviewImage={setLightboxImg}
                       onResolveApproval={resolveApproval}
@@ -1866,6 +1865,8 @@ export function ChatStage() {
                 {harness && harness.models.length > 0 && (
                   <ModelPicker
                     models={harness.models}
+                    sessionId={session.id}
+                    harnessInstanceId={session.harnessId}
                     value={session.model}
                     defaultModelId={harness.defaultModelId}
                     disabled={isRunning}
@@ -2392,6 +2393,7 @@ const TurnBlock = memo(function TurnBlock({
 
         {turn.status === 'failed' && turn.errorMessage && (
           <FailoverInlineBanner
+            sessionId={session.id}
             failedInstanceId={effectiveId}
             failureClass={turn.failureClass}
             errorMessage={turn.errorMessage}

@@ -7,6 +7,7 @@ import {
   ALL_PLUGIN_UI_SLOTS,
   FILE_PREVIEW_FEATURE,
   HOST_FEATURES_V5,
+  PEER_CONTRACT_NAMES,
   PLUGIN_API_VERSION,
   PluginManifestV4Schema,
   STATIC_PLUGIN_PERMISSIONS,
@@ -57,15 +58,16 @@ const eventRows = Object.entries(pluginEventContracts).map(([name, { mode, permi
 output.set('events.md', heading('公共事件') +
   '| 事件 | 分发 | 权限契约 | 生产方 | 内置消费方 |\n| --- | --- | --- | --- | --- |\n' + eventRows.join('\n') + '\n');
 
-const serviceNames = [
+const serviceNames = [...new Set([
+  ...PEER_CONTRACT_NAMES,
   ...[...builtin.matchAll(/adapterPlugin\('([^']+)'/g)].map(([, id]) => `harness.${id}`),
   ...[...builtin.matchAll(/provides:\s*\[([^\]]+)\]/g)].flatMap(([, list]) =>
     [...list.matchAll(/'([^']+)'/g)].map(([, name]) => name),
   ),
-].sort();
+])].sort();
 const handoffConfig = builtin.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
-  '第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。\n\n' +
+  '第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后提供公共契约或自定义命名空间服务。`harness.*` 下的原生驱动注册保留给第一方，公开契约见下表。\n\n' +
   serviceNames.map((name) => `- \`${name}\`\n`).join('') +
   '\n## 交接配置\n\n```ts\n' + (handoffConfig?.[1] ?? '') + '\n```\n');
 

@@ -5,7 +5,12 @@
     "approval.policy.v1": "hm.plugin.approval-policy-default",
     "history.import.v1": "hm.plugin.history-import",
     "session.search.v1": "hm.plugin.session-search-fts",
-    "hm.session-data.v1": "core.history-session-data"
+    "hm.session-data.v1": "core.history-session-data",
+    "harness.usage.v1": "usage",
+    "harness.model-catalog.v1": "usage",
+    "session.failover.v1": "core.auto-failover",
+    "harness.mcp-config.v1": "core.mcp-hub",
+    "session.model-tools.v1": "core.session-model-tools"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

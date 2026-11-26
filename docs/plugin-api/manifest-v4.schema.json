@@ -73,7 +73,12 @@
                   "approval.policy.v1",
                   "history.source.v1",
                   "history.import.v1",
-                  "session.search.v1"
+                  "session.search.v1",
+                  "harness.usage.v1",
+                  "harness.model-catalog.v1",
+                  "session.failover.v1",
+                  "harness.mcp-config.v1",
+                  "session.model-tools.v1"
                 ]
               },
               {

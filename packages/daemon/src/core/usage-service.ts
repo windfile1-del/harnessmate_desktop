@@ -26,6 +26,7 @@ export interface SessionContextMeterSnapshot {
 }
 
 interface CachedRemoteUsage {
+  adapter: HarnessAdapter;
   result: AdapterUsageLimitResult;
   fetchedAt: number;
 }
@@ -45,7 +46,8 @@ export class UsageService {
   private readonly ttlMs: number;
   private readonly now: () => number;
   private readonly remoteCache = new Map<string, CachedRemoteUsage>();
-  private readonly inflight = new Map<string, Promise<CachedRemoteUsage | null>>();
+  private readonly inflight = new Map<HarnessAdapter, Promise<CachedRemoteUsage | null>>();
+  private stopped = false;
 
   constructor(
     private readonly store: HarnessMateStore,
@@ -101,6 +103,9 @@ export class UsageService {
    * Clears cached remote usage for one instance (e.g. after a `usage_limit` error) or all instances.
    */
   invalidateCache(instanceId?: string): void {
+    for (const adapter of this.inflight.keys()) {
+      if (!instanceId || adapter.id === instanceId) this.inflight.delete(adapter);
+    }
     if (instanceId) {
       this.remoteCache.delete(instanceId);
     } else {
@@ -108,11 +113,17 @@ export class UsageService {
     }
   }
 
+  dispose(): void {
+    this.stopped = true;
+    this.invalidateCache();
+  }
+
   /**
    * Returns cached billing tier for an instance without triggering a remote probe.
    */
   getKnownBillingTier(instanceId: string): InstanceBillingTier {
-    const cached = this.remoteCache.get(instanceId)?.result;
+    const entry = this.remoteCache.get(instanceId);
+    const cached = entry?.adapter === this.registry.get(instanceId) ? entry?.result : undefined;
     if (cached?.billingTier) return cached.billingTier;
     const instance = this.registry.getInstanceConfig(instanceId);
     if (instance?.sanitizedEnv) {
@@ -194,7 +205,7 @@ export class UsageService {
     }
 
     const existingCache = this.remoteCache.get(adapter.id);
-    if (!forceRefresh && existingCache && nowTs - existingCache.fetchedAt < this.ttlMs) {
+    if (!forceRefresh && existingCache?.adapter === adapter && nowTs - existingCache.fetchedAt < this.ttlMs) {
       return this.mergeRemoteResult(base, existingCache.result, existingCache.fetchedAt, true);
     }
 
@@ -204,14 +215,16 @@ export class UsageService {
   }
 
   private async fetchWithDeduplication(adapter: HarnessAdapter): Promise<CachedRemoteUsage | null> {
-    const existing = this.inflight.get(adapter.id);
+    if (this.stopped) return null;
+    const existing = this.inflight.get(adapter);
     if (existing) return existing;
 
-    const promise = (async (): Promise<CachedRemoteUsage | null> => {
+    const promise = Promise.resolve().then(async (): Promise<CachedRemoteUsage | null> => {
       const fetchedAt = this.now();
       try {
         const result = await adapter.readUsageLimits!();
-        const entry: CachedRemoteUsage = { result, fetchedAt };
+        if (this.inflight.get(adapter) !== promise || this.registry.get(adapter.id) !== adapter) return null;
+        const entry: CachedRemoteUsage = { adapter, result, fetchedAt };
         this.remoteCache.set(adapter.id, entry);
         return entry;
       } catch (err) {
@@ -225,15 +238,16 @@ export class UsageService {
           rateLimits: [],
           error: errMsg,
         };
-        const entry: CachedRemoteUsage = { result: fallbackResult, fetchedAt };
+        if (this.inflight.get(adapter) !== promise || this.registry.get(adapter.id) !== adapter) return null;
+        const entry: CachedRemoteUsage = { adapter, result: fallbackResult, fetchedAt };
         this.remoteCache.set(adapter.id, entry);
         return entry;
       } finally {
-        this.inflight.delete(adapter.id);
+        if (this.inflight.get(adapter) === promise) this.inflight.delete(adapter);
       }
-    })();
+    });
 
-    this.inflight.set(adapter.id, promise);
+    this.inflight.set(adapter, promise);
     return promise;
   }
 

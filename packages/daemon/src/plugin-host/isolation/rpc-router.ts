@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  PEER_CONTRACTS,
   PluginApiError,
   isReservedServiceName,
   pluginEventContracts,
@@ -57,6 +58,22 @@ const MAX_FS_BYTES = 2 * 1024 * 1024;
 const MAX_NET_BYTES = 2 * 1024 * 1024;
 const MAX_STORAGE_BYTES = 256 * 1024;
 const MAX_LOGS_PER_PLUGIN = 200;
+
+function isHostHarnessOperation(contract: string, method: string): boolean {
+  switch (contract) {
+    case PEER_CONTRACTS.harnessMcpConfig:
+    case PEER_CONTRACTS.sessionModelTools:
+      return true;
+    case PEER_CONTRACTS.sessionFailover:
+      return method !== 'recommend' && method !== 'getPolicy';
+    case PEER_CONTRACTS.harnessUsage:
+      return method !== 'listAccounts' && method !== 'collectInstanceUsage';
+    case PEER_CONTRACTS.harnessModelCatalog:
+      return method !== 'listModels';
+    default:
+      return false;
+  }
+}
 
 export interface PluginLogEntry {
   timestamp: number;
@@ -422,7 +439,7 @@ export class IsolatedPluginRpcRouter {
           || this.readOptionalString(params.explicitInstanceId) !== undefined;
 
         if (!contract || !fnName) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名或方法名');
-        if (isReservedServiceName(contract)) {
+        if (isReservedServiceName(contract) || isHostHarnessOperation(contract, fnName)) {
           throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接调用内部服务 ${contract}`);
         }
         if (useNewResolution) {
@@ -469,7 +486,8 @@ export class IsolatedPluginRpcRouter {
         const fnName = String(params.method ?? '');
         const args = Array.isArray(params.args) ? params.args : [];
         if (!serviceName || !fnName) throw new PluginApiError('E_INVALID_INPUT', '缺少服务名或方法名');
-        if (serviceName === 'harness' || serviceName.startsWith('harness.') || serviceName === 'mcpHub' || serviceName === 'remote') {
+        if (serviceName === 'harness' || serviceName.startsWith('harness.') || serviceName === 'mcpHub' || serviceName === 'remote'
+          || isHostHarnessOperation(serviceName, fnName)) {
           throw new PluginApiError('E_PERMISSION_DENIED', `隔离插件不能直接调用内部服务 ${serviceName}`);
         }
         const service = this.deps.host.resolveServiceFor<Record<string, unknown>>(instanceId, serviceName);
