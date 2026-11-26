@@ -1,0 +1,33 @@
+{
+  "id": "hm.plugin.session-search-lite",
+  "name": "轻量会话检索 (Lite)",
+  "version": "1.0.0",
+  "description": "纯 JS 轻量倒排索引与中文二元分词会话搜索实现（无 SQLite 依赖），通过 session.search.v1 公共契约独立安装与切换。",
+  "author": "HarnessMate Examples",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "session.search.v1"
+  ],
+  "permissions": [
+    "session:read",
+    "events:turn",
+    "events:message",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "session-search",
+        "title": "会话搜索 (Lite)",
+        "ui": "ui/panel.html",
+        "order": 35
+      }
+    ]
+  }
+}
