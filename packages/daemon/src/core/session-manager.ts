@@ -35,7 +35,6 @@ import type {
   SessionRunRecord,
   SessionSearchResponse,
   SessionStatus,
-  SessionTaskState,
   SideChatMessage,
   SideChatPromoteRequest,
   SideChatRequest,
@@ -44,7 +43,6 @@ import type {
   TurnBlockRecord,
   TurnOptionsMap,
   UpdateSessionRequest,
-  UpdateTaskStateRequest,
   Workspace,
 } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
@@ -418,10 +416,6 @@ export class SessionManager {
             createdAt: ev.createdAt,
             updatedAt: ev.createdAt,
           });
-          const refreshed = this.store.getSession(sessionId);
-          if (refreshed) {
-            this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(refreshed);
-          }
         },
       },
     });
@@ -650,7 +644,7 @@ export class SessionManager {
       getTaskState: (sessionId) => {
         const session = this.store.getSession(sessionId);
         if (!session) return undefined;
-        return this.pluginManager.host.get<TaskLedgerService>('ledger')?.getOrCreate(session);
+        return this.getLocalLedger(session)?.getOrCreate(session) ?? this.store.getTaskState(sessionId) ?? undefined;
       },
     });
     return svc;
@@ -720,8 +714,13 @@ export class SessionManager {
     return service;
   }
 
-  private get taskLedger(): TaskLedgerService {
-    return this.service('ledger');
+  private getLocalLedger(session: Session): TaskLedgerService | undefined {
+    const selection = this.pluginManager.resolveServiceSelection('session.ledger.v1', {
+      sessionId: session.id, allowSingleCandidate: true,
+    });
+    if (selection.status === 'ready') {
+      return this.pluginManager.host.getServiceByInstance<TaskLedgerService>(selection.instanceId, 'ledger');
+    }
   }
 
   // ── Workspaces ───────────────────────────────────────────────────────
@@ -1183,8 +1182,6 @@ export class SessionManager {
       gitAnchor,
     });
 
-    this.pluginManager.host.get<TaskLedgerService>('ledger')?.syncSession(updated);
-
     // If a warm handle for target harness exists with stale model config, apply config now
     const warmTarget = this.liveHandles.get(this.handleKey(sessionId, targetAdapter.id));
     if (warmTarget && warmTarget.handle.updateConfig) {
@@ -1246,42 +1243,6 @@ export class SessionManager {
     });
   }
 
-  // ── Task State Ledger APIs ───────────────────────────────────────────
-
-  getTaskState(sessionId: string): SessionTaskState {
-    const session = this.store.getSession(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
-    return this.taskLedger.getOrCreate(session);
-  }
-
-  updateTaskState(sessionId: string, patch: UpdateTaskStateRequest): SessionTaskState {
-    const session = this.store.getSession(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
-    const updated = this.taskLedger.updateManual(session, patch);
-    this.emitCanonical(sessionId, 'task.state_updated', {
-      version: updated.version,
-      objective: updated.objective,
-      stepsCount: updated.steps.length,
-      doneStepsCount: updated.steps.filter((s) => s.status === 'done').length,
-      pinnedFactsCount: updated.pinnedFacts.length,
-      ledgerFilePath: updated.ledgerFilePath ?? null,
-    });
-    return updated;
-  }
-
-  summarizeTaskState(sessionId: string): SessionTaskState {
-    const session = this.store.getSession(sessionId);
-    if (!session) throw new Error(`Session not found: ${sessionId}`);
-    const updated = this.taskLedger.generateDeterministicDigest(session);
-    this.emitCanonical(sessionId, 'task.state_updated', {
-      version: updated.version,
-      objective: updated.objective,
-      summarizedUpToSeq: updated.summarizedUpToSeq,
-      ledgerFilePath: updated.ledgerFilePath ?? null,
-    });
-    return updated;
-  }
-
   /**
    * Fork & Switch (legacy Handoff upgraded): creates a parallel branch session
    * on targetHarnessId seeded with full compiled Task State Ledger + Context Packet.
@@ -1315,8 +1276,8 @@ export class SessionManager {
     });
 
     // Copy structured Task State Ledger to forked session
-    const sourceLedger = this.taskLedger.getOrCreate(source);
-    this.taskLedger.updateManual(newSession, {
+    const sourceLedger = this.getLocalLedger(source)?.getOrCreate(source) ?? this.store.getTaskState(source.id);
+    if (sourceLedger) this.getLocalLedger(newSession)?.updateManual(newSession, {
       objective: sourceLedger.objective,
       steps: sourceLedger.steps,
       decisions: sourceLedger.decisions,
@@ -1341,8 +1302,8 @@ export class SessionManager {
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
     const events = this.store.iterateEvents(sessionId, 0, session.lastSeq);
-    const ledgerService = this.pluginManager.host.get<TaskLedgerService>('ledger');
-    const ledger = ledgerService?.getOrCreate(session);
+    const ledgerService = this.getLocalLedger(session);
+    const ledger = ledgerService?.getOrCreate(session) ?? this.store.getTaskState(session.id);
     const lines: string[] = [
       `# ${session.title}`,
       '',

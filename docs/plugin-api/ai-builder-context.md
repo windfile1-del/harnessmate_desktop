@@ -32,7 +32,7 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 ```
 
 ## 3. Public Events & Host Services
-- Host services: `approval-center`, `checkpoints`, `compressor`, `failover`, `git`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `ledger`, `native-commands`, `orchestrator`, `session-search`, `terminal-workspace`, `triage-inbox`, `usage`.
+- Host services: `approval-center`, `checkpoints`, `compressor`, `failover`, `git`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `ledger`, `native-commands`, `orchestrator`, `session-search`, `session.inbox.v1`, `session.ledger.v1`, `session.notifications.v1`, `session.snooze.v1`, `session.studio.v1`, `session.summary.v1`, `terminal-workspace`, `triage-inbox`, `usage`.
 - Replaceable public services (with `service:provide:<name>`): `ledger`, `handoff`, `git`, `usage`, `notify`.
 
 | Event / Hook | Mode | Permission |

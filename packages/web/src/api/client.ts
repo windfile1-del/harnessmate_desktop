@@ -299,6 +299,14 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+function instanceQuery(instanceId?: string): string {
+  return instanceId ? '?instanceId=' + encodeURIComponent(instanceId) : '';
+}
+
+function sessionAssistanceUrl(sessionId: string, route: string, instanceId?: string): string {
+  return '/api/v1/sessions/' + encodeURIComponent(sessionId) + '/' + route + instanceQuery(instanceId);
+}
+
 export const daemonApi = {
   health: () =>
     apiFetch<{
@@ -410,16 +418,26 @@ export const daemonApi = {
 
   getTriageState: (signal?: AbortSignal) =>
     apiFetch<TriageStateResponse>('/api/v1/triage/state', { signal }),
-  updateSessionTriage: (id: string, patch: UpdateSessionTriageRequest) =>
-    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}`, {
-      method: 'PATCH', body: JSON.stringify(patch),
+  updateSessionTriage: (id: string, patch: UpdateSessionTriageRequest, options?: { instanceId?: string; signal?: AbortSignal }) =>
+    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}` + instanceQuery(options?.instanceId), {
+      method: 'PATCH', body: JSON.stringify(patch), signal: options?.signal,
     }),
-  markSessionViewed: (id: string, request: MarkSessionViewedRequest, signal?: AbortSignal) =>
-    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}/viewed`, {
+  markSessionViewed: (id: string, request: MarkSessionViewedRequest, signal?: AbortSignal, instanceId?: string) =>
+    apiFetch<{ session: SessionTriageState }>(`/api/v1/triage/sessions/${encodeURIComponent(id)}/viewed` + instanceQuery(instanceId), {
       method: 'POST', body: JSON.stringify(request), signal,
     }),
   checkTriageSnoozes: (signal?: AbortSignal) =>
     apiFetch<TriageCheckSnoozesResponse>('/api/v1/triage/check-snoozes', { method: 'POST', signal }),
+
+  planSessionNotification: (intent: {
+    kind: 'approval' | 'snooze';
+    sessionId: string;
+    identity: string;
+    summary?: string;
+  }) => apiFetch<{ notice: { id: string; title: string; body: string } | null }>(
+    '/api/v1/desktop/session-notifications/plan',
+    { method: 'POST', body: JSON.stringify(intent) },
+  ),
 
   // Plugins
   listPlugins: () => apiFetch<PluginBundleResponse>('/api/v1/plugins'),
@@ -990,6 +1008,7 @@ export const daemonApi = {
     sessionId: string,
     itemId: string,
     opts?: { textOffset?: number; maxChars?: number },
+    signal?: AbortSignal,
   ) => {
     const params = new URLSearchParams();
     if (opts?.textOffset !== undefined) params.set('textOffset', String(opts.textOffset));
@@ -1004,6 +1023,7 @@ export const daemonApi = {
       hasMore: boolean;
     }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}${qs ? `?${qs}` : ''}`,
+      { signal },
     );
   },
 
@@ -1068,27 +1088,22 @@ export const daemonApi = {
     );
   },
 
-  getTaskState: (sessionId: string) =>
+  getTaskState: (sessionId: string, options?: { instanceId?: string; signal?: AbortSignal }) =>
     apiFetch<{ taskState: SessionTaskState }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/task-state`,
+      sessionAssistanceUrl(sessionId, 'task-state', options?.instanceId),
+      { signal: options?.signal },
     ),
 
-  updateTaskState: (sessionId: string, patch: UpdateTaskStateRequest) =>
+  updateTaskState: (sessionId: string, patch: UpdateTaskStateRequest, options?: { instanceId?: string; signal?: AbortSignal }) =>
     apiFetch<{ taskState: SessionTaskState }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/task-state`,
-      {
-        method: 'PUT',
-        body: JSON.stringify(patch),
-      },
+      sessionAssistanceUrl(sessionId, 'task-state', options?.instanceId),
+      { method: 'PUT', body: JSON.stringify(patch), signal: options?.signal },
     ),
 
-  summarizeTaskState: (sessionId: string) =>
+  summarizeTaskState: (sessionId: string, signal?: AbortSignal) =>
     apiFetch<{ taskState: SessionTaskState }>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/task-state/summarize`,
-      {
-        method: 'POST',
-        body: JSON.stringify({}),
-      },
+      sessionAssistanceUrl(sessionId, 'task-state/summarize'),
+      { method: 'POST', body: JSON.stringify({}), signal },
     ),
 
   failoverSession: (sessionId: string, req: FailoverRequest) =>

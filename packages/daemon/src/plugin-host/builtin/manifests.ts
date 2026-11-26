@@ -3,6 +3,7 @@ import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
 import { HISTORY_SESSION_DATA_MANIFEST } from '../../server/routes/history-import-compat.js';
 
 export const BUNDLED_PLUGIN_IDS = [
+  'hm.plugin.message-studio',
   'hm.plugin.browser-desktop',
   'hm.plugin.browser-headless',
   'hm.plugin.file-preview-text',
@@ -189,6 +190,33 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     author: 'HarnessMate Core',
     category: 'workflow',
     contributes: { uiSlots: ['inspector_tab'], hooks: ['after_turn'] },
+  },
+  {
+    id: 'hm.plugin.task-summary',
+    name: '会话任务摘要',
+    description: '从已提交的会话记录提炼任务摘要。',
+    version: '1.0.0',
+    category: 'workflow',
+    provides: ['session.summary.v1'],
+    contributes: {},
+  },
+  {
+    id: 'hm.plugin.session-snooze',
+    name: '会话延后提醒',
+    description: '检查会话待办的延后时间并重新标记到期事项。',
+    version: '1.0.0',
+    category: 'workflow',
+    provides: ['session.snooze.v1'],
+    contributes: {},
+  },
+  {
+    id: 'hm.plugin.desktop-notifications',
+    name: '桌面会话通知',
+    description: '为待审批事项和到期提醒启用桌面通知。',
+    version: '1.0.0',
+    category: 'ui',
+    provides: ['session.notifications.v1'],
+    contributes: {},
   },
   {
     id: 'core.auto-failover',

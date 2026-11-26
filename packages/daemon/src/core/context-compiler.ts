@@ -1,3 +1,4 @@
+import type { SessionTaskState } from '@harnessmate/protocol';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -99,7 +100,10 @@ export class ContextCompiler {
 
   constructor(
     private readonly store: HarnessMateStore,
-    private readonly taskLedger: TaskLedgerService,
+    private readonly taskLedger: TaskLedgerService | {
+      get(sessionId: string): Promise<SessionTaskState | null>;
+      renderLedgerMarkdown?: TaskLedgerService['renderLedgerMarkdown'];
+    },
     readonly options: { budgetTokens: number; autoAttach: boolean },
     private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined,
     private readonly events: PluginEvents,
@@ -165,29 +169,29 @@ export class ContextCompiler {
         : Math.min(binding?.syncedUpToSeq ?? 0, targetSeq);
     let isWarmBinding = Boolean(syncedUpToSeq > 0);
 
-    const taskState = typeof (this.taskLedger as { getOrCreate?: unknown }).getOrCreate === 'function'
+    const taskState = 'getOrCreate' in this.taskLedger
       ? this.taskLedger.getOrCreate(session)
       : await (async () => {
-          const thirdParty = this.taskLedger as unknown as { get?: (sessionId: string) => Promise<Record<string, unknown> | null> };
+          const thirdParty = this.taskLedger as { get?: (sessionId: string) => Promise<SessionTaskState | null> };
           const remote = typeof thirdParty.get === 'function' ? await thirdParty.get(session.id) : null;
+          if (remote) return remote;
           return {
             sessionId: session.id,
-            objective: typeof remote?.objective === 'string' ? remote.objective : '',
-            steps: Array.isArray(remote?.steps) ? remote.steps : [],
-            decisions: Array.isArray(remote?.decisions) ? remote.decisions : [],
-            touchedFiles: Array.isArray(remote?.touchedFiles) ? remote.touchedFiles : [],
+            objective: '',
+            steps: [],
+            decisions: [],
+            touchedFiles: [],
             verifications: [],
-            blockers: Array.isArray(remote?.blockers) ? remote.blockers : [],
-            pinnedFacts: Array.isArray(remote?.pinnedFacts) ? remote.pinnedFacts : [],
-            failedAttempts: Array.isArray(remote?.failedAttempts) ? remote.failedAttempts : [],
+            blockers: [],
+            pinnedFacts: [],
             rollingSummary: '',
             summarizedUpToSeq: 0,
-            version: typeof remote?.version === 'number' ? remote.version : 1,
+            version: 1,
             ledgerFilePath: null,
-            updatedAt: typeof remote?.updatedAt === 'number' ? remote.updatedAt : Date.now(),
+            updatedAt: Date.now(),
           };
         })();
-    const ledgerMarkdown = typeof (this.taskLedger as { renderLedgerMarkdown?: unknown }).renderLedgerMarkdown === 'function'
+    const ledgerMarkdown = typeof this.taskLedger.renderLedgerMarkdown === 'function'
       ? this.taskLedger.renderLedgerMarkdown(taskState, session, referenceOnly ? 'reference' : 'directive')
       : [
           '## Task State Ledger',

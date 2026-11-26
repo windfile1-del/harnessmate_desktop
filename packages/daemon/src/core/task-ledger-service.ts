@@ -89,13 +89,24 @@ interface WorkspaceLedgerMeta {
 
 export class TaskLedgerService {
   constructor(private readonly store: HarnessMateStore,
-    private readonly gitStatus: (cwd: string) => ReturnType<typeof getGitStatusSummary> | undefined) {}
+    private readonly gitStatus: (cwd: string, session: Session) => Promise<Awaited<ReturnType<typeof getGitStatusSummary>> | undefined> | undefined,
+    private readonly instanceId = 'core.task-ledger') {}
+
+  private get usesLegacyData(): boolean {
+    return this.instanceId === 'core.task-ledger';
+  }
+
+  private persist(state: SessionTaskState): SessionTaskState {
+    if (this.usesLegacyData) return this.store.upsertTaskState(state);
+    this.store.setPluginStorageValue(state.sessionId, this.instanceId, 'task-state', state);
+    return state;
+  }
 
   syncSession(session: Session): void {
     const state = this.getOrCreate(session);
     const { ledgerFilePath, state: mergedState, conflictDetected } = this.syncWorkspaceLedgerWithMerge(session, state);
     if (conflictDetected || (ledgerFilePath && ledgerFilePath !== state.ledgerFilePath)) {
-      this.store.upsertTaskState({
+      this.persist({
         ...mergedState,
         ...(ledgerFilePath ? { ledgerFilePath } : {}),
         ...(conflictDetected ? { version: state.version + 1, updatedAt: Date.now() } : {}),
@@ -104,9 +115,11 @@ export class TaskLedgerService {
   }
 
   getOrCreate(session: Session): SessionTaskState {
-    const existing = this.store.getTaskState(session.id);
+    const existing = this.usesLegacyData
+      ? this.store.getTaskState(session.id)
+      : this.store.getPluginStorageValue(session.id, this.instanceId, 'task-state') as SessionTaskState | undefined;
     if (existing) return existing;
-    return this.store.upsertTaskState({
+    return this.persist({
       sessionId: session.id,
       objective: '',
       steps: [],
@@ -159,7 +172,7 @@ export class TaskLedgerService {
     if (ledgerFilePath) {
       mergedState.ledgerFilePath = ledgerFilePath;
     }
-    return this.store.upsertTaskState(mergedState);
+    return this.persist(mergedState);
   }
 
   recordFailedAttempt(
@@ -189,7 +202,7 @@ export class TaskLedgerService {
     if (ledgerFilePath) {
       mergedState.ledgerFilePath = ledgerFilePath;
     }
-    return this.store.upsertTaskState(mergedState);
+    return this.persist(mergedState);
   }
 
   /**
@@ -202,6 +215,29 @@ export class TaskLedgerService {
     turnHarnessId: string,
     turnEvents: CanonicalEvent[],
   ): Promise<SessionTaskState> {
+    const git = await this.readGitChanges(session);
+    return this.applyTurnEvents(session, turnId, turnHarnessId, turnEvents, git);
+  }
+
+  async readGitChanges(session: Session): Promise<string[]> {
+    try {
+      const git = hasGitRepoAncestor(session.cwd) ? await this.gitStatus(session.cwd, session) : undefined;
+      return git?.isGitRepo
+        ? git.changes.map((change) => change.path).filter((file) => file && !file.startsWith('.harnessmate/'))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  applyTurnEvents(
+    session: Session,
+    turnId: string,
+    turnHarnessId: string,
+    turnEvents: CanonicalEvent[],
+    gitChanges: readonly string[],
+    mirror = true,
+  ): SessionTaskState {
     if (!this.store.isOpen()) {
       return {
         sessionId: session.id,
@@ -337,21 +373,7 @@ export class TaskLedgerService {
       }
     }
 
-    // Reconcile live git modified files (Workspace Truth) only when inside a git worktree
-    try {
-      if (hasGitRepoAncestor(session.cwd)) {
-        const git = await this.gitStatus(session.cwd);
-        if (git?.isGitRepo) {
-          for (const ch of git.changes) {
-            if (ch.path && !ch.path.startsWith('.harnessmate/')) {
-              touchedFiles.add(ch.path);
-            }
-          }
-        }
-      }
-    } catch {
-      // ignore git errors on non-git folders
-    }
+    for (const file of gitChanges) touchedFiles.add(file);
 
     // Extract markdown checklist steps from assistant reply
     if (assistantText) {
@@ -369,7 +391,7 @@ export class TaskLedgerService {
             failureReason: compactSingleLine(turnFailedMessage, 480),
             relatedFiles: [...turnTouchedFiles],
             harnessInstanceId: turnHarnessId,
-            recordedAt: Date.now(),
+            recordedAt: turnEvents.at(-1)?.createdAt ?? Date.now(),
           },
           turnHarnessId,
           session.cwd,
@@ -401,9 +423,8 @@ export class TaskLedgerService {
       updatedAt: Date.now(),
     };
 
-    if (!this.store.isOpen()) {
-      return next;
-    }
+    if (!this.store.isOpen()) return next;
+    if (!mirror) return this.persist(next);
     const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
     if (ledgerFilePath) {
       mergedState.ledgerFilePath = ledgerFilePath;
@@ -412,7 +433,7 @@ export class TaskLedgerService {
     if (!this.store.isOpen()) {
       return mergedState;
     }
-    return this.store.upsertTaskState(mergedState);
+    return this.persist(mergedState);
   }
 
   /**
@@ -486,7 +507,7 @@ export class TaskLedgerService {
     };
     const { ledgerFilePath, state: mergedState } = this.syncWorkspaceLedgerWithMerge(session, next);
     if (ledgerFilePath) mergedState.ledgerFilePath = ledgerFilePath;
-    return this.store.upsertTaskState(mergedState);
+    return this.persist(mergedState);
   }
 
   /**
@@ -494,101 +515,7 @@ export class TaskLedgerService {
    * for injection into any Harness and for `<cwd>/.harnessmate/task-ledger.md`.
    */
   renderLedgerMarkdown(state: SessionTaskState, session: Session, style: 'directive' | 'reference' = 'directive'): string {
-    const lines: string[] = [
-      '# HarnessMate Task State Ledger',
-      '',
-      `- **Session**: ${session.title} (\`${session.id}\`)`,
-      `- **Workspace**: \`${session.cwd}\``,
-      `- **Active Harness**: \`${session.harnessId}\`${session.actualModel || session.model ? ` (${session.actualModel || session.model})` : ''}`,
-      `- **Collaborating Harnesses**: ${(session.participatingHarnesses?.length ? session.participatingHarnesses : [session.harnessId]).join(', ')}`,
-      ...(style === 'directive' ? [`- **Ledger Version**: v${state.version} · Updated ${new Date(state.updatedAt).toISOString()}`] : []),
-      '',
-    ];
-
-    if (state.objective) {
-      lines.push('## Objective', '', state.objective, '');
-    }
-
-    if (state.pinnedFacts.length > 0) {
-      lines.push(style === 'reference' ? '## Previously Recorded Constraints' : '## Pinned Constraints (MUST FOLLOW — NEVER FORGET)', '');
-      for (const fact of state.pinnedFacts) {
-        lines.push(`- [PINNED] ${fact}`);
-      }
-      lines.push('');
-    }
-
-    if (state.steps.length > 0) {
-      lines.push('## Plan & Progress', '');
-      for (const step of state.steps) {
-        const mark =
-          step.status === 'done'
-            ? '[x]'
-            : step.status === 'in_progress'
-              ? '[~]'
-              : step.status === 'blocked'
-                ? '[!]'
-                : '[ ]';
-        const owner = step.ownerHarnessId ? ` _(by ${step.ownerHarnessId})_` : '';
-        lines.push(`- ${mark} ${step.title}${owner}`);
-      }
-      lines.push('');
-    }
-
-    if (state.decisions.length > 0) {
-      lines.push('## Key Decisions', '');
-      for (const d of state.decisions) {
-        lines.push(`- ${d}`);
-      }
-      lines.push('');
-    }
-
-    if ((state.failedAttempts?.length ?? 0) > 0) {
-      lines.push(
-        style === 'reference'
-          ? '## Previously Attempted Approaches (Failed)'
-          : '## Failed Attempts (DO NOT REPEAT)',
-        '',
-      );
-      for (const fa of state.failedAttempts!.slice(-8)) {
-        const files = fa.relatedFiles?.length
-          ? ` (files: ${fa.relatedFiles.slice(0, 5).map((f) => `\`${f}\``).join(', ')})`
-          : '';
-        lines.push(`- [${fa.harnessInstanceId || 'unknown'}] ${fa.summary} — Reason: ${fa.failureReason}${files}`);
-      }
-      lines.push('');
-    }
-
-    if (state.touchedFiles.length > 0) {
-      lines.push('## Touched Files', '');
-      for (const f of state.touchedFiles) {
-        lines.push(`- \`${f}\``);
-      }
-      lines.push('');
-    }
-
-    if (state.verifications.length > 0) {
-      lines.push('## Verification Results', '');
-      for (const v of state.verifications.slice(-8)) {
-        const icon = v.status === 'pass' ? 'PASS' : v.status === 'fail' ? 'FAIL' : 'INFO';
-        const by = v.harnessId ? ` [${v.harnessId}]` : '';
-        lines.push(`- **${icon}**${by} \`${v.command}\`${v.summary ? ` — ${v.summary}` : ''}`);
-      }
-      lines.push('');
-    }
-
-    if (state.blockers.length > 0) {
-      lines.push('## Open Blockers / Errors', '');
-      for (const b of state.blockers) {
-        lines.push(`- ${b}`);
-      }
-      lines.push('');
-    }
-
-    if (state.rollingSummary && style === 'directive') {
-      lines.push('## Historical Digest', '', state.rollingSummary, '');
-    }
-
-    return `${lines.join('\n').trim()}\n`;
+    return renderTaskLedgerMarkdown(state, session, style);
   }
 
   /**
@@ -604,7 +531,7 @@ export class TaskLedgerService {
     state: SessionTaskState,
   ): { ledgerFilePath: string | null; state: SessionTaskState; conflictDetected: boolean } {
     try {
-      if (!session.cwd || !fs.existsSync(session.cwd)) {
+      if (!this.usesLegacyData || !session.cwd || !fs.existsSync(session.cwd)) {
         return { ledgerFilePath: null, state, conflictDetected: false };
       }
       const hmDir = path.join(session.cwd, '.harnessmate');
@@ -685,6 +612,106 @@ export class TaskLedgerService {
       return { ledgerFilePath: null, state, conflictDetected: false };
     }
   }
+}
+
+export function renderTaskLedgerMarkdown(
+  state: SessionTaskState, session: Session, style: 'directive' | 'reference' = 'directive',
+): string {
+  const lines: string[] = [
+    '# HarnessMate Task State Ledger',
+    '',
+    `- **Session**: ${session.title} (\`${session.id}\`)`,
+    `- **Workspace**: \`${session.cwd}\``,
+    `- **Active Harness**: \`${session.harnessId}\`${session.actualModel || session.model ? ` (${session.actualModel || session.model})` : ''}`,
+    `- **Collaborating Harnesses**: ${(session.participatingHarnesses?.length ? session.participatingHarnesses : [session.harnessId]).join(', ')}`,
+    ...(style === 'directive' ? [`- **Ledger Version**: v${state.version} · Updated ${new Date(state.updatedAt).toISOString()}`] : []),
+    '',
+  ];
+
+  if (state.objective) {
+    lines.push('## Objective', '', state.objective, '');
+  }
+
+  if (state.pinnedFacts.length > 0) {
+    lines.push(style === 'reference' ? '## Previously Recorded Constraints' : '## Pinned Constraints (MUST FOLLOW — NEVER FORGET)', '');
+    for (const fact of state.pinnedFacts) {
+      lines.push(`- [PINNED] ${fact}`);
+    }
+    lines.push('');
+  }
+
+  if (state.steps.length > 0) {
+    lines.push('## Plan & Progress', '');
+    for (const step of state.steps) {
+      const mark =
+        step.status === 'done'
+          ? '[x]'
+          : step.status === 'in_progress'
+            ? '[~]'
+            : step.status === 'blocked'
+              ? '[!]'
+              : '[ ]';
+      const owner = step.ownerHarnessId ? ` _(by ${step.ownerHarnessId})_` : '';
+      lines.push(`- ${mark} ${step.title}${owner}`);
+    }
+    lines.push('');
+  }
+
+  if (state.decisions.length > 0) {
+    lines.push('## Key Decisions', '');
+    for (const d of state.decisions) {
+      lines.push(`- ${d}`);
+    }
+    lines.push('');
+  }
+
+  if ((state.failedAttempts?.length ?? 0) > 0) {
+    lines.push(
+      style === 'reference'
+        ? '## Previously Attempted Approaches (Failed)'
+        : '## Failed Attempts (DO NOT REPEAT)',
+      '',
+    );
+    for (const fa of state.failedAttempts!.slice(-8)) {
+      const files = fa.relatedFiles?.length
+        ? ` (files: ${fa.relatedFiles.slice(0, 5).map((f) => `\`${f}\``).join(', ')})`
+        : '';
+      lines.push(`- [${fa.harnessInstanceId || 'unknown'}] ${fa.summary} — Reason: ${fa.failureReason}${files}`);
+    }
+    lines.push('');
+  }
+
+  if (state.touchedFiles.length > 0) {
+    lines.push('## Touched Files', '');
+    for (const f of state.touchedFiles) {
+      lines.push(`- \`${f}\``);
+    }
+    lines.push('');
+  }
+
+  if (state.verifications.length > 0) {
+    lines.push('## Verification Results', '');
+    for (const v of state.verifications.slice(-8)) {
+      const icon = v.status === 'pass' ? 'PASS' : v.status === 'fail' ? 'FAIL' : 'INFO';
+      const by = v.harnessId ? ` [${v.harnessId}]` : '';
+      lines.push(`- **${icon}**${by} \`${v.command}\`${v.summary ? ` — ${v.summary}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  if (state.blockers.length > 0) {
+    lines.push('## Open Blockers / Errors', '');
+    for (const b of state.blockers) {
+      lines.push(`- ${b}`);
+    }
+    lines.push('');
+  }
+
+  if (state.rollingSummary && style === 'directive') {
+    lines.push('## Historical Digest', '', state.rollingSummary, '');
+  }
+
+  return `${lines.join('\n').trim()}\n`;
 }
 
 function atomicWriteFile(targetPath: string, content: string): void {

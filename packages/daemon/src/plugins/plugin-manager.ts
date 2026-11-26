@@ -702,13 +702,14 @@ export class PluginManager {
         if (!fs.existsSync(path.join(dir, MANIFEST_FILE))) continue;
         try {
           const pack = readPluginPackage(dir);
-          if (next.has(pack.manifest.id)) continue;
+          const kernel = next.get(pack.manifest.id);
+          if (kernel && (pack.manifest.main || !this.firstParty.has(pack.manifest.id))) continue;
           const enabled = this.desiredEnabled(pack.manifest.id, true);
           next.set(pack.manifest.id, {
             info: {
               ...pack.manifest,
               builtin: true,
-              sourceKind: 'bundled',
+              sourceKind: kernel ? 'kernel' : 'bundled',
               instanceId: pack.manifest.id,
               enabled,
               sourcePath: null,

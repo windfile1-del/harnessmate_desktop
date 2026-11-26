@@ -18,6 +18,12 @@
 - `native-commands`
 - `orchestrator`
 - `session-search`
+- `session.inbox.v1`
+- `session.ledger.v1`
+- `session.notifications.v1`
+- `session.snooze.v1`
+- `session.studio.v1`
+- `session.summary.v1`
 - `terminal-workspace`
 - `triage-inbox`
 - `usage`

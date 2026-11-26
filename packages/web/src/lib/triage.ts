@@ -13,7 +13,7 @@ export function isActivePlugin(plugin: InstalledPluginInfo): boolean {
 }
 
 export function isTriageEnabled(plugins: readonly InstalledPluginInfo[]): boolean {
-  return plugins.some((plugin) => plugin.id === TRIAGE_INBOX_PLUGIN_ID && isActivePlugin(plugin));
+  return plugins.some((plugin) => (plugin.id === TRIAGE_INBOX_PLUGIN_ID || plugin.providedContracts?.some(({ contract }) => contract === 'session.inbox.v1')) && isActivePlugin(plugin));
 }
 
 export function classifyTriage(session: Session, state?: SessionTriageState): TriageGroup {

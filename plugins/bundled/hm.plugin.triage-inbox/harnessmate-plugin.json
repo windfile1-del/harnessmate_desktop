@@ -1,0 +1,30 @@
+{
+  "id": "hm.plugin.triage-inbox",
+  "name": "会话待办与命令面板",
+  "description": "分拣待审批、未读与运行会话，支持置顶、延后提醒和全局命令检索。",
+  "version": "1.0.0",
+  "category": "ui",
+  "apiVersion": 4,
+  "provides": [
+    "triage-inbox",
+    "session.inbox.v1"
+  ],
+  "permissions": [
+    "session:read",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "uiSlots": [
+      "sidebar_tool",
+      "modal"
+    ],
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "session-inbox",
+        "title": "会话待办",
+        "ui": "ui/panel.html"
+      }
+    ]
+  }
+}

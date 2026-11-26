@@ -1,0 +1,22 @@
+{
+  "id": "core.task-ledger",
+  "name": "任务账本",
+  "description": "查看和编辑会话目标、步骤、决策、校验与历史摘要。",
+  "version": "1.0.0",
+  "category": "workflow",
+  "apiVersion": 4,
+  "provides": [
+    "ledger",
+    "session.ledger.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "inspector.tabs",
+        "id": "task-ledger",
+        "title": "任务账本",
+        "ui": "ui/panel.html"
+      }
+    ]
+  }
+}

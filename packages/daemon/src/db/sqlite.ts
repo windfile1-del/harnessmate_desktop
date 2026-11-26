@@ -1858,6 +1858,28 @@ export class HarnessMateStore {
     }
   }
 
+  readCommittedLedgerEvents(
+    sessionId: string,
+    range: { afterSeq: number; throughSeq: number },
+    turnId?: string,
+  ): CanonicalEvent[] {
+    const filter = turnId === undefined
+      ? "type IN ('turn.completed', 'turn.failed', 'turn.cancelled', 'checkpoint.reverted', 'session.harness_switched')"
+      : 'turn_id = ?';
+    const args = [sessionId, range.afterSeq, range.throughSeq, ...(turnId === undefined ? [] : [turnId])];
+    const rows = this.db.prepare(
+      `SELECT * FROM session_events WHERE session_id = ? AND seq > ? AND seq <= ? AND ${filter} ORDER BY seq ASC`,
+    ).all(...args) as unknown as EventRow[];
+    return rows.map((row) => ({
+      sessionId,
+      seq: row.seq,
+      type: row.type as CanonicalEventType,
+      turnId: row.turn_id,
+      createdAt: row.created_at,
+      payload: safeJsonParse<Record<string, unknown>>(row.payload_json, {}),
+    }));
+  }
+
   readPluginTurns(session: Session, projection: PluginProjection, query: PluginPanelQuery, pageSize: number) {
     const scopeColumn = projection.scope === 'workspace' ? 's.workspace_id' : 's.id';
     const scopeId = projection.scope === 'workspace' ? session.workspaceId : session.id;

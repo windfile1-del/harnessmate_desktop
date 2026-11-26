@@ -27,7 +27,7 @@ import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
 import { HtmlRenderCard } from '../components/HtmlRenderCard';
-import { FailoverInlineBanner } from '../components/MessageStudio';
+import { FailoverInlineBanner } from '../components/FailoverInlineBanner';
 import {
   OrchestratorCohortBlockCard,
   ParallelExecutionBoard,
@@ -512,13 +512,13 @@ export function PluginSlotSync() {
       }),
     );
 
-    // Built-in V5 Message Studio: dynamic schema-driven TraitsPicker (composer.traits)
+    // Built-in V5 Chat: dynamic schema-driven TraitsPicker (composer.traits)
     disposers.push(
       registry.register({
         slot: 'composer.traits',
         id: 'message-studio-traits',
-        pluginId: 'hm.plugin.message-studio',
-        pluginName: 'Message Studio',
+        pluginId: 'core.chat',
+        pluginName: '会话正文',
         title: '动态参数选择器',
         order: 100,
         sourceKind: 'builtin',
@@ -536,13 +536,13 @@ export function PluginSlotSync() {
       }),
     );
 
-    // Built-in V5 Message Studio: sandboxed html_render card (chat.block)
+    // Built-in V5 Chat: sandboxed html_render card (chat.block)
     disposers.push(
       registry.register({
         slot: 'chat.block',
         id: 'message-studio-html-render',
-        pluginId: 'hm.plugin.message-studio',
-        pluginName: 'Message Studio',
+        pluginId: 'core.chat',
+        pluginName: '会话正文',
         title: 'HTML 沙箱预览',
         key: 'html_render',
         order: 100,

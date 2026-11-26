@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font: 12px system-ui, sans-serif; }
+body { color: var(--text-primary); margin: 0; }
+main { display: grid; gap: 6px; padding: 6px; }
+p, h2, h3, ul { margin: 0; }
+pre { margin: 0; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+button, input, textarea, select { font: inherit; color: inherit; background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 6px; }
+button { cursor: pointer; }
+button:hover { background: var(--bg-hover); }
+button:disabled { opacity: .55; cursor: default; }
+label { display: grid; gap: 3px; }
+small { color: var(--text-muted); }
+[data-error] { color: var(--accent-rose); }
+nav { display: grid; justify-items: center; gap: 4px; max-height: 420px; overflow: auto; }
+nav button { width: 16px; height: 16px; padding: 0; color: var(--accent-indigo); }
+nav [aria-current="true"] { background: var(--accent-indigo); color: var(--bg-surface); }
+.actions { display: flex; flex-wrap: wrap; gap: 5px; }
+article { border: 1px solid var(--border-hairline); border-radius: 8px; padding: 8px; display: grid; gap: 5px; }

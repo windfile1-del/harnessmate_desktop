@@ -33,7 +33,6 @@ import {
   GitPushRequestSchema,
   InstallPluginRequestSchema,
   LinkDevPluginRequestSchema,
-  MarkSessionViewedRequestSchema,
   ManualCompressRequestSchema,
   MergeBackRequestSchema,
   MergeSubagentRequestSchema,
@@ -59,8 +58,6 @@ import {
   UpdatePluginRegistryConfigRequestSchema,
   UpdateRemoteConfigRequestSchema,
   UpdateSessionRequestSchema,
-  UpdateTaskStateRequestSchema,
-  UpdateSessionTriageRequestSchema,
   PluginPanelQuerySchema,
   PluginUiMessageRequestSchema,
   PreviewPluginProgramRequestSchema,
@@ -96,7 +93,7 @@ import { GitOperationError } from '../core/git-service.js';
 import { McpService } from '../core/mcp-service.js';
 import { SessionManager } from '../core/session-manager.js';
 import { runWorkspaceCommand } from '../core/terminal-service.js';
-import { TriageInboxService } from '../core/triage-inbox-service.js';
+import { readSessionLedger, registerSessionAssistanceCompatRoutes } from './routes/session-assistance-compat.js';
 import {
   TERMINAL_WORKSPACE_PLUGIN_ID,
   TerminalWorkspaceError,
@@ -202,20 +199,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const pluginPermissions = new PluginPermissionService(store);
   const pluginSecrets = new PluginSecretStore();
   const terminalWorkspace = new TerminalWorkspaceService(store, { initialActive: false });
-  const triageInbox = new TriageInboxService(store, (session, event) => {
-    wsGateway.notifyTriage({ op: 'triage_updated', session, event });
-    if (event) {
-      void pluginManager.dispatchLifecycleEvent({
-        version: PLUGIN_EVENT_VERSION,
-        type: event.type,
-        sessionId: event.sessionId,
-        turnId: null,
-        seq: null,
-        createdAt: event.createdAt,
-        data: { snoozedUntilMs: event.snoozedUntilMs },
-      }, store.getSession(event.sessionId)?.workspaceId);
-    }
-  });
   const terminalSessionOwners = new Map<string, string>();
   const sessionChangeFeed = new SessionChangeFeedService(store);
   const historyImportAdapter = new HistoryImportAdapter(store, registry, sessionChangeFeed);
@@ -227,19 +210,39 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       store,
       registry,
       config,
-      (state) => {
-        if (!store.getSession(state.sessionId)) return;
-        eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
-          version: state.version, objective: state.objective, stepsCount: state.steps.length,
-          doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
-          touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
-        }));
+      {
+        plugins: () => pluginManager,
+        changes: sessionChangeFeed,
+        events: eventBus,
+        readLedger: (session) => readSessionLedger(pluginManager, store, session.id),
+        report: (error) => app.log.error(error),
+        ledgerUpdated: (state) => {
+          if (!store.getSession(state.sessionId)) return;
+          eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
+            version: state.version, objective: state.objective, stepsCount: state.steps.length,
+            doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
+            touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
+          }));
+        },
+        inboxUpdated: (session, event) => {
+          wsGateway.notifyTriage({ op: 'triage_updated', session, event });
+          if (event) {
+            void pluginManager.dispatchLifecycleEvent({
+              version: PLUGIN_EVENT_VERSION,
+              type: event.type,
+              sessionId: event.sessionId,
+              turnId: null,
+              seq: null,
+              createdAt: event.createdAt,
+              data: { snoozedUntilMs: event.snoozedUntilMs },
+            }, store.getSession(event.sessionId)?.workspaceId);
+          }
+        },
       },
       () => pluginManager.host.events,
       opts.customAdapters,
       async (event) => (await pluginManager.isolated?.collectHandoffSections(event)) ?? [],
       terminalWorkspace,
-      { service: triageInbox, bus: eventBus },
       paths.agyProfilesDir,
       historyImportAdapter,
     ),
@@ -1507,45 +1510,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { deleted: true };
   });
 
-  // ── Session Triage ─────────────────────────────────────────────────
-
-  const activeTriage = () => pluginManager.host.get<TriageInboxService>('triage-inbox');
-  app.get('/api/v1/triage/state', async (_request, reply) => {
-    const service = activeTriage();
-    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
-    return { sessions: service.list() };
-  });
-
-  app.patch('/api/v1/triage/sessions/:id', async (request, reply) => {
-    const service = activeTriage();
-    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
-    const parsed = UpdateSessionTriageRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message });
-    const { id } = request.params as { id: string };
-    const session = service.update(id, parsed.data);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { session };
-  });
-
-  app.post('/api/v1/triage/sessions/:id/viewed', async (request, reply) => {
-    const service = activeTriage();
-    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
-    const parsed = MarkSessionViewedRequestSchema.safeParse(request.body ?? {});
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message });
-    const { id } = request.params as { id: string };
-    const session = service.markViewed(id, parsed.data);
-    if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { session };
-  });
-
-  app.post('/api/v1/triage/check-snoozes', async (_request, reply) => {
-    const service = activeTriage();
-    if (!service) return reply.code(409).send({ error: '会话待办插件已停用' });
-    const expired = service.checkExpiredSnoozes();
-    return { expired, sessions: service.list() };
-  });
-
-  // ── Sessions, Attachments, Files, Rules, Terminal & Handoff ──────────
+  registerSessionAssistanceCompatRoutes(app, pluginManager, store);
 
   app.get('/api/v1/sessions', async (request) => {
     const q = request.query as {
@@ -1579,7 +1544,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const pendingApprovals = sessionManager.listPendingApprovals(id);
-    const taskState = sessionManager.getTaskState(id);
+    const taskState = await readSessionLedger(pluginManager, store, id);
     return { session, pendingApprovals, taskState };
   });
 
@@ -1707,37 +1672,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       const preview = await sessionManager.getContextPreview(id, q.targetHarnessId, q.syncMode);
       return { preview };
-    } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.get('/api/v1/sessions/:id/task-state', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    try {
-      return { taskState: sessionManager.getTaskState(id) };
-    } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.put('/api/v1/sessions/:id/task-state', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const parsed = UpdateTaskStateRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid task state' });
-    }
-    try {
-      return { taskState: sessionManager.updateTaskState(id, parsed.data) };
-    } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  app.post('/api/v1/sessions/:id/task-state/summarize', async (request, reply) => {
-    const { id } = request.params as { id: string };
-    try {
-      return { taskState: sessionManager.summarizeTaskState(id) };
     } catch (err) {
       return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
     }

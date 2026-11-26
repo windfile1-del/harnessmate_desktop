@@ -30,6 +30,7 @@ export interface SandboxedPluginFrameProps {
   props?: Record<string, unknown>;
   defaultHeight?: number;
   compact?: boolean;
+  onAction?: (action: string, params: Record<string, unknown>, signal: AbortSignal) => unknown;
 }
 
 function serializeSafeProps(input: Record<string, unknown> | undefined): Record<string, unknown> {
@@ -59,6 +60,7 @@ export function SandboxedPluginFrame({
   props,
   defaultHeight,
   compact = false,
+  onAction,
 }: SandboxedPluginFrameProps) {
   const effectiveInstanceId = instanceId ?? pluginId;
   const registry = useSlotRegistry();
@@ -69,6 +71,8 @@ export function SandboxedPluginFrame({
   const [height, setHeight] = useState<number>(defaultHeight ?? (compact ? 48 : 220));
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const actionRef = useRef(onAction);
+  actionRef.current = onAction;
 
   const sessionDto = useMemo(() => toPublicSessionDto(session), [session]);
   const safeProps = useMemo(() => {
@@ -187,6 +191,9 @@ export function SandboxedPluginFrame({
       iframeWindow: Window,
       runId: string,
     ): Promise<unknown> => {
+      if (method === 'surface.action' && actionRef.current && typeof params?.action === 'string') {
+        return actionRef.current(params.action, params, rpcAbort.signal);
+      }
       if (method.startsWith('browser.') || method.startsWith('desktopView.')) {
         if (!desktopView) {
           throw Object.assign(new Error('桌面视图预览需要 HarnessMate Desktop'), { code: 'E_NOT_SUPPORTED' });
@@ -355,6 +362,11 @@ export function SandboxedPluginFrame({
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       srcDoc={srcDoc}
+      onLoad={() => {
+        iframeRef.current?.contentWindow?.postMessage({
+          type: 'hm:context', session: sessionDtoRef.current, props: safePropsRef.current,
+        } satisfies PluginSlotBridgeHostMessage, '*');
+      }}
       className={slot === 'workspace.pages'
         ? 'block size-full border-0 bg-transparent'
         : 'w-full rounded-xl border border-[var(--border-hairline)] bg-transparent'}

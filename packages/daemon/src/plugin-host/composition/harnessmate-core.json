@@ -5,7 +5,13 @@
     "approval.policy.v1": "hm.plugin.approval-policy-default",
     "history.import.v1": "hm.plugin.history-import",
     "session.search.v1": "hm.plugin.session-search-fts",
-    "hm.session-data.v1": "core.history-session-data"
+    "hm.session-data.v1": "core.history-session-data",
+    "session.studio.v1": "hm.plugin.message-studio",
+    "session.ledger.v1": "ledger",
+    "session.summary.v1": "hm.plugin.task-summary",
+    "session.inbox.v1": "hm.plugin.triage-inbox",
+    "session.snooze.v1": "hm.plugin.session-snooze",
+    "session.notifications.v1": "hm.plugin.desktop-notifications"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

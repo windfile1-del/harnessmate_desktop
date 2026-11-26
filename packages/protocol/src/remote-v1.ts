@@ -164,6 +164,7 @@ export type TriageStateResponse = z.infer<typeof TriageStateResponseSchema>;
 
 export const TriageCheckSnoozesResponseSchema = z.object({
   expired: z.array(TriageSnoozeExpiredSchema),
+  reminders: z.array(TriageSnoozeExpiredSchema).optional(),
   sessions: z.array(SessionTriageStateSchema),
 });
 export type TriageCheckSnoozesResponse = z.infer<typeof TriageCheckSnoozesResponseSchema>;

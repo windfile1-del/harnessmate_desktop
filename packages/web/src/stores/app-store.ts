@@ -1,3 +1,5 @@
+import type { TriageSnoozeExpired } from '@harnessmate/protocol';
+import { showSessionNotification } from '../lib/desktop-notifications';
 import type {
   AddMcpServerRequest,
   AgyAuthState,
@@ -727,6 +729,21 @@ export const useAppStore = create<AppState>((set, get) => {
     }
   };
 
+  const handleSnoozeReminder = (event: TriageSnoozeExpired, toast: boolean) => {
+    const session = get().sessions.find(({ id }) => id === event.sessionId);
+    if (!session) return;
+    const key = 'snooze:' + event.sessionId + ':' + event.snoozedUntilMs + ':' + event.createdAt;
+    if (toast && !snoozeToasts.has(key)) {
+      snoozeToasts.add(key);
+      if (snoozeToasts.size > 256) snoozeToasts.delete(snoozeToasts.values().next().value!);
+      get().pushToast({ kind: 'info', title: '延后提醒已到期', body: session.title });
+    }
+    showSessionNotification(get(), session, {
+      kind: 'snooze', sessionId: session.id, identity: event.snoozedUntilMs + ':' + event.createdAt,
+    });
+  };
+  const snoozeToasts = new Set<string>();
+
   const handleAttention = (item: AttentionItem) => {
     if (item.kind === 'approval_needed') {
       void get().refreshPendingApprovals();
@@ -735,7 +752,10 @@ export const useAppStore = create<AppState>((set, get) => {
         title: `需要审批 · ${item.sessionTitle}`,
         body: item.summary,
       });
-      window.harnessMateBridge?.notify(`HarnessMate 需要审批`, `${item.sessionTitle}: ${item.summary}`);
+      showSessionNotification(get(), get().sessions.find(({ id }) => id === item.sessionId), {
+        kind: 'approval', sessionId: item.sessionId, identity: item.approvalId ?? String(item.timestamp),
+        summary: item.summary.slice(0, 500),
+      });
     } else if (item.kind === 'turn_failed') {
       get().pushToast({
         kind: 'error',
@@ -946,10 +966,7 @@ export const useAppStore = create<AppState>((set, get) => {
               });
             } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
               ingestTriage([frame.session]);
-              if (frame.event) {
-                const session = get().sessions.find(({ id }) => id === frame.session.sessionId);
-                if (session) get().pushToast({ kind: 'info', title: '延后提醒已到期', body: session.title });
-              }
+              if (frame.event) handleSnoozeReminder(frame.event, true);
             }
           },
         });
@@ -1071,8 +1088,16 @@ export const useAppStore = create<AppState>((set, get) => {
       return found;
     },
     refreshTriage: async (checkSnoozes, signal) => {
-      const result = await (checkSnoozes ? daemonApi.checkTriageSnoozes(signal) : daemonApi.getTriageState(signal));
-      if (!signal.aborted) ingestTriage(result.sessions);
+      if (checkSnoozes) {
+        const { sessions, expired, reminders } = await daemonApi.checkTriageSnoozes(signal);
+        if (signal.aborted) return;
+        ingestTriage(sessions);
+        for (const event of expired) handleSnoozeReminder(event, true);
+        for (const event of reminders ?? []) handleSnoozeReminder(event, false);
+      } else {
+        const { sessions } = await daemonApi.getTriageState(signal);
+        if (!signal.aborted) ingestTriage(sessions);
+      }
     },
     updateTriage: async (id, patch) => {
       const { session } = await daemonApi.updateSessionTriage(id, patch);

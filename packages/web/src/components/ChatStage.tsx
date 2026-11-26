@@ -1,3 +1,4 @@
+import { useBoundSessionPlugin } from '../slots/BoundSessionSurface';
 import { useShallow } from 'zustand/react/shallow';
 import type {
   ApprovalRequest,
@@ -79,7 +80,6 @@ import {
   isExtensionOrUnknownBlock,
   readTimelinePosition,
   rememberTimelinePosition,
-  type TimelineMinimapEntry,
 } from '../lib/work-groups';
 import { useAppStore } from '../stores/app-store';
 import type { FileLink } from '../lib/file-links';
@@ -103,12 +103,8 @@ import { HarnessSwitcher } from './HarnessSwitcher';
 import { HtmlRenderCard } from './HtmlRenderCard';
 import { InspectorDrawer } from './InspectorDrawer';
 import { MarkdownView } from './MarkdownView';
-import {
-  FailoverInlineBanner,
-  GenericExtBlockCard,
-  TimelineMinimap,
-  WorkGroupRow,
-} from './MessageStudio';
+import { FailoverInlineBanner } from './FailoverInlineBanner';
+import { StudioExtension, StudioMinimap, StudioScope, StudioWorkGroup } from '../slots/StudioSurfaces';
 import { ModelPicker } from './ModelPicker';
 import { ComposerPendingTerminalContexts } from './TerminalContextInlineChip';
 import {
@@ -377,7 +373,7 @@ export function ChatStage() {
   );
   const autoFailoverEnabled = isPluginEnabled('core.auto-failover');
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
-  const taskLedgerEnabled = isPluginEnabled('core.task-ledger');
+  const taskLedgerEnabled = Boolean(useBoundSessionPlugin('session.ledger.v1', session ?? null));
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
   const explorerEnabled = isPluginEnabled('hm.plugin.session-explorer');
   const approvalCenterEnabled = isPluginEnabled('hm.plugin.approval-center');
@@ -1324,6 +1320,7 @@ export function ChatStage() {
         <SessionUndoRevertBar sessionId={session.id} />
 
         {/* Main Conversation Stream + Turn Minimap */}
+        <StudioScope session={session}>
         <div className="flex min-h-0 flex-1 overflow-hidden">
           <div
             ref={scrollRef}
@@ -1437,17 +1434,9 @@ export function ChatStage() {
             </div>
           </div>
 
-          <TimelineMinimap
-            entries={minimapEntries}
-            harnesses={harnesses}
-            activeTurnId={focusedTurn?.turnId ?? null}
-            onJump={(entry: TimelineMinimapEntry) => {
-              if (entry.kind === 'turn') {
-                focusTurn({ sessionId: session.id, turnId: entry.id });
-              }
-            }}
-          />
+          <StudioMinimap session={session} entries={minimapEntries} activeTurnId={focusedTurn?.turnId} />
         </div>
+        </StudioScope>
 
         {commandOutputs[session.id]?.output && (
           <section role="status" className="mx-5 mb-2 flex min-w-0 items-start gap-3 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2 text-[12px]">
@@ -2209,7 +2198,7 @@ const TurnBlock = memo(function TurnBlock({
           <div className="space-y-2.5">
             {groupedSegments.map((segment) => {
               if (segment.kind === 'work_group') {
-                return <WorkGroupRow key={segment.groupId} session={session} group={segment} />;
+                return <StudioWorkGroup key={segment.groupId} session={session} group={segment} />;
               }
               const block = segment.block;
               if (block.type === 'assistant_text') {
@@ -2323,7 +2312,7 @@ const TurnBlock = memo(function TurnBlock({
                     name="chat.block"
                     matchKey={matchKey}
                     slotProps={{ session, turn, block, onOpenFile, onFailover }}
-                    fallback={<GenericExtBlockCard block={block} />}
+                    fallback={<StudioExtension session={session} block={block} />}
                   />
                 );
               }

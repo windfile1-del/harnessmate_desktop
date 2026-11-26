@@ -1,0 +1,47 @@
+{
+  "id": "user.session-studio-fixture",
+  "name": "W2 会话夹具",
+  "version": "1.0.0",
+  "description": "模拟 Studio 视图和 Git 状态服务，用于会话绑定联调。",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
+  "main": "index.mjs",
+  "provides": [
+    "session.studio.v1",
+    "git.workspace.v1",
+    "session.failover.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "chat.node",
+        "id": "studio-work-group",
+        "title": "工作组",
+        "ui": "ui/panel.html",
+        "key": "studio-work-group"
+      },
+      {
+        "slot": "tool.result",
+        "id": "studio-tool",
+        "title": "工具输出",
+        "ui": "ui/panel.html",
+        "key": "studio-tool"
+      },
+      {
+        "slot": "chat.block",
+        "id": "studio-extension",
+        "title": "扩展",
+        "ui": "ui/panel.html",
+        "key": "studio-extension"
+      },
+      {
+        "slot": "chat.node",
+        "id": "studio-timeline",
+        "title": "时间线",
+        "ui": "ui/panel.html",
+        "key": "studio-timeline"
+      }
+    ]
+  }
+}

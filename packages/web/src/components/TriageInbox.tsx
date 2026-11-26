@@ -3,8 +3,9 @@ import { AlarmClock, Check, Circle, Pin } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type MouseEvent, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { isImeComposing } from '../lib/ime';
-import { classifyTriage, isTriageEnabled, type TriageFilter } from '../lib/triage';
+import { classifyTriage, type TriageFilter } from '../lib/triage';
 import { useAppStore } from '../stores/app-store';
+import { useBoundSessionPlugin } from '../slots/BoundSessionSurface';
 
 export function openTriageSession(session: Session): Promise<void> {
   const state = useAppStore.getState();
@@ -141,7 +142,8 @@ const actionButton = 'rounded p-0.5 text-[var(--text-secondary)] hover:bg-[var(-
 export function TriageSidebarBadge({ session }: { session: Session }) {
   const state = useAppStore((store) => store.triageBySession[session.id]);
   const selected = useAppStore((store) => store.selectedSessionId === session.id);
-  const enabled = useAppStore((store) => isTriageEnabled(store.plugins));
+  const enabled = useBoundSessionPlugin('session.inbox.v1', session);
+  const snoozeEnabled = useBoundSessionPlugin('session.snooze.v1', session);
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
   const snoozeButton = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => {
@@ -171,17 +173,17 @@ export function TriageSidebarBadge({ session }: { session: Session }) {
       <span className={`flex overflow-hidden ${anchor ? '' : 'max-w-0 group-hover:max-w-24 group-focus-within:max-w-24'}`}>
         <button type="button" className={actionButton} title={meta?.pinned ? '取消置顶' : '置顶'}
           aria-label={meta?.pinned ? '取消置顶' : '置顶'} onClick={(event) => action(event, { pinned: !meta?.pinned })}><Pin size={13} /></button>
-        <button type="button" className={actionButton} ref={snoozeButton} title="延后提醒" aria-label="延后提醒"
+        {snoozeEnabled && <button type="button" className={actionButton} ref={snoozeButton} title="延后提醒" aria-label="延后提醒"
           aria-expanded={!!anchor} onClick={(event) => {
             event.stopPropagation();
             setAnchor(anchor ? null : event.currentTarget.getBoundingClientRect());
-          }}><AlarmClock size={13} /></button>
+          }}><AlarmClock size={13} /></button>}
         <button type="button" className={actionButton} title={meta?.settled ? '重新待办' : '标为已处理'}
           aria-label={meta?.settled ? '重新待办' : '标为已处理'} onClick={(event) => action(event, { settled: !meta?.settled })}><Check size={13} /></button>
         <button type="button" className={actionButton} title="标为未读" aria-label="标为未读"
           onClick={(event) => action(event, { forceUnread: true })}><Circle size={13} /></button>
       </span>
-      {anchor && <SnoozeMenu anchor={anchor} trigger={snoozeButton} isSnoozed={snoozedUntil != null} onClose={closeMenu}
+      {anchor && snoozeEnabled && <SnoozeMenu anchor={anchor} trigger={snoozeButton} isSnoozed={snoozedUntil != null} onClose={closeMenu}
         onChoose={(snoozedUntilMs) => {
         closeMenu();
         apply({ snoozedUntilMs });

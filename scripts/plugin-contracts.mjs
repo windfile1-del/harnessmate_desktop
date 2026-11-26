@@ -49,20 +49,29 @@ const producers = {
 };
 const mapper = read(`${daemon}/plugin-host/runtime/map-event.ts`);
 const builtin = read(`${daemon}/plugin-host/builtin/services.ts`);
+const builtinSources = fs.readdirSync(path.join(root, daemon, 'plugin-host/builtin'))
+  .filter((file) => file.endsWith('.ts'))
+  .sort()
+  .map((file) => 'plugin-host/builtin/' + file)
+  .map((file) => ({ file, source: read(`${daemon}/${file}`) }));
 const eventRows = Object.entries(pluginEventContracts).map(([name, { mode, permission }]) => {
   const producer = producers[name] ?? (mapper.includes(`'${name}'`) ? 'plugin-host/runtime/map-event.ts' : null);
-  const listener = builtin.includes(`ctx.on('${name}'`) ? 'plugin-host/builtin/services.ts' : null;
+  const listener = builtinSources.find(({ source }) => source.includes(`ctx.on('${name}'`))?.file;
   return `| \`${name}\` | ${mode} | ${permission ? `\`${permission}\`` : '—'} | ${producer ?? '契约预留'} | ${listener ?? '—'} |`;
 });
 output.set('events.md', heading('公共事件') +
   '| 事件 | 分发 | 权限契约 | 生产方 | 内置消费方 |\n| --- | --- | --- | --- | --- |\n' + eventRows.join('\n') + '\n');
 
-const serviceNames = [
+const serviceNames = [...new Set([
   ...[...builtin.matchAll(/adapterPlugin\('([^']+)'/g)].map(([, id]) => `harness.${id}`),
-  ...[...builtin.matchAll(/provides:\s*\[([^\]]+)\]/g)].flatMap(([, list]) =>
-    [...list.matchAll(/'([^']+)'/g)].map(([, name]) => name),
-  ),
-].sort();
+  ...builtinSources.flatMap(({ source }) => {
+    const constants = new Map([...source.matchAll(/(?:export )?const (\w+) = '([^']+)';/g)]
+      .map(([, identifier, value]) => [identifier, value]));
+    return [...source.matchAll(/provides:\s*\[([^\]]+)\]/g)].flatMap(([, list]) =>
+      list.split(',').map((entry) => /^'([^']+)'$/.exec(entry.trim())?.[1] ?? constants.get(entry.trim())).filter(Boolean),
+    );
+  }),
+])].sort();
 const handoffConfig = builtin.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
   '第一方服务按名称注册；第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后替换公共服务（`ledger`、`handoff`、`git`、`usage`、`notify`），或提供带命名空间前缀的第三方服务。`harness.*` 仅允许第一方提供。\n\n' +

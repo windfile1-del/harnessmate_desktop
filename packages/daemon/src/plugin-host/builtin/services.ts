@@ -2,8 +2,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
-import { TRIAGE_INBOX_PLUGIN_ID, type Attachment, type SessionTaskState } from '@harnessmate/protocol';
-import type { HandoffComposeEvent, PluginEventV4 } from '@harnessmate/plugin-api';
+import { type Attachment } from '@harnessmate/protocol';
+import type { HandoffComposeEvent } from '@harnessmate/plugin-api';
 import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointService } from '../../core/checkpoint-service.js';
 import {
@@ -45,10 +45,9 @@ import {
   workspaceTruthDigest,
 } from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
-import { TaskLedgerService } from '../../core/task-ledger-service.js';
+import { renderTaskLedgerMarkdown } from '../../core/task-ledger-service.js';
+import { registerSessionAssistance, type SessionAssistanceDependencies } from './session-assistance.js';
 import { TerminalWorkspaceService } from '../../core/terminal-workspace-service.js';
-import type { TriageInboxService } from '../../core/triage-inbox-service.js';
-import type { DaemonEventBus } from '../../core/event-bus.js';
 import { UsageService } from '../../core/usage-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { createAgyDriverFactory } from '../../harnesses/agy/agy-driver.js';
@@ -103,12 +102,11 @@ export const handoffConfigSchema = z.object({
 }).strict();
 
 export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessRegistry, config: DaemonPersistedConfig,
-  ledgerUpdated: (state: SessionTaskState) => void,
+  assistance: Omit<SessionAssistanceDependencies, 'store'>,
   events: () => PluginEvents,
   overrides: readonly HarnessAdapter[] = [],
   collectIsolatedSections?: (event: HandoffComposeEvent) => Promise<Array<{ id: string; source: string; order: number; text: string }>>,
   terminalWorkspace?: TerminalWorkspaceService,
-  triage?: { service: TriageInboxService; bus: DaemonEventBus },
   agyProfilesDir?: string,
   historyImportAdapter?: HistoryImportAdapter) {
   const resolvedAgyProfilesDir =
@@ -217,40 +215,18 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('checkpoints', new CheckpointService(store));
     },
   });
-  plugins.set('core.task-ledger', {
-    provides: ['ledger'],
-    apply(ctx) {
-      let disposed = false;
-      ctx.effect(() => () => {
-        disposed = true;
-      });
-      const ledger = new TaskLedgerService(store, (cwd) => ctx.get<GitService>('git')?.status(cwd));
-      ctx.provide('ledger', ledger);
-      ctx.on('session.created', ({ sessionId }) => {
-        if (disposed || !store.isOpen()) return;
-        const session = sessionId && store.getSession(sessionId);
-        if (session) ledger.syncSession(session);
-      });
-      const refresh = async ({ sessionId, turnId, data }: PluginEventV4<'turn.completed' | 'turn.failed'>) => {
-        if (disposed || !store.isOpen()) return;
-        if (data.maintenance || !sessionId || !turnId) return;
-        const session = store.getSession(sessionId);
-        if (!session || disposed || !store.isOpen()) return;
-        const events = store.getEventsAfter(sessionId, Math.max(0, session.lastSeq - 250), 300);
-        const updated = await ledger.ingestTurnEvents(session, turnId, data.harnessId ?? session.harnessId, events);
-        if (disposed || !store.isOpen()) return;
-        ledgerUpdated(updated);
-      };
-      ctx.on('turn.completed', refresh);
-      ctx.on('turn.failed', refresh);
-    },
-  });
+  registerSessionAssistance(plugins, { ...assistance, store });
   plugins.set('core.context-bridge', {
-    inject: ['ledger'],
     provides: ['handoff'],
     apply(ctx, settings) {
       ctx.host?.setRegistryBridge(registry);
-      const ledger = ctx.get<TaskLedgerService>('ledger')!;
+      const ledger = {
+        get: async (sessionId: string) => {
+          const session = store.getSession(sessionId);
+          return session ? assistance.readLedger(session) : null;
+        },
+        renderLedgerMarkdown: renderTaskLedgerMarkdown,
+      };
       const options = handoffConfigSchema.parse(settings);
       const compiler = new ContextCompiler(
         store,
@@ -427,13 +403,6 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.effect(() => () => {
         void svc.onPluginDisabled().catch(() => {});
       });
-    },
-  });
-  if (triage) plugins.set(TRIAGE_INBOX_PLUGIN_ID, {
-    provides: ['triage-inbox'],
-    apply(ctx) {
-      ctx.provide('triage-inbox', triage.service);
-      ctx.effect(() => triage.service.start(triage.bus));
     },
   });
   return plugins;

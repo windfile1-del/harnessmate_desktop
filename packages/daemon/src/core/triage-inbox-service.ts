@@ -1,5 +1,6 @@
 import {
   SessionTriageMetaSchema,
+  TriageSnoozeExpiredSchema,
   TRIAGE_INBOX_PLUGIN_ID,
   type CanonicalEventType,
   type MarkSessionViewedRequest,
@@ -12,9 +13,11 @@ import {
 import type { HarnessMateStore } from '../db/sqlite.js';
 import { GLOBAL_WORKSPACE_SCOPE } from '../plugin-host/permissions/permissions.js';
 import type { DaemonEventBus } from './event-bus.js';
+import type { SessionChangeFeedService } from './session-change-feed.js';
 
 const scope = GLOBAL_WORKSPACE_SCOPE;
-const pluginId = TRIAGE_INBOX_PLUGIN_ID;
+const reminderScope = 'session-snooze-notifications';
+const reminderRetentionMs = 24 * 60 * 60_000;
 const triageEvents = new Set<CanonicalEventType>([
   'session.status', 'turn.completed', 'approval.requested', 'approval.resolved',
   'subagent.spawned', 'subagent.updated',
@@ -24,9 +27,12 @@ export class TriageInboxService {
   constructor(
     private readonly store: HarnessMateStore,
     private readonly publish: (state: SessionTriageState, event?: TriageSnoozeExpired) => void,
+    private readonly instanceId = TRIAGE_INBOX_PLUGIN_ID,
+    private readonly owns: (session: Session) => boolean = () => true,
+    private readonly canSnooze: (session: Session) => boolean = () => true,
   ) {}
 
-  start(bus: DaemonEventBus): () => void {
+  start(bus: DaemonEventBus, changes?: SessionChangeFeedService): () => void {
     this.collectOrphans();
     const dirty = new Set<string>();
     let active = true;
@@ -40,7 +46,7 @@ export class TriageInboxService {
         dirty.clear();
         for (const id of sessions) {
           const session = this.store.getSession(id);
-          if (session) this.publish(this.project(session));
+          if (session && this.owns(session)) this.publish(this.project(session));
         }
       });
     };
@@ -50,25 +56,40 @@ export class TriageInboxService {
     const unsubscribeAttention = bus.subscribeAttention(({ kind, sessionId }) => {
       if (kind === 'session_updated') enqueue(sessionId);
     });
-    queueMicrotask(() => { if (active) this.checkExpiredSnoozes(); });
-    const timer = setInterval(() => this.checkExpiredSnoozes(), 30_000);
-    timer.unref();
+    let cursor = changes?.getLatestSeq() ?? 0;
+    const unsubscribeChanges = changes?.onCommitted(() => {
+      let more = true;
+      while (more && active) {
+        const page = changes.readCommittedChanges({ afterSeq: cursor });
+        for (const change of page.changes) {
+          if (change.kind === 'delete_session') {
+            this.store.deletePluginStorageValue(scope, this.instanceId, change.sessionId);
+            this.store.deletePluginStorageValue(reminderScope, this.instanceId, change.sessionId);
+          } else if (change.kind === 'upsert_session') {
+            enqueue(change.sessionId);
+          }
+          cursor = change.changeSeq;
+        }
+        more = page.hasMore;
+      }
+    });
     return () => {
       active = false;
       unsubscribeEvents();
       unsubscribeAttention();
-      clearInterval(timer);
+      unsubscribeChanges?.();
     };
   }
 
   list(): SessionTriageState[] {
     this.collectOrphans();
-    return this.store.listSessions().map((session) => this.project(session));
+    return this.store.listSessions().filter(this.owns).map((session) => this.project(session));
   }
 
   update(sessionId: string, patch: UpdateSessionTriageRequest): SessionTriageState | undefined {
     const session = this.store.getSession(sessionId);
-    if (!session) return;
+    if (!session || !this.owns(session)) return;
+    if (patch.snoozedUntilMs != null && !this.canSnooze(session)) throw new Error('延后提醒已停用');
     const state = this.project(session);
     const { meta } = state;
     const acknowledge = patch.settled === true || patch.snoozedUntilMs != null;
@@ -92,7 +113,7 @@ export class TriageInboxService {
 
   markViewed(sessionId: string, request: MarkSessionViewedRequest = {}): SessionTriageState | undefined {
     const session = this.store.getSession(sessionId);
-    if (!session) return;
+    if (!session || !this.owns(session)) return;
     const state = this.project(session);
     const { meta, latestTurnSeq } = state;
     const through = Math.min(latestTurnSeq, request.throughTurnSeq ?? latestTurnSeq);
@@ -108,17 +129,33 @@ export class TriageInboxService {
 
   checkExpiredSnoozes(nowMs = Date.now()): TriageSnoozeExpired[] {
     const expired: TriageSnoozeExpired[] = [];
-    for (const id of this.store.listPluginStorageKeys(scope, pluginId)) {
+    for (const id of this.store.listPluginStorageKeys(scope, this.instanceId)) {
       const meta = this.readMeta(id);
       if (meta.snoozedUntilMs === null || meta.snoozedUntilMs > nowMs) continue;
       const session = this.store.getSession(id);
       if (!session) {
-        this.store.deletePluginStorageValue(scope, pluginId, id);
+        this.store.deletePluginStorageValue(scope, this.instanceId, id);
         continue;
       }
-      expired.push(this.expire(this.project(session, meta), meta.snoozedUntilMs, nowMs).event);
+      if (this.owns(session) && this.canSnooze(session)) {
+        expired.push(this.expire(this.project(session, meta), meta.snoozedUntilMs, nowMs).event);
+      }
     }
     return expired;
+  }
+
+  recentSnoozeReminders(nowMs = Date.now()): TriageSnoozeExpired[] {
+    const reminders: TriageSnoozeExpired[] = [];
+    for (const id of this.store.listPluginStorageKeys(reminderScope, this.instanceId)) {
+      const result = TriageSnoozeExpiredSchema.safeParse(this.store.getPluginStorageValue(reminderScope, this.instanceId, id));
+      const session = this.store.getSession(id);
+      if (!session || !result.success || nowMs - result.data.createdAt > reminderRetentionMs) {
+        this.store.deletePluginStorageValue(reminderScope, this.instanceId, id);
+      } else if (this.owns(session) && this.canSnooze(session)) {
+        reminders.push(result.data);
+      }
+    }
+    return reminders;
   }
 
   private expire(state: SessionTriageState, snoozedUntilMs: number, nowMs: number) {
@@ -136,13 +173,13 @@ export class TriageInboxService {
 
   private collectOrphans(): void {
     const ids = new Set(this.store.listSessionIds());
-    for (const id of this.store.listPluginStorageKeys(scope, pluginId)) {
-      if (!ids.has(id)) this.store.deletePluginStorageValue(scope, pluginId, id);
+    for (const id of this.store.listPluginStorageKeys(scope, this.instanceId)) {
+      if (!ids.has(id)) this.store.deletePluginStorageValue(scope, this.instanceId, id);
     }
   }
 
   private readMeta(sessionId: string): SessionTriageMeta {
-    const parsed = SessionTriageMetaSchema.safeParse(this.store.getPluginStorageValue(scope, pluginId, sessionId));
+    const parsed = SessionTriageMetaSchema.safeParse(this.store.getPluginStorageValue(scope, this.instanceId, sessionId));
     if (parsed.success && parsed.data.sessionId === sessionId) return parsed.data;
     return {
       sessionId, pinned: false, settled: false, forceUnread: false,
@@ -164,7 +201,10 @@ export class TriageInboxService {
 
   private save(state: SessionTriageState, meta: SessionTriageMeta, event?: TriageSnoozeExpired): SessionTriageState {
     meta = { ...meta, updatedAt: Math.max(event?.createdAt ?? Date.now(), state.meta.updatedAt + 1) };
-    this.store.setPluginStorageValue(scope, pluginId, state.sessionId, meta);
+    this.store.runInImmediateTransaction(() => {
+      this.store.setPluginStorageValue(scope, this.instanceId, state.sessionId, meta);
+      if (event) this.store.setPluginStorageValue(reminderScope, this.instanceId, state.sessionId, event);
+    });
     const updated = { ...state, meta };
     this.publish(updated, event);
     return updated;

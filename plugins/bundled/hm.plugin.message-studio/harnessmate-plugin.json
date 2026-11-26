@@ -1,0 +1,43 @@
+{
+  "id": "hm.plugin.message-studio",
+  "name": "Message Studio",
+  "description": "按需展示会话工作组、工具输出、扩展块和时间线。",
+  "version": "1.0.0",
+  "category": "ui",
+  "apiVersion": 4,
+  "provides": [
+    "session.studio.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "chat.node",
+        "id": "studio-work-group",
+        "title": "工作组",
+        "ui": "ui/panel.html",
+        "key": "studio:work-group"
+      },
+      {
+        "slot": "tool.result",
+        "id": "studio-tool",
+        "title": "工具条目",
+        "ui": "ui/panel.html",
+        "key": "studio:tool"
+      },
+      {
+        "slot": "chat.block",
+        "id": "studio-extension",
+        "title": "扩展条目",
+        "ui": "ui/panel.html",
+        "key": "studio:extension"
+      },
+      {
+        "slot": "chat.node",
+        "id": "studio-timeline",
+        "title": "时间线",
+        "ui": "ui/panel.html",
+        "key": "studio:timeline"
+      }
+    ]
+  }
+}

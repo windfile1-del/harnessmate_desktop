@@ -1,13 +1,13 @@
+import { TaskLedgerSurface } from '../slots/TaskLedgerSurface';
+import { useBoundSessionPlugin } from '../slots/BoundSessionSurface';
 import { useShallow } from 'zustand/react/shallow';
-import type { Session, TaskStep, WorkspaceFileEntry } from '@harnessmate/protocol';
+import type { Session, WorkspaceFileEntry } from '@harnessmate/protocol';
 import {
   AlertCircle,
   AtSign,
   BookOpen,
-  CheckCircle2,
   Circle,
   Clock,
-  Eye,
   FileCode2,
   FolderTree,
   GitBranch,
@@ -23,7 +23,6 @@ import {
   RefreshCw,
   ScrollText,
   Search,
-  Sparkles,
   Terminal,
   Trash2,
   X,
@@ -65,9 +64,6 @@ export function InspectorDrawer({
     openPluginPanel,
     refreshGitStatus,
     refreshTaskState,
-    updateTaskState,
-    summarizeTaskState,
-    openModal,
     addDraftAttachment,
     pushToast,
     isPluginEnabled,
@@ -88,9 +84,6 @@ export function InspectorDrawer({
     openPluginPanel: state.openPluginPanel,
     refreshGitStatus: state.refreshGitStatus,
     refreshTaskState: state.refreshTaskState,
-    updateTaskState: state.updateTaskState,
-    summarizeTaskState: state.summarizeTaskState,
-    openModal: state.openModal,
     addDraftAttachment: state.addDraftAttachment,
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
@@ -109,20 +102,10 @@ export function InspectorDrawer({
     inspectorSlotItems[0];
   const hasV1PanelSlot = inspectorSlotItems.some(({ sourceKind }) => sourceKind === 'v1-panel');
 
-  // Task Board local draft inputs
-  const [objectiveDraft, setObjectiveDraft] = useState(taskState?.objective ?? '');
-  const [newPinnedInput, setNewPinnedInput] = useState('');
-  const [newStepInput, setNewStepInput] = useState('');
-  const [summarizing, setSummarizing] = useState(false);
+  const ledgerPlugin = useBoundSessionPlugin('session.ledger.v1', session);
 
   useEffect(() => {
-    setObjectiveDraft(taskState?.objective ?? '');
-  }, [taskState?.objective, session.id]);
-
-  useEffect(() => {
-    if ((inspectorTab === 'task' || (inspectorTab === 'plugins' && hasV1PanelSlot)) && !taskState) {
-      void refreshTaskState(session.id);
-    }
+    if (inspectorTab === 'plugins' && hasV1PanelSlot && !taskState) void refreshTaskState(session.id);
   }, [inspectorTab, session.id, taskState, refreshTaskState, hasV1PanelSlot]);
 
   // Files tab state
@@ -302,7 +285,7 @@ export function InspectorDrawer({
         style={{ borderBottom: '1px solid var(--border-hairline)' }}
       >
         <div className="flex flex-wrap items-center gap-0.5">
-          {isPluginEnabled('core.task-ledger') && (
+          {ledgerPlugin && (
             <TabBtn
               active={inspectorTab === 'task'}
               icon={<ListChecks size={12.5} />}
@@ -405,414 +388,7 @@ export function InspectorDrawer({
             )}
           </div>
         )}
-        {inspectorTab === 'task' && (
-          <div className="space-y-3.5">
-            {/* Top Action Row */}
-            <div className="flex flex-wrap items-center justify-between gap-1.5">
-              <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-[var(--text-primary)]">
-                <ListChecks size={13.5} className="text-[var(--accent-indigo)]" />
-                任务状态账本
-                {taskState && (
-                  <span className="font-mono-code text-[10px] text-[var(--text-muted)]">
-                    v{taskState.version}
-                  </span>
-                )}
-              </span>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => openModal('context_preview')}
-                  title="预览切换引擎时将注入的上下文内容"
-                  className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] text-[var(--accent-indigo)] transition-colors hover:bg-[var(--bg-hover)]"
-                  style={{ border: '1px solid var(--border-focus)' }}
-                >
-                  <Eye size={11} />
-                  透视上下文
-                </button>
-                <button
-                  type="button"
-                  disabled={summarizing}
-                  onClick={() => {
-                    setSummarizing(true);
-                    void summarizeTaskState(session.id).finally(() => setSummarizing(false));
-                  }}
-                  title="将历史对话提炼为结构化阶段摘要并更新 .harnessmate/task-ledger.md"
-                  className="inline-flex cursor-pointer items-center gap-1 rounded-lg px-2 py-1 text-[10.5px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50"
-                  style={{ border: '1px solid var(--border-hairline)' }}
-                >
-                  {summarizing ? <Loader2 size={11} className="animate-spin" /> : <Sparkles size={11} />}
-                  提炼摘要
-                </button>
-              </div>
-            </div>
-
-            {taskState?.ledgerFilePath && (
-              <div
-                className="truncate rounded-lg px-2.5 py-1.5 font-mono-code text-[10px] text-[var(--text-muted)]"
-                title={taskState.ledgerFilePath}
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  border: '1px solid var(--border-hairline)',
-                }}
-              >
-                同步落盘：{taskState.ledgerFilePath}
-              </div>
-            )}
-
-            {/* Objective */}
-            <div className="space-y-1.5">
-              <label className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
-                核心目标 (Objective)
-              </label>
-              <textarea
-                rows={2}
-                value={objectiveDraft}
-                onChange={(e) => setObjectiveDraft(e.target.value)}
-                onBlur={() => {
-                  const trimmed = objectiveDraft.trim();
-                  if (trimmed !== (taskState?.objective ?? '')) {
-                    void updateTaskState(session.id, { objective: trimmed });
-                  }
-                }}
-                placeholder="描述当前跨引擎协作的最终目标（自动从首轮提取，可随时修改）..."
-                className="w-full resize-none rounded-xl px-2.5 py-2 text-[12px] leading-relaxed text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-                style={{
-                  backgroundColor: 'var(--bg-surface)',
-                  border: '1px solid var(--border-hairline)',
-                }}
-              />
-            </div>
-
-            {/* Pinned Constraints (Never Forgotten Across Switches) */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1 text-[10.5px] font-medium uppercase tracking-wider text-[var(--accent-star)]">
-                  <Pin size={10.5} />
-                  钉选铁律（切换引擎永不遗忘）
-                </span>
-              </div>
-              <div className="space-y-1">
-                {(taskState?.pinnedFacts ?? []).map((fact, idx) => (
-                  <div
-                    key={`${fact}-${idx}`}
-                    className="group flex items-start justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[11.5px] text-[var(--text-primary)]"
-                    style={{
-                      backgroundColor: 'var(--accent-star-soft)',
-                      border: '1px solid color-mix(in srgb, var(--accent-star) 28%, transparent)',
-                    }}
-                  >
-                    <span className="break-words">{fact}</span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void updateTaskState(session.id, {
-                          pinnedFacts: (taskState?.pinnedFacts ?? []).filter((_, i) => i !== idx),
-                        })
-                      }
-                      className="shrink-0 cursor-pointer text-[var(--text-muted)] opacity-60 hover:text-[var(--accent-rose)] hover:opacity-100"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                ))}
-                <div className="flex gap-1.5">
-                  <input
-                    value={newPinnedInput}
-                    onChange={(e) => setNewPinnedInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && newPinnedInput.trim()) {
-                        void updateTaskState(session.id, {
-                          pinnedFacts: [...(taskState?.pinnedFacts ?? []), newPinnedInput.trim()],
-                        });
-                        setNewPinnedInput('');
-                      }
-                    }}
-                    placeholder="添加不可违反的约束，回车钉选..."
-                    className="min-w-0 flex-1 rounded-lg px-2.5 py-1.5 text-[11.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-                    style={{
-                      backgroundColor: 'var(--bg-surface)',
-                      border: '1px solid var(--border-hairline)',
-                    }}
-                  />
-                  <button
-                    type="button"
-                    disabled={!newPinnedInput.trim()}
-                    onClick={() => {
-                      if (!newPinnedInput.trim()) return;
-                      void updateTaskState(session.id, {
-                        pinnedFacts: [...(taskState?.pinnedFacts ?? []), newPinnedInput.trim()],
-                      });
-                      setNewPinnedInput('');
-                    }}
-                    className="cursor-pointer rounded-lg px-2 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
-                    style={{ border: '1px solid var(--border-hairline)' }}
-                  >
-                    <Plus size={13} />
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Steps Checklist */}
-            <div className="space-y-1.5">
-              <span className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
-                计划与进度 ({taskState?.steps.filter((s) => s.status === 'done').length ?? 0}/
-                {taskState?.steps.length ?? 0})
-              </span>
-              <div className="space-y-1">
-                {(taskState?.steps ?? []).map((step) => {
-                  const nextStatus: TaskStep['status'] =
-                    step.status === 'pending'
-                      ? 'in_progress'
-                      : step.status === 'in_progress'
-                        ? 'done'
-                        : 'pending';
-                  return (
-                    <div
-                      key={step.id}
-                      className="group flex items-start justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[11.5px]"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        border: '1px solid var(--border-hairline)',
-                      }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void updateTaskState(session.id, {
-                            steps: (taskState?.steps ?? []).map((s) =>
-                              s.id === step.id ? { ...s, status: nextStatus, updatedAt: Date.now() } : s,
-                            ),
-                          })
-                        }
-                        className="flex min-w-0 flex-1 cursor-pointer items-start gap-2 text-left"
-                      >
-                        {step.status === 'done' ? (
-                          <CheckCircle2 size={13.5} className="mt-0.5 shrink-0 text-[var(--accent-emerald)]" />
-                        ) : step.status === 'in_progress' ? (
-                          <Clock size={13.5} className="mt-0.5 shrink-0 text-[var(--accent-indigo)]" />
-                        ) : step.status === 'blocked' ? (
-                          <AlertCircle size={13.5} className="mt-0.5 shrink-0 text-[var(--accent-rose)]" />
-                        ) : (
-                          <Circle size={13.5} className="mt-0.5 shrink-0 text-[var(--text-muted)]" />
-                        )}
-                        <span
-                          className={`break-words ${
-                            step.status === 'done'
-                              ? 'text-[var(--text-muted)] line-through'
-                              : 'text-[var(--text-primary)]'
-                          }`}
-                        >
-                          {step.title}
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void updateTaskState(session.id, {
-                            steps: (taskState?.steps ?? []).filter((s) => s.id !== step.id),
-                          })
-                        }
-                        className="shrink-0 cursor-pointer opacity-0 transition-opacity group-hover:opacity-100 text-[var(--text-muted)] hover:text-[var(--accent-rose)]"
-                      >
-                        <Trash2 size={11.5} />
-                      </button>
-                    </div>
-                  );
-                })}
-                <div className="flex gap-1.5">
-                  <input
-                    value={newStepInput}
-                    onChange={(e) => setNewStepInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && newStepInput.trim()) {
-                        void updateTaskState(session.id, {
-                          steps: [
-                            ...(taskState?.steps ?? []),
-                            {
-                              id: `step_${Date.now().toString(36)}`,
-                              title: newStepInput.trim(),
-                              status: 'pending',
-                              ownerHarnessId: session.harnessId,
-                              updatedAt: Date.now(),
-                            },
-                          ],
-                        });
-                        setNewStepInput('');
-                      }
-                    }}
-                    placeholder="添加任务步骤，回车保存..."
-                    className="min-w-0 flex-1 rounded-lg px-2.5 py-1.5 text-[11.5px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-                    style={{
-                      backgroundColor: 'var(--bg-surface)',
-                      border: '1px solid var(--border-hairline)',
-                    }}
-                  />
-                  <button
-                    type="button"
-                    disabled={!newStepInput.trim()}
-                    onClick={() => {
-                      if (!newStepInput.trim()) return;
-                      void updateTaskState(session.id, {
-                        steps: [
-                          ...(taskState?.steps ?? []),
-                          {
-                            id: `step_${Date.now().toString(36)}`,
-                            title: newStepInput.trim(),
-                            status: 'pending',
-                            ownerHarnessId: session.harnessId,
-                            updatedAt: Date.now(),
-                          },
-                        ],
-                      });
-                      setNewStepInput('');
-                    }}
-                    className="cursor-pointer rounded-lg px-2 text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
-                    style={{ border: '1px solid var(--border-hairline)' }}
-                  >
-                    <Plus size={13} />
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Harness Sync Watermarks */}
-            {(session.bindings?.length ?? 0) > 0 && (
-              <div className="space-y-1.5">
-                <span className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
-                  各引擎上下文水位线 (seq #{session.lastSeq})
-                </span>
-                <div className="space-y-1">
-                  {session.bindings!.map((b) => {
-                    const meta = resolveHarnessMeta(
-                      { harnessId: b.harnessId, harnessKind: b.harnessKind },
-                      harnesses,
-                    );
-                    const upToDate = b.syncedUpToSeq >= session.lastSeq;
-                    return (
-                      <div
-                        key={b.harnessId}
-                        className="flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[11px]"
-                        style={{
-                          backgroundColor: 'var(--bg-surface)',
-                          border: '1px solid var(--border-hairline)',
-                        }}
-                      >
-                        <div className="flex min-w-0 items-center gap-1.5">
-                          <span
-                            className="h-2 w-2 shrink-0 rounded-full"
-                            style={{ backgroundColor: meta.accentColor }}
-                          />
-                          <span className="font-medium text-[var(--text-primary)]">
-                            {meta.shortLabel}
-                          </span>
-                          {b.driverUsed && (
-                            <span className="truncate font-mono-code text-[9.5px] text-[var(--text-muted)]">
-                              · {b.driverUsed}
-                            </span>
-                          )}
-                        </div>
-                        <span
-                          className="shrink-0 font-mono-code text-[10.5px]"
-                          style={{
-                            color: upToDate ? 'var(--accent-emerald)' : 'var(--accent-star)',
-                          }}
-                        >
-                          #{b.syncedUpToSeq}/{session.lastSeq}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Verifications & Touched Files */}
-            {(taskState?.verifications.length ?? 0) > 0 && (
-              <div className="space-y-1.5">
-                <span className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
-                  客观验证记录
-                </span>
-                <div className="space-y-1">
-                  {taskState!.verifications.slice(-5).map((v, i) => (
-                    <div
-                      key={`${v.command}-${i}`}
-                      className="rounded-lg px-2.5 py-1.5 font-mono-code text-[10.5px]"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        border: '1px solid var(--border-hairline)',
-                      }}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate text-[var(--text-primary)]">{v.command}</span>
-                        <span
-                          className="shrink-0 font-semibold uppercase"
-                          style={{
-                            color:
-                              v.status === 'pass'
-                                ? 'var(--accent-emerald)'
-                                : v.status === 'fail'
-                                  ? 'var(--accent-rose)'
-                                  : 'var(--text-muted)',
-                          }}
-                        >
-                          {v.status}
-                        </span>
-                      </div>
-                      {v.summary && (
-                        <div className="mt-0.5 truncate text-[10px] text-[var(--text-muted)]">
-                          {v.summary}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {(taskState?.touchedFiles.length ?? 0) > 0 && (
-              <div className="space-y-1.5">
-                <span className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--text-muted)]">
-                  涉及改动文件 ({taskState!.touchedFiles.length})
-                </span>
-                <div className="flex flex-wrap gap-1">
-                  {taskState!.touchedFiles.slice(-16).map((f) => (
-                    <span
-                      key={f}
-                      className="max-w-full truncate rounded-md px-2 py-0.5 font-mono-code text-[10px] text-[var(--text-secondary)]"
-                      style={{
-                        backgroundColor: 'var(--bg-surface)',
-                        border: '1px solid var(--border-hairline)',
-                      }}
-                    >
-                      {f}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {(taskState?.blockers.length ?? 0) > 0 && (
-              <div className="space-y-1">
-                <span className="block text-[10.5px] font-medium uppercase tracking-wider text-[var(--accent-rose)]">
-                  当前阻塞项
-                </span>
-                {taskState!.blockers.map((b, i) => (
-                  <div
-                    key={`${b}-${i}`}
-                    className="rounded-lg px-2.5 py-1.5 text-[11px] text-[var(--accent-rose)]"
-                    style={{
-                      backgroundColor: 'var(--accent-rose-soft)',
-                      border: '1px solid color-mix(in srgb, var(--accent-rose) 28%, transparent)',
-                    }}
-                  >
-                    {b}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        {inspectorTab === 'task' && <TaskLedgerSurface session={session} plugin={ledgerPlugin} />}
 
         {inspectorTab === 'git' && (
           <Slot

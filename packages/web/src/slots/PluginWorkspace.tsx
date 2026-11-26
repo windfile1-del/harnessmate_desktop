@@ -1,3 +1,4 @@
+import { InboxWorkspaceSurface } from './InboxWorkspaceSurface';
 import { ArrowLeft, Globe, History, Puzzle, Search } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
@@ -621,7 +622,9 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
       )}
       <div className="min-h-0 flex-1">
         <SlotErrorBoundary key={pageKey(page!)} registry={registry} item={page!}>
-          <WorkspacePageContent page={page!} hostProps={hostProps} />
+          {activeSlotId === 'session-inbox' && activeInstanceId
+            ? <InboxWorkspaceSurface instanceId={activeInstanceId} />
+            : <WorkspacePageContent page={page!} hostProps={hostProps} />}
         </SlotErrorBoundary>
       </div>
     </main>
