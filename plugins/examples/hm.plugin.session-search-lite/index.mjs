@@ -111,6 +111,28 @@ function isSearchableItem(item) {
   return true;
 }
 
+function parseScopedSkips(raw) {
+  const arr = Array.isArray(raw) ? raw : [];
+  return arr.filter(
+    (entry) =>
+      entry &&
+      typeof entry.workspaceId === 'string' &&
+      entry.workspaceId.length > 0 &&
+      typeof entry.upToSeq === 'number' &&
+      Number.isFinite(entry.upToSeq),
+  );
+}
+
+function mergeScopedSkip(skips, workspaceId, upToSeq) {
+  const next = skips.filter((s) => s.workspaceId !== workspaceId);
+  next.push({ workspaceId, upToSeq });
+  return next;
+}
+
+function pruneScopedSkips(skips, cursorSeq) {
+  return skips.filter((s) => s.upToSeq > cursorSeq);
+}
+
 export async function apply(ctx, config = {}) {
   const batchSize = Math.max(1, Math.min(200, Number(config.batchSize) || DEFAULT_BATCH_SIZE));
   const readModelContractOverride =
@@ -120,6 +142,7 @@ export async function apply(ctx, config = {}) {
 
   let disposed = false;
   let generation = 1;
+  let persistedGeneration = 0;
   let cancelRequested = false;
   let activeReindexPromise = null;
   let lastError = null;
@@ -128,14 +151,63 @@ export async function apply(ctx, config = {}) {
   const itemsById = new Map();
   const itemTokens = new Map();
   const invertedIndex = new Map();
+  const sessionWorkspaces = new Map();
   let syncState = {
     cursorSeq: 0,
+    scopedSkips: [],
     snapshotId: null,
     snapshotWatermark: null,
     snapshotCursor: null,
     reindexState: 'idle',
     job: null,
   };
+
+  function serializeChunksWithHash(items) {
+    const chunks = [];
+    let current = [];
+    for (const item of items) {
+      current.push(item);
+      if (Buffer.byteLength(JSON.stringify(current), 'utf8') > MAX_STORAGE_CHUNK_BYTES && current.length > 1) {
+        current.pop();
+        chunks.push(current);
+        current = [item];
+      }
+    }
+    if (current.length > 0) chunks.push(current);
+
+    const hash = crypto.createHash('sha256');
+    let totalBytes = 0;
+    for (const chunk of chunks) {
+      const encoded = JSON.stringify(chunk);
+      totalBytes += Buffer.byteLength(encoded, 'utf8');
+      hash.update(encoded, 'utf8');
+    }
+    return { chunks, totalBytes, sha256: hash.digest('hex') };
+  }
+
+  function resolveChangeWorkspaceId(change) {
+    if (!change || typeof change !== 'object') return null;
+    if (typeof change.workspaceId === 'string' && change.workspaceId) return change.workspaceId;
+    if (typeof change.item?.workspaceId === 'string' && change.item.workspaceId) return change.item.workspaceId;
+    if (typeof change.session?.workspaceId === 'string' && change.session.workspaceId) return change.session.workspaceId;
+    if (typeof change.sessionId === 'string' && change.sessionId) {
+      const cached = sessionWorkspaces.get(change.sessionId);
+      if (cached) return cached;
+      for (const item of itemsById.values()) {
+        if (item.sessionId === change.sessionId && item.workspaceId) return item.workspaceId;
+      }
+    }
+    return null;
+  }
+
+  function shouldSkipScopedChange(change, skips) {
+    if (!skips || skips.length === 0) return false;
+    const seq = Number(change?.changeSeq ?? 0);
+    if (!Number.isFinite(seq) || seq <= 0) return false;
+    const wsId = resolveChangeWorkspaceId(change);
+    if (!wsId) return false;
+    return skips.some((skip) => skip.workspaceId === wsId && seq <= skip.upToSeq);
+  }
 
   function unindexItem(itemId) {
     const oldTokens = itemTokens.get(itemId);
@@ -174,6 +246,9 @@ export async function apply(ctx, config = {}) {
       updatedAt: Number(raw.updatedAt ?? raw.createdAt ?? Date.now()),
     };
     itemsById.set(normalized.itemId, normalized);
+    if (normalized.sessionId && normalized.workspaceId) {
+      sessionWorkspaces.set(normalized.sessionId, normalized.workspaceId);
+    }
     const tokens = tokenizeForLiteIndex(`${normalized.sessionTitle} ${normalized.textBody}`);
     itemTokens.set(normalized.itemId, tokens);
     for (const tok of tokens) {
@@ -194,6 +269,9 @@ export async function apply(ctx, config = {}) {
     } else if (change.kind === 'upsert_session') {
       const title = change.session?.title ?? change.sessionTitle ?? '';
       const workspaceId = change.session?.workspaceId ?? change.workspaceId ?? '';
+      if (change.sessionId && workspaceId) {
+        sessionWorkspaces.set(change.sessionId, workspaceId);
+      }
       const updatedAt = Number(change.session?.updatedAt ?? change.updatedAt ?? change.committedAt ?? Date.now());
       for (const [id, item] of [...itemsById.entries()]) {
         if (item.sessionId === change.sessionId) {
@@ -206,6 +284,7 @@ export async function apply(ctx, config = {}) {
         }
       }
     } else if (change.kind === 'delete_session') {
+      sessionWorkspaces.delete(change.sessionId);
       for (const [id, item] of [...itemsById.entries()]) {
         if (item.sessionId === change.sessionId) unindexItem(id);
       }
@@ -215,77 +294,146 @@ export async function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * Two-phase generation commit to ctx.storage.plugin:
+   * Phase 1 writes `lite:gen:<nextGen>:chunk:<i>`, Phase 2 commits `lite:meta`, Phase 3 cleans old chunks.
+   * Write errors are NEVER swallowed so cursorSeq never leads persisted chunks.
+   */
   async function persistState() {
     if (disposed) return;
-    try {
-      const allItems = [...itemsById.values()].sort(
-        (a, b) => a.createdAt - b.createdAt || a.itemId.localeCompare(b.itemId),
-      );
-      const chunks = [];
-      let current = [];
-      for (const item of allItems) {
-        current.push(item);
-        if (Buffer.byteLength(JSON.stringify(current), 'utf8') > MAX_STORAGE_CHUNK_BYTES && current.length > 1) {
-          current.pop();
-          chunks.push(current);
-          current = [item];
-        }
-      }
-      if (current.length > 0) chunks.push(current);
+    const allItems = [...itemsById.values()].sort(
+      (a, b) => a.createdAt - b.createdAt || a.itemId.localeCompare(b.itemId),
+    );
+    const nextGen = persistedGeneration + 1;
+    const { chunks, totalBytes, sha256 } = serializeChunksWithHash(allItems);
+    const writtenChunkKeys = [];
 
-      const oldKeys = await ctx.storage.plugin.keys();
-      await ctx.storage.plugin.set('lite:meta', { ...syncState, chunkCount: chunks.length });
+    try {
       for (let i = 0; i < chunks.length; i += 1) {
-        await ctx.storage.plugin.set(`lite:chunk:${i}`, chunks[i]);
+        const key = `lite:gen:${nextGen}:chunk:${i}`;
+        await ctx.storage.plugin.set(key, chunks[i]);
+        writtenChunkKeys.push(key);
       }
+
+      const meta = {
+        schemaVersion: 2,
+        generation: nextGen,
+        ...syncState,
+        scopedSkips: parseScopedSkips(syncState.scopedSkips),
+        chunkCount: chunks.length,
+        totalBytes,
+        sha256,
+        committedAt: Date.now(),
+      };
+      await ctx.storage.plugin.set('lite:meta', meta);
+      persistedGeneration = nextGen;
+    } catch (err) {
+      for (const key of writtenChunkKeys) {
+        await ctx.storage.plugin.delete(key).catch(() => {});
+      }
+      lastError = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
+
+    try {
+      const oldKeys = await ctx.storage.plugin.keys();
+      const prefix = `lite:gen:${nextGen}:chunk:`;
       for (const key of oldKeys) {
-        if (key.startsWith('lite:chunk:')) {
-          const idx = Number.parseInt(key.slice('lite:chunk:'.length), 10);
-          if (!Number.isFinite(idx) || idx >= chunks.length) {
-            await ctx.storage.plugin.delete(key);
-          }
+        if ((key.startsWith('lite:gen:') && !key.startsWith(prefix)) || key.startsWith('lite:chunk:')) {
+          await ctx.storage.plugin.delete(key).catch(() => {});
         }
       }
     } catch {
-      // Storage is optional if not granted
+      // Ignore non-critical old chunk cleanup error
     }
   }
 
   async function restoreState() {
     if (disposed) return;
+    let meta;
     try {
-      const meta = await ctx.storage.plugin.get('lite:meta');
-      if (!meta || typeof meta !== 'object') return;
-      const chunkCount = Number(meta.chunkCount || 0);
-      for (let i = 0; i < chunkCount; i += 1) {
-        const chunk = await ctx.storage.plugin.get(`lite:chunk:${i}`);
-        if (Array.isArray(chunk)) {
-          for (const item of chunk) indexItem(item);
-        }
-      }
-      let job = meta.job ?? null;
-      let reindexState = typeof meta.reindexState === 'string' ? meta.reindexState : 'idle';
-      if (job && (job.status === 'running' || job.status === 'queued')) {
-        job = {
-          ...job,
-          status: 'cancelled',
-          resumeAvailable: Boolean(meta.snapshotId || meta.snapshotCursor !== null || meta.snapshotWatermark !== null),
-          updatedAt: Date.now(),
-          error: job.error ?? '实例重载或中断，支持断点续跑',
-        };
-        reindexState = 'cancelled';
-      }
-      syncState = {
-        cursorSeq: Number(meta.cursorSeq || 0),
-        snapshotId: meta.snapshotId ?? null,
-        snapshotWatermark: meta.snapshotWatermark ?? null,
-        snapshotCursor: meta.snapshotCursor ?? null,
-        reindexState,
-        job,
-      };
-    } catch {
-      // Ignore if storage empty or denied
+      meta = await ctx.storage.plugin.get('lite:meta');
+    } catch (err) {
+      if (err && err.code === 'E_PERMISSION_DENIED') return;
+      lastError = err instanceof Error ? err.message : String(err);
+      return;
     }
+    if (!meta || typeof meta !== 'object') return;
+
+    const chunkCount = Number(meta.chunkCount || 0);
+    const hasGeneration = meta.schemaVersion === 2 && typeof meta.generation === 'number';
+    const restoredItems = [];
+    let corruptReason = null;
+
+    if (hasGeneration) {
+      persistedGeneration = meta.generation;
+      const hash = crypto.createHash('sha256');
+      let actualBytes = 0;
+      for (let i = 0; i < chunkCount; i += 1) {
+        const chunk = await ctx.storage.plugin.get(`lite:gen:${meta.generation}:chunk:${i}`).catch(() => undefined);
+        if (!Array.isArray(chunk)) {
+          corruptReason = `缺失分块 lite:gen:${meta.generation}:chunk:${i}`;
+          break;
+        }
+        const encoded = JSON.stringify(chunk);
+        actualBytes += Buffer.byteLength(encoded, 'utf8');
+        hash.update(encoded, 'utf8');
+        restoredItems.push(...chunk);
+      }
+      if (!corruptReason && (actualBytes !== meta.totalBytes || hash.digest('hex') !== meta.sha256)) {
+        corruptReason = '持久化分块哈希校验失败';
+      }
+    } else {
+      for (let i = 0; i < chunkCount; i += 1) {
+        const chunk = await ctx.storage.plugin.get(`lite:chunk:${i}`).catch(() => undefined);
+        if (!Array.isArray(chunk)) {
+          corruptReason = `缺失旧分块 lite:chunk:${i}`;
+          break;
+        }
+        restoredItems.push(...chunk);
+      }
+    }
+
+    if (corruptReason) {
+      lastError = `${corruptReason}，已重置游标以重新同步`;
+      itemsById.clear();
+      itemTokens.clear();
+      invertedIndex.clear();
+      sessionWorkspaces.clear();
+      syncState = {
+        cursorSeq: 0,
+        scopedSkips: [],
+        snapshotId: null,
+        snapshotWatermark: null,
+        snapshotCursor: null,
+        reindexState: 'idle',
+        job: null,
+      };
+      return;
+    }
+
+    for (const item of restoredItems) indexItem(item);
+    let job = meta.job ?? null;
+    let reindexState = typeof meta.reindexState === 'string' ? meta.reindexState : 'idle';
+    if (job && (job.status === 'running' || job.status === 'queued')) {
+      job = {
+        ...job,
+        status: 'cancelled',
+        resumeAvailable: Boolean(meta.snapshotId || meta.snapshotCursor !== null || meta.snapshotWatermark !== null),
+        updatedAt: Date.now(),
+        error: job.error ?? '实例重载或中断，支持断点续跑',
+      };
+      reindexState = 'cancelled';
+    }
+    syncState = {
+      cursorSeq: Number(meta.cursorSeq || 0),
+      scopedSkips: parseScopedSkips(meta.scopedSkips),
+      snapshotId: meta.snapshotId ?? null,
+      snapshotWatermark: meta.snapshotWatermark ?? null,
+      snapshotCursor: meta.snapshotCursor ?? null,
+      reindexState,
+      job,
+    };
   }
 
   await restoreState();
@@ -389,30 +537,60 @@ export async function apply(ctx, config = {}) {
     return { changes: sliced, latestSeq, hasMore: changes.length > sliced.length };
   }
 
+  let syncQueue = Promise.resolve();
+  function enqueueSync() {
+    if (disposed) return Promise.resolve({ appliedChanges: 0, cursorSeq: syncState.cursorSeq });
+    const g = generation;
+    const next = syncQueue.then(async () => {
+      if (disposed || generation !== g) return { appliedChanges: 0, cursorSeq: syncState.cursorSeq };
+      return await syncIncremental();
+    });
+    syncQueue = next.catch(() => {});
+    return next;
+  }
+
   async function syncIncremental() {
     if (disposed) return { appliedChanges: 0, cursorSeq: syncState.cursorSeq };
     const startGen = generation;
     let appliedChanges = 0;
 
     while (!disposed && generation === startGen) {
-      const page = await readChangesViaHost(syncState.cursorSeq);
+      const prevCursorSeq = syncState.cursorSeq;
+      const prevScopedSkips = parseScopedSkips(syncState.scopedSkips);
+      const page = await readChangesViaHost(prevCursorSeq);
       if (disposed || generation !== startGen) break;
       const list = Array.isArray(page?.changes) ? page.changes : [];
       if (list.length === 0) {
-        if (typeof page?.latestSeq === 'number' && page.latestSeq > syncState.cursorSeq) {
+        if (typeof page?.latestSeq === 'number' && page.latestSeq > prevCursorSeq) {
           syncState.cursorSeq = page.latestSeq;
-          await persistState();
+          syncState.scopedSkips = pruneScopedSkips(prevScopedSkips, page.latestSeq);
+          try {
+            await persistState();
+          } catch (err) {
+            syncState.cursorSeq = prevCursorSeq;
+            syncState.scopedSkips = prevScopedSkips;
+            throw err;
+          }
         }
         break;
       }
 
       const maxBatchSeq = list[list.length - 1].changeSeq;
       for (const change of list) {
+        if (shouldSkipScopedChange(change, prevScopedSkips)) continue;
         applyChange(change);
         appliedChanges += 1;
       }
-      syncState.cursorSeq = Math.max(syncState.cursorSeq, Number(maxBatchSeq || 0));
-      await persistState();
+      const nextCursor = Math.max(prevCursorSeq, Number(maxBatchSeq || 0));
+      syncState.cursorSeq = nextCursor;
+      syncState.scopedSkips = pruneScopedSkips(prevScopedSkips, nextCursor);
+      try {
+        await persistState();
+      } catch (err) {
+        syncState.cursorSeq = prevCursorSeq;
+        syncState.scopedSkips = prevScopedSkips;
+        throw err;
+      }
       if (!page.hasMore) break;
     }
 
@@ -433,22 +611,26 @@ export async function apply(ctx, config = {}) {
       const jobId = typeof req.jobId === 'string' && req.jobId.trim()
         ? req.jobId.trim()
         : `reindex_lite_${crypto.randomBytes(5).toString('hex')}`;
-      const syncRes = await syncIncremental();
-      const done = {
-        jobId,
-        mode: 'incremental',
-        status: 'completed',
-        indexedCount: syncRes.appliedChanges,
-        deletedCount: 0,
-        cursorSeq: syncRes.cursorSeq,
-        resumeAvailable: false,
-        startedAt: now,
-        updatedAt: Date.now(),
-        finishedAt: Date.now(),
-      };
-      syncState = { ...syncState, snapshotId: null, snapshotWatermark: null, snapshotCursor: null, reindexState: 'idle', job: done };
-      await persistState();
-      return { ok: true, value: done };
+      try {
+        const syncRes = await enqueueSync();
+        const done = {
+          jobId,
+          mode: 'incremental',
+          status: 'completed',
+          indexedCount: syncRes.appliedChanges,
+          deletedCount: 0,
+          cursorSeq: syncRes.cursorSeq,
+          resumeAvailable: false,
+          startedAt: now,
+          updatedAt: Date.now(),
+          finishedAt: Date.now(),
+        };
+        syncState = { ...syncState, snapshotId: null, snapshotWatermark: null, snapshotCursor: null, reindexState: 'idle', job: done };
+        await persistState();
+        return { ok: true, value: done };
+      } catch (err) {
+        return { ok: false, error: { code: 'internal_error', message: err instanceof Error ? err.message : String(err) } };
+      }
     }
 
     cancelRequested = false;
@@ -458,9 +640,12 @@ export async function apply(ctx, config = {}) {
       const canResume =
         mode === 'resume' &&
         Boolean(syncState.snapshotId || syncState.snapshotCursor !== null || syncState.snapshotWatermark !== null);
+      const targetWorkspaceId = canResume
+        ? (syncState.job?.workspaceId ?? (typeof req.workspaceId === 'string' && req.workspaceId ? req.workspaceId : null))
+        : (typeof req.workspaceId === 'string' && req.workspaceId ? req.workspaceId : null);
       const now = Date.now();
       let job = canResume && syncState.job
-        ? { ...syncState.job, mode: 'resume', status: 'running', updatedAt: now, finishedAt: null, error: null }
+        ? { ...syncState.job, mode: 'resume', status: 'running', workspaceId: targetWorkspaceId, updatedAt: now, finishedAt: null, error: null }
         : {
             jobId:
               typeof req.jobId === 'string' && req.jobId.trim()
@@ -468,6 +653,7 @@ export async function apply(ctx, config = {}) {
                 : `reindex_lite_${crypto.randomBytes(5).toString('hex')}`,
             mode: 'full',
             status: 'running',
+            workspaceId: targetWorkspaceId,
             indexedCount: 0,
             deletedCount: 0,
             cursorSeq: syncState.cursorSeq,
@@ -482,14 +668,15 @@ export async function apply(ctx, config = {}) {
           };
 
       if (!canResume) {
-        if (req.workspaceId) {
+        if (targetWorkspaceId) {
           for (const [id, item] of [...itemsById.entries()]) {
-            if (item.workspaceId === req.workspaceId) unindexItem(id);
+            if (item.workspaceId === targetWorkspaceId) unindexItem(id);
           }
         } else {
           itemsById.clear();
           itemTokens.clear();
           invertedIndex.clear();
+          sessionWorkspaces.clear();
         }
         syncState.snapshotId = null;
         syncState.snapshotWatermark = null;
@@ -523,12 +710,12 @@ export async function apply(ctx, config = {}) {
               snapshotId,
               cursor,
               limit: batchSize,
-              ...(req.workspaceId ? { workspaceId: req.workspaceId } : {}),
+              ...(targetWorkspaceId ? { workspaceId: targetWorkspaceId } : {}),
             });
           } catch {
             page = await readSnapshotViaHost({
               limit: batchSize,
-              ...(req.workspaceId ? { workspaceId: req.workspaceId } : {}),
+              ...(targetWorkspaceId ? { workspaceId: targetWorkspaceId } : {}),
             });
           }
 
@@ -561,8 +748,19 @@ export async function apply(ctx, config = {}) {
           job.updatedAt = Date.now();
 
           if (!nextCursor) {
-            syncState.cursorSeq = Math.max(syncState.cursorSeq, Number(watermarkSeq || 0));
-            job.cursorSeq = syncState.cursorSeq;
+            const currSeq = syncState.cursorSeq;
+            const snapSeq = Number(watermarkSeq || 0);
+            if (targetWorkspaceId) {
+              // Scoped workspace rebuild: preserve global cursorSeq so other workspaces' unconsumed changes are NOT skipped
+              if (snapSeq > currSeq) {
+                syncState.scopedSkips = mergeScopedSkip(parseScopedSkips(syncState.scopedSkips), targetWorkspaceId, snapSeq);
+              }
+              job.cursorSeq = currSeq;
+            } else {
+              syncState.cursorSeq = Math.max(currSeq, snapSeq);
+              syncState.scopedSkips = [];
+              job.cursorSeq = syncState.cursorSeq;
+            }
             syncState.snapshotId = null;
             syncState.snapshotWatermark = null;
             syncState.snapshotCursor = null;
@@ -580,7 +778,7 @@ export async function apply(ctx, config = {}) {
           await new Promise((resolve) => setImmediate(resolve));
         }
 
-        const catchup = await syncIncremental();
+        const catchup = await enqueueSync();
         job = {
           ...job,
           status: 'completed',
@@ -601,7 +799,7 @@ export async function apply(ctx, config = {}) {
         job = { ...job, status: 'failed', error: message, updatedAt: Date.now(), finishedAt: Date.now() };
         if (!disposed) {
           syncState = { ...syncState, snapshotId: snapshotId ?? null, snapshotWatermark: watermarkSeq ?? null, snapshotCursor: cursor ?? null, reindexState: 'error', job };
-          await persistState();
+          await persistState().catch(() => {});
         }
         throw err;
       }
@@ -618,7 +816,10 @@ export async function apply(ctx, config = {}) {
     }
   }
 
-  function runQuery(req = {}) {
+  async function runQuery(req = {}) {
+    if (!req.skipSync && !disposed) {
+      await enqueueSync().catch(() => {});
+    }
     const start = Date.now();
     const rawQuery = typeof req.q === 'string' ? req.q.trim() : '';
     if (!rawQuery) {
@@ -781,25 +982,18 @@ export async function apply(ctx, config = {}) {
     };
   }
 
-  let syncQueue = Promise.resolve();
   const scheduleCatchup = () => {
     if (disposed) return;
-    const g = generation;
-    syncQueue = syncQueue
-      .then(async () => {
-        if (disposed || generation !== g) return;
-        await syncIncremental().catch(() => {});
-      })
-      .catch(() => {});
+    void enqueueSync().catch(() => {});
   };
 
-  for (const eventName of ['turn.completed', 'message.user', 'message.assistant.completed']) {
+  for (const eventName of ['turn.completed', 'message.user', 'message.assistant.completed', 'session.created']) {
     ctx.events.on(eventName, () => {
       scheduleCatchup();
     });
   }
 
-  if (syncState.cursorSeq > 0 || config.autoSyncOnStart === true) {
+  if (syncState.cursorSeq > 0 || config.autoSyncOnStart !== false) {
     scheduleCatchup();
   }
 
@@ -826,7 +1020,12 @@ export async function apply(ctx, config = {}) {
       return runReindex({ ...req, mode: 'resume' });
     },
     async sync() {
-      return { ok: true, value: await syncIncremental() };
+      try {
+        const res = await enqueueSync();
+        return { ok: true, value: res };
+      } catch (err) {
+        return { ok: false, error: { code: 'internal_error', message: err instanceof Error ? err.message : String(err) } };
+      }
     },
   };
 

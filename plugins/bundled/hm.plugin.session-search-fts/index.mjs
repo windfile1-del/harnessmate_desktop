@@ -161,15 +161,63 @@ function initDatabase(db, isFileBacked) {
       snapshot_id TEXT,
       snapshot_watermark INTEGER,
       snapshot_cursor TEXT,
+      scoped_skips_json TEXT NOT NULL DEFAULT '[]',
       reindex_state TEXT NOT NULL DEFAULT 'idle',
       job_json TEXT,
       updated_at INTEGER NOT NULL
     );
   `);
+  const cols = db.prepare('PRAGMA table_info(search_sync_state)').all();
+  if (!cols.some((c) => c.name === 'scoped_skips_json')) {
+    db.exec("ALTER TABLE search_sync_state ADD COLUMN scoped_skips_json TEXT NOT NULL DEFAULT '[]';");
+  }
   db.prepare(
-    `INSERT OR IGNORE INTO search_sync_state (id, cursor_seq, reindex_state, updated_at)
-     VALUES (1, 0, 'idle', ?)`,
+    `INSERT OR IGNORE INTO search_sync_state (id, cursor_seq, scoped_skips_json, reindex_state, updated_at)
+     VALUES (1, 0, '[]', 'idle', ?)`,
   ).run(Date.now());
+}
+
+function parseScopedSkips(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = Array.isArray(raw) ? raw : JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s) => s && typeof s === 'object' && typeof s.workspaceId === 'string' && typeof s.upToSeq === 'number',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function mergeScopedSkip(skips, workspaceId, upToSeq) {
+  const map = new Map();
+  for (const s of skips) map.set(s.workspaceId, s.upToSeq);
+  map.set(workspaceId, Math.max(map.get(workspaceId) ?? 0, upToSeq));
+  return [...map.entries()].map(([ws, seq]) => ({ workspaceId: ws, upToSeq: seq }));
+}
+
+function pruneScopedSkips(skips, cursorSeq) {
+  return skips.filter((s) => s.upToSeq > cursorSeq);
+}
+
+function resolveChangeWorkspaceId(change) {
+  if (!change || typeof change !== 'object') return null;
+  if (change.kind === 'upsert_item') {
+    return change.item?.workspaceId ?? change.workspaceId ?? null;
+  }
+  if (change.kind === 'upsert_session') {
+    return change.session?.workspaceId ?? change.workspaceId ?? null;
+  }
+  return change.workspaceId ?? null;
+}
+
+function shouldSkipScopedChange(change, skips) {
+  if (!skips.length) return false;
+  const wsId = resolveChangeWorkspaceId(change);
+  if (!wsId) return false;
+  const entry = skips.find((s) => s.workspaceId === wsId);
+  return Boolean(entry && change.changeSeq <= entry.upToSeq);
 }
 
 export async function apply(ctx, config = {}) {
@@ -182,6 +230,7 @@ export async function apply(ctx, config = {}) {
 
   let disposed = false;
   let generation = 1;
+  let persistedGeneration = 0;
   let cancelRequested = false;
   let activeReindexPromise = null;
   let lastError = null;
@@ -215,7 +264,7 @@ export async function apply(ctx, config = {}) {
   function readSyncRow() {
     return db
       .prepare(
-        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, reindex_state, job_json, updated_at
+        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, scoped_skips_json, reindex_state, job_json, updated_at
          FROM search_sync_state WHERE id = 1`,
       )
       .get();
@@ -316,120 +365,218 @@ export async function apply(ctx, config = {}) {
     }
   }
 
+  function serializeChunksWithHash(items) {
+    const chunks = [];
+    let current = [];
+    for (const item of items) {
+      current.push(item);
+      if (Buffer.byteLength(JSON.stringify(current), 'utf8') > MAX_STORAGE_CHUNK_BYTES && current.length > 1) {
+        current.pop();
+        chunks.push(current);
+        current = [item];
+      }
+    }
+    if (current.length > 0) chunks.push(current);
+
+    const hash = crypto.createHash('sha256');
+    let totalBytes = 0;
+    for (const chunk of chunks) {
+      const encoded = JSON.stringify(chunk);
+      totalBytes += Buffer.byteLength(encoded, 'utf8');
+      hash.update(encoded, 'utf8');
+    }
+    return {
+      chunks,
+      totalBytes,
+      sha256: hash.digest('hex'),
+    };
+  }
+
+  /**
+   * Two-phase generation commit to ctx.storage.plugin:
+   * Phase 1 writes all `fts:gen:<nextGen>:chunk:<i>` entries first.
+   * Phase 2 commits `fts:meta` (cursorSeq, generation, sha256) only after every chunk succeeds.
+   * Phase 3 removes previous-generation chunk keys.
+   * Write errors are NEVER swallowed so persisted cursorSeq never leads persisted chunks.
+   */
   async function persistMemoryState() {
     if (isFileBacked || disposed) return;
+    const syncRow = readSyncRow();
+    const items = db
+      .prepare(
+        `SELECT item_id, session_id, session_title, workspace_id, turn_id, turn_seq,
+                driver_id, harness_id, block_type, body, created_at, updated_at
+         FROM search_items ORDER BY created_at ASC, item_id ASC`,
+      )
+      .all()
+      .map((r) => ({
+        itemId: r.item_id,
+        sessionId: r.session_id,
+        sessionTitle: r.session_title,
+        workspaceId: r.workspace_id,
+        turnId: r.turn_id,
+        turnSeq: r.turn_seq,
+        driverId: r.driver_id,
+        harnessId: r.harness_id,
+        blockType: r.block_type,
+        textBody: r.body,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      }));
+
+    const nextGen = persistedGeneration + 1;
+    const { chunks, totalBytes, sha256 } = serializeChunksWithHash(items);
+    const writtenChunkKeys = [];
+
     try {
-      const syncRow = readSyncRow();
-      const items = db
-        .prepare(
-          `SELECT item_id, session_id, session_title, workspace_id, turn_id, turn_seq,
-                  driver_id, harness_id, block_type, body, created_at, updated_at
-           FROM search_items ORDER BY created_at ASC, item_id ASC`,
-        )
-        .all()
-        .map((r) => ({
-          itemId: r.item_id,
-          sessionId: r.session_id,
-          sessionTitle: r.session_title,
-          workspaceId: r.workspace_id,
-          turnId: r.turn_id,
-          turnSeq: r.turn_seq,
-          driverId: r.driver_id,
-          harnessId: r.harness_id,
-          blockType: r.block_type,
-          textBody: r.body,
-          createdAt: r.created_at,
-          updatedAt: r.updated_at,
-        }));
+      for (let i = 0; i < chunks.length; i += 1) {
+        const key = `fts:gen:${nextGen}:chunk:${i}`;
+        await ctx.storage.plugin.set(key, chunks[i]);
+        writtenChunkKeys.push(key);
+      }
 
       const meta = {
+        schemaVersion: 2,
+        generation: nextGen,
         cursorSeq: syncRow.cursor_seq,
+        scopedSkips: parseScopedSkips(syncRow.scoped_skips_json),
         snapshotId: syncRow.snapshot_id,
         snapshotWatermark: syncRow.snapshot_watermark,
         snapshotCursor: syncRow.snapshot_cursor,
         reindexState: syncRow.reindex_state,
         job: parseJob(syncRow.job_json),
+        chunkCount: chunks.length,
+        totalBytes,
+        sha256,
+        committedAt: Date.now(),
       };
-
-      const chunks = [];
-      let current = [];
-      for (const item of items) {
-        current.push(item);
-        if (Buffer.byteLength(JSON.stringify(current), 'utf8') > MAX_STORAGE_CHUNK_BYTES && current.length > 1) {
-          current.pop();
-          chunks.push(current);
-          current = [item];
-        }
+      await ctx.storage.plugin.set('fts:meta', meta);
+      persistedGeneration = nextGen;
+    } catch (err) {
+      // Abort commit: roll back newly written partial chunks and keep old fts:meta untouched
+      for (const key of writtenChunkKeys) {
+        await ctx.storage.plugin.delete(key).catch(() => {});
       }
-      if (current.length > 0) chunks.push(current);
+      lastError = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
 
-      const oldKeys = await ctx.storage.plugin.keys();
-      await ctx.storage.plugin.set('fts:meta', { ...meta, chunkCount: chunks.length });
-      for (let i = 0; i < chunks.length; i += 1) {
-        await ctx.storage.plugin.set(`fts:chunk:${i}`, chunks[i]);
-      }
-      for (const key of oldKeys) {
-        if (key.startsWith('fts:chunk:')) {
-          const idx = Number.parseInt(key.slice('fts:chunk:'.length), 10);
-          if (!Number.isFinite(idx) || idx >= chunks.length) {
-            await ctx.storage.plugin.delete(key);
-          }
+    // Best-effort cleanup of older generation chunks after atomic meta commit
+    try {
+      const allKeys = await ctx.storage.plugin.keys();
+      const prefix = `fts:gen:${nextGen}:chunk:`;
+      for (const key of allKeys) {
+        if ((key.startsWith('fts:gen:') && !key.startsWith(prefix)) || key.startsWith('fts:chunk:')) {
+          await ctx.storage.plugin.delete(key).catch(() => {});
         }
       }
     } catch {
-      // Storage persistence is best-effort if permission not granted
+      // Ignore non-critical old chunk cleanup error
     }
   }
 
   async function restoreMemoryState() {
     if (isFileBacked || disposed) return;
+    let meta;
     try {
-      const meta = await ctx.storage.plugin.get('fts:meta');
-      if (!meta || typeof meta !== 'object') return;
-      const chunkCount = Number(meta.chunkCount || 0);
-      const restoredItems = [];
+      meta = await ctx.storage.plugin.get('fts:meta');
+    } catch (err) {
+      if (err && err.code === 'E_PERMISSION_DENIED') return;
+      lastError = err instanceof Error ? err.message : String(err);
+      return;
+    }
+    if (!meta || typeof meta !== 'object') return;
+
+    const chunkCount = Number(meta.chunkCount || 0);
+    const hasGeneration = meta.schemaVersion === 2 && typeof meta.generation === 'number';
+    const restoredItems = [];
+    let corruptReason = null;
+
+    if (hasGeneration) {
+      persistedGeneration = meta.generation;
+      const hash = crypto.createHash('sha256');
+      let actualBytes = 0;
       for (let i = 0; i < chunkCount; i += 1) {
-        const chunk = await ctx.storage.plugin.get(`fts:chunk:${i}`);
-        if (Array.isArray(chunk)) restoredItems.push(...chunk);
+        const chunk = await ctx.storage.plugin.get(`fts:gen:${meta.generation}:chunk:${i}`).catch(() => undefined);
+        if (!Array.isArray(chunk)) {
+          corruptReason = `缺失分块 fts:gen:${meta.generation}:chunk:${i}`;
+          break;
+        }
+        const encoded = JSON.stringify(chunk);
+        actualBytes += Buffer.byteLength(encoded, 'utf8');
+        hash.update(encoded, 'utf8');
+        restoredItems.push(...chunk);
       }
+      if (!corruptReason && (actualBytes !== meta.totalBytes || hash.digest('hex') !== meta.sha256)) {
+        corruptReason = '持久化分块哈希校验失败';
+      }
+    } else {
+      for (let i = 0; i < chunkCount; i += 1) {
+        const chunk = await ctx.storage.plugin.get(`fts:chunk:${i}`).catch(() => undefined);
+        if (!Array.isArray(chunk)) {
+          corruptReason = `缺失旧分块 fts:chunk:${i}`;
+          break;
+        }
+        restoredItems.push(...chunk);
+      }
+    }
+
+    if (corruptReason) {
+      // Reset cursor safely so next sync catches up cleanly from 0 instead of running with partial data
+      lastError = `${corruptReason}，已重置游标以重新同步`;
       db.exec('BEGIN IMMEDIATE');
       try {
-        for (const item of restoredItems) {
-          upsertItemInTx(item);
-        }
-        let job = meta.job ?? null;
-        let reindexState = typeof meta.reindexState === 'string' ? meta.reindexState : 'idle';
-        if (job && (job.status === 'running' || job.status === 'queued')) {
-          job = {
-            ...job,
-            status: 'cancelled',
-            resumeAvailable: Boolean(meta.snapshotId || meta.snapshotCursor !== null || meta.snapshotWatermark !== null),
-            updatedAt: Date.now(),
-            error: job.error ?? '实例重载或中断，支持断点续跑',
-          };
-          reindexState = 'cancelled';
-        }
+        db.exec('DELETE FROM search_items; DELETE FROM search_fts; DELETE FROM search_sessions_meta;');
         db.prepare(
           `UPDATE search_sync_state
-           SET cursor_seq = ?, snapshot_id = ?, snapshot_watermark = ?, snapshot_cursor = ?,
-               reindex_state = ?, job_json = ?, updated_at = ?
+           SET cursor_seq = 0, scoped_skips_json = '[]', snapshot_id = NULL, snapshot_watermark = NULL,
+               snapshot_cursor = NULL, reindex_state = 'idle', job_json = NULL, updated_at = ?
            WHERE id = 1`,
-        ).run(
-          Number(meta.cursorSeq || 0),
-          meta.snapshotId ?? null,
-          meta.snapshotWatermark ?? null,
-          meta.snapshotCursor ?? null,
-          reindexState,
-          job ? JSON.stringify(job) : null,
-          Date.now(),
-        );
+        ).run(Date.now());
         db.exec('COMMIT');
       } catch (err) {
         db.exec('ROLLBACK');
         throw err;
       }
-    } catch {
-      // Ignore if storage not granted or empty
+      return;
+    }
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const item of restoredItems) {
+        upsertItemInTx(item);
+      }
+      let job = meta.job ?? null;
+      let reindexState = typeof meta.reindexState === 'string' ? meta.reindexState : 'idle';
+      if (job && (job.status === 'running' || job.status === 'queued')) {
+        job = {
+          ...job,
+          status: 'cancelled',
+          resumeAvailable: Boolean(meta.snapshotId || meta.snapshotCursor !== null || meta.snapshotWatermark !== null),
+          updatedAt: Date.now(),
+          error: job.error ?? '实例重载或中断，支持断点续跑',
+        };
+        reindexState = 'cancelled';
+      }
+      db.prepare(
+        `UPDATE search_sync_state
+         SET cursor_seq = ?, scoped_skips_json = ?, snapshot_id = ?, snapshot_watermark = ?, snapshot_cursor = ?,
+             reindex_state = ?, job_json = ?, updated_at = ?
+         WHERE id = 1`,
+      ).run(
+        Number(meta.cursorSeq || 0),
+        JSON.stringify(parseScopedSkips(meta.scopedSkips)),
+        meta.snapshotId ?? null,
+        meta.snapshotWatermark ?? null,
+        meta.snapshotCursor ?? null,
+        reindexState,
+        job ? JSON.stringify(job) : null,
+        Date.now(),
+      );
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
     }
   }
 
@@ -553,6 +700,18 @@ export async function apply(ctx, config = {}) {
     return { changes: sliced, latestSeq, hasMore: changes.length > sliced.length };
   }
 
+  let syncQueue = Promise.resolve();
+  function enqueueSync() {
+    if (disposed) return Promise.resolve({ appliedChanges: 0, cursorSeq: 0 });
+    const g = generation;
+    const next = syncQueue.then(async () => {
+      if (disposed || generation !== g) return { appliedChanges: 0, cursorSeq: 0 };
+      return await syncIncremental();
+    });
+    syncQueue = next.catch(() => {});
+    return next;
+  }
+
   async function syncIncremental() {
     if (disposed) return { appliedChanges: 0, cursorSeq: 0 };
     const startGen = generation;
@@ -565,25 +724,40 @@ export async function apply(ctx, config = {}) {
       const list = Array.isArray(page?.changes) ? page.changes : [];
       if (list.length === 0) {
         if (typeof page?.latestSeq === 'number' && page.latestSeq > state.cursor_seq) {
-          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, updated_at = ? WHERE id = 1').run(
+          const pruned = pruneScopedSkips(parseScopedSkips(state.scoped_skips_json), page.latestSeq);
+          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
             page.latestSeq,
+            JSON.stringify(pruned),
             Date.now(),
           );
-          await persistMemoryState();
+          try {
+            await persistMemoryState();
+          } catch (err) {
+            db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+              state.cursor_seq,
+              state.scoped_skips_json ?? '[]',
+              Date.now(),
+            );
+            throw err;
+          }
         }
         break;
       }
 
       const maxBatchSeq = list[list.length - 1].changeSeq;
+      const skips = parseScopedSkips(state.scoped_skips_json);
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const change of list) {
+          if (shouldSkipScopedChange(change, skips)) continue;
           applyChangeInTx(change);
           appliedChanges += 1;
         }
         const nextCursor = Math.max(state.cursor_seq, Number(maxBatchSeq || 0));
-        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, updated_at = ? WHERE id = 1').run(
+        const prunedSkips = pruneScopedSkips(skips, nextCursor);
+        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
           nextCursor,
+          JSON.stringify(prunedSkips),
           Date.now(),
         );
         db.exec('COMMIT');
@@ -592,7 +766,17 @@ export async function apply(ctx, config = {}) {
         lastError = err instanceof Error ? err.message : String(err);
         throw err;
       }
-      await persistMemoryState();
+      try {
+        await persistMemoryState();
+      } catch (err) {
+        // Revert in-memory cursor_seq so memory state does not outrun failed chunk persistence
+        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+          state.cursor_seq,
+          state.scoped_skips_json ?? '[]',
+          Date.now(),
+        );
+        throw err;
+      }
       if (!page.hasMore) break;
     }
 
@@ -631,22 +815,26 @@ export async function apply(ctx, config = {}) {
       const jobId = typeof req.jobId === 'string' && req.jobId.trim()
         ? req.jobId.trim()
         : `reindex_${crypto.randomBytes(5).toString('hex')}`;
-      const syncRes = await syncIncremental();
-      const doneJob = {
-        jobId,
-        mode: 'incremental',
-        status: 'completed',
-        indexedCount: syncRes.appliedChanges,
-        deletedCount: 0,
-        cursorSeq: syncRes.cursorSeq,
-        resumeAvailable: false,
-        startedAt: now,
-        updatedAt: Date.now(),
-        finishedAt: Date.now(),
-      };
-      persistJob(doneJob, { snapshotId: null, snapshotWatermark: null, snapshotCursor: null, reindexState: 'idle' });
-      await persistMemoryState();
-      return { ok: true, value: doneJob };
+      try {
+        const syncRes = await enqueueSync();
+        const doneJob = {
+          jobId,
+          mode: 'incremental',
+          status: 'completed',
+          indexedCount: syncRes.appliedChanges,
+          deletedCount: 0,
+          cursorSeq: syncRes.cursorSeq,
+          resumeAvailable: false,
+          startedAt: now,
+          updatedAt: Date.now(),
+          finishedAt: Date.now(),
+        };
+        persistJob(doneJob, { snapshotId: null, snapshotWatermark: null, snapshotCursor: null, reindexState: 'idle' });
+        await persistMemoryState();
+        return { ok: true, value: doneJob };
+      } catch (err) {
+        return { ok: false, error: { code: 'internal_error', message: err instanceof Error ? err.message : String(err) } };
+      }
     }
 
     cancelRequested = false;
@@ -658,9 +846,20 @@ export async function apply(ctx, config = {}) {
       const canResume =
         mode === 'resume' &&
         Boolean(row.snapshot_id || row.snapshot_cursor !== null || row.snapshot_watermark !== null);
+      const targetWorkspaceId = canResume
+        ? (prevJob?.workspaceId ?? (typeof req.workspaceId === 'string' && req.workspaceId ? req.workspaceId : null))
+        : (typeof req.workspaceId === 'string' && req.workspaceId ? req.workspaceId : null);
       const now = Date.now();
       let job = canResume && prevJob
-        ? { ...prevJob, mode: 'resume', status: 'running', updatedAt: now, finishedAt: null, error: null }
+        ? {
+            ...prevJob,
+            mode: 'resume',
+            status: 'running',
+            workspaceId: targetWorkspaceId,
+            updatedAt: now,
+            finishedAt: null,
+            error: null,
+          }
         : {
             jobId:
               typeof req.jobId === 'string' && req.jobId.trim()
@@ -668,6 +867,7 @@ export async function apply(ctx, config = {}) {
                 : `reindex_${crypto.randomBytes(5).toString('hex')}`,
             mode: 'full',
             status: 'running',
+            workspaceId: targetWorkspaceId,
             indexedCount: 0,
             deletedCount: 0,
             cursorSeq: row.cursor_seq,
@@ -684,14 +884,14 @@ export async function apply(ctx, config = {}) {
       if (!canResume) {
         db.exec('BEGIN IMMEDIATE');
         try {
-          if (req.workspaceId) {
+          if (targetWorkspaceId) {
             const existingIds = db
               .prepare('SELECT item_id FROM search_items WHERE workspace_id = ?')
-              .all(req.workspaceId);
+              .all(targetWorkspaceId);
             for (const itemRow of existingIds) {
               db.prepare('DELETE FROM search_fts WHERE item_id = ?').run(itemRow.item_id);
             }
-            db.prepare('DELETE FROM search_items WHERE workspace_id = ?').run(req.workspaceId);
+            db.prepare('DELETE FROM search_items WHERE workspace_id = ?').run(targetWorkspaceId);
           } else {
             db.exec('DELETE FROM search_items; DELETE FROM search_fts; DELETE FROM search_sessions_meta;');
           }
@@ -745,12 +945,12 @@ export async function apply(ctx, config = {}) {
               snapshotId,
               cursor,
               limit: batchSize,
-              ...(req.workspaceId ? { workspaceId: req.workspaceId } : {}),
+              ...(targetWorkspaceId ? { workspaceId: targetWorkspaceId } : {}),
             });
           } catch {
             page = await readSnapshotViaHost({
               limit: batchSize,
-              ...(req.workspaceId ? { workspaceId: req.workspaceId } : {}),
+              ...(targetWorkspaceId ? { workspaceId: targetWorkspaceId } : {}),
             });
           }
 
@@ -777,6 +977,7 @@ export async function apply(ctx, config = {}) {
           snapshotId = page.snapshotId;
           watermarkSeq = page.watermarkSeq;
           const nextCursor = page.nextCursor ?? null;
+          const prevSyncRow = readSyncRow();
 
           db.exec('BEGIN IMMEDIATE');
           try {
@@ -790,15 +991,30 @@ export async function apply(ctx, config = {}) {
             job.updatedAt = Date.now();
 
             if (!nextCursor) {
-              const currSeq = readSyncRow().cursor_seq;
-              const nextCursorSeq = Math.max(currSeq, Number(watermarkSeq || 0));
-              job.cursorSeq = nextCursorSeq;
-              db.prepare(
-                `UPDATE search_sync_state
-                 SET cursor_seq = ?, snapshot_id = NULL, snapshot_watermark = NULL,
-                     snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
-                 WHERE id = 1`,
-              ).run(nextCursorSeq, JSON.stringify(job), job.updatedAt);
+              const currSeq = prevSyncRow.cursor_seq;
+              const snapSeq = Number(watermarkSeq || 0);
+              if (targetWorkspaceId) {
+                // Scoped workspace rebuild: keep global cursor_seq intact so other workspaces' unconsumed changes are NOT skipped
+                const nextSkips = snapSeq > currSeq
+                  ? mergeScopedSkip(parseScopedSkips(prevSyncRow.scoped_skips_json), targetWorkspaceId, snapSeq)
+                  : parseScopedSkips(prevSyncRow.scoped_skips_json);
+                job.cursorSeq = currSeq;
+                db.prepare(
+                  `UPDATE search_sync_state
+                   SET scoped_skips_json = ?, snapshot_id = NULL, snapshot_watermark = NULL,
+                       snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
+                   WHERE id = 1`,
+                ).run(JSON.stringify(nextSkips), JSON.stringify(job), job.updatedAt);
+              } else {
+                const nextCursorSeq = Math.max(currSeq, snapSeq);
+                job.cursorSeq = nextCursorSeq;
+                db.prepare(
+                  `UPDATE search_sync_state
+                   SET cursor_seq = ?, scoped_skips_json = '[]', snapshot_id = NULL, snapshot_watermark = NULL,
+                       snapshot_cursor = NULL, reindex_state = 'running', job_json = ?, updated_at = ?
+                   WHERE id = 1`,
+                ).run(nextCursorSeq, JSON.stringify(job), job.updatedAt);
+              }
             } else {
               db.prepare(
                 `UPDATE search_sync_state
@@ -812,14 +1028,33 @@ export async function apply(ctx, config = {}) {
             db.exec('ROLLBACK');
             throw err;
           }
-          await persistMemoryState();
+          try {
+            await persistMemoryState();
+          } catch (err) {
+            db.prepare(
+              `UPDATE search_sync_state
+               SET cursor_seq = ?, scoped_skips_json = ?, snapshot_id = ?, snapshot_watermark = ?, snapshot_cursor = ?,
+                   reindex_state = ?, job_json = ?, updated_at = ?
+               WHERE id = 1`,
+            ).run(
+              prevSyncRow.cursor_seq,
+              prevSyncRow.scoped_skips_json ?? '[]',
+              prevSyncRow.snapshot_id,
+              prevSyncRow.snapshot_watermark,
+              prevSyncRow.snapshot_cursor,
+              prevSyncRow.reindex_state,
+              prevSyncRow.job_json,
+              Date.now(),
+            );
+            throw err;
+          }
 
           if (!nextCursor) break;
           cursor = nextCursor;
           await new Promise((resolve) => setImmediate(resolve));
         }
 
-        const catchup = await syncIncremental();
+        const catchup = await enqueueSync();
         job = {
           ...job,
           status: 'completed',
@@ -869,11 +1104,14 @@ export async function apply(ctx, config = {}) {
     }
   }
 
-  function runQuery(req = {}) {
+  async function runQuery(req = {}) {
     const start = Date.now();
     const rawQuery = typeof req.q === 'string' ? req.q.trim() : '';
     if (!rawQuery) {
       return { ok: true, value: { hits: [], nextOffset: null, fallbackUsed: false, tookMs: 0 } };
+    }
+    if (!req.skipSync) {
+      await enqueueSync().catch(() => {});
     }
     const limit = Math.min(100, Math.max(1, Number(req.limit ?? 25) || 25));
     const offset = Math.max(0, Number(req.offset ?? 0) || 0);
@@ -1070,26 +1308,19 @@ export async function apply(ctx, config = {}) {
   }
 
   // Subscribe to live committed turn/message events while enabled
-  let syncQueue = Promise.resolve();
   const scheduleCatchup = () => {
     if (disposed) return;
-    const g = generation;
-    syncQueue = syncQueue
-      .then(async () => {
-        if (disposed || generation !== g) return;
-        await syncIncremental().catch(() => {});
-      })
-      .catch(() => {});
+    void enqueueSync().catch(() => {});
   };
 
-  for (const eventName of ['turn.completed', 'message.user', 'message.assistant.completed']) {
+  for (const eventName of ['turn.completed', 'message.user', 'message.assistant.completed', 'session.created']) {
     ctx.events.on(eventName, () => {
       scheduleCatchup();
     });
   }
 
-  // Initial non-blocking catch-up if this instance already has a sync cursor or autoSync enabled
-  if (readSyncRow().cursor_seq > 0 || config.autoSyncOnStart === true) {
+  // Initial non-blocking catch-up on activation (covers enabled-time or offline-time committed changes)
+  if (readSyncRow().cursor_seq > 0 || config.autoSyncOnStart !== false) {
     scheduleCatchup();
   }
 
@@ -1121,8 +1352,12 @@ export async function apply(ctx, config = {}) {
       return runReindex({ ...req, mode: 'resume' });
     },
     async sync() {
-      const res = await syncIncremental();
-      return { ok: true, value: res };
+      try {
+        const res = await enqueueSync();
+        return { ok: true, value: res };
+      } catch (err) {
+        return { ok: false, error: { code: 'internal_error', message: err instanceof Error ? err.message : String(err) } };
+      }
     },
   };
 
