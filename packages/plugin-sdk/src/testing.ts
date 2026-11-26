@@ -1,4 +1,5 @@
 import {
+  FILE_PREVIEW_FEATURE,
   HOST_FEATURES_V5,
   PLUGIN_API_VERSION,
   PluginApiError,
@@ -385,7 +386,7 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
   const runId = options.runId ?? `run_mock_${mockIdSeq}`;
   const strictPermissions = options.permissions !== undefined;
   const permissionSet = new Set<string>(options.permissions ?? []);
-  const featureSet = new Set<string>(options.features ?? [...HOST_FEATURES_V5, 'ui.workspace.pages', 'runtime.trustedLocal']);
+  const featureSet = new Set<string>(options.features ?? [...HOST_FEATURES_V5, 'ui.workspace.pages', 'runtime.trustedLocal', FILE_PREVIEW_FEATURE]);
 
   const logs: MockPluginLogEntry[] = [];
   const drivers = new Map<string, PluginHarnessDriverRegistration>();

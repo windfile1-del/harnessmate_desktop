@@ -2,11 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
+  FILE_PREVIEW_PERMISSION,
+  FilePreviewResultSchema,
   PluginApiError,
   isBuiltinPublicService,
   isReservedServiceName,
   isThirdPartyCustomServiceName,
   normalizePluginSlotKey,
+  type FilePreviewRequest,
   type PluginEventV4,
 } from '@harnessmate/plugin-api';
 import {
@@ -201,6 +204,78 @@ export class PluginManager {
       safeMode: Boolean(this.safeComposition),
       canRestore: this.composition.canRestore(),
     };
+  }
+
+  get filePreviewProviderId(): string | undefined {
+    if (this.safeComposition || this.compositionError) return;
+    return this.composition.extensionBindings?.filePreviewProvider;
+  }
+
+  private readyFilePreviewProvider(pluginId: string) {
+    const entry = this.isolated?.getActive(pluginId);
+    if (entry?.process.alive && entry.handshake?.hasFilePreview && entry.info.contributes.filePreview
+      && this.isPluginEnabled(pluginId)) return entry;
+  }
+
+  listFilePreviewProviders(workspaceId?: string) {
+    return this.listInstalled().flatMap(({ id, name, contributes }) => {
+      if (!contributes.filePreview) return [];
+      const entry = this.readyFilePreviewProvider(id);
+      const ready = Boolean(entry);
+      const authorized = Boolean(workspaceId && entry && this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId));
+      return [{ id, name, extensions: contributes.filePreview.extensions, ready, authorized }];
+    });
+  }
+
+  setFilePreviewProvider(pluginId: string | null, workspaceId?: string): Promise<void> {
+    return this.serialize(async () => {
+      if (this.safeComposition || this.compositionError) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '请在组合配置可用的正常模式中切换文件预览');
+      }
+      if (pluginId !== null) {
+        const entry = this.readyFilePreviewProvider(pluginId);
+        if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '文件预览提供方尚未就绪');
+        if (!workspaceId || !this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)) {
+          throw new PluginApiError('E_PERMISSION_DENIED', '请先为当前工作区授权 file:preview');
+        }
+      }
+      this.composition.setFilePreviewProvider(pluginId);
+    });
+  }
+
+  async renderFilePreview(workspaceId: string, request: FilePreviewRequest) {
+    const bindings = this.composition.extensionBindings;
+    const pluginId = this.filePreviewProviderId;
+    const entry = pluginId && this.readyFilePreviewProvider(pluginId);
+    if (!entry || !this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId) ||
+      !entry.info.contributes.filePreview?.extensions.includes(path.extname(request.relativePath).toLowerCase())) return null;
+
+    let revoked = false;
+    const unsubscribe = this.permissions.onChange((event) => {
+      if (event.pluginId === entry.pluginId && event.capability === FILE_PREVIEW_PERMISSION
+        && event.workspaceId === workspaceId && !this.permissions?.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)) {
+        revoked = true;
+      }
+    });
+    try {
+      const result = await entry.process.call<unknown>('host.filePreview.render', { request }, 600, entry.runId);
+      if (revoked || bindings !== this.composition.extensionBindings || this.filePreviewProviderId !== entry.pluginId
+        || this.readyFilePreviewProvider(entry.pluginId) !== entry
+        || !this.permissions.isGranted(entry.info, FILE_PREVIEW_PERMISSION, workspaceId)) return null;
+      if (result === null) return null;
+      const parsed = FilePreviewResultSchema.safeParse(result);
+      if (!parsed.success) {
+        this.appendHostLog(entry.pluginId, 'warn', '文件预览返回了无效的结果，已使用内置预览');
+        return null;
+      }
+      return { ...parsed.data, pluginId: entry.pluginId, pluginName: entry.info.name };
+    } catch (error) {
+      const reason = error instanceof PluginApiError ? error.code : 'E_INTERNAL';
+      this.appendHostLog(entry.pluginId, 'warn', `文件预览调用失败，已使用内置预览 (${reason})`);
+      return null;
+    } finally {
+      unsubscribe();
+    }
   }
 
   restoreComposition(useDefaults: boolean): Promise<void> {

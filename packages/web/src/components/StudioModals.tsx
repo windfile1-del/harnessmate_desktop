@@ -115,8 +115,12 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     restorePluginComposition,
     rollbackPlugin,
     pushToast,
+    selectedWorkspaceId,
+    workspaces,
+    pluginPermissionRevision,
   } = useAppStore();
 
+  const previewWorkspace = workspaces.find(({ id }) => id === selectedWorkspaceId) ?? workspaces[0];
   const [tab, setTab] = useState<'installed' | 'catalog' | 'install' | 'dev' | 'logs' | 'composition'>('installed');
   const [composition, setComposition] = useState<Awaited<ReturnType<typeof daemonApi.getPluginComposition>>>();
   const [registryState, setRegistryState] = useState<PluginRegistryStateDto>();
@@ -146,10 +150,10 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     let current = true;
-    void daemonApi.getPluginComposition().then((result) => { if (current) setComposition(result); })
+    void daemonApi.getPluginComposition(previewWorkspace?.id).then((result) => { if (current) setComposition(result); })
       .catch((error: Error) => { if (current) pushToast({ kind: 'error', title: '无法读取组合', body: error.message }); });
     return () => { current = false; };
-  }, [plugins, pushToast]);
+  }, [plugins, pluginPermissionRevision, previewWorkspace?.id, pushToast]);
 
   useEffect(() => {
     if (tab !== 'catalog') return;
@@ -782,6 +786,36 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                     void runPluginAction(() => restorePluginComposition('builtin'));
                   }
                 }}>恢复内置组合</button>
+            </div>
+            <div className="space-y-1 rounded-xl border border-[var(--border-hairline)] p-3">
+              <label className="flex flex-wrap items-center justify-between gap-2">
+                <span>右侧文件预览</span>
+                <select
+                  value={composition.extensions?.filePreviewProvider ?? ''}
+                  disabled={busy || composition.safeMode || Boolean(composition.error)}
+                  className="rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 py-1 disabled:opacity-50"
+                  onChange={(event) => {
+                    const provider = event.target.value || null;
+                    void runPluginAction(async () => {
+                      await daemonApi.setFilePreviewProvider(provider, previewWorkspace?.id);
+                      await refreshPlugins();
+                    });
+                  }}
+                >
+                  <option value="">内置文本预览</option>
+                  {composition.extensions?.filePreviewProvider && !composition.filePreviewProviders.some(
+                    ({ id }) => id === composition.extensions?.filePreviewProvider,
+                  ) && <option value={composition.extensions.filePreviewProvider} disabled>{composition.extensions.filePreviewProvider}（未安装）</option>}
+                  {composition.filePreviewProviders.map(({ id, name, extensions, ready, authorized }) => (
+                    <option key={id} value={id} disabled={!ready || !authorized}>
+                      {name} · {extensions.join('、')}{ready ? (authorized ? '' : '（待授权）') : '（未就绪）'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="text-[var(--text-muted)]">
+                {previewWorkspace ? `按「${previewWorkspace.name}」检查工作区授权。` : '创建工作区后可为预览插件授权。'}
+              </p>
             </div>
             {composition.entries.map((entry) => {
               const plugin = plugins.find(({ id }) => id === entry.name);

@@ -112,7 +112,7 @@ import {
 } from '../core/context-compression-service.js';
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type FailoverService, type GitService } from '../plugin-host/builtin/services.js';
-import { PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
+import { FILE_PREVIEW_PERMISSION, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import { AgyAuthService } from '../harnesses/agy/agy-auth-service.js';
@@ -307,6 +307,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     eventBus,
     sessionManager,
     terminalWorkspace,
+  });
+  pluginManager.host.events.on('plugin.state', ({ data }) => {
+    if (data.pluginId === pluginManager.filePreviewProviderId) wsGateway.notifyPluginsChanged();
+  });
+  pluginPermissions.onChange(({ capability }) => {
+    if (capability === FILE_PREVIEW_PERMISSION) wsGateway.notifyPluginsChanged();
   });
   const nativeWsGateway = new NativeWsFeedGateway({
     auth,
@@ -702,7 +708,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
-  app.get('/api/v1/plugins/composition', async () => pluginManager.getComposition());
+  app.get('/api/v1/plugins/composition', async (request) => {
+    const { workspaceId } = request.query as { workspaceId?: string };
+    const workspace = typeof workspaceId === 'string' ? store.getWorkspace(workspaceId) : undefined;
+    return { ...pluginManager.getComposition(), filePreviewProviders: pluginManager.listFilePreviewProviders(workspace?.id) };
+  });
   registerPluginMcp(app, pluginCapabilities, store, {
     getOrchestrator: () => sessionManager.getOrchestratorService(),
     isOrchestratorEnabled: () => pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID),
@@ -1006,11 +1016,26 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
   };
 
+  app.put('/api/v1/plugins/composition/file-preview', async (request, reply) => {
+    const { pluginId, workspaceId } = (request.body ?? {}) as { pluginId?: unknown; workspaceId?: unknown };
+    if (pluginId !== null && (typeof pluginId !== 'string' || typeof workspaceId !== 'string' || !store.getWorkspace(workspaceId))) {
+      return reply.code(400).send({ error: '请选择文件预览提供方和工作区' });
+    }
+    try {
+      await pluginManager.setFilePreviewProvider(pluginId, typeof workspaceId === 'string' ? workspaceId : undefined);
+      wsGateway.notifyPluginsChanged();
+      return { ok: true };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post('/api/v1/plugins/composition/restore', async (request, reply) => {
     const source = (request.body as { source?: unknown } | null)?.source;
     if (source !== 'previous' && source !== 'builtin') return reply.code(400).send({ error: '请选择要恢复的组合配置' });
     try {
       await pluginManager.restoreComposition(source === 'builtin');
+      wsGateway.notifyPluginsChanged();
       return await updatedPlugins();
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
@@ -1632,6 +1657,26 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return readWorkspaceFilePreview(session.cwd, q.path);
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/v1/sessions/:id/file-preview', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = sessionManager.getSession(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const q = request.query as { path?: string; line?: string };
+    if (typeof q.path !== 'string' || !q.path) return reply.code(400).send({ error: 'Missing path parameter' });
+    reply.header('Cache-Control', 'no-store');
+    if (!pluginManager.filePreviewProviderId) return { preview: null };
+    const line = Number(q.line);
+    try {
+      const file = readWorkspaceFilePreview(session.cwd, q.path);
+      const preview = await pluginManager.renderFilePreview(session.workspaceId, {
+        ...file, version: 1, ...(Number.isSafeInteger(line) && line > 0 ? { line } : {}),
+      });
+      return { preview };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 

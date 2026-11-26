@@ -28,16 +28,19 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Slot, SlotErrorBoundary, useSlotItems, useSlotRegistry } from '../slots';
 import {
   daemonApi,
   type ProjectInstructionInfo,
+  type RenderedFilePreview,
   type TerminalExecResult,
 } from '../api/client';
 import { formatTokenCount, resolveHarnessMeta } from '../lib/harness-meta';
 import type { DiagnosticEntry } from '../lib/projector';
+import type { FileLink } from '../lib/file-links';
 import { useAppStore } from '../stores/app-store';
+import { FilePreviewBody } from './FilePreviewBody';
 
 export function InspectorDrawer({
   session,
@@ -66,6 +69,8 @@ export function InspectorDrawer({
     addDraftAttachment,
     pushToast,
     isPluginEnabled,
+    plugins,
+    pluginPermissionRevision,
   } = useAppStore(useShallow((state) => ({
     harnesses: state.harnesses,
     inspectorTab: state.inspectorTab,
@@ -86,6 +91,8 @@ export function InspectorDrawer({
     addDraftAttachment: state.addDraftAttachment,
     pushToast: state.pushToast,
     isPluginEnabled: state.isPluginEnabled,
+    plugins: state.plugins,
+    pluginPermissionRevision: state.pluginPermissionRevision,
   })));
 
   const slotRegistry = useSlotRegistry();
@@ -123,8 +130,21 @@ export function InspectorDrawer({
     content: string;
     truncated: boolean;
   } | null>(null);
-  const previewLine = useRef<HTMLElement>(null);
   const activePreview = inspectorFile?.sessionId === session.id && previewFile?.target === inspectorFile ? previewFile : null;
+  const [renderedPreview, setRenderedPreview] = useState<{
+    source: NonNullable<typeof previewFile>;
+    plugins: typeof plugins;
+    permissionRevision: number;
+    preview: RenderedFilePreview;
+  }>();
+  const clearRenderedPreview = useCallback(() => setRenderedPreview(undefined), []);
+  const pluginPreview = renderedPreview?.source === activePreview && renderedPreview.plugins === plugins
+    && renderedPreview.permissionRevision === pluginPermissionRevision ? renderedPreview.preview : undefined;
+  const previewPath = activePreview?.relativePath;
+  const openPreviewLink = useCallback(({ path, line }: FileLink) => {
+    const directory = previewPath?.slice(0, previewPath.lastIndexOf('/') + 1) ?? '';
+    openInspectorFile(session.id, /^(?:\/|[a-z]:\/)/i.test(path) ? path : directory + path, line);
+  }, [previewPath, openInspectorFile, session.id]);
   const [filesLoading, setFilesLoading] = useState(false);
 
   // Terminal tab state
@@ -171,9 +191,17 @@ export function InspectorDrawer({
   }, [inspectorFile, inspectorTab, session.id, pushToast]);
 
   useEffect(() => {
-    const line = previewLine.current;
-    if (line?.parentElement) line.parentElement.scrollTop = Math.max(0, line.offsetTop - 45);
-  }, [activePreview, inspectorTab]);
+    if (inspectorTab !== 'files' || !activePreview ||
+      !plugins.some((plugin) => plugin.runtimeState === 'ACTIVE' && plugin.contributes.filePreview)) return;
+    const controller = new AbortController();
+    const { path, line } = activePreview.target;
+    void daemonApi.renderSessionFile(session.id, path, line, controller.signal).then(({ preview }) => {
+      if (!controller.signal.aborted) setRenderedPreview(preview
+        ? { source: activePreview, plugins, permissionRevision: pluginPermissionRevision, preview }
+        : undefined);
+    }).catch(() => {});
+    return () => controller.abort();
+  }, [activePreview, inspectorTab, session.id, plugins, pluginPermissionRevision]);
 
   const handleAttachFile = (entry: WorkspaceFileEntry) => {
     addDraftAttachment(session.id, {
@@ -874,9 +902,12 @@ export function InspectorDrawer({
                   className="flex items-center justify-between px-3 py-1.5 text-[11px]"
                   style={{ borderBottom: '1px solid var(--border-hairline)' }}
                 >
-                  <span className="font-mono-code truncate text-[var(--accent-indigo)]">
-                    {activePreview.relativePath}{activePreview.target.line ? `:${activePreview.target.line}` : ''}
-                  </span>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="font-mono-code truncate text-[var(--accent-indigo)]">
+                      {activePreview.relativePath}{activePreview.target.line ? `:${activePreview.target.line}` : ''}
+                    </span>
+                    {pluginPreview && <span className="truncate text-[var(--text-muted)]">{pluginPreview.pluginName}</span>}
+                  </div>
                   <button
                     type="button"
                     aria-label="关闭文件预览"
@@ -886,17 +917,15 @@ export function InspectorDrawer({
                     <X size={13} />
                   </button>
                 </div>
-                <pre className="relative m-0 max-h-[260px] overflow-auto p-3 font-mono-code text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                  {activePreview.target.line ? (() => {
-                    const lines = activePreview.content.split('\n');
-                    const index = activePreview.target.line - 1;
-                    if (index >= lines.length) return activePreview.content;
-                    return <>{index > 0 ? `${lines.slice(0, index).join('\n')}\n` : ''}
-                      <mark ref={previewLine} className="bg-[var(--accent-indigo-soft)] text-[var(--text-primary)]">{lines[index] || ' '}</mark>
-                      {index + 1 < lines.length ? `\n${lines.slice(index + 1).join('\n')}` : ''}</>;
-                  })() : activePreview.content}
-                  {activePreview.truncated ? '\n\n... [文件过大已截断]' : ''}
-                </pre>
+                <FilePreviewBody
+                  key={activePreview.target.path}
+                  content={activePreview.content}
+                  line={activePreview.target.line}
+                  truncated={activePreview.truncated}
+                  preview={pluginPreview}
+                  onOpenFile={openPreviewLink}
+                  onRenderError={clearRenderedPreview}
+                />
               </div>
             )}
 

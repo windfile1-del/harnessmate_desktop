@@ -18,7 +18,11 @@ const entriesSchema = z.array(entrySchema).max(512).superRefine((entries, ctx) =
     ctx.addIssue({ code: 'custom', message: '组合条目 ID 重复' });
   }
 });
-const profileSchema = z.object({ bundles: z.array(identifier).max(32) }).strict();
+const profileSchema = z.object({
+  bundles: z.array(identifier).max(32),
+  extensions: z.object({ filePreviewProvider: identifier.optional() }).strict().optional(),
+}).strict();
+type ProfileConfig = z.infer<typeof profileSchema>;
 
 type LayerEntry = z.infer<typeof entrySchema>;
 const recoverySchema = profileSchema.extend({ patch: entriesSchema });
@@ -29,8 +33,7 @@ export interface CompositionEntry {
   config: Record<string, unknown>;
   sources: string[];
 }
-export interface PluginProfile {
-  bundles: string[];
+export interface PluginProfile extends ProfileConfig {
   entries: CompositionEntry[];
 }
 
@@ -86,7 +89,7 @@ export class PluginComposition {
   private readonly patchFile: string;
   private readonly recoveryFile: string;
   private readonly pendingRestoreFile: string;
-  private bundles = [defaultBundle];
+  private profile: ProfileConfig = { bundles: [defaultBundle] };
   private layers: Array<{ source: string; entries: LayerEntry[] }> = [];
   private patch: LayerEntry[] = [];
 
@@ -103,19 +106,19 @@ export class PluginComposition {
       this.applyRestore(this.readRecovery(this.pendingRestoreFile));
       return;
     }
-    const profile = readFile(this.profileFile);
-    const bundles = profile ? profileSchema.parse(JSON.parse(profile)).bundles : [defaultBundle];
-    const layers = this.readLayers(bundles);
+    const profileText = readFile(this.profileFile);
+    const profile = profileText ? profileSchema.parse(JSON.parse(profileText)) : { bundles: [defaultBundle] };
+    const layers = this.readLayers(profile.bundles);
     const patchText = readFile(this.patchFile);
     const patch = patchText === undefined
       ? [...new Set(legacyDisabled)].map((name) => ({ id: entryId(name), disabled: true }))
       : parseYaml(patchText);
     if (!readOnly) {
-      if (profile === undefined) writeAtomic(this.profileFile, JSON.stringify({ bundles }, null, 2) + '\n');
+      if (profileText === undefined) this.writeProfile(profile);
       if (patchText === undefined) writeAtomic(this.patchFile, dump(patch));
-      if (!this.canRestore()) this.saveRecovery(bundles, patch);
+      if (!this.canRestore()) this.saveRecovery(profile, patch);
     }
-    this.bundles = bundles;
+    this.profile = profile;
     this.layers = layers;
     this.patch = patch;
   }
@@ -136,8 +139,27 @@ export class PluginComposition {
     return fs.existsSync(this.recoveryFile);
   }
 
-  private saveRecovery(bundles: string[], patch: LayerEntry[]): void {
-    writeAtomic(this.recoveryFile, JSON.stringify({ bundles, patch }));
+  private saveRecovery(profile: ProfileConfig, patch: LayerEntry[]): void {
+    writeAtomic(this.recoveryFile, JSON.stringify({ ...profile, patch }));
+  }
+
+  private writeProfile(profile: ProfileConfig): void {
+    writeAtomic(this.profileFile, JSON.stringify(profile, null, 2) + '\n');
+  }
+
+  get extensionBindings(): Readonly<NonNullable<ProfileConfig['extensions']>> | undefined {
+    return this.profile.extensions;
+  }
+
+  setFilePreviewProvider(pluginId: string | null): void {
+    if ((this.extensionBindings?.filePreviewProvider ?? null) === pluginId) return;
+    const profile = profileSchema.parse({
+      bundles: this.profile.bundles,
+      extensions: pluginId ? { filePreviewProvider: pluginId } : undefined,
+    });
+    this.saveRecovery(this.profile, this.patch);
+    this.writeProfile(profile);
+    this.profile = profile;
   }
 
   private readRecovery(file: string): z.infer<typeof recoverySchema> {
@@ -156,20 +178,20 @@ export class PluginComposition {
   }
 
   private applyRestore(
-    { bundles, patch }: z.infer<typeof recoverySchema>,
-    layers = this.readLayers(bundles),
+    { patch, ...profile }: z.infer<typeof recoverySchema>,
+    layers = this.readLayers(profile.bundles),
   ): void {
-    writeAtomic(this.profileFile, JSON.stringify({ bundles }, null, 2) + '\n');
+    this.writeProfile(profile);
     writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
     fs.rmSync(this.pendingRestoreFile);
-    this.bundles = bundles;
+    this.profile = profile;
     this.layers = layers;
     this.patch = patch;
   }
 
   private writePatch(patch: LayerEntry[]): void {
     entriesSchema.parse(patch);
-    this.saveRecovery(this.bundles, this.patch);
+    this.saveRecovery(this.profile, this.patch);
     writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
     this.patch = patch;
   }
@@ -193,7 +215,11 @@ export class PluginComposition {
       names.add(entry.name);
       return true;
     }).reverse();
-    return { bundles: [...this.bundles], entries: resolved };
+    return {
+      bundles: [...this.profile.bundles],
+      ...(this.extensionBindings && { extensions: { ...this.extensionBindings } }),
+      entries: resolved,
+    };
   }
 
   setEnabled(name: string, enabled: boolean, installed: readonly string[]): void {

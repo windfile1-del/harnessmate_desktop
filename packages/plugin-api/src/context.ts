@@ -11,6 +11,7 @@ import type {
 } from './events.js';
 import type { PLUGIN_API_VERSION } from './manifest.js';
 import type { PublicSlotRegistration } from './slots.js';
+import type { FilePreviewRenderer } from './file-preview.js';
 
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
@@ -673,5 +674,6 @@ export interface PluginModule<Ctx extends IsolatedPluginContext = IsolatedPlugin
   readonly optional?: readonly string[];
   readonly provides?: readonly string[];
   readonly requires?: readonly string[];
+  readonly renderFilePreview?: FilePreviewRenderer;
   apply(ctx: Ctx, config: Readonly<Record<string, unknown>>): void | Promise<void>;
 }

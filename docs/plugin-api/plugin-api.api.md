@@ -8,6 +8,7 @@
 import type { ApprovalAnnotateEvent, HandoffComposeEvent, HandoffComposeSection, HandoffOfferDecision, HandoffRedactEvent, HandoffRedactResult, HandoffShouldOfferEvent, PluginEventName, PluginEventV4 } from './events.js';
 import type { PLUGIN_API_VERSION } from './manifest.js';
 import type { PublicSlotRegistration } from './slots.js';
+import type { FilePreviewRenderer } from './file-preview.js';
 export declare const pluginErrorCodes: readonly ["E_PERMISSION_DENIED", "E_SERVICE_UNAVAILABLE", "E_NOT_SUPPORTED", "E_TIMEOUT", "E_INVALID_INPUT", "E_LIMIT_EXCEEDED", "E_CONFLICT", "E_STALE_RUN", "E_CIRCULAR_DEPENDENCY"];
 export type PluginErrorCode = typeof pluginErrorCodes[number];
 export declare class PluginApiError extends Error {
@@ -721,6 +722,7 @@ export interface PluginModule<Ctx extends IsolatedPluginContext = IsolatedPlugin
     readonly optional?: readonly string[];
     readonly provides?: readonly string[];
     readonly requires?: readonly string[];
+    readonly renderFilePreview?: FilePreviewRenderer;
     apply(ctx: Ctx, config: Readonly<Record<string, unknown>>): void | Promise<void>;
 }
 
@@ -930,7 +932,7 @@ import type { PluginRuntimeSlotDescriptor } from './slots.js';
 export declare const PLUGIN_RPC_PROTOCOL_VERSION = 1;
 export declare const HOST_FEATURES_V5: readonly ["harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
 export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
-export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal"];
+export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal", "ui.filePreview.v1"];
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 export interface PluginHandshakeRequest {
     trustedLocal?: boolean;
@@ -969,6 +971,7 @@ export interface PluginHandshakeResponse {
     hasHandoffCompose?: boolean;
     hasHandoffShouldOffer?: boolean;
     hasApprovalAnnotate?: boolean;
+    hasFilePreview?: boolean;
     hasHandoffRedact?: boolean;
     registeredDrivers?: PublicHarnessDriverDescriptor[];
 }
@@ -1323,4 +1326,42 @@ export interface PluginBrowserBridge {
     onFrame(listener: (frame: PluginBrowserFrame) => void): () => void;
     onStatus(listener: (status: PluginBrowserStatus) => void): () => void;
 }
+
+import { z } from 'zod';
+export declare const FILE_PREVIEW_FEATURE = "ui.filePreview.v1";
+export declare const FILE_PREVIEW_PERMISSION = "file:preview";
+export declare const FilePreviewContributionSchema: z.ZodObject<{
+    extensions: z.ZodEffects<z.ZodArray<z.ZodString, "many">, string[], string[]>;
+}, "strict", z.ZodTypeAny, {
+    extensions: string[];
+}, {
+    extensions: string[];
+}>;
+export interface FilePreviewRequest {
+    readonly version: 1;
+    readonly relativePath: string;
+    readonly content: string;
+    readonly truncated: boolean;
+    readonly sizeBytes: number;
+    readonly line?: number;
+}
+export declare const FilePreviewResultSchema: z.ZodObject<{
+    version: z.ZodLiteral<1>;
+    format: z.ZodEnum<["markdown", "text"]>;
+    content: z.ZodString;
+    line: z.ZodOptional<z.ZodNumber>;
+}, "strict", z.ZodTypeAny, {
+    version: 1;
+    format: "text" | "markdown";
+    content: string;
+    line?: number | undefined;
+}, {
+    version: 1;
+    format: "text" | "markdown";
+    content: string;
+    line?: number | undefined;
+}>;
+/** The optional line refers to the returned content. Return null to use the built-in preview. */
+export type FilePreviewResult = z.infer<typeof FilePreviewResultSchema>;
+export type FilePreviewRenderer = (request: FilePreviewRequest) => FilePreviewResult | null | Promise<FilePreviewResult | null>;
 ```

@@ -62,6 +62,7 @@ const sections = new Map();
 const composeListeners = new Set();
 const offerListeners = new Set();
 const annotateListeners = new Set();
+let filePreviewRenderer;
 const redactListeners = new Set();
 const configListeners = new Set();
 const driverHandlers = new Map();
@@ -602,6 +603,7 @@ async function handleMessage(message) {
       }
       const ctx = buildContext(params);
       await mod.apply(ctx, params.config || {});
+      filePreviewRenderer = typeof mod.renderFilePreview === 'function' ? mod.renderFilePreview.bind(mod) : undefined;
       handshakeCompleted = true;
       const serviceMethods = {};
       for (const [serviceName, impl] of providedServices) {
@@ -623,6 +625,7 @@ async function handleMessage(message) {
         hasHandoffCompose: composeListeners.size > 0,
         hasHandoffShouldOffer: offerListeners.size > 0,
         hasApprovalAnnotate: annotateListeners.size > 0,
+        hasFilePreview: Boolean(filePreviewRenderer),
         hasHandoffRedact: redactListeners.size > 0,
         registeredDrivers: [...driverHandlers.values()].map(({ descriptor }) => descriptor),
       };
@@ -683,6 +686,9 @@ async function handleMessage(message) {
         }
       }
       result = { text: currentText, categories };
+    } else if (method === 'host.filePreview.render') {
+      if (!filePreviewRenderer) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '插件未提供文件预览渲染器');
+      result = await filePreviewRenderer(params.request);
     } else if (method === 'host.approval.annotate') {
       const annotations = [];
       for (const listener of [...annotateListeners]) {

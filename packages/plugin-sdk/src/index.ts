@@ -9,6 +9,8 @@ import {
   isValidPluginSlotKey,
   normalizeAnyPluginSlotKey,
   type Disposer,
+  type FilePreviewRenderer,
+  type FilePreviewRequest,
   type HandoffRedactEvent,
   type HandoffRedactResult,
   type IsolatedPluginContext,
@@ -60,6 +62,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
   let activeRunId = '';
   let disposed = false;
   let handshakeCompleted = false;
+  let filePreviewRenderer: FilePreviewRenderer | undefined;
   let seq = 0;
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   const effects = new Set<Disposer>();
@@ -612,6 +615,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         }
         const ctx = buildContext(handshake);
         await mod.apply(ctx as unknown as Ctx, handshake.config);
+        filePreviewRenderer = mod.renderFilePreview?.bind(mod);
         handshakeCompleted = true;
         const serviceMethods: Record<string, string[]> = {};
         for (const [serviceName, impl] of providedServices) {
@@ -633,6 +637,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           hasHandoffCompose: composeListeners.size > 0,
           hasHandoffShouldOffer: offerListeners.size > 0,
           hasApprovalAnnotate: annotateListeners.size > 0,
+          hasFilePreview: Boolean(filePreviewRenderer),
           hasHandoffRedact: redactListeners.size > 0,
           registeredDrivers: [...driverHandlers.values()].map(({ descriptor }) => descriptor),
         } satisfies PluginHandshakeResponse;
@@ -701,6 +706,9 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           }
         }
         result = { text: currentText, categories };
+      } else if (method === 'host.filePreview.render') {
+        if (!filePreviewRenderer) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '插件未提供文件预览渲染器');
+        result = await filePreviewRenderer(params.request as FilePreviewRequest);
       } else if (method === 'host.approval.annotate') {
         const annotations: unknown[] = [];
         for (const listener of [...annotateListeners]) {

@@ -104,6 +104,7 @@ export const PluginScaffoldTemplateSchema = z.enum([
   'declarative',
   'browser-preview',
   'browser-workspace',
+  'markdown-preview',
   'harness-adapter',
 ]);
 export type PluginScaffoldTemplateDto = z.infer<typeof PluginScaffoldTemplateSchema>;

@@ -6,6 +6,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
+  FilePreviewResult,
   UpsertAgyInstanceRequest,
   BuilderV2AuditRequest,
   BuilderV2GenerateRequest,
@@ -152,6 +153,8 @@ export interface TerminalExecResult {
   durationMs: number;
   timedOut: boolean;
 }
+
+export type RenderedFilePreview = FilePreviewResult & { pluginId: string; pluginName: string };
 
 export interface PluginBundleResponse {
   plugins: InstalledPluginInfo[];
@@ -373,9 +376,16 @@ export const daemonApi = {
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
 
-  getPluginComposition: () => apiFetch<{ bundles: string[]; error?: string; safeMode: boolean; canRestore: boolean;
+  getPluginComposition: (workspaceId?: string) => apiFetch<{ bundles: string[]; error?: string; safeMode: boolean; canRestore: boolean;
     entries: Array<{ id: string; name: string; disabled: boolean; config: Record<string, unknown>; sources: string[] }>;
-  }>('/api/v1/plugins/composition'),
+    extensions?: { filePreviewProvider?: string };
+    filePreviewProviders: Array<{ id: string; name: string; extensions: string[]; ready: boolean; authorized: boolean }>;
+  }>(`/api/v1/plugins/composition${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`),
+
+  setFilePreviewProvider: (pluginId: string | null, workspaceId?: string) =>
+    apiFetch<{ ok: true }>('/api/v1/plugins/composition/file-preview', {
+      method: 'PUT', body: JSON.stringify({ pluginId, workspaceId }),
+    }),
 
   restorePluginComposition: (source: 'previous' | 'builtin') =>
     apiFetch<PluginBundleResponse>('/api/v1/plugins/composition/restore', {
@@ -809,6 +819,14 @@ export const daemonApi = {
     apiFetch<{ relativePath: string; content: string; truncated: boolean; sizeBytes: number }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-content?path=${encodeURIComponent(relativePath)}`, { signal },
     ),
+
+  renderSessionFile: (sessionId: string, path: string, line?: number, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ path });
+    if (line !== undefined) query.set('line', String(line));
+    return apiFetch<{ preview: RenderedFilePreview | null }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-preview?${query}`, { signal },
+    );
+  },
 
   getSessionRules: (sessionId: string) =>
     apiFetch<{ instructions: ProjectInstructionInfo[] }>(

@@ -10,6 +10,7 @@ export type PluginScaffoldTemplate =
   | 'declarative'
   | 'browser-preview'
   | 'browser-workspace'
+  | 'markdown-preview'
   | 'harness-adapter';
 
 export interface PluginScaffoldOptions {
@@ -49,6 +50,37 @@ export function scaffoldPluginFiles(options: PluginScaffoldOptions): PluginScaff
   const description = (options.description?.trim() || `${name} — HarnessMate V4 插件`).slice(0, 320);
   const author = (options.author?.trim() || 'Local Developer').slice(0, 80);
   const slug = toSlug(id);
+
+  if (options.template === 'markdown-preview') {
+    const manifest = {
+      id, name, version: '0.1.0', description, author, category: 'ui',
+      apiVersion: PLUGIN_MANIFEST_VERSION, engines: { pluginApi: '^4.0' },
+      main: 'index.mjs',
+      permissions: ['file:preview'],
+      contributes: { filePreview: { extensions: ['.md', '.markdown', '.mdown', '.mkd'] } },
+    };
+    return {
+      manifest,
+      files: {
+        'harnessmate-plugin.json': JSON.stringify(manifest, null, 2) + '\n',
+        'index.mjs': `export const requires = ['ui.filePreview.v1'];
+
+export function apply() {}
+
+/** @param {import('@harnessmate/plugin-sdk').FilePreviewRequest} file */
+export function renderFilePreview(file) {
+  return { version: 1, format: 'markdown', content: file.content, line: file.line };
+}
+`,
+        'README.md': `# Markdown 文件预览
+
+在插件中心的「开发」页关联此目录，或从「安装」页安装此目录。为要使用预览的工作区授权 \`file:preview\`，然后在「组合」页的「右侧文件预览」选择此插件。
+
+在会话中打开 Markdown 文件即可查看渲染结果。修改 \`index.mjs\` 可以改变预览内容。返回的 \`line\` 对应修改后的内容行号。选择「内置文本预览」可以单独关闭这项接管。
+`,
+      },
+    };
+  }
 
   if (options.template === 'harness-adapter') {
     const rawDriverId = (options.driverId?.trim() || slug).toLowerCase().replace(/[^a-z0-9_-]/g, '-');

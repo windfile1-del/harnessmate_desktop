@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { PluginActionSchema, PluginDataPanelSchema, PluginProgramSchema, PluginProjectionSchema } from './contributions.js';
 import { PluginSlotContributionSchema } from './slots.js';
+import { FILE_PREVIEW_PERMISSION, FilePreviewContributionSchema } from './file-preview.js';
 
 export const PLUGIN_API_VERSION = '4.0.0';
 export const PLUGIN_MANIFEST_VERSION = 4;
@@ -50,6 +51,7 @@ export const STATIC_PLUGIN_PERMISSIONS = [
   'notify',
   'clipboard:write',
   'browser:preview',
+  FILE_PREVIEW_PERMISSION,
   'tools:model',
 ] as const;
 export type StaticPluginPermission = typeof STATIC_PLUGIN_PERMISSIONS[number];
@@ -160,6 +162,7 @@ export const PluginContributesSchema = z.object({
   programs: z.array(PluginProgramSchema).max(12).optional(),
   actions: z.array(PluginActionSchema).max(12).optional(),
   slots: z.array(PluginSlotContributionSchema).max(12).optional(),
+  filePreview: FilePreviewContributionSchema.optional(),
   settings: z.record(PluginSettingSchema).optional(),
   uiSlots: z
     .array(z.enum(['sidebar_tool', 'inspector_tab', 'composer_action', 'modal']))

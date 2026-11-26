@@ -59,12 +59,30 @@ function extractText(node: ReactNode): string {
   return '';
 }
 
-export const MarkdownView = memo(function MarkdownView({ content, onOpenFile }: {
+type MarkdownElement = {
+  type: string;
+  properties?: Record<string, unknown>;
+  position?: { start: { line: number }; end: { line: number } };
+};
+
+export const MarkdownView = memo(function MarkdownView({ content, onOpenFile, filePreview }: {
   content: string;
   onOpenFile?: (file: FileLink) => void;
+  filePreview?: { line?: number };
 }) {
+  const isFilePreview = Boolean(filePreview);
+  const sourceLine = filePreview?.line;
+  const rehypePlugins = useMemo(() => {
+    if (!sourceLine) return [rehypeHighlight];
+    return [rehypeHighlight, () => (tree: { children: MarkdownElement[] }) => {
+      const block = tree.children.find((node) => node.type === 'element' && node.position
+        && node.position.start.line <= sourceLine && node.position.end.line >= sourceLine);
+      if (block?.properties) block.properties.dataFilePreviewLine = String(sourceLine);
+    }];
+  }, [sourceLine]);
   const components = useMemo<Components>(() => ({
           a({ href, children, title }) {
+            if (isFilePreview && !href) return <>{children}</>;
             const file = onOpenFile && href ? parseFileLink(href) : null;
             if (file) return <button type="button" className="cursor-pointer break-all text-[var(--accent-indigo)] underline"
               title={title ?? file.path} onClick={() => onOpenFile?.(file)}>{children}</button>;
@@ -76,7 +94,12 @@ export const MarkdownView = memo(function MarkdownView({ content, onOpenFile }: 
                 }
               }}>{children}</a>;
           },
-          pre({ children }) {
+          ...(isFilePreview && {
+            img: ({ alt }: { alt?: string }) => alt ? <span>{alt}</span> : null,
+          }),
+          pre({ children, node }) {
+            const line = node?.properties.dataFilePreviewLine;
+            if (line) return <div data-file-preview-line={line}>{children}</div>;
             return <>{children}</>;
           },
           code({ className, children, ...rest }) {
@@ -90,12 +113,12 @@ export const MarkdownView = memo(function MarkdownView({ content, onOpenFile }: 
             }
             return <CodeBlock className={className}>{children}</CodeBlock>;
           },
-  }), [onOpenFile]);
+  }), [onOpenFile, isFilePreview]);
   return (
     <div className="hm-prose">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        rehypePlugins={rehypePlugins}
         urlTransform={(url, key) => key === 'href' && onOpenFile && parseFileLink(url) ? url : defaultUrlTransform(url)}
         components={components}
       >

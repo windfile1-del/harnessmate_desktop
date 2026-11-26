@@ -388,6 +388,9 @@ export class IsolatedPluginManager {
         let handshake: PluginHandshakeResponse;
         try {
           handshake = await proc.handshake();
+          if (info.contributes.filePreview && !handshake.hasFilePreview) {
+            throw new PluginApiError('E_INVALID_INPUT', '文件预览插件必须导出 renderFilePreview(file)');
+          }
         } catch (error) {
           this.cleanupPluginDrivers(placeholder);
           await this.cliProcesses.killAllForRun(info.id, proc.runId);

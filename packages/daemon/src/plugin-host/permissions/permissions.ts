@@ -44,6 +44,7 @@ const STATIC_PERMISSION_META: Record<string, PermissionMeta> = {
   notify: { description: '发送桌面通知', risk: 'low', scope: 'global' },
   'clipboard:write': { description: '写入系统剪贴板', risk: 'low', scope: 'global' },
   'browser:preview': { description: '在独立 Chromium 中显示和操作 HTTP(S) 页面，包括本机开发页面', risk: 'medium', scope: 'global' },
+  'file:preview': { description: '读取此工作区中当前打开的预览文件并提供渲染结果', risk: 'medium', scope: 'workspace' },
   'tools:model': { description: '通过官方 MCP 通道向模型注册会话级工具', risk: 'medium', scope: 'workspace' },
 };
 

@@ -760,6 +760,24 @@
               },
               "maxItems": 12
             },
+            "filePreview": {
+              "type": "object",
+              "properties": {
+                "extensions": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^\\.[a-z0-9][a-z0-9_-]{0,15}$"
+                  },
+                  "minItems": 1,
+                  "maxItems": 24
+                }
+              },
+              "required": [
+                "extensions"
+              ],
+              "additionalProperties": false
+            },
             "settings": {
               "type": "object",
               "additionalProperties": {

@@ -298,6 +298,7 @@ export function PluginDevPanel({
               <option value="ui-slot">纯声明式沙箱 UI 插槽</option>
               <option value="browser-preview">浏览器预览</option>
               <option value="browser-workspace">浏览器工作页（本地后端）</option>
+              <option value="markdown-preview">Markdown 文件预览</option>
               <option value="service">第三方服务提供方 (provides)</option>
               <option value="declarative">纯声明式斜杠命令 + 数据面板</option>
             </select>

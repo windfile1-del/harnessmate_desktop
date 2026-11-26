@@ -1,5 +1,6 @@
 import type { PluginErrorCode, PublicHarnessDriverDescriptor } from './context.js';
 import type { PluginRuntimeSlotDescriptor } from './slots.js';
+import { FILE_PREVIEW_FEATURE } from './file-preview.js';
 
 export const PLUGIN_RPC_PROTOCOL_VERSION = 1;
 
@@ -30,6 +31,7 @@ export const HOST_SUPPORTED_FEATURES = [
   ...HOST_FEATURES_V5,
   'ui.workspace.pages',
   'runtime.trustedLocal',
+  FILE_PREVIEW_FEATURE,
 ] as const;
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 
@@ -62,6 +64,7 @@ export interface PluginHandshakeResponse {
   hasHandoffCompose?: boolean;
   hasHandoffShouldOffer?: boolean;
   hasApprovalAnnotate?: boolean;
+  hasFilePreview?: boolean;
   hasHandoffRedact?: boolean;
   registeredDrivers?: PublicHarnessDriverDescriptor[];
 }
