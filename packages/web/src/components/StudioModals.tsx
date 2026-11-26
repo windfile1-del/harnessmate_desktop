@@ -112,6 +112,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
     installPlugin,
     uninstallPlugin,
     reloadPlugins,
+    restorePluginComposition,
     rollbackPlugin,
     pushToast,
   } = useAppStore();
@@ -144,12 +145,11 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
   }, [refreshPlugins, pushToast]);
 
   useEffect(() => {
-    if (tab !== 'composition') return;
     let current = true;
     void daemonApi.getPluginComposition().then((result) => { if (current) setComposition(result); })
       .catch((error: Error) => { if (current) pushToast({ kind: 'error', title: '无法读取组合', body: error.message }); });
     return () => { current = false; };
-  }, [tab, plugins, pushToast]);
+  }, [plugins, pushToast]);
 
   useEffect(() => {
     if (tab !== 'catalog') return;
@@ -302,6 +302,11 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
       </div>
 
       <div className="max-h-[480px] overflow-y-auto p-5">
+        {composition?.safeMode && (
+          <p role="status" className="mb-3 text-[12px] text-[var(--text-secondary)]">
+            安全模式正在使用内置组合。恢复完成后，可从托盘重新正常启动。
+          </p>
+        )}
         {tab === 'installed' && (
           <div className="space-y-2.5">
             {permissionPlugin && <PluginPermissionsEditor key={permissionPlugin.id} plugin={permissionPlugin}
@@ -380,7 +385,8 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                           color: 'var(--accent-star)',
                         }}
                       >
-                        {p.devMode ? '开发中' : p.runtimeMode === 'isolated' ? '隔离进程' : '外部插件'}
+                        {p.devTrustedLocal ? '可信本地' :
+                          p.devMode ? '开发中' : p.runtimeMode === 'isolated' ? '隔离进程' : '外部插件'}
                       </span>
                     )}
                     {p.devMode && p.runtimeMode === 'isolated' && (
@@ -498,8 +504,16 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                       <Trash2 size={13.5} />
                     </button>
                   )}
-                  <button
+                  {composition?.safeMode && !p.builtin && (
+                    <button type="button" disabled={busy || Boolean(composition.error)}
+                      className="text-[11px] text-[var(--text-secondary)]"
+                      onClick={() => void runPluginAction(() => togglePlugin(p.id, false))}>下次启动停用</button>
+                  )}
+                  {!composition?.safeMode && <button
                     type="button"
+                    role="switch"
+                    aria-checked={p.enabled}
+                    aria-label={`启用 ${p.name}`}
                     disabled={busy}
                     onClick={() => void runPluginAction(() => togglePlugin(p.id, !p.enabled))}
                     className="relative h-5 w-10 cursor-pointer rounded-full transition-colors"
@@ -511,7 +525,7 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
                       className="absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white transition-transform"
                       style={{ transform: p.enabled ? 'translateX(20px)' : 'translateX(0)' }}
                     />
-                  </button>
+                  </button>}
                 </div>
               </div>
             ))}
@@ -753,6 +767,22 @@ export function PluginStudioModal({ onClose }: { onClose: () => void }) {
           <div className="space-y-2 text-[12px]">
             <p className="text-[var(--text-secondary)]">组合包 · {composition.bundles.join(' → ') || '无'}</p>
             {composition.error && <p role="alert" className="text-[var(--accent-rose)]">{composition.error}</p>}
+            <div className="flex flex-wrap gap-2">
+              <button type="button" disabled={busy || !composition.canRestore}
+                className="rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 disabled:opacity-50"
+                onClick={() => {
+                  if (window.confirm('恢复上一套组合配置？恢复后插件启停状态可能变化。')) {
+                    void runPluginAction(() => restorePluginComposition('previous'));
+                  }
+                }}>恢复上一套配置</button>
+              <button type="button" disabled={busy}
+                className="rounded-lg border border-[var(--border-hairline)] px-2.5 py-1 disabled:opacity-50"
+                onClick={() => {
+                  if (window.confirm('恢复内置组合并停用第三方插件？插件文件和历史数据会保留。')) {
+                    void runPluginAction(() => restorePluginComposition('builtin'));
+                  }
+                }}>恢复内置组合</button>
+            </div>
             {composition.entries.map((entry) => {
               const plugin = plugins.find(({ id }) => id === entry.name);
               return <div key={entry.id} className="rounded-xl border border-[var(--border-hairline)] p-3">

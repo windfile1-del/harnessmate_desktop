@@ -627,10 +627,11 @@ export const InstalledPluginInfoSchema = PluginManifestSchema.extend({
   runtimeState: z.enum(['PENDING', 'LOADING', 'ACTIVE', 'UNLOADING', 'DISPOSED', 'FAILED']).optional(),
   missingServices: z.array(z.string()).optional(),
   runId: z.string().optional(),
-  runtimeMode: z.enum(['kernel', 'isolated', 'declarative']).optional(),
+  runtimeMode: z.enum(['kernel', 'isolated', 'trusted-local', 'declarative']).optional(),
   runtimeSlots: z.array(PluginSlotContributionSchema).optional(),
   devMode: z.boolean().optional(),
   devSourceDir: z.string().nullable().optional(),
+  devTrustedLocal: z.boolean().optional(),
 });
 export type InstalledPluginInfo = z.infer<typeof InstalledPluginInfoSchema>;
 

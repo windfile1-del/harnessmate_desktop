@@ -702,6 +702,7 @@
                   "slot": {
                     "type": "string",
                     "enum": [
+                      "workspace.pages",
                       "session.header.title",
                       "sidebar.tools",
                       "composer.actions",

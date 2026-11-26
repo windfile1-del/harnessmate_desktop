@@ -19,6 +19,7 @@ import { formatRelativeTime, resolveHarnessMeta } from '../lib/harness-meta';
 import { isImeComposing } from '../lib/ime';
 import { filterTriage, isTriageEnabled, isTriagePending, sortTriage, type TriageFilter } from '../lib/triage';
 import { Slot, SlotSessionProvider, useSlotItems } from '../slots';
+import { PluginWorkspaceLinks } from '../slots/PluginWorkspace';
 import { useAppStore } from '../stores/app-store';
 import { StarLoomCrest } from './BrandMark';
 import { TriageFilters } from './TriageInbox';
@@ -200,6 +201,7 @@ export function Sidebar() {
           />
         </div>
       )}
+      <PluginWorkspaceLinks />
 
       {/* Workspaces Strip */}
       <div className="px-3.5 pb-2.5">

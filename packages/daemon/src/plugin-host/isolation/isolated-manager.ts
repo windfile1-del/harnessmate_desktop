@@ -321,6 +321,7 @@ export class IsolatedPluginManager {
       provides: info.provides,
       config,
       apply: async (ctx, resolvedConfig) => {
+        await this.awaitPendingDisposals();
         // Pre-validate service replacement permissions before spawning if plugin declares built-in public services
         for (const service of info.provides ?? []) {
           if (isReservedServiceName(service)) {
@@ -334,6 +335,7 @@ export class IsolatedPluginManager {
         let procRef: IsolatedPluginProcess | undefined;
         const proc = new IsolatedPluginProcess({
           pluginId: info.id,
+          trustedLocal: info.devTrustedLocal,
           packageRoot,
           entryRelativePath,
           packageDigest: digest,

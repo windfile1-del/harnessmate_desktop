@@ -28,10 +28,13 @@ export const HOST_SUPPORTED_FEATURES = [
   'net.fetch',
   'ui.slots',
   ...HOST_FEATURES_V5,
+  'ui.workspace.pages',
+  'runtime.trustedLocal',
 ] as const;
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 
 export interface PluginHandshakeRequest {
+  trustedLocal?: boolean;
   protocolVersion: number;
   pluginApi: string;
   features: readonly string[];

@@ -637,6 +637,8 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
     listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
   };
   readonly runtime: {
+    /** Whether the user authorized direct system access for this development instance. */
+    readonly trustedLocal?: boolean;
     spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
   };
   readonly sessions: IsolatedPluginContext['sessions'] & {

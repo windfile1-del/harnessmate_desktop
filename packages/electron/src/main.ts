@@ -19,6 +19,7 @@ import { registerPluginBrowser } from './plugin-browser';
 const DAEMON_PORT = Number(process.env.HARNESSMATE_PORT || 4789);
 const DEV_WEB_URL = process.env.HARNESSMATE_DEV_URL || 'http://127.0.0.1:5173';
 const IS_DEV = process.env.HARNESSMATE_DEV === '1';
+const SAFE_MODE = process.argv.includes('--safe-mode');
 const APP_URL = IS_DEV ? DEV_WEB_URL : `http://127.0.0.1:${DAEMON_PORT}`;
 
 // Enforce single instance so re-launching the .exe brings the existing tray/window to focus
@@ -84,14 +85,14 @@ function resolveAppIconPath(): string | null {
   return null;
 }
 
-async function checkDaemonHealth(): Promise<{ ok: boolean; daemonVersion?: string }> {
+async function checkDaemonHealth(): Promise<{ ok: boolean; daemonVersion?: string; pluginSafeMode?: boolean }> {
   try {
     const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/api/v1/health`, {
       signal: AbortSignal.timeout(1200),
     });
     if (!res.ok) return { ok: false };
-    const data = (await res.json()) as { daemonVersion?: string };
-    return { ok: true, daemonVersion: data.daemonVersion };
+    const data = (await res.json()) as { daemonVersion?: string; pluginSafeMode?: boolean };
+    return { ok: true, daemonVersion: data.daemonVersion, pluginSafeMode: data.pluginSafeMode };
   } catch {
     return { ok: false };
   }
@@ -99,10 +100,11 @@ async function checkDaemonHealth(): Promise<{ ok: boolean; daemonVersion?: strin
 
 async function ensureDaemonRunning(): Promise<void> {
   const expectedVersion = app.getVersion();
+  const matches = (health: Awaited<ReturnType<typeof checkDaemonHealth>>) =>
+    health.ok && health.daemonVersion === expectedVersion && Boolean(health.pluginSafeMode) === SAFE_MODE;
   const existing = await checkDaemonHealth();
   if (existing.ok) {
-    if (existing.daemonVersion === expectedVersion) return;
-    // Different/older daemon version on the same port: request graceful shutdown before spawning ours
+    if (matches(existing)) return;
     try {
       await fetch(`http://127.0.0.1:${DAEMON_PORT}/api/v1/shutdown`, {
         method: 'POST',
@@ -113,7 +115,7 @@ async function ensureDaemonRunning(): Promise<void> {
     }
     for (let i = 0; i < 15; i++) {
       if (!(await checkDaemonHealth()).ok) break;
-      if (i === 14) throw new Error('旧版 HarnessMate 后台仍在运行，请从托盘退出后重新打开。');
+      if (i === 14) throw new Error('HarnessMate 后台仍在运行，请从托盘退出后重新打开。');
       await new Promise((r) => setTimeout(r, 150));
     }
   }
@@ -126,7 +128,7 @@ async function ensureDaemonRunning(): Promise<void> {
   const webDist = resolveWebDistDir();
   let stderrLog = '';
 
-  daemonProcess = spawn(process.execPath, ['--no-warnings', entry], {
+  daemonProcess = spawn(process.execPath, ['--no-warnings', entry, ...(SAFE_MODE ? ['--safe-mode'] : [])], {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
@@ -147,7 +149,7 @@ async function ensureDaemonRunning(): Promise<void> {
 
   for (let i = 0; i < 60; i++) {
     const h = await checkDaemonHealth();
-    if (h.ok && h.daemonVersion === expectedVersion) return;
+    if (matches(h)) return;
     if (daemonProcess.exitCode !== null) {
       throw new Error(
         `HarnessMate daemon exited prematurely (code=${daemonProcess.exitCode}).\n${stderrLog}`,
@@ -225,6 +227,13 @@ function createWindow(): void {
   });
 }
 
+function restartInMode(safeMode: boolean): void {
+  const args = process.argv.slice(1).filter((arg) => arg !== '--safe-mode');
+  if (safeMode) args.push('--safe-mode');
+  app.relaunch({ args });
+  app.quit();
+}
+
 function createTray(): void {
   const iconPath = resolveAppIconPath();
   let trayImage = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
@@ -247,6 +256,10 @@ function createTray(): void {
       {
         label: '打开 HarnessMate 窗口',
         click: () => showOrCreateWindow(),
+      },
+      {
+        label: SAFE_MODE ? '重新正常启动' : '重新以安全模式启动',
+        click: () => restartInMode(!SAFE_MODE),
       },
       { type: 'separator' },
       {
@@ -285,7 +298,11 @@ ipcMain.on('desktop:notify', (event, payload: { title: string; body: string }) =
   }
 });
 
-app.on('second-instance', () => {
+app.on('second-instance', (_event, args) => {
+  if (!SAFE_MODE && args.includes('--safe-mode') && !isQuitting) {
+    restartInMode(true);
+    return;
+  }
   showOrCreateWindow();
 });
 
@@ -295,10 +312,14 @@ app.whenReady().then(async () => {
     createTray();
     createWindow();
   } catch (err) {
-    dialog.showErrorBox(
-      'HarnessMate Desktop 启动失败',
-      err instanceof Error ? err.message : String(err),
-    );
+    const { response } = await dialog.showMessageBox({
+      type: 'error',
+      title: 'HarnessMate Desktop 启动失败',
+      message: err instanceof Error ? err.message : String(err),
+      buttons: SAFE_MODE ? ['退出'] : ['退出', '以安全模式启动'],
+      cancelId: 0,
+    });
+    if (!SAFE_MODE && response === 1) { restartInMode(true); return; }
     isQuitting = true;
     killDaemonProcess();
     app.quit();

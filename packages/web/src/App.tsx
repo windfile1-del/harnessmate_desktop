@@ -1,6 +1,7 @@
 import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
+import { ChatStage } from './components/ChatStage';
 import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
 import { registerSubagentManagerView } from './components/agy/native/child/register';
 import { registerSwarmStudioView } from './components/agy/native/swarm/register';
@@ -8,7 +9,7 @@ import { registerBoostStudioView } from './components/agy/native/boost/register'
 import { registerTeamworkStudioView } from './components/agy/native/teamwork/register';
 import { registerDynamicWorkflowStudioView } from './components/agy/native/workflow';
 import { registerNativeTasksView } from './components/agy/native/tasks/register';
-import { ChatStage } from './components/ChatStage';
+import { PluginWorkspaceStage } from './slots/PluginWorkspace';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
 import { TriageInboxLifecycle, openTriageSession } from './components/TriageInbox';
@@ -171,7 +172,7 @@ export function App() {
         <div className="flex h-screen w-screen flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {!sidebarCollapsed && <Sidebar />}
-            <ChatStage />
+            <PluginWorkspaceStage><ChatStage /></PluginWorkspaceStage>
             <ModalHost />
           </div>
           <StatusbarSlotStrip session={selectedSession} />

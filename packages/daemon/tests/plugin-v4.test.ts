@@ -9,6 +9,8 @@ import { PluginEvents, sessionPluginEvent } from '../src/plugin-host/runtime/eve
 import { toPluginEvent } from '../src/plugin-host/runtime/map-event.js';
 import { composeSnapshot } from '../src/core/handoff-snapshot.js';
 import { createDaemon } from '../src/server/app.js';
+import { readRevisionPointer } from '../src/plugins/plugin-package.js';
+import { PluginComposition } from '../src/plugin-host/composition/profile.js';
 
 it('migrates adjacent manifest generations and rejects incompatible API ranges', () => {
   const base = { id: 'fixture.v4', name: 'Fixture', description: '' };
@@ -164,3 +166,116 @@ it('requires digest-bound confirmation for pasted and catalog CLI contributions'
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+it('starts with builtins in safe mode and restores a damaged composition for the next launch', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-plugin-recovery-'));
+  const patch = path.join(root, 'patch.yml');
+  const manifest = PluginManifestSchema.parse({
+    id: 'fixture.recovery', name: 'Recovery fixture', description: '', apiVersion: 4,
+    engines: { pluginApi: '^4.0' }, main: 'index.mjs',
+    contributes: { slashCommands: [{ command: 'recovery-test', description: '', template: 'Active {{args}}' }] },
+  });
+  let daemon = createDaemon({ dataDir: root, port: 0 });
+  try {
+    await daemon.start();
+    const source = path.join(root, 'source');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'harnessmate-plugin.json'), JSON.stringify(manifest));
+    fs.writeFileSync(path.join(source, 'index.mjs'), 'export function apply() {}\n');
+    const request = { mode: 'local_dir', dirPath: source } as const;
+    const preview = daemon.pluginManager.previewInstall(request);
+    await daemon.pluginManager.installPlugin({ ...request, trustCode: true, expectedDigest: preview.digest });
+    expect(daemon.pluginManager.isolated?.getRunId(manifest.id)).toBeDefined();
+    expect(daemon.pluginManager.expandSlashCommand('/recovery-test yes').text).toBe('Active yes');
+    await daemon.pluginManager.togglePlugin('core.harness.codex', false);
+    const profile = fs.readFileSync(path.join(root, 'profile.json'), 'utf8');
+    await daemon.stop();
+    const damagedPatch = '- id: [';
+    fs.writeFileSync(patch, damagedPatch);
+
+    daemon = createDaemon({ dataDir: root, port: 0, pluginSafeMode: true });
+    await daemon.start();
+    expect((await daemon.app.inject('/api/v1/health')).json()).toMatchObject({ pluginSafeMode: true });
+    expect(daemon.pluginManager.getComposition()).toMatchObject({ safeMode: true, canRestore: true, error: expect.any(String) });
+    expect(daemon.pluginManager.isolated?.getRunId(manifest.id)).toBeUndefined();
+    expect(daemon.pluginManager.expandSlashCommand('/recovery-test yes').text).toBe('/recovery-test yes');
+    expect(daemon.registry.get('codex')).toBeDefined();
+    expect(fs.readFileSync(patch, 'utf8')).toBe(damagedPatch);
+    expect(fs.readFileSync(path.join(root, 'profile.json'), 'utf8')).toBe(profile);
+    const response = await daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/composition/restore', payload: { source: 'previous' },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(daemon.pluginManager.getComposition().error).toBeUndefined();
+    expect(daemon.pluginManager.isPluginEnabled(manifest.id)).toBe(false);
+    await expect(daemon.pluginManager.togglePlugin(manifest.id, true)).rejects.toThrow('安全模式');
+    await daemon.pluginManager.togglePlugin(manifest.id, false);
+    await daemon.stop();
+
+    daemon = createDaemon({ dataDir: root, port: 0 });
+    await daemon.start();
+    expect(daemon.pluginManager.getComposition().safeMode).toBe(false);
+    expect(daemon.registry.get('codex')).toBeDefined();
+    expect(daemon.pluginManager.isPluginEnabled(manifest.id)).toBe(false);
+  } finally {
+    await daemon.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+it('completes an interrupted composition restore on normal startup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-composition-restore-'));
+  try {
+    const journal = path.join(root, 'plugin-composition.restore.json');
+    fs.writeFileSync(path.join(root, 'profile.json'), '{"bundles":["broken"]}');
+    fs.writeFileSync(path.join(root, 'patch.yml'), 'broken: [');
+    fs.writeFileSync(journal, JSON.stringify({
+      bundles: ['harnessmate-core'], patch: [{ id: 'ledger', disabled: true }],
+    }));
+    const composition = new PluginComposition(root, ['core.task-ledger']);
+    expect(() => composition.reload([], true)).toThrow('找不到组合包');
+    expect(fs.existsSync(journal)).toBe(true);
+    composition.reload([]);
+    expect(fs.existsSync(journal)).toBe(false);
+    expect(composition.resolve([]).entries[0]).toMatchObject({ id: 'ledger', disabled: true });
+    expect(JSON.parse(fs.readFileSync(path.join(root, 'profile.json'), 'utf8'))).toEqual({ bundles: ['harnessmate-core'] });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('keeps the active revision when a rollback candidate cannot start', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-plugin-rollback-'));
+  const pluginId = 'fixture.rollback-recovery';
+  const source = path.join(root, 'source');
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, 'index.mjs'), 'export function apply() {}\n');
+  const daemon = createDaemon({ dataDir: root, port: 0 });
+  try {
+    await daemon.start();
+    for (const version of ['1.0.0', '2.0.0']) {
+      fs.writeFileSync(path.join(source, 'harnessmate-plugin.json'), JSON.stringify({
+        id: pluginId, name: 'Rollback fixture', description: '', version, apiVersion: 4,
+        engines: { pluginApi: '^4.0' }, main: 'index.mjs', inject: version === '1.0.0' ? ['ledger'] : [],
+      }));
+      const request = { mode: 'local_dir', dirPath: source } as const;
+      const preview = daemon.pluginManager.previewInstall(request);
+      await daemon.pluginManager.installPlugin({ ...request, trustCode: true, expectedDigest: preview.digest });
+    }
+    const pluginRoot = path.join(daemon.paths.pluginsDir, pluginId);
+    const pointer = readRevisionPointer(pluginRoot);
+    expect(pointer?.previous).toBeDefined();
+    await daemon.pluginManager.togglePlugin('core.task-ledger', false);
+    await expect(daemon.pluginManager.rollbackPlugin(pluginId)).rejects.toThrow('回退版本未就绪');
+    expect(readRevisionPointer(pluginRoot)).toEqual(pointer);
+    expect(daemon.pluginManager.listInstalled().find(({ id }) => id === pluginId))
+      .toMatchObject({ version: '2.0.0', runtimeState: 'ACTIVE' });
+    await daemon.pluginManager.togglePlugin('core.task-ledger', true);
+    await daemon.pluginManager.rollbackPlugin(pluginId);
+    expect(daemon.pluginManager.listInstalled().find(({ id }) => id === pluginId))
+      .toMatchObject({ version: '1.0.0', runtimeState: 'ACTIVE' });
+  } finally {
+    await daemon.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);

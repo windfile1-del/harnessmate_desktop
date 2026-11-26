@@ -21,6 +21,7 @@ const entriesSchema = z.array(entrySchema).max(512).superRefine((entries, ctx) =
 const profileSchema = z.object({ bundles: z.array(identifier).max(32) }).strict();
 
 type LayerEntry = z.infer<typeof entrySchema>;
+const recoverySchema = profileSchema.extend({ patch: entriesSchema });
 export interface CompositionEntry {
   id: string;
   name: string;
@@ -33,9 +34,9 @@ export interface PluginProfile {
   entries: CompositionEntry[];
 }
 
-function readFile(file: string): string | undefined {
+function readFile(file: string, maxBytes = 512 * 1024): string | undefined {
   if (!fs.existsSync(file)) return;
-  if (fs.statSync(file).size > 512 * 1024) throw new PluginApiError('E_LIMIT_EXCEEDED', `组合文件过大 · ${path.basename(file)}`);
+  if (fs.statSync(file).size > maxBytes) throw new PluginApiError('E_LIMIT_EXCEEDED', `组合文件过大 · ${path.basename(file)}`);
   return fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
 }
 
@@ -83,6 +84,8 @@ const defaultBuiltinEntry = (name: string): LayerEntry =>
 export class PluginComposition {
   private readonly profileFile: string;
   private readonly patchFile: string;
+  private readonly recoveryFile: string;
+  private readonly pendingRestoreFile: string;
   private bundles = [defaultBundle];
   private layers: Array<{ source: string; entries: LayerEntry[] }> = [];
   private patch: LayerEntry[] = [];
@@ -90,14 +93,36 @@ export class PluginComposition {
   constructor(private readonly directory: string, private readonly builtin: readonly string[]) {
     this.profileFile = path.join(directory, 'profile.json');
     this.patchFile = path.join(directory, 'patch.yml');
+    this.recoveryFile = path.join(directory, 'plugin-composition.previous.json');
+    this.pendingRestoreFile = path.join(directory, 'plugin-composition.restore.json');
     this.layers = [{ source: defaultBundle, entries: builtin.map(defaultBuiltinEntry) }];
   }
 
-  reload(legacyDisabled: readonly string[]): void {
+  reload(legacyDisabled: readonly string[], readOnly = false): void {
+    if (!readOnly && fs.existsSync(this.pendingRestoreFile)) {
+      this.applyRestore(this.readRecovery(this.pendingRestoreFile));
+      return;
+    }
     const profile = readFile(this.profileFile);
     const bundles = profile ? profileSchema.parse(JSON.parse(profile)).bundles : [defaultBundle];
+    const layers = this.readLayers(bundles);
+    const patchText = readFile(this.patchFile);
+    const patch = patchText === undefined
+      ? [...new Set(legacyDisabled)].map((name) => ({ id: entryId(name), disabled: true }))
+      : parseYaml(patchText);
+    if (!readOnly) {
+      if (profile === undefined) writeAtomic(this.profileFile, JSON.stringify({ bundles }, null, 2) + '\n');
+      if (patchText === undefined) writeAtomic(this.patchFile, dump(patch));
+      if (!this.canRestore()) this.saveRecovery(bundles, patch);
+    }
+    this.bundles = bundles;
+    this.layers = layers;
+    this.patch = patch;
+  }
+
+  private readLayers(bundles: readonly string[]) {
     if (new Set(bundles).size !== bundles.length) throw new PluginApiError('E_CONFLICT', '组合包列表含有重复项');
-    const layers = bundles.map((bundle) => {
+    return bundles.map((bundle) => {
       if (bundle === defaultBundle) {
         return { source: bundle, entries: this.builtin.map(defaultBuiltinEntry) };
       }
@@ -105,14 +130,47 @@ export class PluginComposition {
       if (content === undefined) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `找不到组合包 ${bundle}`);
       return { source: bundle, entries: parseYaml(content) };
     });
-    const patchText = readFile(this.patchFile);
-    const patch = patchText === undefined
-      ? [...new Set(legacyDisabled)].map((name) => ({ id: entryId(name), disabled: true }))
-      : parseYaml(patchText);
-    if (profile === undefined) writeAtomic(this.profileFile, JSON.stringify({ bundles }, null, 2) + '\n');
-    if (patchText === undefined) writeAtomic(this.patchFile, dump(patch));
+  }
+
+  canRestore(): boolean {
+    return fs.existsSync(this.recoveryFile);
+  }
+
+  private saveRecovery(bundles: string[], patch: LayerEntry[]): void {
+    writeAtomic(this.recoveryFile, JSON.stringify({ bundles, patch }));
+  }
+
+  private readRecovery(file: string): z.infer<typeof recoverySchema> {
+    const text = readFile(file, 2 * 1024 * 1024);
+    if (text === undefined) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '没有可恢复的组合配置');
+    return recoverySchema.parse(JSON.parse(text));
+  }
+
+  restore(disabledPlugins?: readonly string[]): void {
+    const snapshot = disabledPlugins
+      ? recoverySchema.parse({ bundles: [defaultBundle], patch: disabledPlugins.map((id) => ({ id, disabled: true })) })
+      : this.readRecovery(this.recoveryFile);
+    const layers = this.readLayers(snapshot.bundles);
+    writeAtomic(this.pendingRestoreFile, JSON.stringify(snapshot));
+    this.applyRestore(snapshot, layers);
+  }
+
+  private applyRestore(
+    { bundles, patch }: z.infer<typeof recoverySchema>,
+    layers = this.readLayers(bundles),
+  ): void {
+    writeAtomic(this.profileFile, JSON.stringify({ bundles }, null, 2) + '\n');
+    writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
+    fs.rmSync(this.pendingRestoreFile);
     this.bundles = bundles;
     this.layers = layers;
+    this.patch = patch;
+  }
+
+  private writePatch(patch: LayerEntry[]): void {
+    entriesSchema.parse(patch);
+    this.saveRecovery(this.bundles, this.patch);
+    writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
     this.patch = patch;
   }
 
@@ -147,16 +205,15 @@ export class PluginComposition {
     if (!entry) value.name = name;
     if ((baseline?.disabled ?? false) === !enabled) delete value.disabled;
     else value.disabled = !enabled;
+    if (value.disabled === existing.disabled && value.name === existing.name) return;
     const patch = this.patch.filter((item) => item.id !== id);
     if (value.disabled !== undefined || value.name || value.config) patch.push(value);
-    writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
-    this.patch = patch;
+    this.writePatch(patch);
   }
 
   removePlugin(name: string): void {
     const patch = this.patch.filter((entry) => entry.name !== name && entry.id !== name);
     if (patch.length === this.patch.length) return;
-    writeAtomic(this.patchFile, dump(patch, { noRefs: true }));
-    this.patch = patch;
+    this.writePatch(patch);
   }
 }

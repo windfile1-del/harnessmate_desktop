@@ -154,6 +154,7 @@ export interface CreateDaemonOptions {
   binaryOverrides?: Record<string, string>;
   webDistDir?: string | null;
   pluginCrashPolicy?: CrashPolicy;
+  pluginSafeMode?: boolean;
   nativeFeatureFlags?: Partial<AgyNativeFeatureFlags>;
 }
 
@@ -234,7 +235,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       { service: triageInbox, bus: eventBus },
       paths.agyProfilesDir,
     ),
-    { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy,
+    { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
   const pluginAuthoring = new PluginAuthoring(registry);
@@ -353,6 +354,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.get('/api/v1/health', async () => ({
     status: 'ok',
     daemonVersion: process.env.HARNESSMATE_APP_VERSION || '0.6.0',
+    pluginSafeMode: Boolean(opts.pluginSafeMode),
     protocolVersion: PROTOCOL_VERSION,
     desktopId: config.desktopId,
     desktopName: config.desktopName,
@@ -748,19 +750,34 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { ok: true };
   });
 
+  app.post('/api/v1/plugins/dev/preview', async (request, reply) => {
+    const parsed = LinkDevPluginRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: '请提供有效的本地插件源码目录', code: 'E_INVALID_INPUT' });
+    try {
+      return pluginManager.previewDevPlugin(parsed.data.dirPath);
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    }
+  });
+
   app.post('/api/v1/plugins/dev/link', async (request, reply) => {
     const parsed = LinkDevPluginRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: '请提供有效的本地插件源码目录', code: 'E_INVALID_INPUT' });
     }
     try {
-      await pluginManager.linkDevPlugin(parsed.data.dirPath);
+      await pluginManager.linkDevPlugin(parsed.data.dirPath, parsed.data.trustedId);
       return await updatedPlugins();
     } catch (error) {
       return reply.code(400).send({
         error: error instanceof Error ? error.message : String(error),
         code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
       });
+    } finally {
+      wsGateway.notifyPluginsChanged();
     }
   });
 
@@ -774,6 +791,23 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         error: error instanceof Error ? error.message : String(error),
         code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
       });
+    } finally {
+      wsGateway.notifyPluginsChanged();
+    }
+  });
+
+  app.delete('/api/v1/plugins/dev/:id/trust', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      await pluginManager.revokeDevTrust(id);
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({
+        error: error instanceof Error ? error.message : String(error),
+        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
+      });
+    } finally {
+      wsGateway.notifyPluginsChanged();
     }
   });
 
@@ -972,6 +1006,17 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
   };
 
+  app.post('/api/v1/plugins/composition/restore', async (request, reply) => {
+    const source = (request.body as { source?: unknown } | null)?.source;
+    if (source !== 'previous' && source !== 'builtin') return reply.code(400).send({ error: '请选择要恢复的组合配置' });
+    try {
+      await pluginManager.restoreComposition(source === 'builtin');
+      return await updatedPlugins();
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.post('/api/v1/plugins/preview', async (request, reply) => {
     const parsed = InstallPluginRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: '插件清单或目录无效' });
@@ -1115,6 +1160,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return await updatedPlugins();
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      wsGateway.notifyPluginsChanged();
     }
   });
 

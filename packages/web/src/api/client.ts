@@ -373,9 +373,14 @@ export const daemonApi = {
   previewPlugin: (req: InstallPluginRequest) =>
     apiFetch<PluginPreview>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(req) }),
 
-  getPluginComposition: () => apiFetch<{ bundles: string[]; error?: string;
+  getPluginComposition: () => apiFetch<{ bundles: string[]; error?: string; safeMode: boolean; canRestore: boolean;
     entries: Array<{ id: string; name: string; disabled: boolean; config: Record<string, unknown>; sources: string[] }>;
   }>('/api/v1/plugins/composition'),
+
+  restorePluginComposition: (source: 'previous' | 'builtin') =>
+    apiFetch<PluginBundleResponse>('/api/v1/plugins/composition/restore', {
+      method: 'POST', body: JSON.stringify({ source }),
+    }),
 
   previewTurnSuggestion: (id: string, text: string, attachments?: Attachment[]) =>
     apiFetch<{ suggestion: { text: string; pluginNames: string[] } | null }>(
@@ -484,10 +489,21 @@ export const daemonApi = {
       { method: 'DELETE' },
     ),
 
-  linkDevPlugin: (dirPath: string) =>
-    apiFetch<PluginBundleResponse>('/api/v1/plugins/dev/link', {
+  previewDevPlugin: (dirPath: string) =>
+    apiFetch<{ dirPath: string; id: string; name: string; hasBackend: boolean }>('/api/v1/plugins/dev/preview', {
       method: 'POST',
       body: JSON.stringify({ dirPath }),
+    }),
+
+  linkDevPlugin: (dirPath: string, trustedId?: string) =>
+    apiFetch<PluginBundleResponse>('/api/v1/plugins/dev/link', {
+      method: 'POST',
+      body: JSON.stringify({ dirPath, trustedId }),
+    }),
+
+  revokeDevPluginTrust: (id: string) =>
+    apiFetch<PluginBundleResponse>(`/api/v1/plugins/dev/${encodeURIComponent(id)}/trust`, {
+      method: 'DELETE',
     }),
 
   reloadDevPlugin: (id: string) =>

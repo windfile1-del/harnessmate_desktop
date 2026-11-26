@@ -1,6 +1,7 @@
+import { ALL_PLUGIN_SLOT_KEYS } from '@harnessmate/plugin-api';
+
 /**
- * Self-contained Node child-process runner for isolated V4 plugins.
- * Launched with `--permission --allow-fs-read=<packageRoot> --max-old-space-size=128 -e <source> -- <entryUrl>`.
+ * Self-contained Node child-process runner for SDK plugins.
  * Stdout is strictly reserved for newline-delimited JSON-RPC 2.0 frames; console methods redirect to RPC log / stderr.
  */
 export const ISOLATED_RUNNER_SOURCE = `'use strict';
@@ -12,22 +13,7 @@ const VALID_CODES = new Set([
   'E_CIRCULAR_DEPENDENCY',
 ]);
 
-const VALID_SLOT_KEYS = new Set([
-  'session.header.title',
-  'sidebar.tools',
-  'composer.actions',
-  'inspector.tabs',
-  'statusbar.items',
-  'chat.node',
-  'tool.result',
-  'approval.detail',
-  'chat.message.wrapper',
-  'chat.block',
-  'composer.traits',
-  'harness.settings',
-  'inspector.diff',
-  'session.sidebar.badge',
-]);
+const VALID_SLOT_KEYS = new Set(${JSON.stringify(ALL_PLUGIN_SLOT_KEYS)});
 
 function normalizeSlotKey(rawSlot) {
   const value = String(rawSlot || '');
@@ -261,6 +247,7 @@ function buildContext(handshake) {
       listInstances: () => rpcCall('harnesses.listInstances', {}),
     },
     runtime: {
+      trustedLocal: handshake.trustedLocal === true,
       async spawnCli(spec) {
         const spawned = await rpcCall('runtime.spawnCli', spec || {});
         const processId = spawned.processId;
@@ -706,8 +693,9 @@ async function handleMessage(message) {
     } else if (method === 'host.slot.message') {
       const slotId = String(params.slotId || '');
       const slotName = params.slot ? normalizeSlotKey(params.slot) : '';
-      const entry = (slotName ? slotHandlers.get(slotName + ':' + slotId) : undefined)
-        || [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
+      const entry = slotName
+        ? slotHandlers.get(slotName + ':' + slotId)
+        : [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
       if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '未注册插槽项 ' + slotId);
       if (!entry.onMessage) {
         result = { handled: false };

@@ -349,8 +349,10 @@ export function SandboxedPluginFrame({
       sandbox="allow-scripts"
       referrerPolicy="no-referrer"
       srcDoc={srcDoc}
-      className="w-full rounded-xl border border-[var(--border-hairline)] bg-transparent"
-      style={{ height: `${height}px` }}
+      className={slot === 'workspace.pages'
+        ? 'block size-full border-0 bg-transparent'
+        : 'w-full rounded-xl border border-[var(--border-hairline)] bg-transparent'}
+      style={slot === 'workspace.pages' ? undefined : { height: `${height}px` }}
     />
   );
 }

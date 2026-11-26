@@ -20,3 +20,4 @@
 | `harness.settings` | `keyed` | `root` | 按 driverId 渲染 Harness 插件自定义认证与高级设置面板 |
 | `inspector.diff` | `single` | `session` | 接管或增强右侧 Diff 与检查点视图 |
 | `session.sidebar.badge` | `list` | `session-maybe` | 侧栏会话行轻量状态徽标 |
+| `workspace.pages` | `list` | `root` | 在侧栏提供入口并在主工作区打开独立插件页面 |

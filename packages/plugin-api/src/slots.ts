@@ -101,7 +101,15 @@ export const PLUGIN_UI_SLOTS_V5 = {
 } as const satisfies Record<string, PluginSlotContract>;
 
 export type PluginSlotKeyV5 = keyof typeof PLUGIN_UI_SLOTS_V5;
-export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5;
+const workspaceSlots = {
+  'workspace.pages': {
+    cardinality: 'list',
+    scope: 'root',
+    description: '在侧栏提供入口并在主工作区打开独立插件页面',
+  },
+} as const satisfies Record<string, PluginSlotContract>;
+
+export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
 
 export const PLUGIN_SLOT_KEYS_V5 = [
   'chat.block',
@@ -114,11 +122,13 @@ export const PLUGIN_SLOT_KEYS_V5 = [
 export const ALL_PLUGIN_UI_SLOTS = {
   ...PLUGIN_UI_SLOTS,
   ...PLUGIN_UI_SLOTS_V5,
+  ...workspaceSlots,
 } as const satisfies Record<AnyPluginSlotKey, PluginSlotContract>;
 
 export const ALL_PLUGIN_SLOT_KEYS = [
   ...PLUGIN_SLOT_KEYS,
   ...PLUGIN_SLOT_KEYS_V5,
+  'workspace.pages',
 ] as const satisfies readonly AnyPluginSlotKey[];
 
 const SLOT_ALIASES: Readonly<Record<string, AnyPluginSlotKey>> = {
@@ -151,6 +161,7 @@ export function isSafePluginUiPath(value: string): boolean {
 }
 
 export const PluginSlotKeyInputSchema = z.enum([
+  'workspace.pages',
   'session.header.title',
   'sidebar.tools',
   'composer.actions',

@@ -1,6 +1,7 @@
 import { PLUGIN_MANIFEST_VERSION, PluginApiError } from '@harnessmate/plugin-api';
 
 import { browserPreviewTemplate } from './browser-preview-template.js';
+import { browserWorkspaceTemplate } from './browser-workspace-template.js';
 
 export type PluginScaffoldTemplate =
   | 'isolated'
@@ -8,6 +9,7 @@ export type PluginScaffoldTemplate =
   | 'service'
   | 'declarative'
   | 'browser-preview'
+  | 'browser-workspace'
   | 'harness-adapter';
 
 export interface PluginScaffoldOptions {
@@ -478,6 +480,23 @@ export async function runReplayTest() {
       'README.md': `# ${name}\n\nHarnessMate V5 隔离进程 Harness Adapter 插件（驱动 ID: \`${driverId}\`，CLI: \`${binaryName}\`）。\n\n- 驱动入口：\`index.mjs\`（通过 \`ctx.harnesses.registerDriver\` 与 \`ctx.runtime.spawnCli\` 运行）\n- 沙箱 UI 插槽：\`ui/settings.html\`（\`harness.settings\`）与 \`ui/block-card.html\`（\`chat.block\`）\n- 离线回放测试：\`tests/adapter-replay.test.mjs\`（基于 \`@harnessmate/plugin-sdk/testing\`）\n`,
     };
     return { manifest, files };
+  }
+
+  if (options.template === 'browser-workspace') {
+    const manifest = {
+      id, name, description, author, version: '0.1.0', category: 'ui',
+      apiVersion: PLUGIN_MANIFEST_VERSION, engines: { pluginApi: '^4.0' },
+      main: 'index.mjs',
+      permissions: ['browser:preview'],
+      contributes: { slots: [{ slot: 'workspace.pages', id: 'browser', title: name, ui: 'ui/panel.html' }] },
+    };
+    return {
+      manifest,
+      files: {
+        'harnessmate-plugin.json': JSON.stringify(manifest, null, 2) + '\n',
+        ...browserWorkspaceTemplate(name),
+      },
+    };
   }
 
   if (options.template === 'browser-preview') {

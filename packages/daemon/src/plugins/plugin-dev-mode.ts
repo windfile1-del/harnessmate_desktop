@@ -6,6 +6,20 @@ export interface DevPluginLink {
   id: string;
   dirPath: string;
   linkedAt: number;
+  trustedLocal?: boolean;
+  current?: DevPluginRevision;
+  previous?: DevPluginRevision;
+}
+
+export interface DevPluginRevision {
+  revision: string;
+  digest: string;
+}
+
+function parseRevision(value: DevPluginRevision | undefined): DevPluginRevision | undefined {
+  if (value && /^[a-f0-9-]{36}$/.test(value.revision) && /^[a-f0-9]{64}$/.test(value.digest)) {
+    return { revision: value.revision, digest: value.digest };
+  }
 }
 
 const IGNORED_SEGMENTS = new Set(['.git', 'node_modules', '.revisions', '.harnessmate-active.json']);
@@ -42,6 +56,9 @@ export class PluginDevWatcher {
             id: entry.id,
             dirPath: entry.dirPath,
             linkedAt: typeof entry.linkedAt === 'number' ? entry.linkedAt : Date.now(),
+            trustedLocal: entry.trustedLocal === true,
+            current: parseRevision(entry.current),
+            previous: parseRevision(entry.previous),
           });
         }
       }
@@ -50,11 +67,16 @@ export class PluginDevWatcher {
     }
   }
 
-  private save(): void {
+  private save(links: Map<string, DevPluginLink>): void {
     fs.mkdirSync(path.dirname(this.storePath), { recursive: true });
     const tmp = `${this.storePath}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify([...this.links.values()], null, 2), 'utf8');
-    fs.renameSync(tmp, this.storePath);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify([...links.values()], null, 2), { flag: 'wx' });
+      fs.renameSync(tmp, this.storePath);
+      this.links = links;
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
   }
 
   list(): DevPluginLink[] {
@@ -69,19 +91,17 @@ export class PluginDevWatcher {
     return this.links.has(pluginId);
   }
 
-  link(pluginId: string, dirPath: string): DevPluginLink {
-    const resolved = fs.realpathSync(dirPath);
-    const entry: DevPluginLink = { id: pluginId, dirPath: resolved, linkedAt: Date.now() };
-    this.links.set(pluginId, entry);
-    this.save();
-    this.startWatching(entry);
-    return entry;
+  set(entry: DevPluginLink): void {
+    const old = this.links.get(entry.id);
+    this.save(new Map(this.links).set(entry.id, entry));
+    if (old?.dirPath !== entry.dirPath) this.startWatching(entry);
   }
 
   unlink(pluginId: string): boolean {
-    const existed = this.links.delete(pluginId);
+    const links = new Map(this.links);
+    const existed = links.delete(pluginId);
+    if (existed) this.save(links);
     this.stopWatching(pluginId);
-    if (existed) this.save();
     return existed;
   }
 

@@ -32,11 +32,20 @@ export function PluginDevPanel({
     if (picked) setter(picked);
   };
 
-  const handleLink = async () => {
-    if (!devDir.trim()) return;
+  const handleLink = async (dirPath: string, trustedLocal = false) => {
+    if (!dirPath.trim()) return;
     setBusy(true);
     try {
-      await daemonApi.linkDevPlugin(devDir.trim());
+      if (trustedLocal) {
+        const preview = await daemonApi.previewDevPlugin(dirPath.trim());
+        if (!preview.hasBackend) throw new Error('可信本地运行需要清单声明 main 后端入口');
+        if (!window.confirm(
+          `允许 ${preview.name}（${preview.id}）可信本地运行？\n\n${preview.dirPath}\n\n该目录中的后端代码和之后保存的修改将以当前系统用户权限运行，可以访问文件、网络及启动进程。你可以随时在开发页撤销授权。`,
+        )) return;
+        await daemonApi.linkDevPlugin(preview.dirPath, preview.id);
+      } else {
+        await daemonApi.linkDevPlugin(dirPath.trim());
+      }
       await refreshPlugins();
       setDevDir('');
       pushToast({ kind: 'success', title: '已关联开发模式插件', body: '保存源码文件后将自动热重载' });
@@ -46,6 +55,19 @@ export function PluginDevPanel({
         title: '关联开发目录失败',
         body: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRevokeTrust = async (pluginId: string) => {
+    setBusy(true);
+    try {
+      await daemonApi.revokeDevPluginTrust(pluginId);
+      await refreshPlugins();
+      pushToast({ kind: 'info', title: '已撤销可信本地授权' });
+    } catch (error) {
+      pushToast({ kind: 'error', title: '撤销授权失败', body: error instanceof Error ? error.message : String(error) });
     } finally {
       setBusy(false);
     }
@@ -95,15 +117,17 @@ export function PluginDevPanel({
         template,
         serviceName: template === 'service' ? serviceName.trim() : undefined,
         targetDir: targetDir.trim() || undefined,
-        linkDevMode,
+        linkDevMode: linkDevMode && template !== 'browser-workspace',
       });
       await refreshPlugins();
       setLastCreated({ dirPath: res.dirPath, files: res.files });
       pushToast({
         kind: 'success',
         title: `已生成插件脚手架 ${id.trim()}`,
-        body: linkDevMode ? '已自动进入开发模式并监听文件变更' : `输出目录：${res.dirPath}`,
+        body: template === 'browser-workspace' ? '请选择「关联并信任」安装本地后端' :
+          linkDevMode ? '已自动进入开发模式并监听文件变更' : `输出目录：${res.dirPath}`,
       });
+      if (template === 'browser-workspace') setDevDir(res.dirPath);
     } catch (err) {
       pushToast({
         kind: 'error',
@@ -146,11 +170,19 @@ export function PluginDevPanel({
           <button
             type="button"
             disabled={busy || !devDir.trim()}
-            onClick={() => void handleLink()}
+            onClick={() => void handleLink(devDir)}
             className="cursor-pointer rounded-lg px-3 py-1.5 text-[11.5px] font-medium text-white disabled:opacity-40"
             style={{ backgroundColor: 'var(--accent-indigo)' }}
           >
             关联开发目录
+          </button>
+          <button
+            type="button"
+            disabled={busy || !devDir.trim()}
+            onClick={() => void handleLink(devDir, true)}
+            className="cursor-pointer rounded-lg border border-[var(--border-hairline)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
+          >
+            关联并信任
           </button>
         </div>
 
@@ -168,7 +200,7 @@ export function PluginDevPanel({
                       className="rounded px-1.5 py-0.5 text-[10px] font-medium"
                       style={{ backgroundColor: 'var(--accent-star-soft)', color: 'var(--accent-star)' }}
                     >
-                      开发中
+                      {p.devTrustedLocal ? '可信本地' : '开发中'}
                     </span>
                     <span className="font-mono-code text-[10.5px] text-[var(--text-muted)]">
                       {p.runtimeState ?? (p.enabled ? 'ACTIVE' : 'DISABLED')}
@@ -181,7 +213,17 @@ export function PluginDevPanel({
                     <div className="mt-1 break-words text-[11px] text-[var(--accent-rose)]">{p.loadError}</div>
                   )}
                 </div>
-                <div className="flex shrink-0 items-center gap-1.5">
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  {p.devTrustedLocal ? (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void handleRevokeTrust(p.id)}
+                      className="cursor-pointer rounded-md border border-[var(--border-hairline)] px-2 py-1 text-[11px] text-[var(--accent-rose)] hover:bg-[var(--bg-hover)]"
+                    >
+                      撤销信任
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => onOpenLogs(p.id)}
@@ -255,6 +297,7 @@ export function PluginDevPanel({
               <option value="harness-adapter">第三方 Harness 引擎驱动 (V5 Adapter)</option>
               <option value="ui-slot">纯声明式沙箱 UI 插槽</option>
               <option value="browser-preview">浏览器预览</option>
+              <option value="browser-workspace">浏览器工作页（本地后端）</option>
               <option value="service">第三方服务提供方 (provides)</option>
               <option value="declarative">纯声明式斜杠命令 + 数据面板</option>
             </select>
@@ -296,7 +339,8 @@ export function PluginDevPanel({
           <label className="inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] text-[var(--text-secondary)]">
             <input
               type="checkbox"
-              checked={linkDevMode}
+              checked={linkDevMode && template !== 'browser-workspace'}
+              disabled={template === 'browser-workspace'}
               onChange={(e) => setLinkDevMode(e.target.checked)}
             />
             创建后立即以开发模式关联并监听变更

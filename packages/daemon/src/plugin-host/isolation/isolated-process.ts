@@ -14,6 +14,7 @@ import {
   type PluginRpcMessage,
   type PluginRpcResponse,
 } from '@harnessmate/plugin-api';
+import { killProcessTree } from '../../harnesses/process.js';
 import { ISOLATED_RUNNER_SOURCE } from './runner-bootstrap.js';
 
 const MAX_RPC_LINE_BYTES = 4 * 1024 * 1024;
@@ -51,6 +52,7 @@ export type IsolatedHostRpcHandler = (
 
 export interface IsolatedProcessOptions {
   pluginId: string;
+  trustedLocal?: boolean;
   packageRoot: string;
   entryRelativePath: string;
   packageDigest: string;
@@ -97,8 +99,7 @@ export class IsolatedPluginProcess {
     const entryFile = path.join(opts.packageRoot, opts.entryRelativePath.replace(/\\/g, '/'));
     const entryUrl = pathToFileURL(entryFile).href;
     const args = [
-      '--permission',
-      `--allow-fs-read=${opts.packageRoot}`,
+      ...(opts.trustedLocal ? [] : ['--permission', `--allow-fs-read=${opts.packageRoot}`]),
       '--max-old-space-size=128',
       '-e',
       ISOLATED_BOOTSTRAP_STUB,
@@ -110,6 +111,7 @@ export class IsolatedPluginProcess {
       env: buildIsolatedChildEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: opts.trustedLocal && process.platform !== 'win32',
     });
     this.child.stdout?.setEncoding('utf8');
     this.child.stderr?.setEncoding('utf8');
@@ -145,6 +147,7 @@ export class IsolatedPluginProcess {
       protocolVersion: PLUGIN_RPC_PROTOCOL_VERSION,
       pluginApi: PLUGIN_API_VERSION,
       features: HOST_SUPPORTED_FEATURES,
+      trustedLocal: this.opts.trustedLocal === true,
       pluginId: this.opts.pluginId,
       packageDigest: this.opts.packageDigest,
       runId: this.runId,
@@ -221,11 +224,12 @@ export class IsolatedPluginProcess {
     }
     this.retired = true;
     this.rejectAllPending(new PluginApiError('E_STALE_RUN', '插件实例已卸载'));
-    try { this.child.stdin?.end(); } catch { /* ignore */ }
     if (!this.exited) {
-      try { this.child.kill(); } catch { /* ignore */ }
+      if (this.opts.trustedLocal) await killProcessTree(this.child);
+      else this.forceKill();
       await Promise.race([this.exitedPromise, new Promise((resolve) => setTimeout(resolve, 1_000))]);
     }
+    try { this.child.stdin?.end(); } catch { /* ignore */ }
   }
 
   /**
@@ -233,7 +237,8 @@ export class IsolatedPluginProcess {
    */
   forceKill(): void {
     if (!this.exited) {
-      try { this.child.kill(); } catch { /* ignore */ }
+      if (this.opts.trustedLocal) void killProcessTree(this.child);
+      else try { this.child.kill(); } catch { /* ignore */ }
     }
   }
 

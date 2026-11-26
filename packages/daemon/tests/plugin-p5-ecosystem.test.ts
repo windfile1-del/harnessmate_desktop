@@ -17,6 +17,125 @@ async function waitFor(condition: () => boolean, timeoutMs = 4_000, intervalMs =
   throw new Error('Timed out waiting for condition');
 }
 
+it('recovers a trusted browser workspace across edits, rollback, shutdown, safety mode and revocation', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-browser-workspace-'));
+  const id = 'user.browser-workspace';
+  const route = `/api/v1/plugins/${id}`;
+  let daemon = createDaemon({ dataDir, port: 0 });
+  const installed = () => daemon.pluginManager.listInstalled().find((plugin) => plugin.id === id);
+  const viewerUrl = async (runId = installed()?.runId) => {
+    const reply = await daemon.app.inject({
+      method: 'POST', url: `${route}/ui-message`,
+      payload: { slot: 'workspace.pages', slotId: 'browser', runId, payload: { type: 'viewer.url' } },
+    });
+    expect(reply.statusCode, reply.body).toBe(200);
+    return reply.json<{ result: { url: string } }>().result.url;
+  };
+  const view = async (url: string) => (await fetch(url, { signal: AbortSignal.timeout(1_500) })).text();
+
+  try {
+    await daemon.start();
+    const generated = await daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/scaffold',
+      payload: { id, name: '浏览器工作页', template: 'browser-workspace', linkDevMode: true },
+    });
+    expect(generated.statusCode).toBe(201);
+    expect(installed()).toBeUndefined();
+    const { dirPath } = generated.json<{ dirPath: string }>();
+    const entryPath = path.join(dirPath, 'index.mjs');
+    const viewerPath = path.join(dirPath, 'viewer.html');
+    const entry = fs.readFileSync(entryPath, 'utf8');
+    const initial = fs.readFileSync(viewerPath, 'utf8');
+    const link = (trustedId?: string) => daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/dev/link', payload: { dirPath, trustedId },
+    });
+    const preview = await daemon.app.inject({
+      method: 'POST', url: '/api/v1/plugins/dev/preview', payload: { dirPath },
+    });
+    expect(preview.json()).toMatchObject({ dirPath, id, hasBackend: true });
+    expect((await link('user.other')).statusCode).toBe(400);
+    const untrusted = await link();
+    expect(untrusted.statusCode).toBe(400);
+    expect(untrusted.body).toContain('关联并信任');
+    expect(installed()).toBeUndefined();
+    const trusted = await link(id);
+    expect(trusted.statusCode, trusted.body).toBe(200);
+    expect(installed()).toMatchObject({ runtimeMode: 'trusted-local', runtimeState: 'ACTIVE',
+      runtimeSlots: [{ slot: 'workspace.pages', id: 'browser' }] });
+    const firstRun = installed()!.runId!;
+    const firstUrl = await viewerUrl();
+    expect(await view(firstUrl)).toContain('输入测试文字');
+
+    const authorize = (runId: string) => daemon.app.inject({
+      method: 'POST', url: `${route}/browser-authorize`, payload: { runId },
+    });
+    expect((await authorize(firstRun)).statusCode).toBe(403);
+    const grant = await daemon.app.inject({
+      method: 'PUT', url: `${route}/permissions`,
+      payload: { workspaceId: '__global__', capability: 'browser:preview', granted: true,
+        digest: installed()!.packageDigest, coverFuture: true },
+    });
+    expect(grant.statusCode, grant.body).toBe(200);
+    const authorizedRun = installed()!.runId!;
+    expect((await authorize(authorizedRun)).statusCode).toBe(200);
+
+    const originalDigest = installed()!.packageDigest;
+    fs.writeFileSync(viewerPath, initial.replace('输入测试文字', '新版中文输入'));
+    await waitFor(() => installed()?.canRollback === true && installed()?.packageDigest !== originalDigest, 8_000);
+    const second = installed()!;
+    expect(second.runtimeState).toBe('ACTIVE');
+    expect((await authorize(authorizedRun)).statusCode).toBe(409);
+    expect((await authorize(second.runId!)).statusCode).toBe(200);
+    const secondUrl = await viewerUrl();
+    expect(await view(secondUrl)).toContain('新版中文输入');
+
+    fs.writeFileSync(entryPath, entry.replace("ctx.logger.info('本地查看服务已就绪');", "throw new Error('候选启动失败');"));
+    await waitFor(() => Boolean(installed()?.loadError?.includes('候选启动失败')), 8_000);
+    expect(installed()).toMatchObject({ runtimeState: 'ACTIVE', packageDigest: second.packageDigest, canRollback: true });
+    expect(await view(await viewerUrl())).toContain('新版中文输入');
+
+    expect((await daemon.app.inject({ method: 'POST', url: `${route}/rollback` })).statusCode).toBe(200);
+    const rolledBackUrl = await viewerUrl();
+    expect(await view(rolledBackUrl)).toContain('输入测试文字');
+    expect(fs.readFileSync(entryPath, 'utf8')).toContain('候选启动失败');
+    expect(fs.readFileSync(viewerPath, 'utf8')).toContain('新版中文输入');
+    await daemon.stop();
+    await expect(view(rolledBackUrl)).rejects.toThrow();
+
+    daemon = createDaemon({ dataDir, port: 0, pluginSafeMode: true });
+    await daemon.start();
+    expect(installed()).toMatchObject({ enabled: false, packageDigest: originalDigest, devTrustedLocal: true });
+    expect(installed()?.runId).toBeUndefined();
+    await daemon.stop();
+
+    daemon = createDaemon({ dataDir, port: 0 });
+    await daemon.start();
+    const restartedUrl = await viewerUrl();
+    expect(await view(restartedUrl)).toContain('输入测试文字');
+    const toggle = (enabled: boolean) => daemon.app.inject({
+      method: 'PATCH', url: route, payload: { enabled },
+    });
+    expect((await toggle(false)).statusCode).toBe(200);
+    expect(installed()?.runtimeSlots).toBeUndefined();
+    await expect(view(restartedUrl)).rejects.toThrow();
+    expect((await toggle(true)).statusCode).toBe(200);
+    const beforeRevocation = await viewerUrl();
+    expect((await daemon.app.inject({ method: 'DELETE', url: `/api/v1/plugins/dev/${id}/trust` })).statusCode).toBe(200);
+    expect(installed()).toMatchObject({ devTrustedLocal: false, runtimeMode: 'isolated', runtimeState: 'FAILED' });
+    expect(installed()?.runtimeSlots).toBeUndefined();
+    await expect(view(beforeRevocation)).rejects.toThrow();
+    await daemon.stop();
+
+    daemon = createDaemon({ dataDir, port: 0 });
+    await daemon.start();
+    expect(installed()).toMatchObject({ devTrustedLocal: false, runtimeMode: 'isolated' });
+    expect(installed()?.runId).toBeUndefined();
+  } finally {
+    await daemon.stop();
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}, 40_000);
+
 it('scaffolds V4 templates, hot-reloads linked dev-mode plugins with unified logs, and preserves source dir on unlink', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-p5-dev-'));
   const targetDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hm-p5-src-')), 'demo-plugin');

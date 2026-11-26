@@ -275,6 +275,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         listInstances: () => rpcCall('harnesses.listInstances', {}),
       },
       runtime: {
+        trustedLocal: handshake.trustedLocal === true,
         spawnCli: async (spec: SpawnCliSpec): Promise<ManagedCliProcessHandle> => {
           const spawned = await rpcCall<{ processId: string; pid: number }>(
             'runtime.spawnCli',
@@ -710,8 +711,9 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
       } else if (method === 'host.slot.message') {
         const slotId = String(params.slotId ?? '');
         const slotName = params.slot ? normalizeAnyPluginSlotKey(String(params.slot)) : '';
-        const entry = (slotName ? slotHandlers.get(`${slotName}:${slotId}`) : undefined)
-          ?? [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
+        const entry = slotName
+          ? slotHandlers.get(`${slotName}:${slotId}`)
+          : [...slotHandlers.values()].find(({ meta }) => meta.id === slotId);
         if (!entry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `未注册插槽项 ${slotId}`);
         if (!entry.onMessage) {
           result = { handled: false };

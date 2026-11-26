@@ -103,6 +103,7 @@ export const PluginScaffoldTemplateSchema = z.enum([
   'service',
   'declarative',
   'browser-preview',
+  'browser-workspace',
   'harness-adapter',
 ]);
 export type PluginScaffoldTemplateDto = z.infer<typeof PluginScaffoldTemplateSchema>;
@@ -122,6 +123,7 @@ export const ScaffoldPluginRequestSchema = z.object({
 export type ScaffoldPluginRequest = z.infer<typeof ScaffoldPluginRequestSchema>;
 
 export const LinkDevPluginRequestSchema = z.object({
+  trustedId: z.string().min(1).max(64).optional(),
   dirPath: z.string().trim().min(1).max(500),
 }).strict();
 export type LinkDevPluginRequest = z.infer<typeof LinkDevPluginRequestSchema>;

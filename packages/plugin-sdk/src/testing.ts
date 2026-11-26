@@ -331,6 +331,7 @@ export function createMockNetStream(options: CreateMockNetStreamOptions = {}): P
 export interface CreateMockPluginHostOptions {
   pluginId?: string;
   runId?: string;
+  trustedLocal?: boolean;
   /** If provided, permissions are strictly enforced against this set. */
   permissions?: readonly string[];
   features?: readonly string[];
@@ -384,7 +385,7 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
   const runId = options.runId ?? `run_mock_${mockIdSeq}`;
   const strictPermissions = options.permissions !== undefined;
   const permissionSet = new Set<string>(options.permissions ?? []);
-  const featureSet = new Set<string>(options.features ?? HOST_FEATURES_V5);
+  const featureSet = new Set<string>(options.features ?? [...HOST_FEATURES_V5, 'ui.workspace.pages', 'runtime.trustedLocal']);
 
   const logs: MockPluginLogEntry[] = [];
   const drivers = new Map<string, PluginHarnessDriverRegistration>();
@@ -804,6 +805,7 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
       },
     },
     runtime: {
+      trustedLocal: options.trustedLocal === true,
       spawnCli: async (spec) => {
         const bin = spec.command.trim();
         if (bin) requirePermission(`process:spawn:${bin}`);

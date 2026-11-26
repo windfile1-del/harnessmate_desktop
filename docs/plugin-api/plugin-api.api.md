@@ -684,6 +684,8 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
         listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
     };
     readonly runtime: {
+        /** Whether the user authorized direct system access for this development instance. */
+        readonly trustedLocal?: boolean;
         spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
     };
     readonly sessions: IsolatedPluginContext['sessions'] & {
@@ -928,9 +930,10 @@ import type { PluginRuntimeSlotDescriptor } from './slots.js';
 export declare const PLUGIN_RPC_PROTOCOL_VERSION = 1;
 export declare const HOST_FEATURES_V5: readonly ["harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
 export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
-export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
+export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal"];
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 export interface PluginHandshakeRequest {
+    trustedLocal?: boolean;
     protocolVersion: number;
     pluginApi: string;
     features: readonly string[];
@@ -1081,9 +1084,21 @@ export declare const PLUGIN_UI_SLOTS_V5: {
     };
 };
 export type PluginSlotKeyV5 = keyof typeof PLUGIN_UI_SLOTS_V5;
-export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5;
+declare const workspaceSlots: {
+    readonly 'workspace.pages': {
+        readonly cardinality: "list";
+        readonly scope: "root";
+        readonly description: "在侧栏提供入口并在主工作区打开独立插件页面";
+    };
+};
+export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
 export declare const PLUGIN_SLOT_KEYS_V5: readonly ["chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
 export declare const ALL_PLUGIN_UI_SLOTS: {
+    readonly 'workspace.pages': {
+        readonly cardinality: "list";
+        readonly scope: "root";
+        readonly description: "在侧栏提供入口并在主工作区打开独立插件页面";
+    };
     readonly 'chat.block': {
         readonly cardinality: "keyed";
         readonly scope: "session";
@@ -1155,14 +1170,14 @@ export declare const ALL_PLUGIN_UI_SLOTS: {
         readonly description: "包裹聊天消息内容的容器组件";
     };
 };
-export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"];
+export declare const ALL_PLUGIN_SLOT_KEYS: readonly ["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge", "workspace.pages"];
 export declare function normalizePluginSlotKey(key: string): PluginSlotKey;
 export declare function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey;
 export declare function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey;
 export declare function isSafePluginUiPath(value: string): boolean;
-export declare const PluginSlotKeyInputSchema: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
 export declare const PluginSlotContributionSchema: z.ZodObject<{
-    slot: z.ZodEnum<["session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
+    slot: z.ZodEnum<["workspace.pages", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "session.sidebar.badge"]>;
     id: z.ZodString;
     title: z.ZodString;
     ui: z.ZodEffects<z.ZodString, string, string>;
@@ -1172,7 +1187,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -1180,7 +1195,7 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
 }, {
     id: string;
     title: string;
-    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "inspector.tab";
+    slot: "session.header.title" | "sidebar.tools" | "composer.actions" | "inspector.tabs" | "statusbar.items" | "chat.node" | "tool.result" | "approval.detail" | "chat.message.wrapper" | "chat.block" | "composer.traits" | "harness.settings" | "inspector.diff" | "session.sidebar.badge" | "workspace.pages" | "inspector.tab";
     ui: string;
     key?: string | undefined;
     order?: number | undefined;
@@ -1262,6 +1277,7 @@ export type PluginSlotBridgeIframeMessage = {
     params?: Record<string, unknown>;
 };
 import type { PluginBrowserFrame, PluginBrowserStatus } from './browser-preview.js';
+export {};
 
 /** An HTTP(S) page rendered by the desktop host in a private Chromium session. */
 export interface PluginBrowserOptions {

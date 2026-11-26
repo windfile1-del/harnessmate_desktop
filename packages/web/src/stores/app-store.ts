@@ -203,6 +203,8 @@ interface AppState {
   harnessFilter: string | null;
   searchQuery: string;
   selectedSessionId: string | null;
+  activePluginPage: string | null;
+  setActivePluginPage: (page: string | null) => void;
 
   eventsBySession: Record<string, CanonicalEvent[]>;
   turnItemsBySession: Record<string, TurnBlockRecord[]>;
@@ -283,6 +285,7 @@ interface AppState {
   installPlugin: (req: InstallPluginRequest) => Promise<void>;
   togglePlugin: (id: string, enabled: boolean) => Promise<void>;
   reloadPlugins: () => Promise<void>;
+  restorePluginComposition: (source: 'previous' | 'builtin') => Promise<void>;
   rollbackPlugin: (id: string) => Promise<void>;
   uninstallPlugin: (id: string) => Promise<void>;
 
@@ -762,6 +765,8 @@ export const useAppStore = create<AppState>((set, get) => {
     harnessFilter: null,
     searchQuery: '',
     selectedSessionId: null,
+    activePluginPage: null,
+    setActivePluginPage: (activePluginPage) => set({ activePluginPage }),
 
     eventsBySession: {},
     turnItemsBySession: {},
@@ -1175,13 +1180,13 @@ export const useAppStore = create<AppState>((set, get) => {
     refreshAll: async () => {
       set({ loading: true });
       try {
-        const [hRes, wRes, sRes, rRes, pRes, aRes] = await Promise.all([
+        const [hRes, wRes, sRes, rRes, aRes] = await Promise.all([
           daemonApi.listHarnesses(false),
           daemonApi.listWorkspaces(),
           daemonApi.listSessions(),
           daemonApi.getRemoteStatus(),
-          daemonApi.listPlugins(),
           daemonApi.listPendingApprovals().catch(() => ({ approvals: [] as ApprovalRequest[] })),
+          get().refreshPlugins(),
         ]);
         set({
           harnesses: hRes.harnesses,
@@ -1189,11 +1194,6 @@ export const useAppStore = create<AppState>((set, get) => {
           sessions: sRes.sessions,
           pendingApprovals: aRes.approvals,
           remoteStatus: rRes,
-          plugins: pRes.plugins,
-          pluginCatalog: pRes.catalog,
-          slashCommands: pRes.slashCommands,
-          mcpPresets: pRes.mcpPresets,
-          pluginsDir: pRes.pluginsDir,
           loading: false,
         });
       } catch (err) {
@@ -1261,6 +1261,15 @@ export const useAppStore = create<AppState>((set, get) => {
       get().pushToast(failures.length
         ? { kind: 'warning', title: '部分插件加载异常', body: failures.map((plugin) => plugin.name).join('、') }
         : { kind: 'success', title: '插件已热重载' });
+    },
+
+    restorePluginComposition: async (source) => {
+      const result = await daemonApi.restorePluginComposition(source);
+      set({
+        plugins: result.plugins, pluginCatalog: result.catalog, slashCommands: result.slashCommands,
+        mcpPresets: result.mcpPresets, ...(result.harnesses ? { harnesses: result.harnesses } : {}),
+      });
+      get().pushToast({ kind: 'success', title: '组合配置已恢复' });
     },
 
     rollbackPlugin: async (id) => {
@@ -1451,7 +1460,7 @@ export const useAppStore = create<AppState>((set, get) => {
         disposeNativeFeedController(prevSessionId);
         bumpNativeScopeEpoch(prevSessionId);
       }
-      set({ selectedSessionId: sessionId, focusedTurn: null });
+      set({ selectedSessionId: sessionId, focusedTurn: null, activePluginPage: null });
       if (!sessionId) return;
 
       const existing = get().eventsBySession[sessionId] ?? [];
