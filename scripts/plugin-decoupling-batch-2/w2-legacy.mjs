@@ -52,6 +52,11 @@ try {
   });
   writtenObjective = update.json().taskState?.objective;
   if (writtenObjective !== objective) throw new Error('Could not update the legacy ledger through W2');
+  await daemon.pluginManager.togglePlugin('hm.plugin.triage-inbox', true);
+  const triage = await daemon.app.inject({
+    url: '/api/v1/triage/sessions/' + sessionId, method: 'PATCH', payload: { pinned: true, forceUnread: true },
+  });
+  if (!triage.json().session?.meta?.pinned) throw new Error('Could not update the legacy inbox through W2');
 } finally {
   await daemon.stop();
 }
@@ -60,6 +65,9 @@ const listener = net.createServer();
 await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
 const { port } = listener.address();
 await new Promise((resolve) => listener.close(resolve));
+const configFile = path.join(run, 'config.json');
+const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+fs.writeFileSync(configFile, JSON.stringify({ ...config, port, lanEnabled: false }, null, 2));
 const log = fs.openSync(path.join(run, 'b1-daemon.log'), 'a');
 const child = spawn(process.execPath, [path.resolve(oldDaemon)], {
   env: {
@@ -76,18 +84,29 @@ try {
   const base = 'http://127.0.0.1:' + port;
   const deadline = Date.now() + 25_000;
   let objective;
+  let lastStatus;
   while (Date.now() < deadline && child.exitCode === null) {
     try {
-      const req = await fetch(base + '/api/v1/sessions/' + sessionId, { signal: AbortSignal.timeout(1000) });
+      const req = await fetch(base + '/api/v1/sessions/' + sessionId + '/task-state', { signal: AbortSignal.timeout(1000) });
+      lastStatus = req.status;
       if (req.ok) {
         objective = (await req.json()).taskState?.objective;
         break;
       }
-    } catch {}
+    } catch (error) {
+      lastStatus = error.cause?.code ?? error.name;
+    }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  if (objective !== writtenObjective) throw new Error('B1 packaged daemon could not read the W2 ledger update');
-  const result = { run, oldCounts: counts, w2LegacySessionOpen: true, b1PackagedDaemonReadsW2Ledger: true };
+  if (objective !== writtenObjective) {
+    throw new Error(`B1 packaged daemon could not read the W2 ledger update (HTTP or transport status: ${lastStatus})`);
+  }
+  const response = await fetch(base + '/api/v1/triage/state', { signal: AbortSignal.timeout(3000) });
+  const meta = (await response.json()).sessions?.find((session) => session.sessionId === sessionId)?.meta;
+  if (!response.ok || !meta?.pinned || !meta.forceUnread) {
+    throw new Error(`B1 packaged daemon could not read the W2 inbox update (HTTP ${response.status})`);
+  }
+  const result = { run, oldCounts: counts, w2LegacySessionOpen: true, b1PackagedDaemonReadsW2Ledger: true, b1PackagedDaemonReadsW2Inbox: true };
   fs.writeFileSync(path.join(run, 'results.json'), JSON.stringify(result, null, 2));
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 } finally {

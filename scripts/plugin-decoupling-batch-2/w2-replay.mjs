@@ -75,14 +75,27 @@ function seed(daemon, session) {
         outputOmitted: false, omittedBytes: 0, createdAt: event.createdAt, updatedAt: event.createdAt,
       });
     }
-    if (!recording) daemon.store.appendEvent(session.id, 'turn.completed', {}, turnId);
+    if (!recording) {
+      daemon.store.appendEvent(session.id, 'tool.call.completed', { toolCallId, toolName: 'shell', status: 'success', output: 'complete' }, turnId);
+      daemon.store.appendEvent(session.id, 'turn.completed', {}, turnId);
+    }
   }
 }
 
 const instrumentation = String.raw`
-window.w2Replay = { first: null, long: [], subscriptions: [] };
+window.w2Replay = { first: null, selectedAt: null, long: [], subscriptions: [] };
+const fetchFromDaemon = window.fetch;
+window.w2Requests = [];
+window.fetch = async function (...args) {
+  const response = await fetchFromDaemon.apply(this, args);
+  const url = new URL(response.url, location.href);
+  if (url.pathname.startsWith('/api/v1/') && !response.ok) {
+    window.w2Requests.push({ path: url.pathname, status: response.status });
+  }
+  return response;
+};
 new PerformanceObserver((list) => {
-  for (const entry of list.getEntries()) window.w2Replay.long.push(entry.duration);
+  for (const entry of list.getEntries()) window.w2Replay.long.push({ start: entry.startTime, duration: entry.duration });
 }).observe({ type: 'longtask', buffered: true });
 new MutationObserver((_mutations, observer) => {
   if (document.body?.textContent.includes('W2 replay response')) {
@@ -116,6 +129,10 @@ for (const [name, webDistDir] of [['b1', baselineWeb], ['w2', candidateWeb]]) {
     const workspace = await daemon.sessionManager.addWorkspace(project);
     const session = await daemon.sessionManager.createSession({ workspaceId: workspace.id, harnessId: 'agy', permissionMode: 'manual', title: 'W2 replay fixture' });
     seed(daemon, session);
+    const listed = await daemon.app.inject('/api/v1/sessions');
+    if (!listed.json().sessions?.some(({ id }) => id === session.id)) {
+      throw new Error('Replay session missing from the default session list');
+    }
     const profile = path.join(run, 'browser');
     fs.mkdirSync(profile);
     browser = spawn(browserPath, [
@@ -147,33 +164,47 @@ for (const [name, webDistDir] of [['b1', baselineWeb], ['w2', candidateWeb]]) {
       if (document.body?.innerText.includes('W2 replay response')) return true;
       const button = [...document.querySelectorAll('button,[role="button"],a')].find((node) =>
         node.innerText?.includes('W2 replay fixture') || node.title?.includes('W2 replay fixture'));
-      if (button && !window.w2Replay.clicked) { button.click(); window.w2Replay.clicked = true; }
+      if (button && window.w2Replay.selectedAt === null) { window.w2Replay.selectedAt = performance.now(); button.click(); }
       return false;
     })()`), 'first replay response');
     await wait(750);
-    const opened = await evaluate(`(() => {
-      const details = document.querySelector('[data-item-id="w2-tool-100"]');
-      if (details?.tagName === 'DETAILS') { details.open = true; return true; }
+    const firstPaint = await evaluate('window.w2Replay');
+    result[name] = {
+      ...firstPaint,
+      firstAfterSelectionMs: firstPaint.first - firstPaint.selectedAt,
+      studioFrames: await evaluate('document.querySelectorAll(\'iframe[title*="Message Studio"]\').length'),
+    };
+    const opened = name === 'w2' && await until(() => evaluate(`(() => {
+      const details = [...document.querySelectorAll('details[data-item-id]')].find((node) =>
+        node.querySelector('summary')?.textContent.trim() === 'echo replay 100');
+      if (details) { details.scrollIntoView({ block: 'center' }); details.open = true; return details.dataset.itemId; }
+      const lastGroup = [...document.querySelectorAll('[data-testid="work-group-row"]')].at(-1);
+      const button = lastGroup?.querySelector('button[aria-expanded="false"]');
+      if (button) button.click();
       return false;
-    })()`);
+    })()`), 'running command block');
     if (opened) {
       await until(() => evaluate('window.w2Replay.subscriptions.some((value) => value.toolCallId === "command-100")'), 'tool subscription');
-      daemon.commandOutputHub.append(session.id, 'command-100', 'W2 replay streamed output');
+      daemon.sessionManager.commandOutputHub.append(session.id, 'command-100', 'W2 replay streamed output', 'stdout');
       await wait(350);
       const toolScreenshot = await cdp.call('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(path.join(run, 'tool-output.png'), Buffer.from(toolScreenshot.data, 'base64'));
-      await evaluate('document.querySelector(\'[data-item-id="w2-tool-100"]\').open = false');
-      await wait(350);
+      const priorUnsubscribes = await evaluate('window.w2Replay.subscriptions.filter(({ op }) => op === "unsubscribe_command_output").length');
+      await evaluate(`document.querySelector('details[data-item-id="' + CSS.escape(${JSON.stringify(opened)}) + '"]').open = false`);
+      await until(() => evaluate(`window.w2Replay.subscriptions.filter(({ op, toolCallId }) => op === "unsubscribe_command_output" && toolCallId === "command-100").length > ${priorUnsubscribes}`), 'tool unsubscription');
+      result[name].subscriptions = await evaluate('window.w2Replay.subscriptions');
+      const outputOps = result[name].subscriptions.filter(({ sessionId, toolCallId }) => sessionId === session.id && toolCallId === 'command-100');
+      if (outputOps.map(({ op }) => op).join(',') !== 'subscribe_command_output,unsubscribe_command_output') {
+        throw new Error('Expected one subscribe and one unsubscribe for the opened tool');
+      }
     }
-    result[name] = await evaluate('window.w2Replay');
-    result[name].studioFrames = await evaluate('document.querySelectorAll(\'iframe[title*="Message Studio"]\').length');
     result[name].openedLastTool = opened;
     const screenshot = await cdp.call('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(path.join(run, 'replay.png'), Buffer.from(screenshot.data, 'base64'));
   } catch (error) {
     if (cdp) {
       const snapshot = await cdp.call('Runtime.evaluate', {
-        expression: '({ url: location.href, page: document.body?.innerText?.slice(0, 3000) })',
+        expression: '({ url: location.href, page: document.body?.innerText?.slice(-4500), failedRequests: window.w2Requests, tools: [...document.querySelectorAll("details[data-item-id]")].slice(-8).map((node) => [node.dataset.itemId, node.querySelector("summary")?.textContent]) })',
         returnByValue: true,
       });
       fs.writeFileSync(path.join(run, 'page-state.json'), JSON.stringify(snapshot.result.value, null, 2));

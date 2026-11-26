@@ -66,7 +66,8 @@ export function startTaskLedgerProjection(options: {
       });
       if (state) {
         ledger.syncSession(current);
-        publish(ledger.getOrCreate(current));
+        // Imported turns keep their recorded event sequence while the ledger catches up.
+        if (event.payload.imported !== true) publish(ledger.getOrCreate(current));
       }
     }
     startupMirrors.delete(id);

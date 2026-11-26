@@ -46,7 +46,10 @@ const state = (id: string, meta: Partial<SessionTriageState['meta']> = {},
 });
 const enabled: InstalledPluginInfo = {
   id: TRIAGE_INBOX_PLUGIN_ID, name: 'Triage Inbox', version: '1.0.0', category: 'ui', contributes: {},
-  enabled: true, builtin: true, source: 'builtin', runtimeState: 'ACTIVE',
+  enabled: true, builtin: true, source: 'builtin', runtimeState: 'ACTIVE', provides: ['session.inbox.v1'],
+};
+const snoozePlugin: InstalledPluginInfo = {
+  ...enabled, id: 'hm.plugin.session-snooze', name: 'Session Snooze', provides: ['session.snooze.v1'],
 };
 const command = (id: string, title: string, patch: Partial<CommandPaletteEntry> = {}): CommandPaletteEntry => ({
   id, title, sourcePluginId: 'test.plugin', category: 'plugin_action', keywords: [], execute: vi.fn(), ...patch,
@@ -90,7 +93,7 @@ it('renders real sidebar slots before selection, clears the selected red badge, 
   expect(registry.getItems('inspector.tabs', { hasSession: false })).toBe(unscoped);
   const sessions = [session('normal'), session('approval'), session('unread'), session('deferred')];
   useAppStore.setState({
-    sessions, plugins: [enabled], selectedSessionId: null,
+    sessions, plugins: [enabled, snoozePlugin], selectedSessionId: null,
     triageBySession: {
       approval: state('approval', {}, { pendingApprovalCount: 1 }),
       unread: state('unread', { forceUnread: true }),
@@ -107,6 +110,9 @@ it('renders real sidebar slots before selection, clears the selected red badge, 
   expect(dashboard).toContain('aria-label="延后提醒"');
   expect(dashboard.indexOf('Session approval')).toBeLessThan(dashboard.indexOf('Session normal'));
   expect(dashboard).not.toContain('Session deferred');
+  useAppStore.setState({ plugins: [enabled, { ...snoozePlugin, enabled: false }] });
+  expect(render()).not.toContain('aria-label="延后提醒"');
+  expect(render()).toContain('aria-label="需要处理"');
   useAppStore.setState({ selectedSessionId: 'approval' });
   expect(render()).not.toContain('aria-label="需要处理"');
   expect(render()).toContain('待处理 (2)');

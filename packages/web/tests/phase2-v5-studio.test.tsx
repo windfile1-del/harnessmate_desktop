@@ -12,11 +12,8 @@ import {
   HTML_RENDER_MAX_BYTES,
   HtmlRenderCard,
 } from '../src/components/HtmlRenderCard';
-import {
-  FailoverInlineBanner,
-  GenericExtBlockCard,
-  WorkGroupRow,
-} from '../src/components/MessageStudio';
+import { FailoverInlineBanner } from '../src/components/FailoverInlineBanner';
+import { StudioExtension, StudioWorkGroup } from '../src/slots/StudioSurfaces';
 import { sanitizeTraitValues, TraitsPicker } from '../src/components/TraitsPicker';
 import {
   resolveContextWindowMeter,
@@ -440,7 +437,7 @@ describe('TurnBlock Projection, WorkGroup & Fallback Rendering', () => {
       expect(segments[0].summaryText).toContain('已完成 3 个步骤');
       expect(segments[0].summaryText).toContain('运行 1 命令');
       const wgHtml = renderToStaticMarkup(
-        <WorkGroupRow session={sampleSession} group={segments[0]} />,
+        <StudioWorkGroup session={sampleSession} group={segments[0]} />,
       );
       expect(wgHtml).toContain('work-group-row');
       expect(wgHtml).toContain('已完成 3 个步骤');
@@ -466,8 +463,8 @@ describe('TurnBlock Projection, WorkGroup & Fallback Rendering', () => {
       createdAt: 3000,
       updatedAt: 3000,
     };
-    const fallbackHtml = renderToStaticMarkup(<GenericExtBlockCard block={unknownBlock} />);
-    expect(fallbackHtml).toContain('generic-ext-fallback-card');
+    const fallbackHtml = renderToStaticMarkup(<StudioExtension session={sampleSession} block={unknownBlock} />);
+    expect(fallbackHtml).toContain('扩展视图不可用');
     expect(fallbackHtml).toContain('future_v9_widget');
     expect(fallbackHtml).toContain('Graceful degradation summary');
   });

@@ -176,7 +176,11 @@ function approvalHarness() {
       };
     },
   };
-  return { adapter, complete: (turnId: string) => sendEvent?.({ type: 'turn.completed', turnId }) };
+  return {
+    adapter,
+    emit: (event: NormalizedAdapterEvent) => sendEvent?.(event),
+    complete: (turnId: string) => sendEvent?.({ type: 'turn.completed', turnId }),
+  };
 }
 
 it('projects background approval and turn completion on the desktop socket without a session subscription', async () => {
@@ -211,4 +215,36 @@ it('projects background approval and turn completion on the desktop socket witho
   expect(latestTurnSeq).toBeGreaterThan(0);
   await daemon.app.inject({ method: 'POST', url: `${endpoint}/sessions/${session.id}/viewed` });
   await expect.poll(() => updates.at(-1)?.meta.lastViewedTurnSeq, { timeout: 1000 }).toBe(latestTurnSeq);
+});
+
+it('keeps a running turn and the next send usable when Studio is disabled', async () => {
+  const mock = approvalHarness();
+  const { daemon, dataDir } = await start(tempDir(), [mock.adapter]);
+  const session = await createSession(daemon, dataDir, mock.adapter.id);
+  const sessionUrl = `/api/v1/sessions/${session.id}`;
+  const send = (text: string) => daemon.app.inject({ method: 'POST', url: `${sessionUrl}/turns`, payload: { text } });
+  await daemon.pluginManager.togglePlugin(pluginId, true);
+  const first = await send('First W2 stream');
+  expect(first.statusCode).toBe(202);
+  const { turnId } = first.json();
+  await expect.poll(() => daemon.sessionManager.listPendingApprovals(session.id).length).toBe(1);
+  const [approval] = daemon.sessionManager.listPendingApprovals(session.id);
+  expect((await daemon.app.inject({ method: 'POST', url: `/api/v1/approvals/${approval!.id}/resolve`,
+    payload: { decision: 'allow_once' } })).statusCode).toBe(200);
+
+  const toolCallId = 'w2-live-command';
+  mock.emit({ type: 'tool.call.started', turnId, toolCallId, toolName: 'shell', toolKind: 'shell', summary: 'Replay command' });
+  mock.emit({ type: 'command.output.delta', turnId, toolCallId, chunk: 'before disable' });
+  await daemon.pluginManager.togglePlugin('hm.plugin.message-studio', false);
+  mock.emit({ type: 'command.output.delta', turnId, toolCallId, chunk: ' after disable' });
+  mock.emit({ type: 'tool.call.completed', turnId, toolCallId, toolName: 'shell', status: 'success' });
+  mock.emit({ type: 'message.assistant.completed', turnId, text: '- [x] Kept the stream' });
+  mock.complete(turnId);
+
+  await expect.poll(() => state(daemon, session.id)).toMatchObject({ status: 'idle' });
+  const item = daemon.store.getTurnItem(`tool:${toolCallId}`);
+  expect(item).toMatchObject({ status: 'completed', textBody: 'before disable after disable', payload: { toolCallId } });
+  const ledger = async () => (await daemon.app.inject(`${sessionUrl}/task-state`)).json().taskState;
+  await expect.poll(ledger).toMatchObject({ steps: expect.arrayContaining([expect.objectContaining({ title: 'Kept the stream', status: 'done' })]) });
+  expect((await send('Second W2 stream')).statusCode).toBe(202);
 });
