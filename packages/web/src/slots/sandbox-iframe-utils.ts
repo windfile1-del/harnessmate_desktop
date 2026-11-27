@@ -130,6 +130,7 @@ export function buildIframeSrcDoc(params: {
   var reqSeq = 0;
   var themeListeners = [];
   var contextListeners = [];
+  var serviceListeners = new Map();
   var browserFrameListeners = new Set();
   var browserStatusListeners = new Set();
 
@@ -153,10 +154,28 @@ export function buildIframeSrcDoc(params: {
     try { window.parent.postMessage(msg, '*'); } catch (_) {}
   }
 
-  function call(method, params) {
+  function call(method, params, options) {
     var requestId = 'req_' + (++reqSeq) + '_' + Date.now();
     return new Promise(function (resolve, reject) {
-      pending[requestId] = { resolve: resolve, reject: reject };
+      var signal = options && options.signal;
+      var timer;
+      function cancel() {
+        if (!pending[requestId]) return;
+        delete pending[requestId];
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', cancel);
+        post({ type: 'hm:rpc:cancel', requestId: requestId, runId: init.runId });
+        reject(Object.assign(new Error('请求已取消'), { name: 'AbortError' }));
+      }
+      function finish(fn, value) {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', cancel);
+        fn(value);
+      }
+      pending[requestId] = { resolve: function(v) { finish(resolve, v); }, reject: function(e) { finish(reject, e); } };
+      if (signal && signal.aborted) { cancel(); return; }
+      if (signal) signal.addEventListener('abort', cancel, { once: true });
+      timer = setTimeout(cancel, (options && options.timeoutMs) || 120000);
       post({
         type: 'hm:rpc:request',
         requestId: requestId,
@@ -183,6 +202,9 @@ export function buildIframeSrcDoc(params: {
       browserFrameListeners.forEach(function (listener) { try { listener(data.frame); } catch (_) {} });
     } else if (data.type === 'hm:browser:status' && data.runId === init.runId) {
       browserStatusListeners.forEach(function (listener) { try { listener(data.status); } catch (_) {} });
+    } else if (data.type === 'hm:service:batch' && data.runId === init.runId) {
+      var listener = serviceListeners.get(data.subscriptionId);
+      if (listener) listener(data.batch);
     } else if (data.type === 'hm:rpc:response') {
       var entry = pending[data.requestId];
       if (!entry) return;
@@ -213,6 +235,28 @@ export function buildIframeSrcDoc(params: {
     get session() { return init.session; },
     get props() { return init.props; },
     call: call,
+    services: {
+      call: function (contract, method, args, options) {
+        var params = Object.assign({ contract: contract, method: method, args: args || [] }, options || {});
+        delete params.signal; delete params.timeoutMs;
+        return call('services.call', params, options);
+      },
+      subscribe: function (options, listener) {
+        var id = 'service_' + (++reqSeq);
+        serviceListeners.set(id, listener);
+        var released = false;
+        var release = function () {
+          if (released) return;
+          released = true;
+          serviceListeners.delete(id);
+          return call('services.unsubscribe', { subscriptionId: id });
+        };
+        var params = Object.assign({}, options, { subscriptionId: id });
+        delete params.signal; delete params.timeoutMs;
+        return call('services.subscribe', params, options)
+          .then(function () { return release; }, function (error) { release(); throw error; });
+      }
+    },
     requestPluginRoute: function (options) { return call('plugin.route', options || {}); },
     resolveService: function (options) { return call('services.resolve', options || {}); },
     listPlugins: function () { return call('plugins.list', {}); },

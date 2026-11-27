@@ -201,7 +201,7 @@ export function PluginWorkspaceLinks() {
 
   return (
     <nav aria-label="插件工作页" className="max-h-56 space-y-1 overflow-y-auto px-3.5 pb-2">
-      {pages.map((page) => (
+      {pages.filter(page => page.id !== 'chat' || !plugins.some(plugin => getPluginInstanceId(plugin) === page.pluginId && pluginProvidesContract(plugin, 'chat.view.v1'))).map((page) => (
         <button
           type="button"
           key={pageKey(page)}

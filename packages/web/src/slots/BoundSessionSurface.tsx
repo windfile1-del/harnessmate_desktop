@@ -7,7 +7,10 @@ import { SandboxedPluginFrame, type SandboxedPluginFrameProps } from './Sandboxe
 export function useBoundSessionPlugin(contract: string, session: Session | null) {
   const plugins = useAppStore((state) => state.plugins);
   const sessionBindings = useAppStore((state) => session ? state.sessionBindingsBySession[session.id] : undefined);
-  const workspaceBindings = useAppStore((state) => session ? state.workspaceBindingsByWorkspace[session.workspaceId] : undefined);
+  const workspaceBindings = useAppStore((state) => {
+    const workspaceId = session?.workspaceId ?? state.selectedWorkspaceId;
+    return workspaceId ? state.workspaceBindingsByWorkspace[workspaceId] : undefined;
+  });
   const compositionBindings = useAppStore((state) => state.compositionBindings);
   const compositionEntries = useAppStore((state) => state.compositionEntries);
   return useMemo(() => {

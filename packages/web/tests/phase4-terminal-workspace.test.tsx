@@ -17,6 +17,7 @@ import { daemonApi } from '../src/api/client';
 import { parseAnsiSegments } from '../src/lib/ansi-render';
 import { SlotRegistry, SlotRegistryProvider } from '../src/slots';
 import { useAppStore } from '../src/stores/app-store';
+import { useAppStore as useChatStore } from '../src/plugins/chat-default/store';
 
 const sampleWorkspace: Workspace = {
   id: 'ws_term_1',
@@ -293,9 +294,9 @@ describe('Phase 4.2 Frontend: TerminalWorkspaceDrawer, Inline Chips & Worktree R
       exitCode: 1,
     };
 
-    const store = useAppStore.getState();
+    const store = useChatStore.getState();
     store.addPendingTerminalChip(sampleSession.id, chip);
-    expect(useAppStore.getState().pendingTerminalChipsBySession[sampleSession.id]).toHaveLength(1);
+    expect(useChatStore.getState().pendingTerminalChipsBySession[sampleSession.id]).toHaveLength(1);
 
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ turnId: 'turn_1' }), {
@@ -318,7 +319,7 @@ describe('Phase 4.2 Frontend: TerminalWorkspaceDrawer, Inline Chips & Worktree R
       vi.unstubAllGlobals();
     }
 
-    useAppStore.getState().clearDraft(sampleSession.id);
-    expect(useAppStore.getState().pendingTerminalChipsBySession[sampleSession.id]).toEqual([]);
+    useChatStore.getState().clearDraft(sampleSession.id);
+    expect(useChatStore.getState().pendingTerminalChipsBySession[sampleSession.id]).toEqual([]);
   });
 });

@@ -445,6 +445,14 @@ export const SessionDataStreamIdentitySchema = z.object({
 
 export const WsClientFrameSchema = z.discriminatedUnion('op', [
   z.object({
+    op: z.literal('subscribe_service'),
+    subscriptionId: z.string().min(1),
+    contract: z.string().min(1),
+    instanceId: z.string().min(1),
+    runId: z.string().optional(),
+  }),
+  z.object({ op: z.literal('unsubscribe_service'), subscriptionId: z.string() }),
+  z.object({
     op: z.literal('subscribe'),
     sessionId: z.string(),
     afterSeq: z.number().int().nonnegative().default(0),
@@ -511,6 +519,14 @@ export const AttentionItemSchema = z.object({
 export type AttentionItem = z.infer<typeof AttentionItemSchema>;
 
 export const WsServerFrameSchema = z.discriminatedUnion('op', [
+  z.object({
+    op: z.literal('service_batch'),
+    subscriptionId: z.string(),
+    instanceId: z.string(),
+    runId: z.string().optional(),
+    reset: z.boolean().optional(),
+    events: z.array(z.object({ seq: z.number(), emittedAt: z.number(), payload: z.record(z.unknown()) })),
+  }),
   z.object({
     op: z.literal('hello'),
     protocolVersion: z.literal(PROTOCOL_VERSION),

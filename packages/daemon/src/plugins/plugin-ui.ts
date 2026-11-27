@@ -2,8 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PluginApiError, isSafePluginUiPath } from '@harnessmate/plugin-api';
 
-const MAX_UI_ASSET_BYTES = 512 * 1024;
-const MAX_INLINE_HTML_BYTES = 1024 * 1024;
+// The retained React chat build is 1.29 MB. These are generic resource limits,
+// shared by installed and bundled pages; they do not change rendering budgets.
+const MAX_UI_ASSET_BYTES = 2 * 1024 * 1024;
+const MAX_INLINE_HTML_BYTES = 4 * 1024 * 1024;
 
 export const SANDBOX_IFRAME_CSP = [
   "default-src 'none'",
@@ -67,7 +69,7 @@ export function resolvePluginUiAsset(packageRoot: string, relativePath: string):
     throw new PluginApiError('E_INVALID_INPUT', 'UI 资源路径不是普通文件');
   }
   if (stat.size > MAX_UI_ASSET_BYTES) {
-    throw new PluginApiError('E_LIMIT_EXCEEDED', '插件 UI 资源超过 512 KiB 限制');
+    throw new PluginApiError('E_LIMIT_EXCEEDED', '插件 UI 资源超过 2 MiB 限制');
   }
   const ext = path.extname(realTarget).toLowerCase();
   const contentType = MIME_BY_EXT[ext];
@@ -154,7 +156,7 @@ export function buildSandboxedPluginHtml(packageRoot: string, uiRelativePath: st
   );
 
   if (Buffer.byteLength(html, 'utf8') > MAX_INLINE_HTML_BYTES) {
-    throw new PluginApiError('E_LIMIT_EXCEEDED', '打包后的插件 UI 文档超过 1 MiB 限制');
+    throw new PluginApiError('E_LIMIT_EXCEEDED', '打包后的插件 UI 文档超过 4 MiB 限制');
   }
 
   return { html, csp: SANDBOX_IFRAME_CSP, normalizedPath: entry.normalizedPath };

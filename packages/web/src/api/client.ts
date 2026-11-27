@@ -275,6 +275,10 @@ export class ApiHttpError extends Error {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  if (typeof window !== 'undefined' && (window as unknown as { harnessMate?: { call: unknown } }).harnessMate) {
+    const bridge = (window as unknown as { harnessMate: { call(method: string, params: unknown): Promise<T> } }).harnessMate;
+    return bridge.call('transport.request', { path, method: init?.method ?? 'GET', body: init?.body });
+  }
   const url = `${getDaemonBaseUrl()}${path}`;
   const headers = new Headers(init?.headers);
   if (init?.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -321,6 +325,11 @@ function scopedHarnessUrl(path: string, scope?: HarnessServiceScope, refresh = f
 }
 
 export const daemonApi = {
+  callUiService: (callerInstanceId: string, params: Record<string, unknown>, signal?: AbortSignal) =>
+    apiFetch<{ resolution: ServiceResolutionV1; value: unknown }>(
+      `/api/v1/plugin-instances/${encodeURIComponent(callerInstanceId)}/services/call`,
+      { method: 'POST', body: JSON.stringify(params), signal }),
+  request: <T>(path: string, init?: RequestInit) => apiFetch<T>(path, init),
   health: () =>
     apiFetch<{
       status: string;
@@ -1700,7 +1709,19 @@ export interface AgyEcosystemSnapshotDto {
   };
 }
 
+export type ServiceBatch = Extract<WsServerFrame, { op: 'service_batch' }>;
+export let sharedDaemonWs: DaemonWsClient | undefined;
+
 export class DaemonWsClient {
+  private frameObservers = new Set<(frame: WsServerFrame) => void>();
+  observeFrames(listener: (frame: WsServerFrame) => void): () => void {
+    this.frameObservers.add(listener);
+    return () => { this.frameObservers.delete(listener); };
+  }
+  private serviceSubscriptions = new Map<string, {
+    frame: Extract<WsClientFrame, { op: 'subscribe_service' }>;
+    listener: (batch: ServiceBatch) => void;
+  }>();
   private ws: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private closed = false;
@@ -1713,7 +1734,18 @@ export class DaemonWsClient {
       onConnected: (connected: boolean) => void;
       onFrame: (frame: WsServerFrame) => void;
     },
-  ) {}
+  ) { sharedDaemonWs = this; }
+
+  subscribeService(params: { contract: string; instanceId: string; runId?: string }, listener: (batch: ServiceBatch) => void): () => void {
+    const subscriptionId = crypto.randomUUID();
+    const frame = { op: 'subscribe_service' as const, subscriptionId, ...params };
+    this.serviceSubscriptions.set(subscriptionId, { frame, listener });
+    this.send(frame);
+    return () => {
+      this.serviceSubscriptions.delete(subscriptionId);
+      this.send({ op: 'unsubscribe_service', subscriptionId });
+    };
+  }
 
   connect(): void {
     this.closed = false;
@@ -1783,6 +1815,7 @@ export class DaemonWsClient {
       this.ws = ws;
 
       ws.onopen = () => {
+        for (const sub of this.serviceSubscriptions.values()) this.send(sub.frame);
         this.handlers.onConnected(true);
         this.send({ op: 'subscribe_attention' });
         if (this.activeSubscription) {
@@ -1807,6 +1840,9 @@ export class DaemonWsClient {
       ws.onmessage = (ev) => {
         try {
           const frame = JSON.parse(String(ev.data)) as WsServerFrame;
+          if (frame.op === 'plugins_changed') for (const sub of this.serviceSubscriptions.values()) this.send(sub.frame);
+          for (const listener of this.frameObservers) listener(frame);
+          if (frame.op === 'service_batch') this.serviceSubscriptions.get(frame.subscriptionId)?.listener(frame);
           this.handlers.onFrame(frame);
         } catch {
           // ignore malformed frames

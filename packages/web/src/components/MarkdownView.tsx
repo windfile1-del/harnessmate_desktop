@@ -4,6 +4,7 @@ import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markd
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
 import { parseFileLink, type FileLink } from '../lib/file-links';
+import { copyText } from '../lib/clipboard';
 
 function CodeBlock({ children, className }: { children?: ReactNode; className?: string }) {
   const [copied, setCopied] = useState(false);
@@ -12,7 +13,7 @@ function CodeBlock({ children, className }: { children?: ReactNode; className?: 
   const rawText = extractText(children).replace(/\n$/, '');
 
   const handleCopy = () => {
-    void navigator.clipboard.writeText(rawText);
+    void copyText(rawText);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
   };

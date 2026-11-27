@@ -1,0 +1,11 @@
+{
+  "id": "hm.plugin.fixed-replay",
+  "name": "Fixed replay (offline acceptance fixture)",
+  "version": "1.0.0",
+  "description": "Deterministic offline mixed Chinese, Markdown, code and tool output at 25 batches per second; never connects to a provider.",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
+  "main": "index.mjs",
+  "permissions": ["harness:driver:register"],
+  "contributes": {}
+}

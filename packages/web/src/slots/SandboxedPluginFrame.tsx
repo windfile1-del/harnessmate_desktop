@@ -6,11 +6,12 @@ import type {
 } from '@harnessmate/protocol';
 import { Loader2, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { daemonApi } from '../api/client';
+import { daemonApi, sharedDaemonWs } from '../api/client';
 import { isAbortError } from '../api/peer-workspace-client';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry, useSlotTheme } from './hooks';
 import { executeSandboxedBridgeMethod } from './sandbox-bridge-handler';
+import { shellFields } from './shell-bridge';
 import {
   buildIframeSrcDoc,
   collectThemeCssVars,
@@ -168,8 +169,21 @@ export function SandboxedPluginFrame({
     const desktopView = window.harnessMateBridge?.desktopView ?? window.harnessMateBridge?.pluginBrowser;
     const viewId = desktopView ? window.crypto.randomUUID() : '';
     const rpcAbort = new AbortController();
+    const requests = new Map<string, AbortController>();
     let disposed = false;
     let unsubscribeBrowser: (() => void) | undefined;
+    const serviceSubscriptions = new Map<string, () => void>();
+    const outputSubscriptions = new Map<string, () => void>();
+    const unsubscribeShell = useAppStore.subscribe((state, previous) => {
+      const patch = Object.fromEntries(shellFields.filter((field) => state[field] !== previous[field])
+        .map((field) => [field, state[field]]));
+      if (Object.keys(patch).length) iframeRef.current?.contentWindow?.postMessage({ type: 'hm:shell:state', runId: activeRunId, patch }, '*');
+    });
+    const unsubscribeOutput = sharedDaemonWs?.observeFrames((frame) => {
+      if (frame.op === 'command_output' && outputSubscriptions.has(`${frame.sessionId}::${frame.toolCallId}`)) {
+        iframeRef.current?.contentWindow?.postMessage({ type: 'hm:output', runId: activeRunId, frame }, '*');
+      }
+    });
 
     const reply = (
       requestId: string,
@@ -190,7 +204,45 @@ export function SandboxedPluginFrame({
       params: Record<string, unknown> | undefined,
       iframeWindow: Window,
       runId: string,
+      signal: AbortSignal = rpcAbort.signal,
     ): Promise<unknown> => {
+      if (method === 'outputs.subscribe' || method === 'outputs.unsubscribe') {
+        const sessionId = String(params?.sessionId ?? '');
+        const toolCallId = String(params?.toolCallId ?? '');
+        const id = `${sessionId}::${toolCallId}`;
+        outputSubscriptions.get(id)?.();
+        outputSubscriptions.delete(id);
+        if (method === 'outputs.subscribe') outputSubscriptions.set(id, useAppStore.getState().subscribeCommandOutput(sessionId, toolCallId));
+        return id;
+      }
+      if (method === 'services.unsubscribe') {
+        const id = String(params?.subscriptionId ?? '');
+        serviceSubscriptions.get(id)?.();
+        serviceSubscriptions.delete(id);
+        return {};
+      }
+      if (method === 'services.subscribe') {
+        const connection = sharedDaemonWs;
+        if (!connection) throw new Error('事件连接尚未就绪');
+        const contract = String(params?.contract ?? '');
+        const instanceId = String(params?.instanceId ?? '');
+        const subscriptionId = String(params?.subscriptionId ?? '');
+        if (!contract || !instanceId || !subscriptionId) throw new Error('需要契约、实例和订阅 ID');
+        serviceSubscriptions.get(subscriptionId)?.();
+        return new Promise((resolve, reject) => {
+          let acknowledged = false;
+          const cancel = () => { serviceSubscriptions.get(subscriptionId)?.(); serviceSubscriptions.delete(subscriptionId); reject(new DOMException('请求已取消', 'AbortError')); };
+          signal.addEventListener('abort', cancel, { once: true });
+          const release = connection.subscribeService({ contract, instanceId,
+            runId: typeof params?.runId === 'string' ? params.runId : undefined }, (batch) => {
+            if (disposed || rpcAbort.signal.aborted) return;
+            iframeWindow.postMessage({ type: 'hm:service:batch', runId: activeRunId,
+              subscriptionId, batch }, '*');
+            if (!acknowledged) { acknowledged = true; signal.removeEventListener('abort', cancel); resolve({ subscriptionId }); }
+          });
+          serviceSubscriptions.set(subscriptionId, release);
+        });
+      }
       if (method === 'surface.action' && actionRef.current && typeof params?.action === 'string') {
         return actionRef.current(params.action, params, rpcAbort.signal);
       }
@@ -228,7 +280,7 @@ export function SandboxedPluginFrame({
           slotId,
           runId,
           currentSession: sessionRef.current,
-          signal: rpcAbort.signal,
+          signal,
           isDisposed: () => disposed,
         },
         method,
@@ -239,6 +291,9 @@ export function SandboxedPluginFrame({
     const onMessage = (event: MessageEvent) => {
       const iframeWindow = iframeRef.current?.contentWindow;
       if (!iframeWindow || event.source !== iframeWindow) return;
+      if (event.data?.type === 'hm:rpc:cancel' && event.data.runId === activeRunId) {
+        requests.get(event.data.requestId)?.abort(); return;
+      }
       const raw = event.data as
         | PluginSlotBridgeIframeMessage
         | { type: 'hm:action'; action: string; params?: Record<string, unknown>; slotId?: string; runId?: string }
@@ -296,7 +351,9 @@ export function SandboxedPluginFrame({
           return;
         }
 
-        void runHostMethod(method, params, iframeWindow, runId)
+        const controller = new AbortController();
+        requests.set(requestId, controller);
+        void runHostMethod(method, params, iframeWindow, runId, AbortSignal.any([controller.signal, rpcAbort.signal]))
           .then((result) => {
             if (disposed || rpcAbort.signal.aborted) return;
             reply(requestId, { ok: true, result });
@@ -311,7 +368,7 @@ export function SandboxedPluginFrame({
                 message: err instanceof Error ? err.message : String(err),
               },
             });
-          });
+          }).finally(() => requests.delete(requestId));
       }
     };
 
@@ -319,6 +376,12 @@ export function SandboxedPluginFrame({
     return () => {
       disposed = true;
       rpcAbort.abort();
+      requests.clear();
+      unsubscribeShell(); unsubscribeOutput?.();
+      for (const release of outputSubscriptions.values()) release();
+      outputSubscriptions.clear();
+      for (const release of serviceSubscriptions.values()) release();
+      serviceSubscriptions.clear();
       window.removeEventListener('message', onMessage);
       if (unsubscribeBrowser) {
         unsubscribeBrowser();

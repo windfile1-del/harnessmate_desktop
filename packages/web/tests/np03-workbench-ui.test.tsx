@@ -32,6 +32,13 @@ import { ChatStage } from '../src/components/ChatStage';
 import { SlotRegistryProvider, SlotSessionProvider } from '../src/slots';
 import { useAppStore } from '../src/stores/app-store';
 
+// This suite supplies a B4 native-workbench projection fixture. Product chat pages
+// receive that DTO through the shell bridge; this server-render unit test shares
+// the fixture store explicitly, without introducing a product fallback.
+vi.mock('../src/plugins/chat-default/store', async () => ({
+  useAppStore: (await import('../src/stores/app-store')).useAppStore,
+}));
+
 vi.mock('../src/stores/app-store', async (importOriginal) => {
   const original = await importOriginal<typeof import('../src/stores/app-store')>();
   const bound = original.useAppStore;

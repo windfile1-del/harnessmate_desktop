@@ -9,6 +9,7 @@ import {
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   PEER_CONTRACTS,
+  isReservedServiceName,
   sessionDataStreamKey,
   type SessionDataChannelEvent,
   type SessionDataStreamIdentity,
@@ -94,6 +95,7 @@ export class WsGateway {
   }
 
   private handleConnection(ws: WebSocket): void {
+    const serviceUnsubs = new Map<string, () => void>();
     const sessionUnsubs = new Map<string, () => void>();
     const commandOutputUnsubs = new Map<string, () => void>();
     const terminalOutputUnsubs = new Map<string, () => void>();
@@ -181,6 +183,60 @@ export class WsGateway {
 
       const frame = parsed.data;
       switch (frame.op) {
+        case 'unsubscribe_service': {
+          serviceUnsubs.get(frame.subscriptionId)?.();
+          serviceUnsubs.delete(frame.subscriptionId);
+          break;
+        }
+        case 'subscribe_service': {
+          serviceUnsubs.get(frame.subscriptionId)?.();
+          serviceUnsubs.delete(frame.subscriptionId);
+          const pm = this.deps.pluginManager;
+          const provider = pm?.host.getServiceRecordByInstance(frame.instanceId, frame.contract);
+          const sendBatch = (events: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }>, reset = false) =>
+            this.send(ws, { op: 'service_batch', subscriptionId: frame.subscriptionId,
+              instanceId: frame.instanceId, runId: provider?.runId, events, ...(reset ? { reset: true } : {}) });
+          if (!pm || !provider || isReservedServiceName(frame.contract)
+            || (frame.runId && provider.runId !== frame.runId) || !pm.isInstanceEnabled(frame.instanceId)) {
+            sendBatch([], true);
+            break;
+          }
+          let queue: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }> = [];
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let released = false;
+          const flush = () => {
+            timer = undefined;
+            if (released || !queue.length) return;
+            const batch = queue;
+            queue = [];
+            if (ws.bufferedAmount > 2 * 1024 * 1024) { sendBatch([], true); release(); return; }
+            sendBatch(batch);
+          };
+          const unsub = pm.host.subscribeServiceChannel(frame.contract, (event) => {
+            if (event.instanceId !== frame.instanceId || released) return;
+            queue.push({ seq: event.seq, emittedAt: event.emittedAt, payload: event.payload });
+            if (queue.length >= 256) { if (timer) clearTimeout(timer); flush(); }
+            else timer ??= setTimeout(flush, 16);
+          });
+          const changed = pm.host.onServicesChanged(() => {
+            const current = pm.host.getServiceRecordByInstance(frame.instanceId, frame.contract);
+            if (!current || current.runId !== provider.runId || !pm.isInstanceEnabled(frame.instanceId)) {
+              sendBatch([], true); release();
+            }
+          });
+          const release = () => {
+            if (released) return;
+            released = true; unsub(); changed();
+            if (timer) clearTimeout(timer);
+            queue = [];
+            serviceUnsubs.delete(frame.subscriptionId);
+          };
+          serviceUnsubs.set(frame.subscriptionId, release);
+          // Acknowledgement is sent after attaching the listener. Consumers take their
+          // durable snapshot only after this boundary and replay from its own cursor.
+          sendBatch([], true);
+          break;
+        }
         case 'ping': {
           this.send(ws, { op: 'pong', ts: frame.ts ?? Date.now() });
           break;
@@ -448,6 +504,8 @@ export class WsGateway {
     });
 
     ws.on('close', () => {
+      for (const unsub of [...serviceUnsubs.values()]) unsub();
+      serviceUnsubs.clear();
       for (const unsub of sessionUnsubs.values()) unsub();
       sessionUnsubs.clear();
       for (const unsub of commandOutputUnsubs.values()) unsub();

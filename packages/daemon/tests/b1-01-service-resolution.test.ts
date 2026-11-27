@@ -490,6 +490,7 @@ it('loads distribution defaults from harnessmate-core data, preserves legacy pro
   ]);
   comp.reload([]);
   expect(comp.layerBindings).toEqual({
+    'chat.view.v1': 'hm.plugin.chat-default',
     'browser.v1': 'hm.plugin.browser-desktop',
     'filePreview.v1': 'hm.plugin.file-preview-text',
     'approval.policy.v1': 'hm.plugin.approval-policy-default',

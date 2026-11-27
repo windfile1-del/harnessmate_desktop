@@ -68,6 +68,7 @@
               {
                 "type": "string",
                 "enum": [
+                  "chat.view.v1",
                   "browser.v1",
                   "filePreview.v1",
                   "approval.policy.v1",

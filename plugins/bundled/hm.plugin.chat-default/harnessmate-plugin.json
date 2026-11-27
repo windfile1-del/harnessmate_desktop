@@ -1,0 +1,24 @@
+{
+  "id": "hm.plugin.chat-default",
+  "name": "默认聊天",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
+  "permissions": ["storage:plugin"],
+  "category": "ui",
+  "main": "index.mjs",
+  "provides": [
+    "chat.view.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "chat",
+        "title": "聊天",
+        "ui": "ui/index.html"
+      }
+    ]
+  },
+  "description": "通过公开会话数据与运行契约提供可替换聊天页面、草稿与恢复。"
+}

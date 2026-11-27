@@ -1,8 +1,9 @@
 import type { ImportSessionBundleRequest, Session } from '@harnessmate/protocol';
-import { ApiHttpError, daemonApi } from '../api/client';
+import { ApiHttpError, daemonApi, getDaemonBaseUrl } from '../api/client';
 import { getPluginInstanceId, makeWorkspacePageKey } from '../api/peer-contracts';
 import { defaultPeerWorkspaceTransport } from '../api/peer-workspace-client';
 import { useAppStore } from '../stores/app-store';
+import { invokeShell, shellSnapshot } from './shell-bridge';
 
 export interface SandboxedBridgeExecContext {
   pluginId: string;
@@ -35,6 +36,50 @@ export async function executeSandboxedBridgeMethod(
     isDisposed,
   } = ctx;
   const store = useAppStore.getState();
+  if (method === 'presentation.publish') {
+    if (JSON.stringify(params).length > 65536) throw new Error('页面投影超过 64 KiB');
+    if (!signal.aborted && !isDisposed()) window.dispatchEvent(new CustomEvent('hm:presentation', {
+      detail: { instanceId: effectiveInstanceId, sessionId: currentSession?.id, ...params },
+    }));
+    return {};
+  }
+  if (method === 'shell.snapshot') return shellSnapshot();
+  if (method === 'shell.invoke') return invokeShell(String(params?.name ?? ''), Array.isArray(params?.args) ? params.args : []);
+  if (method === 'clipboard.writeText') return navigator.clipboard.writeText(String(params?.text ?? ''));
+  if (method === 'files.download') {
+    const filename = String(params?.filename ?? 'export.txt').split(/[\\/]/).at(-1) || 'export.txt';
+    const blob = new Blob([String(params?.text ?? '')], { type: String(params?.mime ?? 'text/plain') });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = filename; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return { filename };
+  }
+  if (method === 'transport.resource') {
+    const path = String(params?.path ?? '');
+    if (!path.startsWith('/api/v1/') || path.includes('..') || path.includes('\\')) throw new Error('需要本机公开资源路径');
+    const response = await fetch(`${getDaemonBaseUrl()}${path}`, { signal });
+    if (!response.ok) throw new Error(`读取资源失败: ${response.status}`);
+    const blob = await response.blob();
+    if (!blob.type.startsWith('image/') || blob.size > 16 * 1024 * 1024) throw new Error('需要 16 MiB 以内图片资源');
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob);
+    });
+  }
+
+  if (method === 'services.call') {
+    return daemonApi.callUiService(effectiveInstanceId, { ...params, runId }, signal);
+  }
+
+  if (method === 'transport.request') {
+    const path = typeof params?.path === 'string' ? params.path : '';
+    if (!path.startsWith('/api/v1/') || path.includes('..') || path.includes('\\')) {
+      throw Object.assign(new Error('需要本机公开 API 路径'), { code: 'E_INVALID_INPUT' });
+    }
+    return daemonApi.request(path, { signal,
+      method: typeof params?.method === 'string' ? params.method : 'GET',
+      body: typeof params?.body === 'string' ? params.body : undefined });
+  }
 
   if (method === 'plugin.route') {
     const targetInstanceId =

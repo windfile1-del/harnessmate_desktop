@@ -8,6 +8,7 @@
 - `approval.policy.v1`
 - `attachments`
 - `browser.v1`
+- `chat.view.v1`
 - `checkpoints`
 - `compressor`
 - `failover`

@@ -1,0 +1,37 @@
+import fs from 'node:fs';import path from 'node:path';
+import {targets,connect,sleep} from './cdp.mjs';
+const [port='49771',debug='49772']=process.argv.slice(2),base=`http://127.0.0.1:${port}`;
+async function api(route,body,method=body?'POST':'GET'){const r=await fetch(base+route,{method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json();if(!r.ok)throw new Error(`${r.status} ${route} ${JSON.stringify(j)}`);return j;}
+const wait=async fn=>{for(let i=0;i<200;i++){try{const r=await fn();if(r)return r;}catch{}await sleep(200);}throw new Error('update timeout')};
+await api('/api/v1/plugins/hm.plugin.chat-lite',{enabled:true},'PATCH');
+await api('/api/v1/plugins/hm.plugin.fixed-replay',{enabled:true},'PATCH');
+const workspace=(await api('/api/v1/workspaces')).workspaces.find(w=>w.name==='External Chat Lite workspace');
+await api(`/api/v1/workspaces/${workspace.id}/bindings`,{contract:'chat.view.v1',instanceId:'hm.plugin.chat-lite'},'PUT');
+const title=`Chat update acceptance ${Date.now()}`;
+const session=(await api('/api/v1/sessions',{workspaceId:workspace.id,harnessId:'fixed-replay',title,permissionMode:'manual'})).session;
+const shell=await connect((await targets(debug)).find(t=>t.type==='page'));
+await shell.call('Page.reload');
+await wait(()=>shell.eval(`(()=>{const e=[...document.querySelectorAll('[role="button"]')].find(e=>e.textContent.includes(${JSON.stringify(title)}));e?.click();return !!e})()`));
+async function view(notRun){return wait(async()=>{const t=(await targets(debug)).find(t=>t.type==='iframe');if(!t)return;const c=await connect(t);if(await c.eval('!!document.querySelector("#draft")')&&(!notRun||await c.eval('window.harnessMate.runId')!==notRun))return c;c.close();});}
+let page=await view();const oldRun=await page.eval('window.harnessMate.runId');
+await page.eval(`document.querySelector('#draft').value='更新时后台继续';document.querySelector('#draft').dispatchEvent(new Event('input'));document.querySelector('#send').click();true`);
+await wait(()=>page.eval('document.querySelector("#history").textContent.includes("HMREPLAY_5_")'));
+await page.eval(`document.querySelector('#draft').value='更新保留草稿';document.querySelector('#draft').dispatchEvent(new Event('input'));true`);await sleep(300);
+const before=(await api(`/api/v1/sessions/${session.id}`)).session;
+const dirPath=path.resolve('.tmp/w3/chat-lite-update');fs.mkdirSync(dirPath,{recursive:true});fs.cpSync('plugins/examples/hm.plugin.chat-lite',dirPath,{recursive:true});
+const manifest=JSON.parse(fs.readFileSync(path.join(dirPath,'harnessmate-plugin.json'),'utf8'));manifest.version=`1.0.${Math.floor(Date.now()/1000)}`;fs.writeFileSync(path.join(dirPath,'harnessmate-plugin.json'),JSON.stringify(manifest,null,2));
+const preview=await api('/api/v1/plugins/preview',{mode:'local_dir',dirPath});
+await api('/api/v1/plugins/install',{mode:'local_dir',dirPath,trustCode:true,expectedDigest:preview.digest,expectedInstalledDigest:preview.installedDigest});
+for(const capability of manifest.permissions)await api(`/api/v1/plugins/${manifest.id}/permissions`,{workspaceId:'__global__',digest:preview.digest,capability,granted:true},'PUT');
+page.close();page=await view(oldRun);
+const newRun=await wait(async()=>{const id=await page.eval('window.harnessMate.runId');return id!==oldRun?id:null});
+await wait(()=>page.eval('document.querySelector("#draft").value==="更新保留草稿" && document.querySelector("#history").textContent.includes("HMREPLAY_5_")'));
+const after=await wait(async()=>{const s=(await api(`/api/v1/sessions/${session.id}`)).session;return s.lastSeq>before.lastSeq&&s.status==='running'?s:null});
+const stale=await fetch(base+'/api/v1/plugin-instances/hm.plugin.chat-lite/services/call',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({runId:oldRun,contract:'chat.view.v1',method:'readViewState',instanceId:'hm.plugin.chat-lite',args:[{sessionId:session.id}]})});
+if(stale.status!==409)throw new Error('Old generation accepted');
+await page.eval('document.querySelector("#interrupt").click();true');await wait(async()=>(await api(`/api/v1/sessions/${session.id}`)).session.status==='idle');await sleep(250);
+const events=(await api(`/api/v1/sessions/${session.id}/events?limit=500`)).events;
+const users=events.filter(e=>e.type==='message.user').length,settlements=events.filter(e=>['turn.cancelled','turn.failed','turn.completed'].includes(e.type)).length;
+if(users!==1||settlements!==1)throw new Error(`Unexpected user/settlement count ${users}/${settlements}`);
+const result={oldRun,newRun,before:before.lastSeq,after:after.lastSeq,statusDuringUpdate:after.status,staleStatus:stale.status,users,settlements,draftRecovered:true};
+fs.writeFileSync('.tmp/w3/update-results.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));page.close();shell.close();

@@ -10,3 +10,4 @@ export * from './rpc.js';
 export * from './session-contracts.js';
 export * from './driver-contracts.js';
 export * from './collaboration-contracts.js';
+export * from './chat-contracts.js';

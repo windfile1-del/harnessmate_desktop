@@ -133,6 +133,7 @@ import { HistoryImportAdapter } from '../core/history-import-adapter.js';
 import { findSessionWithProvider, findWorkspaceWithProvider, listActiveSessionRuntimeProviders } from '../core/session-peer-router.js';
 import { httpStatusForPluginError } from '../core/w1-service-helpers.js';
 import { registerServiceResolutionRoute } from '../plugin-host/composition/resolve-route.js';
+import { registerUiServices } from './routes/ui-services.js';
 import { registerHistoryImportCompatRoutes } from './routes/history-import-compat.js';
 import { registerSessionSearchCompatRoutes } from './routes/session-search-compat.js';
 import { registerGitWorktreesCompatRoutes } from './routes/git-worktrees-compat.js';
@@ -438,7 +439,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
   pluginManager.host.events.on('plugin.state', ({ data }) => {
     syncTerminalOwnerListeners();
-    if (data.pluginId === pluginManager.filePreviewProviderId) wsGateway.notifyPluginsChanged();
+    wsGateway.notifyPluginsChanged();
   });
   pluginPermissions.onChange(({ capability }) => {
     if (capability === FILE_PREVIEW_PERMISSION) wsGateway.notifyPluginsChanged();
@@ -835,6 +836,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     return { providers: pluginManager.listServiceProviders(typeof contract === 'string' && contract.trim() ? contract.trim() : undefined) };
   });
   registerServiceResolutionRoute(app, pluginManager);
+  registerUiServices(app, pluginManager);
   app.get('/api/v1/plugins/composition', async (request) => {
     const { workspaceId } = request.query as { workspaceId?: string };
     const workspace = typeof workspaceId === 'string'
@@ -1206,6 +1208,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   const updatedPlugins = async () => {
     const harnesses = pluginManager.takeRegistryChanged() ? await registry.probeAll(false) : undefined;
+    wsGateway.notifyPluginsChanged();
     return { ...buildPluginPayload(), ...(harnesses ? { harnesses } : {}) };
   };
 

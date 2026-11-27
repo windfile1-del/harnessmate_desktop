@@ -173,7 +173,7 @@ export interface ToastNotice {
   body?: string;
 }
 
-interface AppState {
+export interface AppState {
   theme: 'dark' | 'light';
   connected: boolean;
   loading: boolean;
@@ -595,156 +595,13 @@ export const useAppStore = create<AppState>((set, get) => {
   const initialTheme = getInitialTheme();
   applyThemeToDocument(initialTheme);
 
-  let eventQueue: CanonicalEvent[] = [];
-  let eventFlush: ReturnType<typeof setTimeout> | undefined;
-  const ingestEvents = (batch: CanonicalEvent[]) => {
-    const accepted: CanonicalEvent[] = [];
-    set((state) => {
-      const grouped = new Map<string, CanonicalEvent[]>();
-      for (const event of batch) {
-        const list = grouped.get(event.sessionId) ?? [];
-        list.push(event);
-        grouped.set(event.sessionId, list);
-      }
-      const eventsBySession = { ...state.eventsBySession };
-      const metadata = new Map<string, CanonicalEvent[]>();
-      for (const [sessionId, incoming] of grouped) {
-        const existing = eventsBySession[sessionId] ?? [];
-        const lastSeq = existing.at(-1)?.seq ?? 0;
-        let seen: Set<number> | undefined;
-        const fresh = incoming.sort((a, b) => a.seq - b.seq).filter((event, index) => {
-          if (event.seq === incoming[index - 1]?.seq) return false;
-          if (event.seq > lastSeq) return true;
-          seen ??= new Set(existing.map(({ seq }) => seq));
-          return !seen.has(event.seq);
-        });
-        if (!fresh.length) continue;
-        const next = [...existing, ...fresh];
-        if (fresh[0]!.seq < lastSeq) next.sort((a, b) => a.seq - b.seq);
-        eventsBySession[sessionId] = next;
-        accepted.push(...fresh);
-        wsClient?.updateCursor(sessionId, fresh.at(-1)!.seq);
-        const updates = fresh.filter(({ type }) => !type.endsWith('.delta'));
-        if (updates.length) metadata.set(sessionId, updates);
-      }
-      if (!accepted.length) return state;
-
-      const sessions = metadata.size ? state.sessions.map((s) => (metadata.get(s.id) ?? []).reduce((s, event) => {
-        if (event.seq <= s.lastSeq) return s;
-        let status = s.status;
-        let pendingApprovalCount = s.pendingApprovalCount;
-        let usage = s.usage;
-        let actualModel = s.actualModel ?? null;
-        let modelReroutedReason = s.modelReroutedReason ?? null;
-        let harnessId = s.harnessId;
-        let harnessKind = s.harnessKind;
-        let participatingHarnesses = s.participatingHarnesses ?? [s.harnessId];
-
-        if (event.type === 'session.status' && typeof event.payload.status === 'string') {
-          status = event.payload.status as Session['status'];
-        } else if (event.type === 'session.harness_switched') {
-          if (typeof event.payload.toHarnessId === 'string') {
-            harnessId = event.payload.toHarnessId;
-            if (!participatingHarnesses.includes(harnessId)) {
-              participatingHarnesses = [...participatingHarnesses, harnessId];
-            }
-          }
-          if (typeof event.payload.toHarnessKind === 'string') {
-            harnessKind = event.payload.toHarnessKind as HarnessKind;
-          }
-        } else if (event.type === 'session.model_confirmed') {
-          if (typeof event.payload.actualModel === 'string') {
-            actualModel = event.payload.actualModel;
-          }
-          modelReroutedReason =
-            typeof event.payload.reason === 'string' && event.payload.reroutedFrom
-              ? event.payload.reason
-              : null;
-        } else if (event.type === 'session.config_confirmed') {
-          if (typeof event.payload.model === 'string') {
-            actualModel = event.payload.thoughtLevel
-              ? `${event.payload.model} (${String(event.payload.thoughtLevel)})`
-              : event.payload.model;
-          }
-        } else if (event.type === 'session.title_updated' && typeof event.payload.title === 'string') {
-          s = { ...s, title: event.payload.title };
-        } else if (event.type === 'approval.requested') {
-          pendingApprovalCount += 1;
-          status = 'awaiting_approval';
-        } else if (event.type === 'approval.resolved') {
-          pendingApprovalCount = Math.max(0, pendingApprovalCount - 1);
-        } else if (event.type === 'usage.updated' && event.payload.usage) {
-          usage = event.payload.usage as Session['usage'];
-        }
-
-        return {
-          ...s,
-          harnessId,
-          harnessKind,
-          participatingHarnesses,
-          status,
-          pendingApprovalCount,
-          usage,
-          actualModel,
-          modelReroutedReason,
-          lastSeq: Math.max(s.lastSeq, event.seq),
-          updatedAt: event.createdAt,
-        };
-      }, s)) : state.sessions;
-
-      return {
-        eventsBySession,
-        sessions,
-      };
-    });
-
-    const currentSelected = get().selectedSessionId;
-    const relevant = accepted.filter(({ sessionId }) => sessionId === currentSelected);
-    if (!currentSelected) return;
-    const turnEnded = relevant.some(({ type }) => type === 'turn.completed' || type === 'turn.failed' || type === 'turn.cancelled');
-    const orchestratorChanged = relevant.some(({ type }) => type.startsWith('subagent.'));
-    if (orchestratorChanged) {
-      void get().refreshOrchestratorBoard(currentSelected);
-      void get().refreshTurnItems(currentSelected);
-      if (relevant.some(({ type }) => type === 'subagent.spawned')) {
-        void daemonApi.listSessions().then(({ sessions }) => set({ sessions })).catch(() => {});
-      }
-      if (relevant.some(({ type }) => type === 'subagent.merged')) {
-        void get().refreshGitStatus(currentSelected);
-      }
-    }
-    if (get().inspectorOpen && (turnEnded || relevant.some(({ type }) => type === 'tool.call.completed'))) {
-      void get().refreshGitStatus(currentSelected);
-    }
-    if (turnEnded) {
-      void get().refreshContextPreview(currentSelected);
-      void get().refreshTurnItems(currentSelected);
-      void get().refreshCheckpoints(currentSelected);
-      void daemonApi.getSession(currentSelected).then(({ session, taskState }) =>
-        set((state) => ({
-          sessions: state.sessions.map((s) => s.id === session.id && s.lastSeq <= session.lastSeq ? session : s),
-          ...(taskState ? { taskStateBySession: { ...state.taskStateBySession, [session.id]: taskState } } : {}),
-        })),
-      ).catch(() => {});
-    } else if (relevant.some(({ type }) => type === 'checkpoint.captured' || type === 'checkpoint.reverted')) {
-      void get().refreshCheckpoints(currentSelected);
-      void get().refreshTurnItems(currentSelected);
-      if (get().inspectorOpen) {
-        void get().refreshGitStatus(currentSelected);
-      }
-    } else if (relevant.some(({ type }) => type === 'task.state_updated')) {
-      void get().refreshTaskState(currentSelected);
-    }
-    if (
-      accepted.some(
-        ({ type }) =>
-          type === 'approval.requested' ||
-          type === 'approval.resolved' ||
-          type === 'runtime_request.updated',
-      )
-    ) {
-      void get().refreshPendingApprovals();
-    }
+  const viewMutation = (sessionId: string, operation: Record<string, unknown>): void => {
+    const selected=get().resolveContractLocal('chat.view.v1',{sessionId});
+    const plugin=get().plugins.find(item=>(item.instanceId??item.id)===selected.instanceId);
+    if(selected.status!=='ready'||!plugin){get().pushToast({kind:'error',title:'聊天插件不可用'});return;}
+    void daemonApi.callUiService(selected.instanceId!,{runId:plugin.runId??plugin.packageDigest,
+      contract:'chat.view.v1',method:'editViewState',instanceId:selected.instanceId,
+      sessionId,args:[{sessionId,operation}]}).catch(error=>get().pushToast({kind:'error',title:'更新聊天草稿失败',body:String(error)}));
   };
 
   const handleSnoozeReminder = (event: TriageSnoozeExpired, toast: boolean) => {
@@ -889,15 +746,7 @@ export const useAppStore = create<AppState>((set, get) => {
             if (connected && !get().loading) void get().refreshPlugins().catch(() => {});
           },
           onFrame: (frame) => {
-            if (frame.op === 'event') {
-              eventQueue.push(frame.event);
-              eventFlush ??= setTimeout(() => {
-                eventFlush = undefined;
-                const batch = eventQueue;
-                eventQueue = [];
-                ingestEvents(batch);
-              }, 25);
-            } else if (frame.op === 'command_output') {
+            if (frame.op === 'command_output') {
               const key = `${frame.sessionId}::${frame.toolCallId}`;
               set((state) => {
                 const prev = state.liveCommandOutputByKey[key];
@@ -1294,37 +1143,13 @@ export const useAppStore = create<AppState>((set, get) => {
     setHarnessFilter: (id) => set({ harnessFilter: id }),
     setSearchQuery: (q) => set({ searchQuery: q }),
 
-    setDraftText: (sessionId, text) =>
-      set((s) => ({ draftTextBySession: { ...s.draftTextBySession, [sessionId]: text } })),
+    setDraftText: (sessionId, text) => viewMutation(sessionId, {type: 'setText', text}),
 
-    addDraftAttachment: (sessionId, att) =>
-      set((s) => {
-        const curr = s.draftAttachmentsBySession[sessionId] ?? [];
-        if (curr.some((x) => x.id === att.id || (att.relativePath && x.relativePath === att.relativePath))) {
-          return s;
-        }
-        return {
-          draftAttachmentsBySession: {
-            ...s.draftAttachmentsBySession,
-            [sessionId]: [...curr, att],
-          },
-        };
-      }),
+    addDraftAttachment: (sessionId, attachment) => viewMutation(sessionId, {type: 'addAttachment', attachment}),
 
-    removeDraftAttachment: (sessionId, attId) =>
-      set((s) => ({
-        draftAttachmentsBySession: {
-          ...s.draftAttachmentsBySession,
-          [sessionId]: (s.draftAttachmentsBySession[sessionId] ?? []).filter((a) => a.id !== attId),
-        },
-      })),
+    removeDraftAttachment: (sessionId, id) => viewMutation(sessionId, {type: 'removeAttachment', id}),
 
-    clearDraft: (sessionId) =>
-      set((s) => ({
-        draftTextBySession: { ...s.draftTextBySession, [sessionId]: '' },
-        draftAttachmentsBySession: { ...s.draftAttachmentsBySession, [sessionId]: [] },
-        pendingTerminalChipsBySession: { ...s.pendingTerminalChipsBySession, [sessionId]: [] },
-      })),
+    clearDraft: (sessionId) => viewMutation(sessionId, {type: 'clear'}),
 
     subscribeTerminalOutput: (terminalId) => {
       const prev = terminalOutputRefCounts.get(terminalId) ?? 0;
@@ -1487,35 +1312,11 @@ export const useAppStore = create<AppState>((set, get) => {
       }
     },
 
-    addPendingTerminalChip: (sessionId, chip) =>
-      set((state) => {
-        const curr = state.pendingTerminalChipsBySession[sessionId] ?? [];
-        if (curr.some((item) => item.id === chip.id)) return state;
-        return {
-          pendingTerminalChipsBySession: {
-            ...state.pendingTerminalChipsBySession,
-            [sessionId]: [...curr.slice(-11), chip],
-          },
-        };
-      }),
+    addPendingTerminalChip: (sessionId, chip) => viewMutation(sessionId, {type: 'addTerminalContext', chip}),
 
-    removePendingTerminalChip: (sessionId, chipId) =>
-      set((state) => ({
-        pendingTerminalChipsBySession: {
-          ...state.pendingTerminalChipsBySession,
-          [sessionId]: (state.pendingTerminalChipsBySession[sessionId] ?? []).filter(
-            (item) => item.id !== chipId,
-          ),
-        },
-      })),
+    removePendingTerminalChip: (sessionId, id) => viewMutation(sessionId, {type: 'removeTerminalContext', id}),
 
-    clearPendingTerminalChips: (sessionId) =>
-      set((state) => ({
-        pendingTerminalChipsBySession: {
-          ...state.pendingTerminalChipsBySession,
-          [sessionId]: [],
-        },
-      })),
+    clearPendingTerminalChips: (sessionId) => viewMutation(sessionId, {type: 'clearTerminalContexts'}),
 
     isPluginEnabled: (pluginId) => {
       const found = get().plugins.find((p) => p.id === pluginId);
@@ -1930,70 +1731,20 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     selectSession: async (sessionId) => {
-      const prevSessionId = get().selectedSessionId;
-      if (prevSessionId && prevSessionId !== sessionId) {
-        disposeNativeFeedController(prevSessionId);
-        bumpNativeScopeEpoch(prevSessionId);
-      }
-      set({ selectedSessionId: sessionId, focusedTurn: null, activePluginPage: null });
-      if (!sessionId) return;
-
-      const existing = get().eventsBySession[sessionId] ?? [];
+      const previous=get().selectedSessionId;
+      if(previous && previous!==sessionId){ disposeNativeFeedController(previous); bumpNativeScopeEpoch(previous); }
+      set({selectedSessionId:sessionId,focusedTurn:null,activePluginPage:null});
+      if(!sessionId)return;
       try {
-        let cursor = contiguousCursor(existing);
-        let snapshot: number | undefined;
-        const history: CanonicalEvent[] = [];
-        do {
-          const page = await daemonApi.getSessionEvents(sessionId, cursor);
-          snapshot ??= page.lastSeq;
-          if (page.events.length === 0) {
-            if (cursor < snapshot) throw new Error('历史分页未到达会话末尾');
-            break;
-          }
-          history.push(...page.events);
-          cursor = page.events.at(-1)!.seq;
-        } while (cursor < snapshot);
-        if (get().selectedSessionId !== sessionId) return;
-        const detail = await daemonApi.getSession(sessionId);
-        if (get().selectedSessionId !== sessionId) return;
-        if (history.length) {
-          set((state) => {
-            const bySeq = new Map([...history, ...(state.eventsBySession[sessionId] ?? [])]
-              .map((event) => [event.seq, event]));
-            return { eventsBySession: { ...state.eventsBySession,
-              [sessionId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq),
-            } };
-          });
-        }
-        set((state) => ({
-          sessions: state.sessions.some((s) => s.id === sessionId)
-            ? state.sessions.map((s) => (s.id === sessionId && s.lastSeq <= detail.session.lastSeq ? detail.session : s))
-            : [detail.session, ...state.sessions],
-          ...(detail.taskState
-            ? { taskStateBySession: { ...state.taskStateBySession, [sessionId]: detail.taskState } }
-            : {}),
-        }));
-
-        const latestList = get().eventsBySession[sessionId] ?? [];
-        wsClient?.subscribeSession(sessionId, contiguousCursor(latestList));
-
-        void get().refreshContextPreview(sessionId);
-        void get().refreshTurnItems(sessionId);
-        void get().refreshCheckpoints(sessionId);
-        void get().refreshFailoverPolicy();
-        if (get().agyNativeWorkbenchEnabled && detail.session.harnessKind === 'agy') {
-          void get().hydrateNativeRuntime(sessionId);
-        }
-        if (get().inspectorOpen) {
-          void get().refreshGitStatus(sessionId);
-        }
-      } catch (err) {
-        get().pushToast({
-          kind: 'error',
-          title: '加载会话事件失败',
-          body: err instanceof Error ? err.message : String(err),
-        });
-      }
+        const detail=await daemonApi.getSession(sessionId);
+        if(get().selectedSessionId!==sessionId)return;
+        set(state=>({sessions:state.sessions.some(s=>s.id===sessionId)
+          ? state.sessions.map(s=>s.id===sessionId?detail.session:s):[detail.session,...state.sessions],
+          ...(detail.taskState?{taskStateBySession:{...state.taskStateBySession,[sessionId]:detail.taskState}}:{})}));
+        void get().refreshSessionBindings(sessionId);
+        void get().refreshWorkspaceBindings(detail.session.workspaceId);
+        if(get().agyNativeWorkbenchEnabled && detail.session.harnessKind==='agy')void get().hydrateNativeRuntime(sessionId);
+      } catch(error){get().pushToast({kind:'error',title:'加载会话失败',body:String(error)});}
     },
 
     createSession: async (req) => {

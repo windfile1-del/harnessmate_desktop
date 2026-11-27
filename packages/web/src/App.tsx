@@ -1,7 +1,9 @@
 import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
-import { useEffect, useMemo, useRef } from 'react';
-import { ChatStage } from './components/ChatStage';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { DiagnosticEntry } from './lib/projector';
+import { BoundSessionSurface, useBoundSessionPlugin } from './slots/BoundSessionSurface';
+import { InspectorDrawer } from './components/InspectorDrawer';
 import { KernelRecoveryView } from './components/KernelRecoveryView';
 import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
 import { registerSubagentManagerView } from './components/agy/native/child/register';
@@ -44,13 +46,24 @@ function StatusbarSlotStrip({ session }: { session: import('@harnessmate/protoco
 
 function MainStageContent({ selectedSession }: { selectedSession: import('@harnessmate/protocol').Session | null }) {
   const startItems = useSlotItems('workspace.start');
+  const chat = useBoundSessionPlugin('chat.view.v1', selectedSession);
   if (!selectedSession && startItems.length > 0) {
     return <Slot name="workspace.start" slotProps={{ session: null }} className="flex min-h-0 flex-1" />;
   }
-  return <ChatStage />;
+  if (!chat) return <div role="status" className="flex flex-1 items-center justify-center p-8 text-[var(--text-secondary)]">聊天插件不可用。可在插件中心启用实例或恢复组合。</div>;
+  return <div className="min-h-0 min-w-0 flex-1"><BoundSessionSurface plugin={chat} surface="chat" session={selectedSession} /></div>;
 }
 
 export function App() {
+  const [presentation, setPresentation] = useState<{sessionId: string; diagnostics: DiagnosticEntry[]}>();
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (Array.isArray(detail?.diagnostics)) setPresentation({ sessionId: detail.sessionId, diagnostics: detail.diagnostics });
+    };
+    window.addEventListener('hm:presentation', listener);
+    return () => window.removeEventListener('hm:presentation', listener);
+  }, []);
   const triageEnabled = useAppStore((state) => isTriageEnabled(state.plugins));
   const composing = useRef(false);
   const {
@@ -191,6 +204,7 @@ export function App() {
               <>
                 {!sidebarCollapsed && <Sidebar />}
                 <PluginWorkspaceStage><MainStageContent selectedSession={selectedSession} /></PluginWorkspaceStage>
+                {inspectorOpen && selectedSession && <InspectorDrawer session={selectedSession} diagnostics={presentation?.sessionId === selectedSession.id ? presentation.diagnostics : []} />}
                 <ModalHost />
               </>
             )}

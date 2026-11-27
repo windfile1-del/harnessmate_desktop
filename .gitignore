@@ -1,4 +1,5 @@
 node_modules/
+.tmp/
 dist/
 dist-electron/
 build/
@@ -16,3 +17,4 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 *.log
+plugins/bundled/hm.plugin.chat-default/ui/

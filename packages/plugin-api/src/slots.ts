@@ -239,6 +239,7 @@ export interface PluginSlotRenderFailure {
 }
 
 export type PluginSlotBridgeHostMessage =
+  | { type: 'hm:service:batch'; runId: string; subscriptionId: string; batch: PluginUiServiceBatch }
   | { type: 'hm:browser:frame'; runId: string; frame: PluginBrowserFrame }
   | { type: 'hm:browser:status'; runId: string; status: PluginBrowserStatus }
   | {
@@ -271,6 +272,7 @@ export type PluginSlotBridgeHostMessage =
     };
 
 export type PluginSlotBridgeIframeMessage =
+  | { type: 'hm:rpc:cancel'; requestId: string; runId: string }
   | { type: 'hm:ready'; slotId: string }
   | { type: 'hm:resize'; slotId: string; height: number }
   | {
@@ -281,3 +283,29 @@ export type PluginSlotBridgeIframeMessage =
       params?: Record<string, unknown>;
     };
 import type { PluginBrowserFrame, PluginBrowserStatus } from './browser-preview.js';
+
+/** One shared shell connection; subscribe acknowledgement precedes the caller's durable snapshot. */
+export interface PluginUiServiceBatch {
+  subscriptionId: string;
+  instanceId: string;
+  runId?: string;
+  reset?: boolean;
+  events: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }>;
+}
+export interface PluginUiCancellationSignal {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
+}
+export interface PluginUiServiceOptions {
+  instanceId?: string;
+  workspaceId?: string;
+  sessionId?: string;
+  runId?: string;
+  signal?: PluginUiCancellationSignal;
+  timeoutMs?: number;
+}
+export interface PluginUiServices {
+  call<T>(contract: string, method: string, args: unknown[], options?: PluginUiServiceOptions): Promise<{ resolution: unknown; value: T }>;
+  subscribe(options: PluginUiServiceOptions & { contract: string; instanceId: string }, listener: (batch: PluginUiServiceBatch) => void): Promise<() => void>;
+}

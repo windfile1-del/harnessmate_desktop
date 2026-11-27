@@ -4,6 +4,7 @@ import { SESSION_DATA_DEFAULT_MANIFEST } from '../../plugins/session-data-defaul
 import { SESSION_RUNTIME_DEFAULT_MANIFEST } from '../../plugins/session-runtime-default/index.js';
 
 export const BUNDLED_PLUGIN_IDS = [
+  'hm.plugin.chat-default',
   'hm.plugin.message-studio',
   'hm.plugin.browser-desktop',
   'hm.plugin.browser-headless',
