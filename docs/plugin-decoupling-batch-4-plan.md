@@ -286,6 +286,6 @@ mock、协议回放、真实 CLI/账号、浏览器、打包 Electron 和性能�
 | 其他 B3 历史未验证项 | 保留原报告状态，本次不重验 | 按涉及领域继承 |
 | 本批合并/发行结论 | 未开始，不自动合 main | 本批交付后决定 |
 
-报告目录：`docs/plugin-decoupling-batch-4/reports/`，各包提供 `W1.md`、`W2.md`、`W3.md`，最终 `integration.md`。本文件是本批唯一实施方案；当前不另外生成多套会话提示词。
+报告目录：`docs/plugin-decoupling-batch-4/reports/`，各包提供 `W1.md`、`W2.md`、`W3.md`，最终 `integration.md`。本文件是本批唯一实施方案；三个会话各自对应一份[启动提示词](plugin-decoupling-batch-4-prompts.md)，共同创建点固定为 `9cfdb1b401416702355ef62cfe1f775267b4ea4e`，正式开发按 W1 → W2 → W3 串行。
 
 第四批完成后，AGY 与审批不再是宿主业务例外；第五批继续迁出应用布局、导航/Sidebar/Inspector、设置、插件中心、插件开发工具、远程和剩余 shell actions，并清理最终入口/业务表初始化。第四批空组合只对已迁领域作结论，不能提前宣称“空组合仅含内核”和全部解耦已完成。
