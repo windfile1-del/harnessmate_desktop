@@ -8,7 +8,7 @@
 | --- | --- |
 | 第二批源码修复提交 | a12a621bceef0d7002e8d466c857aa2d2a5334d3 |
 | 第二批最终报告提交 | a022d24d522481a13883a6c580f3e2feb1c66593 |
-| 三任务共同起点 | 95788293e5af771ae601b4a6385bfefc5c16fecf，包含上述修复、报告和本批方案 |
+| 三任务共同源码基线 | 95788293e5af771ae601b4a6385bfefc5c16fecf，包含上述修复、报告和本批方案 |
 | 基准工作树及分支 | D:/Codex/OpenAI-Codex-data/worktrees/8ef6/harnessmate_desktop，codex/b2-integration |
 | 第二批验证 | 标准 pnpm test 457 项通过；build、typecheck、contracts:check 通过 |
 | 回退成品 | D:/HarnessMate/b2-fix-release/HarnessMate-Desktop-0.6.0-portable.exe，306,534,907 字节 |
@@ -17,7 +17,7 @@
 
 依据：[全量解耦设计](plugin-decoupling-implementation-plan.md)及[B2 最终返修记录](https://github.com/windfile1-del/harnessmate_desktop/blob/a022d24d522481a13883a6c580f3e2feb1c66593/docs/plugin-decoupling-batch-2/reports/fixes-2026-11-27.md)。
 
-第三批从固定共同起点 9578829 建立三个工作树，不要求先合入 main，也不重新派发 B1-01 或已完成的装配基线任务。后续提示词及执行顺序的纯文档提交可一并包含；业务源码仍以 9578829 为共同基线。开工前核对实际 SHA、工作区状态和本文件。
+第三批从包含本文件及启动提示词的 codex/b2-integration 文档提交建立三个工作树，交接时锁定同一个创建 SHA，其业务源码与 9578829 一致。不要求先合入 main，也不重新派发 B1-01 或已完成的装配基线任务。开工前核对实际 SHA、工作区状态和本文件。
 
 第二批仍有成品逐实例停用、跨包在途恢复、完整性能对照、真实账号额度及 Windows 通知横幅等未验证项。它们列入集成验收，不能写成已经通过。规划和独立开发可以继续；会话数据切换前必须完成旧数据副本及回退检查。
 
