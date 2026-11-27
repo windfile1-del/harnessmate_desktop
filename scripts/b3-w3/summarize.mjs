@@ -1,5 +1,5 @@
 import fs from 'node:fs';import path from 'node:path';
-const root=process.argv[2]||'D:/HarnessMate/b3-tmp/w3/performance';
+const root=process.argv[2]||'D:/HarnessMate/b3-tmp/w3/formal-performance';
 const output=process.argv[3]||path.join(root,'summary.json');
 const quantile=(values,q)=>{const a=values.filter(Number.isFinite).sort((x,y)=>x-y);return a.length?a[Math.min(a.length-1,Math.ceil(a.length*q)-1)]:null};
 function markers(value){return [...JSON.stringify(value).matchAll(/HMREPLAY_([0-9]+)_([0-9]+)/g)].map(m=>m[0]);}
@@ -14,6 +14,9 @@ for(const version of ['B2','B3'])for(let run=1;run<=3;run++){
  for(const sample of d.received)for(const entry of sample.frame.events||[])for(const event of entry.payload?.events||[])if(event.sessionId===d.session.id)for(const key of markers(event.payload))first(published,key,entry.emittedAt);
  for(const event of d.events)for(const key of markers(event.payload))first(created,key,event.createdAt);
  const visible=d.metrics.visible.filter(v=>v.index<1500);
+ const byIndex=[...visible].sort((a,b)=>a.index-b.index);
+ const emitIntervals=byIndex.slice(1).map((v,i)=>v.emitted-byIndex[i].emitted);
+ const wsUpdates=[...new Set(ws.values())].sort((a,b)=>a-b);
  const updates=[...new Set(visible.map(v=>v.at))].sort((a,b)=>a-b),intervals=updates.slice(1).map((at,i)=>at-updates[i]);
  const latencies=visible.filter(v=>(version==='B3'?page:ws).has(v.key)).map(v=>v.at-(version==='B3'?page:ws).get(v.key));
  const emit=visible.map(v=>v.at-v.emitted),wsLatency=visible.filter(v=>ws.has(v.key)).map(v=>v.at-ws.get(v.key));
@@ -26,6 +29,8 @@ for(const version of ['B2','B3'])for(let run=1;run<=3;run++){
    createdAtToRenderedP95Ms:quantile(visible.filter(v=>created.has(v.key)).map(v=>v.at-created.get(v.key)),.95),
    postCommitPublishToRenderedP95Ms:quantile(visible.filter(v=>published.has(v.key)).map(v=>v.at-published.get(v.key)),.95),
    updateIntervalP95Ms:quantile(intervals,.95),maxUpdateGapMs:inputPause,updatesPerSecond:updates.length/60,
+   driverEmitIntervalP95Ms:quantile(emitIntervals,.95),driverMaxEmitGapMs:Math.max(0,...emitIntervals),
+   foregroundWsMaxGapMs:Math.max(0,...wsUpdates.slice(1).map((at,i)=>at-wsUpdates[i])),
    pageLongTasks:d.metrics.longTasks.length,pageLongestTaskMs:Math.max(0,...d.metrics.longTasks.map(t=>t.duration)),shellLongTasks:d.shellLongTasks?.length,
    shellLongestTaskMs:Math.max(0,...(d.shellLongTasks||[]).map(t=>t.duration)),pageHeapBefore:d.heapBefore.usedSize,pageHeapAfter:d.heapAfter.usedSize,
    totalHeapBefore:d.heapBefore.usedSize+(version==='B3'?(d.shellHeapBefore?.usedSize||0):0),totalHeapAfter:d.heapAfter.usedSize+(version==='B3'?(d.shellHeapAfter?.usedSize||0):0),

@@ -1,0 +1,20 @@
+{
+  "empty": {
+    "text": "内核恢复模式（空业务组合）\n\n当前未装配任何业务插件，仅保留内核装配与恢复能力。可重新启用预装组合、恢复上一套可用配置，或打开插件中心检查配置与版本。\n\n重新启用预装组合\n恢复上一套配置\n打开插件恢复中心\n聊天同步失败\nError: 页面实例已停止或已更新\n聊天同步失败\nError: 页面实例已停止或已更新\n聊天同步失败\nError: 页面实例已停止或已更新\n聊天同步失败\nError: 页面实例已停止或已更新",
+    "iframes": 0,
+    "plugins": []
+  },
+  "before": [
+    "sess_0a02db54e5d1",
+    "sess_2e7f219e0fdd",
+    "sess_a152d12c2381",
+    "sess_e61d0e93164f"
+  ],
+  "after": [
+    "sess_0a02db54e5d1",
+    "sess_2e7f219e0fdd",
+    "sess_a152d12c2381",
+    "sess_e61d0e93164f"
+  ],
+  "recovered": true
+}

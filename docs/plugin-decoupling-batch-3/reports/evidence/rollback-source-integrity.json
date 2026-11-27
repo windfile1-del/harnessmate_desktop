@@ -1,0 +1,31 @@
+{
+  "before": [
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db",
+      "Hash": "972EA42B901E5948DD9E4CB1A152DE0AF4EE2926124D7B56EBBD0CF56260056C"
+    },
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db-shm",
+      "Hash": "9800525DB15F16445DFE4D6C39B72B3FC74F32714A3C7C662934DC53B980A229"
+    },
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db-wal",
+      "Hash": "4E40098C220F81628E7B55622E0D6D3FE02FEA2A82A4D4F8B3959030C9366667"
+    }
+  ],
+  "after": [
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db",
+      "Hash": "972EA42B901E5948DD9E4CB1A152DE0AF4EE2926124D7B56EBBD0CF56260056C"
+    },
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db-shm",
+      "Hash": "9800525DB15F16445DFE4D6C39B72B3FC74F32714A3C7C662934DC53B980A229"
+    },
+    {
+      "Path": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\data\\harnessmate.db-wal",
+      "Hash": "4E40098C220F81628E7B55622E0D6D3FE02FEA2A82A4D4F8B3959030C9366667"
+    }
+  ],
+  "unchanged": true
+}

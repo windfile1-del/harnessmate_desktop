@@ -2008,7 +2008,7 @@ export function ChatStage() {
         </div>
       )}
 
-      
+
 
       {/* Image Lightbox */}
       {lightboxImg && (

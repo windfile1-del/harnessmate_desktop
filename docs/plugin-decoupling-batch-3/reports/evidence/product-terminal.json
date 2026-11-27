@@ -1,0 +1,38 @@
+{
+  "product": "B3 portable EXE",
+  "workspace": {
+    "id": "ws_77c47e3c494e",
+    "name": "B3 terminal regression",
+    "rootPath": "D:\\HarnessMate\\b3-tmp\\w3\\product-regressions\\workspace",
+    "isGitRepo": false,
+    "gitBranch": null,
+    "createdAt": 1795794757705
+  },
+  "native": {
+    "backend": "pipe",
+    "liveFrames": 3,
+    "executedOutput": true,
+    "contextReference": true,
+    "chip": {
+      "id": "tchip_cae121671d",
+      "terminalId": "term_b565a2ab48c8",
+      "terminalTitle": "B3 native shell",
+      "cwd": "D:\\HarnessMate\\b3-tmp\\w3\\product-regressions\\workspace",
+      "lineStart": 1,
+      "lineEnd": 3,
+      "cleanText": "#< CLIXML\nTERM_B3_EXEC_42\nAssertionError: expected 401 to be 200",
+      "truncated": false,
+      "exitCode": null
+    }
+  },
+  "external": {
+    "ringBufferBytes": 65536,
+    "beforeFrames": 10,
+    "afterFrames": 11,
+    "markerInWs": true,
+    "markerInContext": true,
+    "contextField": "excerpt",
+    "resubscribe": true
+  },
+  "passed": true
+}

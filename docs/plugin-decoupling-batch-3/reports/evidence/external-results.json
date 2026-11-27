@@ -1,0 +1,32 @@
+{
+  "selectedExternal": {
+    "instanceId": "hm.plugin.chat-lite",
+    "text": "Chat Lite · 连接中\n发送中断追补打开文件"
+  },
+  "streamed": true,
+  "interrupted": true,
+  "disabledNoFallback": true,
+  "draftRestoredWithoutSend": {
+    "usersBefore": 1,
+    "usersAfter": 1,
+    "text": "恢复草稿不得发送"
+  },
+  "historyRestored": true,
+  "fileSidebarNavigation": true,
+  "disabledViewKeepsRuntime": {
+    "before": 29,
+    "after": 32,
+    "status": "running"
+  },
+  "resumeCommittedEvents": true,
+  "workspaceDefaultInstance": "hm.plugin.chat-default",
+  "defaultAttachmentPicker": true,
+  "defaultSendWithAttachment": true,
+  "windowsFileUri": {
+    "opened": true,
+    "sessionId": "sess_0a02db54e5d1",
+    "workspaceId": "ws_e6d4c18b9324",
+    "path": "D:/Codex/OpenAI-Codex-data/worktrees/3b20/harnessmate_desktop/.tmp/w3/replay-workspace/README.md",
+    "line": 2
+  }
+}

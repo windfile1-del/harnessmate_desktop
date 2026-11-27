@@ -54,7 +54,7 @@ await shell.call('Runtime.enable');
 await shell.call('Page.reload');
 const loadStart = Date.now();
 let clicked = false;
-for (let n = 0; n < 120; n++) { clicked = await shell.eval(`(()=>{const e=[...document.querySelectorAll('[role="button"]')].find(e=>e.textContent.includes(${JSON.stringify(title)}));if(e){e.click();return true}return false})()`); if (clicked) break; await sleep(250); }
+for (let n = 0; n < 120; n++) { clicked = await shell.eval(`(()=>{const e=[...document.querySelectorAll('[role="button"]')].find(e=>e.textContent.includes(${JSON.stringify(title)})&&!e.textContent.includes(${JSON.stringify(title + ' background')}));if(e){e.click();return true}return false})()`); if (clicked) break; await sleep(250); }
 if (!clicked) throw new Error('Session row unavailable');
 let page = shell;
 for (let n = 0; n < 160; n++) {

@@ -1,0 +1,24 @@
+{
+  "usage": {
+    "rendered": true,
+    "policySaved": true,
+    "instance": "usage"
+  },
+  "mcp": {
+    "installed": true,
+    "toggled": true,
+    "removed": true
+  },
+  "external": {
+    "usage": {
+      "defaultDisabled": true,
+      "dataRendered": true,
+      "instance": "user.b3-usage"
+    },
+    "mcp": {
+      "defaultDisabled": true,
+      "dataRendered": true,
+      "instance": "user.b3-mcp"
+    }
+  }
+}

@@ -1,0 +1,116 @@
+{
+  "passed": true,
+  "old": {
+    "id": "sess_9a890c7926ca",
+    "title": "B2 performance 1795792233694",
+    "lastSeq": 13408,
+    "eventCount": 13408,
+    "digest": "b5a89dc55c4f5eb6cc259d90251dc43e80264283d7b4dfd69fee4da168ff903e",
+    "tailAfter10000Digest": "14649f864f90f80c26c837e121e7a6d74a93f8923d81b23378d07df0505dcbe0",
+    "firstSeq": 1,
+    "finalSeq": 13408,
+    "exportBytes": 644695,
+    "ledger": {
+      "taskState": {
+        "sessionId": "sess_9a890c7926ca",
+        "objective": "历史问题 0",
+        "steps": [],
+        "decisions": [],
+        "touchedFiles": [],
+        "verifications": [],
+        "blockers": [],
+        "pinnedFacts": [],
+        "rollingSummary": "",
+        "summarizedUpToSeq": 0,
+        "version": 2502,
+        "ledgerFilePath": "D:\\HarnessMate\\b3-tmp\\w3\\formal-performance\\b2-1\\repo\\.harnessmate\\task-ledger.md",
+        "updatedAt": 1795792325683
+      }
+    },
+    "containsOldHistory": true,
+    "containsNewText": false,
+    "userMessages": 2501,
+    "settlements": 2501
+  },
+  "written": {
+    "id": "sess_0f795f6ee12f",
+    "title": "B3 rollback new session",
+    "lastSeq": 39,
+    "eventCount": 39,
+    "digest": "366a367aa1366f73ec03941dc096fde6463dab2dce6d574d637734aaa4c8bad2",
+    "tailAfter10000Digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "firstSeq": 1,
+    "finalSeq": 39,
+    "exportBytes": 15104,
+    "ledger": {
+      "taskState": {
+        "sessionId": "sess_0f795f6ee12f",
+        "objective": "short B3_ROLLBACK_NEW 中文与代码",
+        "steps": [],
+        "decisions": [],
+        "touchedFiles": [],
+        "verifications": [],
+        "blockers": [],
+        "pinnedFacts": [],
+        "rollingSummary": "",
+        "summarizedUpToSeq": 0,
+        "version": 2,
+        "ledgerFilePath": "D:\\HarnessMate\\b3-tmp\\w3\\rollback-final\\workspace-copy\\.harnessmate\\task-ledger.md",
+        "updatedAt": 1795793535667
+      }
+    },
+    "containsOldHistory": false,
+    "containsNewText": true,
+    "userMessages": 1,
+    "settlements": 1
+  },
+  "sessionsAfter": [
+    "sess_0f795f6ee12f",
+    "sess_83a752e0d031",
+    "sess_9a890c7926ca",
+    "sess_c3c9db57108d",
+    "sess_fc95db4a8718"
+  ],
+  "search": {
+    "hits": [
+      {
+        "sessionId": "sess_0f795f6ee12f",
+        "sessionTitle": "B3 rollback new session",
+        "workspaceId": "ws_45ee4d95cee2",
+        "turnId": "turn_eeefec943b35",
+        "turnSeq": 3,
+        "itemId": "turn_eeefec943b35:user",
+        "blockType": "user_message",
+        "snippetText": "short B3_ROLLBACK_NEW 中文与代码",
+        "snippetHtmlSafe": "short <mark>B3_ROLLBACK_NEW</mark> 中文与代码",
+        "highlights": [
+          {
+            "start": 6,
+            "end": 21
+          }
+        ],
+        "driverId": "fixed-replay",
+        "createdAt": 1795793533163
+      }
+    ],
+    "nextOffset": null,
+    "fallbackUsed": true,
+    "tookMs": 2,
+    "instanceId": "hm.plugin.session-search-fts",
+    "resolution": {
+      "contract": "session.search.v1",
+      "versionRange": "^1.0.0",
+      "instanceId": "hm.plugin.session-search-fts",
+      "source": "composition",
+      "status": "ready",
+      "candidates": [
+        {
+          "instanceId": "hm.plugin.session-search-fts",
+          "pluginId": "hm.plugin.session-search-fts",
+          "version": "1.0.0"
+        }
+      ]
+    }
+  },
+  "scope": "Real B2-generated fixture data copy, real B3 write, real B2 EXE readback. Production user data and external side effects not exercised."
+}
