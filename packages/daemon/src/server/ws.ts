@@ -7,7 +7,12 @@ import {
   type WsServerFrame,
 } from '@harnessmate/protocol';
 import { WebSocket, WebSocketServer } from 'ws';
-import { PEER_CONTRACTS } from '@harnessmate/plugin-api';
+import {
+  PEER_CONTRACTS,
+  sessionDataStreamKey,
+  type SessionDataChannelEvent,
+  type SessionDataStreamIdentity,
+} from '@harnessmate/plugin-api';
 import type { DaemonEventBus } from '../core/event-bus.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { TerminalWorkspaceService } from '../core/terminal-workspace-service.js';
@@ -183,14 +188,15 @@ export class WsGateway {
 
         case 'subscribe': {
           const { sessionId, afterSeq } = frame;
+          const clientStream = (frame as { stream?: SessionDataStreamIdentity }).stream;
           sessionUnsubs.get(sessionId)?.();
 
-          // Subscribe live first while buffering so we never drop an event between DB replay and live stream
+          // Subscribe live BEFORE replaying so zero committed events are missed between replay and live stream
           let replaying = true;
           let maxSentSeq = afterSeq;
           const liveBuffer: import('@harnessmate/protocol').CanonicalEvent[] = [];
 
-          const unsub = this.deps.eventBus.subscribeSession(sessionId, (event) => {
+          const pushEvent = (event: import('@harnessmate/protocol').CanonicalEvent) => {
             if (replaying) {
               liveBuffer.push(event);
               return;
@@ -199,25 +205,76 @@ export class WsGateway {
               maxSentSeq = event.seq;
               this.send(ws, { op: 'event', event });
             }
+          };
+
+          const unsubBus = this.deps.eventBus.subscribeSession(sessionId, pushEvent);
+          const unsubChannel = this.deps.pluginManager?.host.subscribeServiceChannel(
+            PEER_CONTRACTS.sessionData,
+            (raw) => {
+              const payload = raw.payload as unknown as SessionDataChannelEvent | undefined;
+              if (!payload || payload.sessionId !== sessionId || !Array.isArray(payload.events)) return;
+              for (const ev of payload.events) {
+                pushEvent({
+                  sessionId: ev.sessionId,
+                  seq: ev.seq,
+                  type: ev.type as import('@harnessmate/protocol').CanonicalEventType,
+                  turnId: ev.turnId,
+                  payload: ev.payload,
+                  createdAt: ev.createdAt,
+                });
+              }
+            },
+          );
+          sessionUnsubs.set(sessionId, () => {
+            unsubBus();
+            unsubChannel?.();
           });
-          sessionUnsubs.set(sessionId, unsub);
 
-          for (const ev of this.deps.sessionManager.iterateSessionEvents(sessionId, afterSeq)) {
-            if (ev.seq > maxSentSeq) {
-              maxSentSeq = ev.seq;
-              this.send(ws, { op: 'event', event: ev });
+          try {
+            const page = await this.deps.sessionManager.getSessionEventsPageAsync(sessionId, 0);
+            const activeStream = page.stream;
+            const streamMismatch = Boolean(
+              clientStream &&
+                activeStream &&
+                sessionDataStreamKey(clientStream) !== sessionDataStreamKey(activeStream),
+            );
+            const effectiveAfterSeq = streamMismatch ? 0 : afterSeq;
+            maxSentSeq = effectiveAfterSeq;
+
+            const eventsToReplay = effectiveAfterSeq === 0
+              ? page.events
+              : page.events.filter((ev) => ev.seq > effectiveAfterSeq);
+
+            for (const ev of eventsToReplay) {
+              if (ev.seq > maxSentSeq) {
+                maxSentSeq = ev.seq;
+                this.send(ws, { op: 'event', event: ev });
+              }
             }
-          }
 
-          replaying = false;
-          for (const ev of liveBuffer) {
-            if (ev.seq > maxSentSeq) {
-              maxSentSeq = ev.seq;
-              this.send(ws, { op: 'event', event: ev });
+            replaying = false;
+            for (const ev of liveBuffer) {
+              if (ev.seq > maxSentSeq) {
+                maxSentSeq = ev.seq;
+                this.send(ws, { op: 'event', event: ev });
+              }
             }
-          }
 
-          this.send(ws, { op: 'replay_complete', sessionId, lastSeq: maxSentSeq });
+            this.send(ws, {
+              op: 'replay_complete',
+              sessionId,
+              lastSeq: maxSentSeq,
+              ...(activeStream ? { stream: activeStream } : {}),
+              ...(streamMismatch ? { streamMismatch: true } : {}),
+            });
+          } catch (err) {
+            replaying = false;
+            this.send(ws, {
+              op: 'error',
+              code: 'SERVICE_UNAVAILABLE',
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
           break;
         }
 

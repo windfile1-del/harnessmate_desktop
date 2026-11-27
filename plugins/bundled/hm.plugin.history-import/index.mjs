@@ -4,7 +4,7 @@ export const requires = ['ui.workspace.pages'];
 
 const SOURCE_CONTRACT = 'history.source.v1';
 const IMPORT_CONTRACT = 'history.import.v1';
-const SESSION_DATA_CONTRACT = 'hm.session-data.v1';
+const SESSION_DATA_CONTRACTS = ['session.data.v1', 'hm.session-data.v1'];
 const MAX_READ_PAGES = 200;
 const READ_PAGE_LIMIT = 200;
 
@@ -78,8 +78,22 @@ export function apply(ctx) {
   const inFlightByOpId = new Map();
   const opIdByRequestId = new Map();
 
-  function callData(method, args = []) {
-    return ctx.services.call(SESSION_DATA_CONTRACT, method, args);
+  async function callData(method, args = []) {
+    const providers = await ctx.services.list().catch(() => []);
+    const contract = SESSION_DATA_CONTRACTS.find((c) => providers.some((p) => p.contract === c))
+      ?? SESSION_DATA_CONTRACTS[1];
+    const res = await ctx.services.call(contract, method, args);
+    if (contract === 'session.data.v1') {
+      if (method === 'commitNativeImport' || method === 'commitBundleImport') {
+        return res;
+      }
+      if (res && typeof res === 'object' && 'ok' in res) {
+        if (!res.ok) throw new Error(res.error?.message || `session.data.v1.${method} failed`);
+        if (method === 'listWorkspaces') return res.value?.workspaces ?? [];
+        return res.value;
+      }
+    }
+    return res;
   }
 
   async function forwardCancelToSource(op) {

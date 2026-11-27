@@ -1,0 +1,22 @@
+{
+  "id": "hm.plugin.session-runtime-lite",
+  "name": "轻量会话运行插件 (Lite)",
+  "version": "1.0.0",
+  "description": "纯公开 SDK 会话运行实现，通过 ctx.harnesses.openSession 可撤销句柄租约与 session.data.v1 契约运行轮次，支持幂等、未知结果保护、增量合批与代次隔离。",
+  "author": "HarnessMate Examples",
+  "category": "workflow",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "session.runtime.v1"
+  ],
+  "permissions": [
+    "session:send",
+    "session:read",
+    "storage:plugin"
+  ],
+  "contributes": {}
+}

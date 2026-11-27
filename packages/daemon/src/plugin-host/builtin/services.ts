@@ -39,9 +39,19 @@ import { OrchestratorService } from '../../core/orchestrator-service.js';
 import { SessionChangeFeedService } from '../../core/session-change-feed.js';
 import { SessionExplorerService } from '../../core/session-explorer-service.js';
 import {
-  createHistorySessionDataHostPlugin,
-  HISTORY_SESSION_DATA_PLUGIN_ID,
-} from '../../server/routes/history-import-compat.js';
+  SESSION_DATA_DEFAULT_PLUGIN_ID,
+  createDefaultSessionDataPlugin,
+} from '../../plugins/session-data-default/index.js';
+import {
+  SESSION_RUNTIME_DEFAULT_PLUGIN_ID,
+  createDefaultSessionRuntimePlugin,
+  type SessionRuntimeDefaultController,
+} from '../../plugins/session-runtime-default/index.js';
+import { createHostRuntimePorts } from '../../core/host-runtime-ports.js';
+import type { AgyNativeRuntimeRegistry } from '../../harnesses/agy/native/wiring/registry.js';
+import { CommandOutputHub } from '../../core/command-output-hub.js';
+import { DaemonEventBus } from '../../core/event-bus.js';
+import type { ApprovalRequest, Session } from '@harnessmate/protocol';
 import {
   commitWorktreeChangesIfDirty,
   computeBranchDiffStat,
@@ -427,7 +437,18 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
   historyImportAdapter?: HistoryImportAdapter,
   attachmentsDir?: string,
   getCapabilities?: () => PluginCapabilities,
-  getPluginManager?: () => PluginManager) {
+  getPluginManager?: () => PluginManager,
+  runtimeBridge?: {
+    eventBus: import('../../core/event-bus.js').DaemonEventBus;
+    changeFeed?: SessionChangeFeedService;
+    commandOutputHub?: CommandOutputHub;
+    getNativeRegistry?: () => AgyNativeRuntimeRegistry | undefined;
+    getApprovalCenter?: () => ApprovalCenterService;
+    getOrchestrator?: () => OrchestratorService | undefined;
+    onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
+    onAttachCompressorHooks?: () => void;
+    onRuntimeControllerReady?: (controller: SessionRuntimeDefaultController | null) => void;
+  }) {
   const resolvedAgyProfilesDir =
     agyProfilesDir ?? path.join(os.homedir(), '.harnessmate-desktop', 'agy-profiles');
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
@@ -675,9 +696,67 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       } satisfies NativeCommandsService);
     },
   });
+  const resolvedChangeFeed = runtimeBridge?.changeFeed ?? new SessionChangeFeedService(store);
   const resolvedImportAdapter = historyImportAdapter
-    ?? new HistoryImportAdapter(store, registry, new SessionChangeFeedService(store));
-  plugins.set(HISTORY_SESSION_DATA_PLUGIN_ID, createHistorySessionDataHostPlugin(resolvedImportAdapter));
+    ?? new HistoryImportAdapter(store, registry, resolvedChangeFeed);
+  plugins.set(
+    SESSION_DATA_DEFAULT_PLUGIN_ID,
+    createDefaultSessionDataPlugin({
+      store,
+      historyImportAdapter: resolvedImportAdapter,
+      changeFeed: resolvedChangeFeed,
+    }),
+  );
+  if (runtimeBridge && getPluginManager) {
+    const ports = createHostRuntimePorts({
+      store,
+      registry,
+      eventBus: runtimeBridge.eventBus,
+      getPluginManager,
+      getPluginCapabilities: getCapabilities,
+      getNativeRegistry: runtimeBridge.getNativeRegistry,
+      getApprovalCenter: runtimeBridge.getApprovalCenter,
+      getOrchestrator: runtimeBridge.getOrchestrator,
+      onAnnotatePendingApproval: runtimeBridge.onAnnotatePendingApproval,
+      onAttachCompressorHooks: runtimeBridge.onAttachCompressorHooks,
+    });
+    const hub = runtimeBridge.commandOutputHub ?? new CommandOutputHub();
+    plugins.set(
+      SESSION_RUNTIME_DEFAULT_PLUGIN_ID,
+      createDefaultSessionRuntimePlugin({
+        getPluginManager,
+        ...ports,
+        commandOutputHub: hub,
+        resolveHistorySourceMetadata: (sessionId, nativeSessionId) => {
+          if (!nativeSessionId) return null;
+          const meta = store.getNativeHistory(sessionId, nativeSessionId);
+          return meta ? { source: meta.source, sourcePath: meta.sourcePath ?? undefined } : null;
+        },
+        onControllerReady: runtimeBridge.onRuntimeControllerReady,
+      }),
+    );
+  } else {
+    const bus = runtimeBridge?.eventBus ?? new DaemonEventBus();
+    const hub = runtimeBridge?.commandOutputHub ?? new CommandOutputHub();
+    const mgrGetter = getPluginManager ?? (() => {
+      throw new Error('PluginManager is required by session-runtime-default');
+    });
+    const ports = createHostRuntimePorts({
+      store,
+      registry,
+      eventBus: bus,
+      getPluginManager: mgrGetter,
+      getPluginCapabilities: getCapabilities,
+    });
+    plugins.set(
+      SESSION_RUNTIME_DEFAULT_PLUGIN_ID,
+      createDefaultSessionRuntimePlugin({
+        getPluginManager: mgrGetter,
+        ...ports,
+        commandOutputHub: hub,
+      }),
+    );
+  }
   // Batch-1 temporary session adapter retained solely for Fork / MergeBack / SideChat / Export (and legacy unit tests).
   // Search indexing and HTTP search/import routes are owned by hm.plugin.session-search-fts & hm.plugin.history-import.
   plugins.set('hm.plugin.session-explorer', {

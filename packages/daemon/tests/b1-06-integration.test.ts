@@ -189,7 +189,9 @@ describe('B1-06 · Batch 1 Integrated Distribution, Compat Routes & Recovery', (
     for (const [contract, expectedInstanceId] of [
       ['history.import.v1', 'hm.plugin.history-import'],
       ['session.search.v1', 'hm.plugin.session-search-fts'],
-      ['hm.session-data.v1', 'core.history-session-data'],
+      ['session.data.v1', 'hm.plugin.session-data-default'],
+      ['session.runtime.v1', 'hm.plugin.session-runtime-default'],
+      ['hm.session-data.v1', 'hm.plugin.session-data-default'],
       ['browser.v1', 'hm.plugin.browser-desktop'],
       ['filePreview.v1', 'hm.plugin.file-preview-text'],
       ['approval.policy.v1', 'hm.plugin.approval-policy-default'],

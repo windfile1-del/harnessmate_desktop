@@ -32,20 +32,27 @@ import {
   type PublicTurnBlock,
   type ResolveServiceSelectionOptions,
   type ServiceResolutionV1,
+  type SessionDataServiceV1,
+  type SessionRecordDto,
+  type SessionWorkspaceDto,
   type SpawnCliSpec,
   type SwitchSessionInstanceOptions,
 } from '@harnessmate/plugin-api';
 import {
   PluginNativeCommandSchema,
+  type CanonicalEvent,
+  type CanonicalEventType,
   type InstalledPluginInfo,
   type Session,
   type SessionHarnessBinding,
   type SessionTaskState,
   type TurnBlockRecord,
+  type Workspace,
 } from '@harnessmate/protocol';
 import type { ContextCompiler } from '../../core/context-compiler.js';
 import type { TaskLedgerService } from '../../core/task-ledger-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
+import type { AdapterSessionConfig } from '../../harnesses/types.js';
 import { AgyAdapter } from '../../harnesses/agy/agy-driver.js';
 import { evaluateAgyConsumerProvenance, mintAgyDispatchProvenance } from '../../harnesses/agy/native/wiring/provenance.js';
 import { handoffRedactionMap, type GitService } from '../builtin/services.js';
@@ -102,6 +109,26 @@ export interface PluginRouterDeps {
   onDriverUnregister?: (pluginId: string, runId: string, driverId: string) => void;
   onDriverSessionEvent?: (pluginId: string, runId: string, handleId: string, event: Record<string, unknown>) => void;
   onSubscriptionChange?: (pluginId: string, runId: string, event: string, subscribed: boolean) => void;
+  onServiceChannelSubscriptionChange?: (pluginId: string, runId: string, contract: string, subscribed: boolean) => void;
+  openHarnessSession?: (
+    plugin: InstalledPluginInfo,
+    instanceId: string,
+    runId: string,
+    input: { harnessId: string; config: AdapterSessionConfig },
+  ) => Promise<{
+    leaseId: string;
+    nativeSessionId: string | null;
+    pluginMcpAvailable: boolean;
+    supportsSteer: boolean;
+    supportsInjectContext: boolean;
+  }>;
+  harnessSessionCall?: (
+    instanceId: string,
+    runId: string,
+    leaseId: string,
+    op: 'sendTurn' | 'steerTurn' | 'interrupt' | 'updateConfig' | 'resolveApproval' | 'dispose',
+    payload: Record<string, unknown>,
+  ) => Promise<unknown>;
   onComposerSuggest?: (pluginId: string, sessionId: string, suggestion: PublicComposerSuggestion) => void;
   onNotify?: (pluginId: string, input: { title: string; body?: string; level?: 'info' | 'warn' | 'error' }) => void;
   onClipboardWrite?: (pluginId: string, text: string) => void;
@@ -132,6 +159,48 @@ function toPublicTurnBlock(item: TurnBlockRecord, truncateOmitted = false): Publ
     rawRef: item.rawRef ?? null,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
+  };
+}
+
+function fromSessionRecordDto(dto: SessionRecordDto): Session {
+  return {
+    id: dto.id,
+    workspaceId: dto.workspaceId,
+    harnessId: dto.harnessId,
+    harnessKind: dto.harnessKind,
+    nativeSessionId: dto.nativeSessionId,
+    parentSessionId: dto.parentSessionId ?? null,
+    forkedFromTurnSeq: dto.forkedFromTurnSeq ?? null,
+    forkMode: (dto.forkMode as Session['forkMode']) ?? null,
+    importMode: dto.importMode ?? null,
+    importSource: dto.importSource ?? null,
+    participatingHarnesses: dto.participatingHarnesses ?? [dto.harnessId],
+    contextSyncMode: dto.contextSyncMode ?? 'auto',
+    cwd: dto.cwd,
+    worktreeBranch: dto.worktreeBranch ?? null,
+    title: dto.title,
+    status: dto.status as Session['status'],
+    model: dto.model,
+    actualModel: dto.actualModel ?? null,
+    modelReroutedReason: dto.modelReroutedReason ?? null,
+    reasoningEffort: dto.reasoningEffort,
+    permissionMode: dto.permissionMode,
+    lastSeq: dto.lastSeq,
+    usage: dto.usage ?? null,
+    pendingApprovalCount: dto.pendingApprovalCount,
+    createdAt: dto.createdAt,
+    updatedAt: dto.updatedAt,
+  };
+}
+
+function fromWorkspaceDto(dto: SessionWorkspaceDto): Workspace {
+  return {
+    id: dto.id,
+    name: dto.name,
+    rootPath: dto.rootPath,
+    isGitRepo: dto.isGitRepo,
+    gitBranch: dto.gitBranch ?? null,
+    createdAt: dto.createdAt,
   };
 }
 
@@ -276,11 +345,67 @@ export class IsolatedPluginRpcRouter {
     this.logs.set(entry.pluginId, list);
   }
 
-  private getSessionOrThrow(sessionId: unknown): Session {
+  private resolveSessionDataAccess(options?: {
+    sessionId?: string;
+    workspaceId?: string;
+  }): { mode: 'peer'; service: SessionDataServiceV1; instanceId: string } | { mode: 'multi_peer' } | { mode: 'legacy_store' } {
+    const providers = this.deps.host.listServiceProviders('session.data.v1');
+    const resolution = this.resolveServiceWithFallback('session.data.v1', {
+      sessionId: options?.sessionId,
+      workspaceId: options?.workspaceId,
+      allowSingleCandidate: true,
+    });
+    if (resolution.status === 'ready') {
+      const service = this.deps.host.getServiceByInstance<SessionDataServiceV1>(resolution.instanceId, 'session.data.v1');
+      if (service) {
+        return { mode: 'peer', service, instanceId: resolution.instanceId };
+      }
+    }
+    if (resolution.status === 'unavailable') {
+      throw new PluginApiError(serviceResolutionErrorCode(resolution.status), '会话数据服务当前不可用或已停用');
+    }
+    if (resolution.status === 'selection_required' && providers.length > 0) {
+      return { mode: 'multi_peer' };
+    }
+    if (providers.length === 0 && !this.deps.resolveServiceSelection) {
+      return { mode: 'legacy_store' };
+    }
+    throw new PluginApiError('E_SERVICE_UNAVAILABLE', '会话数据服务当前不可用或未就绪');
+  }
+
+  private async resolveSessionWithProvider(sessionId: unknown): Promise<{
+    session: Session;
+    service?: SessionDataServiceV1;
+    instanceId?: string;
+  }> {
     if (typeof sessionId !== 'string' || !sessionId) throw new PluginApiError('E_INVALID_INPUT', '缺少 sessionId');
-    const session = this.deps.store.getSession(sessionId);
-    if (!session) throw new PluginApiError('E_INVALID_INPUT', `会话不存在: ${sessionId}`);
-    return session;
+    const access = this.resolveSessionDataAccess({ sessionId });
+    if (access.mode === 'legacy_store') {
+      const session = this.deps.store.getSession(sessionId);
+      if (!session) throw new PluginApiError('E_INVALID_INPUT', `会话不存在: ${sessionId}`);
+      return { session };
+    }
+    if (access.mode === 'peer') {
+      const res = await access.service.getSession({ sessionId });
+      if (res.ok && res.value.session) {
+        return { session: fromSessionRecordDto(res.value.session), service: access.service, instanceId: access.instanceId };
+      }
+    } else {
+      for (const provider of this.deps.host.listServiceProviders('session.data.v1')) {
+        const svc = this.deps.host.getServiceByInstance<SessionDataServiceV1>(provider.instanceId, 'session.data.v1');
+        if (!svc) continue;
+        const res = await svc.getSession({ sessionId });
+        if (res.ok && res.value.session) {
+          return { session: fromSessionRecordDto(res.value.session), service: svc, instanceId: provider.instanceId };
+        }
+      }
+    }
+    throw new PluginApiError('E_INVALID_INPUT', `会话不存在: ${sessionId}`);
+  }
+
+  private async getSessionOrThrow(sessionId: unknown): Promise<Session> {
+    const resolved = await this.resolveSessionWithProvider(sessionId);
+    return resolved.session;
   }
 
   private readOptionalString(value: unknown): string | undefined {
@@ -327,11 +452,30 @@ export class IsolatedPluginRpcRouter {
     return { contract, versionRange, instanceId: null, source: 'none', status: 'selection_required', candidates };
   }
 
-  private getWorkspaceOrThrow(workspaceId: unknown) {
+  private async getWorkspaceOrThrow(workspaceId: unknown): Promise<Workspace> {
     if (typeof workspaceId !== 'string' || !workspaceId) throw new PluginApiError('E_INVALID_INPUT', '缺少 workspaceId');
-    const workspace = this.deps.store.getWorkspace(workspaceId);
-    if (!workspace) throw new PluginApiError('E_INVALID_INPUT', `工作区不存在: ${workspaceId}`);
-    return workspace;
+    const access = this.resolveSessionDataAccess({ workspaceId });
+    if (access.mode === 'legacy_store') {
+      const workspace = this.deps.store.getWorkspace(workspaceId);
+      if (!workspace) throw new PluginApiError('E_INVALID_INPUT', `工作区不存在: ${workspaceId}`);
+      return workspace;
+    }
+    if (access.mode === 'peer') {
+      const res = await access.service.getWorkspace({ workspaceId });
+      if (res.ok && res.value.workspace) {
+        return fromWorkspaceDto(res.value.workspace);
+      }
+    } else {
+      for (const provider of this.deps.host.listServiceProviders('session.data.v1')) {
+        const svc = this.deps.host.getServiceByInstance<SessionDataServiceV1>(provider.instanceId, 'session.data.v1');
+        if (!svc) continue;
+        const res = await svc.getWorkspace({ workspaceId });
+        if (res.ok && res.value.workspace) {
+          return fromWorkspaceDto(res.value.workspace);
+        }
+      }
+    }
+    throw new PluginApiError('E_INVALID_INPUT', `工作区不存在: ${workspaceId}`);
   }
 
   async handle(
@@ -482,6 +626,33 @@ export class IsolatedPluginRpcRouter {
         return await fn(...args);
       }
 
+      case 'services.publish': {
+        const contract = typeof params.contract === 'string' ? params.contract.trim() : '';
+        if (!contract) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名');
+        const ownerRecord = this.deps.host.getServiceRecordByInstance(instanceId, contract);
+        if (!ownerRecord) {
+          throw new PluginApiError('E_PERMISSION_DENIED', `实例 ${instanceId} 未处于活动提供 ${contract} 的状态`);
+        }
+        const payload = params.payload && typeof params.payload === 'object' && !Array.isArray(params.payload)
+          ? params.payload as Record<string, unknown>
+          : {};
+        this.deps.host.publishServiceChannel(contract, instanceId, payload);
+        return { ok: true };
+      }
+
+      case 'services.subscribe':
+      case 'services.unsubscribe': {
+        const contract = typeof params.contract === 'string' ? params.contract.trim() : '';
+        if (!contract) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名');
+        this.deps.onServiceChannelSubscriptionChange?.(
+          instanceId,
+          meta.runId,
+          contract,
+          method === 'services.subscribe',
+        );
+        return { ok: true };
+      }
+
       case 'service.call': {
         const serviceName = String(params.service ?? '');
         const fnName = String(params.method ?? '');
@@ -511,12 +682,30 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'events.query': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const requestedTypes = Array.isArray(params.types) ? (params.types as PluginEventName[]) : undefined;
         const afterSeq = typeof params.afterSeq === 'number' && Number.isFinite(params.afterSeq) ? Math.max(0, Math.floor(params.afterSeq)) : 0;
         const limit = typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.min(200, Math.max(1, Math.floor(params.limit))) : 50;
-        const raw = this.deps.store.getEventsAfter(session.id, afterSeq, limit * 4);
+        let raw: CanonicalEvent[];
+        if (resolved.service) {
+          const peerRes = await resolved.service.listEvents({ sessionId: session.id, afterSeq, limit: limit * 4 });
+          if (!peerRes.ok) {
+            const code = peerRes.error.code === 'permission_denied' ? 'E_PERMISSION_DENIED' : 'E_SERVICE_UNAVAILABLE';
+            throw new PluginApiError(code, peerRes.error.message);
+          }
+          raw = peerRes.value.events.map((ev) => ({
+            sessionId: ev.sessionId,
+            seq: ev.seq,
+            type: ev.type as CanonicalEventType,
+            turnId: ev.turnId,
+            payload: ev.payload,
+            createdAt: ev.createdAt,
+          }));
+        } else {
+          raw = this.deps.store.getEventsAfter(session.id, afterSeq, limit * 4);
+        }
         const mapped: PluginEventV4[] = [];
         for (const ev of raw) {
           const dto = toPluginEvent(ev);
@@ -533,26 +722,40 @@ export class IsolatedPluginRpcRouter {
       case 'sessions.list': {
         const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : undefined;
         const harnessId = typeof params.harnessId === 'string' ? params.harnessId : undefined;
+        const access = this.resolveSessionDataAccess(workspaceId ? { workspaceId } : undefined);
+        let list: Session[] = [];
+        if (access.mode === 'legacy_store') {
+          list = this.deps.store.listSessions({ workspaceId, harnessId });
+        } else if (access.mode === 'peer') {
+          const res = await access.service.listSessions({ workspaceId, harnessId });
+          list = res.ok ? res.value.sessions.map(fromSessionRecordDto) : [];
+        } else {
+          for (const provider of this.deps.host.listServiceProviders('session.data.v1')) {
+            const svc = this.deps.host.getServiceByInstance<SessionDataServiceV1>(provider.instanceId, 'session.data.v1');
+            if (!svc) continue;
+            const res = await svc.listSessions({ workspaceId, harnessId });
+            if (res.ok) list.push(...res.value.sessions.map(fromSessionRecordDto));
+          }
+        }
         if (workspaceId) {
           this.deps.permissions.assertGranted(plugin, 'session:read', workspaceId);
-          return this.deps.store.listSessions({ workspaceId, harnessId }).map(toPublicSession);
+          return list.map(toPublicSession);
         }
-        const all = this.deps.store.listSessions({ harnessId });
-        const allowed = all.filter((session) => this.deps.permissions.isGranted(plugin, 'session:read', session.workspaceId));
-        if (allowed.length === 0 && all.length > 0) {
+        const allowed = list.filter((session) => this.deps.permissions.isGranted(plugin, 'session:read', session.workspaceId));
+        if (allowed.length === 0 && list.length > 0) {
           throw new PluginApiError('E_PERMISSION_DENIED', `插件 ${plugin.id} 未获得权限 session:read`);
         }
         return allowed.map(toPublicSession);
       }
 
       case 'sessions.get': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         return toPublicSession(session);
       }
 
       case 'sessions.capabilities': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const caps: PublicSessionCapabilities = {
           harnessId: session.harnessId,
@@ -565,7 +768,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.prepareTurn': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:send', session.workspaceId);
         const text = typeof params.text === 'string' ? params.text : '';
         if (!text.trim() || text.length > 100_000) throw new PluginApiError('E_INVALID_INPUT', '轮次内容无效');
@@ -581,7 +784,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.runNative': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:command', session.workspaceId);
         const parsedCmd = PluginNativeCommandSchema.safeParse(params.command);
         if (!parsedCmd.success) throw new PluginApiError('E_INVALID_INPUT', '仅允许调用白名单原生命令');
@@ -591,7 +794,8 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.listItems': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const opts = params as unknown as ListSessionItemsOptions;
         const afterSeq = typeof opts.afterSeq === 'number' && Number.isFinite(opts.afterSeq)
@@ -607,6 +811,24 @@ export class IsolatedPluginRpcRouter {
           ? Math.min(200, Math.max(1, Math.floor(opts.limit)))
           : 50;
         const includeOmittedBodies = opts.includeOmittedBodies === true;
+        if (resolved.service) {
+          const peerRes = await resolved.service.listTurnItems({
+            sessionId: session.id,
+            afterSeq,
+            beforeSeq,
+            blockTypes: types && types.length > 0 ? types : undefined,
+            limit,
+          });
+          if (!peerRes.ok) {
+            throw new PluginApiError('E_SERVICE_UNAVAILABLE', peerRes.error.message);
+          }
+          return {
+            items: peerRes.value.items.map((item) => (!includeOmittedBodies && item.outputOmitted && item.textBody.length > 512
+              ? { ...item, textBody: item.textBody.slice(0, 512) }
+              : item)),
+            nextSeq: peerRes.value.nextSeq,
+          };
+        }
         const raw = this.deps.store.listTurnItems(session.id, {
           afterSeq,
           blockTypes: types && types.length > 0 ? types : undefined,
@@ -622,15 +844,11 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.getItem': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const itemId = typeof params.itemId === 'string' ? params.itemId : '';
         if (!itemId) throw new PluginApiError('E_INVALID_INPUT', '缺少 itemId');
-        const item = this.deps.store.getTurnItem(itemId);
-        if (!item) return null;
-        if (item.sessionId !== session.id) {
-          throw new PluginApiError('E_PERMISSION_DENIED', '无权读取其他会话的 TurnItem');
-        }
         const opts = params as unknown as GetSessionItemOptions;
         const hasSliceOpts = opts.textOffset !== undefined || opts.maxChars !== undefined;
         const offset = typeof opts.textOffset === 'number' && Number.isFinite(opts.textOffset)
@@ -639,6 +857,28 @@ export class IsolatedPluginRpcRouter {
         const maxChars = typeof opts.maxChars === 'number' && Number.isFinite(opts.maxChars)
           ? Math.min(64_000, Math.max(1, Math.floor(opts.maxChars)))
           : 16_000;
+        if (resolved.service) {
+          const peerRes = await resolved.service.getTurnItem({
+            sessionId: session.id,
+            itemId,
+            ...(hasSliceOpts ? { textOffset: offset, maxChars } : {}),
+          });
+          if (!peerRes.ok) {
+            const code = peerRes.error.code === 'permission_denied' ? 'E_PERMISSION_DENIED' : 'E_SERVICE_UNAVAILABLE';
+            throw new PluginApiError(code, peerRes.error.message);
+          }
+          if (!peerRes.value) return null;
+          return {
+            item: peerRes.value.item,
+            bodyChunk: peerRes.value.text,
+            nextTextOffset: peerRes.value.nextTextOffset,
+          };
+        }
+        const item = this.deps.store.getTurnItem(itemId);
+        if (!item) return null;
+        if (item.sessionId !== session.id) {
+          throw new PluginApiError('E_PERMISSION_DENIED', '无权读取其他会话的 TurnItem');
+        }
         if (hasSliceOpts) {
           const bodyChunk = item.textBody.slice(offset, offset + maxChars);
           const nextTextOffset = offset + maxChars < item.textBody.length ? offset + maxChars : null;
@@ -656,13 +896,34 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.getBindings': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        if (resolved.service) {
+          const peerRes = await resolved.service.listHarnessBindings({ sessionId: session.id });
+          if (!peerRes.ok) {
+            const code = peerRes.error.code === 'permission_denied' ? 'E_PERMISSION_DENIED' : 'E_SERVICE_UNAVAILABLE';
+            throw new PluginApiError(code, peerRes.error.message);
+          }
+          return peerRes.value.bindings.map((b) => ({
+            sessionId: b.sessionId,
+            harnessId: b.harnessId,
+            harnessKind: b.harnessKind,
+            nativeSessionId: b.nativeSessionId,
+            lastModel: b.lastModel ?? null,
+            lastActualModel: b.lastActualModel ?? null,
+            lastEffort: b.lastEffort ?? null,
+            syncedUpToSeq: b.syncedUpToSeq,
+            driverUsed: b.driverUsed ?? null,
+            updatedAt: b.updatedAt,
+          }));
+        }
         return this.deps.store.listSessionBindings(session.id).map(toPublicBinding);
       }
 
       case 'sessions.fork': {
-        const source = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const source = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:fork', source.workspaceId);
         const opts = params as unknown as ForkSessionOptions;
         const targetId = typeof opts.targetInstanceId === 'string' && opts.targetInstanceId.trim()
@@ -681,10 +942,7 @@ export class IsolatedPluginRpcRouter {
         let worktreeBranch = source.worktreeBranch ?? null;
         if (opts.createWorktree === true) {
           this.deps.permissions.assertGranted(plugin, 'workspace:git:write', source.workspaceId);
-          const workspace = this.deps.store.getWorkspace(source.workspaceId);
-          if (!workspace) {
-            throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'git worktree 服务不可用');
-          }
+          const workspace = await this.getWorkspaceOrThrow(source.workspaceId);
           const branchName = `fork-${Date.now()}`;
           const gitResolution = this.resolveServiceWithFallback(PEER_CONTRACTS.gitWorkspace, {
             callerInstanceId: instanceId,
@@ -720,44 +978,85 @@ export class IsolatedPluginRpcRouter {
         const forkedTitle = typeof opts.title === 'string' && opts.title.trim()
           ? opts.title.trim().slice(0, 120)
           : `分支 · ${source.title}`;
-        const forked = this.deps.store.createSession({
-          id: randomUUID(),
-          workspaceId: source.workspaceId,
-          harnessId: targetId,
-          harnessKind: targetKind,
-          nativeSessionId: null,
-          participatingHarnesses: [targetId],
-          contextSyncMode: source.contextSyncMode,
-          cwd,
-          worktreeBranch,
-          title: forkedTitle,
-          status: 'idle',
-          model: targetId === source.harnessId ? source.model : null,
-          actualModel: null,
-          modelReroutedReason: null,
-          reasoningEffort: targetId === source.harnessId ? source.reasoningEffort : null,
-          permissionMode: source.permissionMode,
-          lastSeq: 0,
-          usage: null,
-          pendingApprovalCount: 0,
-          createdAt: now,
-          updatedAt: now,
-        });
+        let forkedSession: Session;
+        if (resolved.service) {
+          const createdRes = await resolved.service.createSession({
+            session: {
+              id: randomUUID(),
+              workspaceId: source.workspaceId,
+              harnessId: targetId,
+              harnessKind: targetKind,
+              nativeSessionId: null,
+              participatingHarnesses: [targetId],
+              contextSyncMode: source.contextSyncMode,
+              cwd,
+              worktreeBranch,
+              title: forkedTitle,
+              status: 'idle',
+              model: targetId === source.harnessId ? source.model : null,
+              actualModel: null,
+              modelReroutedReason: null,
+              reasoningEffort: targetId === source.harnessId ? source.reasoningEffort : null,
+              permissionMode: source.permissionMode,
+              lastSeq: 0,
+              usage: null,
+              pendingApprovalCount: 0,
+              createdAt: now,
+              updatedAt: now,
+            },
+          });
+          if (!createdRes.ok) throw new PluginApiError('E_SERVICE_UNAVAILABLE', createdRes.error.message);
+          forkedSession = fromSessionRecordDto(createdRes.value.session);
+          if (resolved.instanceId) {
+            this.deps.store.upsertResourceOwner({
+              resourceType: 'session',
+              resourceId: forkedSession.id,
+              contract: 'session.data.v1',
+              instanceId: resolved.instanceId,
+              workspaceId: forkedSession.workspaceId,
+            });
+          }
+        } else {
+          forkedSession = this.deps.store.createSession({
+            id: randomUUID(),
+            workspaceId: source.workspaceId,
+            harnessId: targetId,
+            harnessKind: targetKind,
+            nativeSessionId: null,
+            participatingHarnesses: [targetId],
+            contextSyncMode: source.contextSyncMode,
+            cwd,
+            worktreeBranch,
+            title: forkedTitle,
+            status: 'idle',
+            model: targetId === source.harnessId ? source.model : null,
+            actualModel: null,
+            modelReroutedReason: null,
+            reasoningEffort: targetId === source.harnessId ? source.reasoningEffort : null,
+            permissionMode: source.permissionMode,
+            lastSeq: 0,
+            usage: null,
+            pendingApprovalCount: 0,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
         const sourceLedger = this.deps.store.getTaskState(source.id);
         if (sourceLedger) {
           this.deps.store.upsertTaskState({
             ...sourceLedger,
-            sessionId: forked.id,
+            sessionId: forkedSession.id,
             version: 1,
             ledgerFilePath: null,
             updatedAt: now,
           });
         }
-        return toPublicSession(this.deps.store.getSession(forked.id)!);
+        return toPublicSession(forkedSession);
       }
 
       case 'sessions.switchInstance': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:switch', session.workspaceId);
         if (session.status === 'running' || session.status === 'awaiting_approval') {
           throw new PluginApiError('E_CONFLICT', '会话正在运行或等待审批，无法切换实例');
@@ -777,6 +1076,63 @@ export class IsolatedPluginRpcRouter {
         }, mintAgyDispatchProvenance('plugin_automated', 'plugin', 'sessions.switchInstance'));
         if (!decision.allowed) throw new PluginApiError('E_PERMISSION_DENIED', decision.reason ?? 'AGY switch provenance denied');
         const forceFresh = opts.forceFreshNativeSession === true;
+        if (resolved.service) {
+          const existingRes = await resolved.service.getHarnessBinding({ sessionId: session.id, harnessId: targetAdapter.id });
+          const existingBinding = existingRes.ok ? existingRes.value.binding : null;
+          const nextNativeSessionId = forceFresh ? null : (existingBinding?.nativeSessionId ?? null);
+          const participating = Array.from(
+            new Set([...(session.participatingHarnesses ?? []), session.harnessId, targetAdapter.id]),
+          );
+          const commitRes = await resolved.service.commitBatch({
+            sessionId: session.id,
+            sessionPatch: {
+              harnessId: targetAdapter.id,
+              harnessKind: targetAdapter.kind,
+              nativeSessionId: nextNativeSessionId,
+              participatingHarnesses: participating,
+              status: session.status === 'error' ? 'idle' : session.status,
+            },
+            bindingUpsert: existingBinding
+              ? (forceFresh
+                  ? {
+                      ...existingBinding,
+                      nativeSessionId: null,
+                      syncedUpToSeq: 0,
+                      driverUsed: null,
+                      updatedAt: Date.now(),
+                    }
+                  : {
+                      ...existingBinding,
+                      harnessKind: targetAdapter.kind,
+                      updatedAt: Date.now(),
+                    })
+              : {
+                  sessionId: session.id,
+                  harnessId: targetAdapter.id,
+                  harnessKind: targetAdapter.kind,
+                  nativeSessionId: null,
+                  lastModel: session.model,
+                  lastActualModel: null,
+                  lastEffort: session.reasoningEffort,
+                  syncedUpToSeq: 0,
+                  driverUsed: null,
+                  updatedAt: Date.now(),
+                },
+            events: [{
+              type: 'session.harness_switched',
+              payload: {
+                fromHarnessId: session.harnessId,
+                fromHarnessKind: session.harnessKind,
+                toHarnessId: targetAdapter.id,
+                toHarnessKind: targetAdapter.kind,
+                forceFreshNativeSession: forceFresh,
+                initiatedByPlugin: meta.pluginId,
+              },
+            }],
+          });
+          if (!commitRes.ok) throw new PluginApiError('E_SERVICE_UNAVAILABLE', commitRes.error.message);
+          return { ok: true };
+        }
         const existingBinding = this.deps.store.getSessionBinding(session.id, targetAdapter.id);
         const nextNativeSessionId = forceFresh ? null : (existingBinding?.nativeSessionId ?? null);
         const participating = Array.from(
@@ -829,7 +1185,8 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'sessions.postNotice': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:orchestrate', session.workspaceId);
         const notice = (params.notice ?? {}) as Partial<PublicSessionNotice>;
         if (notice.level !== 'info' && notice.level !== 'warn' && notice.level !== 'error') {
@@ -842,6 +1199,22 @@ export class IsolatedPluginRpcRouter {
         const code = typeof notice.code === 'string' && notice.code.trim()
           ? notice.code.trim().slice(0, 80)
           : undefined;
+        if (resolved.service) {
+          const commitRes = await resolved.service.commitBatch({
+            sessionId: session.id,
+            events: [{
+              type: 'handoff.system_notice',
+              payload: {
+                level: notice.level,
+                message,
+                ...(code ? { code } : {}),
+                pluginId: meta.pluginId,
+              },
+            }],
+          });
+          if (!commitRes.ok) throw new PluginApiError('E_SERVICE_UNAVAILABLE', commitRes.error.message);
+          return { ok: true };
+        }
         this.deps.store.appendEvent(session.id, 'handoff.system_notice', {
           level: notice.level,
           message,
@@ -852,7 +1225,8 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'handoff.preview': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const resolved = await this.resolveSessionWithProvider(params.sessionId);
+        const session = resolved.session;
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const targetInstanceId = typeof params.targetInstanceId === 'string' && params.targetInstanceId.trim()
           ? params.targetInstanceId.trim()
@@ -867,7 +1241,20 @@ export class IsolatedPluginRpcRouter {
         if (!compiler) {
           throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'handoff 服务不可用');
         }
-        const binding = this.deps.store.getSessionBinding(session.id, targetInstanceId);
+        const binding = resolved.service
+          ? await resolved.service.getHarnessBinding({ sessionId: session.id, harnessId: targetInstanceId }).then((r) => (r.ok && r.value.binding ? {
+              sessionId: r.value.binding.sessionId,
+              harnessId: r.value.binding.harnessId,
+              harnessKind: r.value.binding.harnessKind,
+              nativeSessionId: r.value.binding.nativeSessionId,
+              lastModel: r.value.binding.lastModel ?? null,
+              lastActualModel: r.value.binding.lastActualModel ?? null,
+              lastEffort: r.value.binding.lastEffort ?? null,
+              syncedUpToSeq: r.value.binding.syncedUpToSeq,
+              driverUsed: (r.value.binding.driverUsed as SessionHarnessBinding['driverUsed']) ?? null,
+              updatedAt: r.value.binding.updatedAt,
+            } : null))
+          : this.deps.store.getSessionBinding(session.id, targetInstanceId);
         const packet = await compiler.compile({
           session,
           targetHarnessId: targetInstanceId,
@@ -913,6 +1300,37 @@ export class IsolatedPluginRpcRouter {
           };
         });
         return result;
+      }
+
+      case 'harnesses.openSession': {
+        if (!this.deps.openHarnessSession) {
+          throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用可撤销 Harness 会话租约');
+        }
+        const harnessId = typeof params.harnessId === 'string' ? params.harnessId.trim() : '';
+        if (!harnessId) throw new PluginApiError('E_INVALID_INPUT', '缺少 harnessId');
+        const config = (params.config && typeof params.config === 'object' ? params.config : {}) as AdapterSessionConfig;
+        return await this.deps.openHarnessSession(plugin, instanceId, meta.runId, { harnessId, config });
+      }
+
+      case 'harnesses.session.sendTurn':
+      case 'harnesses.session.steerTurn':
+      case 'harnesses.session.interrupt':
+      case 'harnesses.session.updateConfig':
+      case 'harnesses.session.resolveApproval':
+      case 'harnesses.session.dispose': {
+        if (!this.deps.harnessSessionCall) {
+          throw new PluginApiError('E_NOT_SUPPORTED', '当前宿主未启用可撤销 Harness 会话租约');
+        }
+        const leaseId = typeof params.leaseId === 'string' ? params.leaseId.trim() : '';
+        if (!leaseId) throw new PluginApiError('E_INVALID_INPUT', '缺少 leaseId');
+        const op = method.slice('harnesses.session.'.length) as
+          | 'sendTurn'
+          | 'steerTurn'
+          | 'interrupt'
+          | 'updateConfig'
+          | 'resolveApproval'
+          | 'dispose';
+        return await this.deps.harnessSessionCall(instanceId, meta.runId, leaseId, op, params);
       }
 
       case 'harnesses.registerDriver': {
@@ -983,7 +1401,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'ledger.get': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const ledger = this.deps.host.get<TaskLedgerService | Record<string, (...args: unknown[]) => unknown>>('ledger');
         if (!ledger) throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'ledger 服务不可用');
@@ -999,7 +1417,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'ledger.append': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
         const entry = (params.entry ?? {}) as PublicTaskLedgerAppend;
         const ledger = this.deps.host.get<TaskLedgerService | Record<string, (...args: unknown[]) => unknown>>('ledger');
@@ -1029,7 +1447,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'composer.suggest': {
-        const session = this.getSessionOrThrow(params.sessionId);
+        const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'composer:suggest', session.workspaceId);
         const suggestion = (params.suggestion ?? {}) as PublicComposerSuggestion;
         const list = this.pendingSuggestions.get(session.id) ?? [];
@@ -1043,8 +1461,7 @@ export class IsolatedPluginRpcRouter {
         const approvalId = typeof params.approvalId === 'string' ? params.approvalId : '';
         const approval = approvalId ? this.deps.store.getApproval(approvalId) : null;
         if (!approval) throw new PluginApiError('E_INVALID_INPUT', '审批项不存在');
-        const session = this.deps.store.getSession(approval.sessionId);
-        if (!session) throw new PluginApiError('E_INVALID_INPUT', '审批所属会话不存在');
+        const session = await this.getSessionOrThrow(approval.sessionId);
         this.deps.permissions.assertGranted(plugin, 'approvals:annotate', session.workspaceId);
         const note = (params.note ?? {}) as PublicApprovalAnnotationInput;
         if (typeof note.label !== 'string' || !note.label.trim()) {
@@ -1072,13 +1489,13 @@ export class IsolatedPluginRpcRouter {
       case 'storage.workspace.set':
       case 'storage.workspace.delete':
       case 'storage.workspace.keys': {
-        const workspace = this.getWorkspaceOrThrow(params.workspaceId);
+        const workspace = await this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'storage:workspace', workspace.id);
         return this.handleStorage(`workspace:${workspace.id}`, instanceId, method.slice('storage.workspace.'.length), params);
       }
 
       case 'fs.read': {
-        const workspace = this.getWorkspaceOrThrow(params.workspaceId);
+        const workspace = await this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'fs:workspace:read', workspace.id);
         const { fullPath } = resolveWorkspacePath(workspace.rootPath, String(params.relativePath ?? ''), true);
         const stat = fs.statSync(fullPath);
@@ -1088,7 +1505,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'fs.list': {
-        const workspace = this.getWorkspaceOrThrow(params.workspaceId);
+        const workspace = await this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'fs:workspace:read', workspace.id);
         const { fullPath, rel } = resolveWorkspacePath(workspace.rootPath, String(params.relativePath ?? ''), true);
         const stat = fs.statSync(fullPath);
@@ -1107,7 +1524,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'fs.stat': {
-        const workspace = this.getWorkspaceOrThrow(params.workspaceId);
+        const workspace = await this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'fs:workspace:read', workspace.id);
         const { fullPath, rel } = resolveWorkspacePath(workspace.rootPath, String(params.relativePath ?? ''), true);
         const stat = fs.statSync(fullPath);
@@ -1121,7 +1538,7 @@ export class IsolatedPluginRpcRouter {
       }
 
       case 'fs.write': {
-        const workspace = this.getWorkspaceOrThrow(params.workspaceId);
+        const workspace = await this.getWorkspaceOrThrow(params.workspaceId);
         this.deps.permissions.assertGranted(plugin, 'fs:workspace:write', workspace.id);
         const content = typeof params.content === 'string' ? params.content : null;
         if (content === null) throw new PluginApiError('E_INVALID_INPUT', '写入内容必须为字符串');
@@ -1346,7 +1763,7 @@ export class IsolatedPluginRpcRouter {
 
   private async handleGitServiceCall(plugin: InstalledPluginInfo, fnName: string, args: unknown[]) {
     const workspaceId = typeof args[0] === 'string' ? args[0] : undefined;
-    const workspace = this.getWorkspaceOrThrow(workspaceId);
+    const workspace = await this.getWorkspaceOrThrow(workspaceId);
     this.deps.permissions.assertGranted(plugin, 'fs:workspace:read', workspace.id);
     const resolution = this.resolveServiceWithFallback(PEER_CONTRACTS.gitWorkspace, {
       workspaceId: workspace.id,

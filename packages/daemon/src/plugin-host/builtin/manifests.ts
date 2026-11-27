@@ -1,6 +1,7 @@
 import type { PluginManifest } from '@harnessmate/plugin-api';
 import { TRIAGE_INBOX_PLUGIN_ID } from '@harnessmate/protocol';
-import { HISTORY_SESSION_DATA_MANIFEST } from '../../server/routes/history-import-compat.js';
+import { SESSION_DATA_DEFAULT_MANIFEST } from '../../plugins/session-data-default/index.js';
+import { SESSION_RUNTIME_DEFAULT_MANIFEST } from '../../plugins/session-runtime-default/index.js';
 
 export const BUNDLED_PLUGIN_IDS = [
   'hm.plugin.message-studio',
@@ -253,7 +254,8 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     category: 'workflow',
     contributes: { uiSlots: ['composer_action'] },
   },
-  HISTORY_SESSION_DATA_MANIFEST,
+  SESSION_DATA_DEFAULT_MANIFEST,
+  SESSION_RUNTIME_DEFAULT_MANIFEST,
   {
     id: 'hm.plugin.session-explorer',
     name: '会话检索、导入与分叉中心',

@@ -1,4 +1,4 @@
-import { PEER_CONTRACTS, type ResolveServiceSelectionOptions } from '@harnessmate/plugin-api';
+import { PEER_CONTRACTS, type ResolveServiceSelectionOptions, type SessionDataServiceV1 } from '@harnessmate/plugin-api';
 import type { HarnessInfo, Session } from '@harnessmate/protocol';
 import { FailoverCoordinator, classifyTerminalFailure } from '../../core/failover-service.js';
 import { McpService } from '../../core/mcp-service.js';
@@ -66,7 +66,16 @@ export function createHarnessIntegrationPlugins(
     ['core.account-usage', {
       provides: ['usage', usageContract, modelCatalogContract],
       apply(ctx) {
-        const usage = new UsageService(store, registry);
+        const usage = new UsageService(store, registry, {
+          getSessionDataServices: () => {
+            const pm = getPlugins?.();
+            if (!pm) return [];
+            return pm.host.listServiceProviders(PEER_CONTRACTS.sessionData)
+              .filter((p) => !pm.isInstanceKnownDisabled(p.instanceId))
+              .map((p) => pm.host.getServiceByInstance<SessionDataServiceV1>(p.instanceId, PEER_CONTRACTS.sessionData))
+              .filter((svc): svc is SessionDataServiceV1 => Boolean(svc));
+          },
+        });
         registerUsagePage(ctx, usage, getPlugins);
         ctx.provide('usage', usage);
         ctx.provide(usageContract, {

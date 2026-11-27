@@ -3,6 +3,7 @@ import {
   HOST_SUPPORTED_FEATURES,
   PLUGIN_API_VERSION, PLUGIN_EVENT_VERSION, PluginApiError,
   type Disposer, type PluginContext, type PluginRouteRequest, type PluginRouteResponse, type PluginState,
+  type ServiceChannelEvent,
 } from '@harnessmate/plugin-api';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import { PluginEvents } from './events.js';
@@ -46,6 +47,10 @@ export interface HostPluginContext extends PluginContext {
   readonly host?: PluginHost;
   readonly instanceId?: string;
   provide(name: string, value: object, opts?: ServiceProvideOptions): Disposer;
+  readonly services?: {
+    publish(contract: string, payload: Record<string, unknown>): ServiceChannelEvent;
+    subscribe(contract: string, listener: (event: ServiceChannelEvent) => void): Disposer;
+  };
   readonly routes?: {
     register(pathPrefix: string, handler: HostPluginRouteHandler): Disposer;
   };
@@ -95,6 +100,8 @@ export class PluginHost {
   private readonly servicesByContract = new Map<string, Map<string, ServiceRecord>>();
   private readonly hostRoutes = new Map<string, Array<{ prefix: string; handler: HostPluginRouteHandler }>>();
   private readonly serviceListeners = new Set<(services: string[]) => void>();
+  private readonly serviceChannelListeners = new Map<string, Set<(event: ServiceChannelEvent) => void>>();
+  private serviceChannelSeq = 0;
   private defaultBindings: Record<string, string> = {};
   private registryBridge?: HarnessRegistry;
   private handoffRedactor?: HandoffRedactorFn;
@@ -251,6 +258,46 @@ export class PluginHost {
   onServicesChanged(listener: (services: string[]) => void): Disposer {
     this.serviceListeners.add(listener);
     return () => { this.serviceListeners.delete(listener); };
+  }
+
+  publishServiceChannel(
+    contract: string,
+    instanceId: string,
+    payload: Record<string, unknown>,
+  ): ServiceChannelEvent {
+    const event: ServiceChannelEvent = {
+      contract,
+      instanceId,
+      seq: ++this.serviceChannelSeq,
+      emittedAt: Date.now(),
+      payload,
+    };
+    const listeners = this.serviceChannelListeners.get(contract);
+    if (listeners) {
+      for (const listener of [...listeners]) {
+        try {
+          listener(event);
+        } catch (error) {
+          this.report(error);
+        }
+      }
+    }
+    return event;
+  }
+
+  subscribeServiceChannel(
+    contract: string,
+    listener: (event: ServiceChannelEvent) => void,
+  ): Disposer {
+    const set = this.serviceChannelListeners.get(contract) ?? new Set<(event: ServiceChannelEvent) => void>();
+    set.add(listener);
+    this.serviceChannelListeners.set(contract, set);
+    return () => {
+      const current = this.serviceChannelListeners.get(contract);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.serviceChannelListeners.delete(contract);
+    };
   }
 
   private notifyServicesChanged(): void {
@@ -547,6 +594,18 @@ export class PluginHost {
         return this.resolveServiceFor(instanceId, name);
       },
       on: (name, listener) => effect(() => this.events.on(name, listener)),
+      services: {
+        publish: (contract, payload) => {
+          assertCurrent();
+          const bucket = this.servicesByContract.get(contract);
+          const ownerRecord = bucket?.get(instanceId);
+          if (!ownerRecord || ownerRecord.owner !== instance) {
+            throw new PluginApiError('E_PERMISSION_DENIED', `实例 ${instanceId} 未处于活动提供 ${contract} 的状态`);
+          }
+          return this.publishServiceChannel(contract, instanceId, payload);
+        },
+        subscribe: (contract, listener) => effect(() => this.subscribeServiceChannel(contract, listener)),
+      },
       routes: {
         register: (pathPrefix, handler) => {
           assertCurrent();

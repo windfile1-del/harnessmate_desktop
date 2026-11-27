@@ -8,6 +8,10 @@ import {
   type SessionTriageState,
   type TriageSnoozeExpired,
 } from '@harnessmate/protocol';
+import {
+  findSessionWithProvider,
+  listActiveSessionDataProviders,
+} from '../../core/session-peer-router.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { INBOX, LEDGER, NOTIFICATIONS, SNOOZE, SUMMARY } from '../../plugin-host/builtin/session-assistance.js';
 import type { PluginManager } from '../../plugins/plugin-manager.js';
@@ -42,7 +46,8 @@ export function registerSessionAssistanceCompatRoutes(
   function ledgerRoute(contract: string, method: string) {
     return async (request: FastifyRequest, reply: FastifyReply) => {
       const id = sessionIdOf(request);
-      if (!store.getSession(id)) return notFound(reply);
+      const found = await findSessionWithProvider(plugins, id);
+      if (!found && !store.getSession(id)) return notFound(reply);
       const args: unknown[] = [id];
       if (method === 'update') {
         const patch = UpdateTaskStateRequestSchema.safeParse(request.body);
@@ -68,7 +73,18 @@ export function registerSessionAssistanceCompatRoutes(
     const instances = new Set<string>();
     if (selection.status === 'ready') instances.add(selection.instanceId);
     if (!explicitInstanceId(request)) {
-      for (const id of store.listSessionIds()) {
+      const allSessionIds = new Set<string>(store.listSessionIds());
+      for (const dp of listActiveSessionDataProviders(plugins)) {
+        try {
+          const res = await dp.service.listSessions({ includeArchived: true });
+          if (res.ok) {
+            for (const s of res.value.sessions) allSessionIds.add(s.id);
+          }
+        } catch {
+          // skip
+        }
+      }
+      for (const id of allSessionIds) {
         const owner = inboxSelection(request, id);
         if (owner.status === 'ready') instances.add(owner.instanceId);
       }
@@ -115,7 +131,8 @@ export function registerSessionAssistanceCompatRoutes(
   app.post('/api/v1/desktop/session-notifications/plan', async (request, reply) => {
     const parsed = notificationIntent.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'Invalid notification intent' });
-    const session = store.getSession(parsed.data.sessionId);
+    const found = await findSessionWithProvider(plugins, parsed.data.sessionId);
+    const session = found?.session ?? store.getSession(parsed.data.sessionId);
     if (!session) return { notice: null };
     const selection = plugins.resolveServiceSelection(NOTIFICATIONS, {
       sessionId: session.id, workspaceId: session.workspaceId, allowSingleCandidate: true,

@@ -1,0 +1,12 @@
+{
+  "id": "hm.plugin.session-runtime-default",
+  "name": "默认会话运行插件",
+  "version": "1.0.0",
+  "description": "负责会话活动句柄池、轮次启动互斥、请求幂等、未知结果保护、增量流合批、配置回执与崩溃恢复的默认运行时实现。",
+  "author": "HarnessMate Core",
+  "category": "workflow",
+  "provides": [
+    "session.runtime.v1"
+  ],
+  "contributes": {}
+}

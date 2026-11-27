@@ -22,7 +22,9 @@ import type {
   ImportSessionBundleRequest,
   MergeBackRequest,
   MergeBackResult,
+  PermissionMode,
   PortableSessionBundleV2,
+  ReasoningEffort,
   ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
@@ -89,16 +91,133 @@ import {
   type TerminalWorkspaceService,
 } from './terminal-workspace-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
-import { PluginApiError } from '@harnessmate/plugin-api';
+import {
+  PEER_CONTRACTS,
+  PluginApiError,
+  type PublicTurnBlock,
+  type SessionCanonicalEventDto,
+  type SessionDataStreamIdentity,
+  type SessionRecordDto,
+  type SessionRunRecordDto,
+  type SessionWorkspaceDto,
+} from '@harnessmate/plugin-api';
 import type { GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
 import { dispatchTurn } from './outbound-gate.js';
+import {
+  SESSION_DATA_DEFAULT_PLUGIN_ID,
+} from '../plugins/session-data-default/index.js';
+import {
+  SESSION_RUNTIME_DEFAULT_PLUGIN_ID,
+  type SessionRuntimeDefaultController,
+} from '../plugins/session-runtime-default/index.js';
+import {
+  findSessionWithProvider,
+  findWorkspaceWithProvider,
+  listActiveSessionDataProviders,
+  recordResourceOwner,
+  removeResourceOwner,
+  resolveOptionalSessionDataProvider,
+  resolveSessionDataProvider,
+  resolveSessionRuntimeProvider,
+} from './session-peer-router.js';
 import {
   releaseTerminalsUsingPath,
   resolveGitCheckpointProvider,
   resolveGitWorkspaceProvider,
   resolveOptionalGitWorkspaceProvider,
+  unwrapPeerServiceResult,
 } from './w1-service-helpers.js';
+
+function workspaceDtoToModel(dto: SessionWorkspaceDto): Workspace {
+  return {
+    id: dto.id,
+    name: dto.name,
+    rootPath: dto.rootPath,
+    isGitRepo: dto.isGitRepo,
+    gitBranch: dto.gitBranch,
+    createdAt: dto.createdAt,
+  };
+}
+
+function sessionDtoToModel(dto: SessionRecordDto): Session {
+  return {
+    id: dto.id,
+    workspaceId: dto.workspaceId,
+    harnessId: dto.harnessId,
+    harnessKind: dto.harnessKind,
+    nativeSessionId: dto.nativeSessionId,
+    parentSessionId: dto.parentSessionId ?? null,
+    forkedFromTurnSeq: dto.forkedFromTurnSeq ?? null,
+    forkMode: dto.forkMode === 'clean_fork' ? 'native' : dto.forkMode === 'with_context' ? 'portable' : null,
+    importMode: dto.importMode ?? null,
+    importSource: dto.importSource ?? null,
+    participatingHarnesses: dto.participatingHarnesses ?? [dto.harnessId],
+    contextSyncMode: dto.contextSyncMode ?? 'auto',
+    cwd: dto.cwd,
+    worktreeBranch: dto.worktreeBranch ?? null,
+    title: dto.title,
+    status: dto.status as SessionStatus,
+    model: dto.model,
+    actualModel: dto.actualModel ?? null,
+    modelReroutedReason: dto.modelReroutedReason ?? null,
+    reasoningEffort: (dto.reasoningEffort as ReasoningEffort | null) ?? null,
+    permissionMode: dto.permissionMode as PermissionMode,
+    lastSeq: dto.lastSeq,
+    usage: dto.usage ?? null,
+    pendingApprovalCount: dto.pendingApprovalCount,
+    createdAt: dto.createdAt,
+    updatedAt: dto.updatedAt,
+  };
+}
+
+function eventDtoToModel(dto: SessionCanonicalEventDto): CanonicalEvent {
+  return {
+    sessionId: dto.sessionId,
+    seq: dto.seq,
+    turnId: dto.turnId,
+    type: dto.type as CanonicalEvent['type'],
+    payload: dto.payload,
+    createdAt: dto.createdAt,
+  };
+}
+
+function turnBlockDtoToModel(dto: PublicTurnBlock): TurnBlockRecord {
+  return {
+    itemId: dto.itemId,
+    schemaVersion: 2,
+    sessionId: dto.sessionId,
+    turnId: dto.turnId,
+    seq: dto.seq,
+    instanceId: dto.instanceId,
+    driverId: dto.driverId,
+    blockType: dto.blockType as TurnBlockRecord['blockType'],
+    status: dto.status as TurnBlockRecord['status'],
+    title: dto.title,
+    textBody: dto.textBody,
+    payload: dto.payload,
+    outputOmitted: dto.outputOmitted,
+    omittedBytes: dto.omittedBytes,
+    createdAt: dto.createdAt,
+    updatedAt: dto.updatedAt,
+  };
+}
+
+function runDtoToModel(dto: SessionRunRecordDto): SessionRunRecord {
+  return {
+    runId: dto.runId,
+    sessionId: dto.sessionId,
+    turnId: dto.turnId,
+    instanceId: dto.instanceId,
+    driverId: dto.driverId,
+    model: dto.model ?? null,
+    status: dto.status as SessionRunRecord['status'],
+    failureClass: dto.failureClass ?? null,
+    usage: dto.usage ?? null,
+    startedAt: dto.startedAt,
+    endedAt: dto.endedAt ?? null,
+  };
+}
 
 interface LiveHandleEntry {
   key: string;
@@ -133,6 +252,7 @@ const MAX_WARM_HANDLES = 6;
 const MAX_STORED_TOOL_OUTPUT_CHARS = 16_384;
 const MAX_TURN_ITEM_TEXT_CHARS = 512_000;
 type TurnOptions = {
+  requestId?: string;
   harnessId?: string;
   model?: string | null;
   turnOptions?: TurnOptionsMap;
@@ -143,6 +263,8 @@ type TurnOptions = {
   dispatchProvenance?: AgyDispatchProvenance;
   expectedNativeHandle?: AdapterSessionHandle;
   verifyNativeDispatch?: () => void;
+  cliCommand?: string;
+  nativeSkill?: { name: string; path: string };
 };
 
 export class SessionManager {
@@ -157,6 +279,7 @@ export class SessionManager {
   private fallbackApprovalCenter?: ApprovalCenterService;
   private fallbackOrchestrator?: OrchestratorService;
   private fallbackCompressor?: ContextCompressionService;
+  private runtimeController: SessionRuntimeDefaultController | null = null;
   constructor(
     private readonly store: HarnessMateStore,
     private readonly registry: HarnessRegistry,
@@ -189,10 +312,57 @@ export class SessionManager {
         }
       },
     });
-    this.recoverStaleSessions();
+    // Stale running/turn crash recovery is owned by session.runtime.v1 & session.data.v1 plugins.
+    // Host only marks AGY native attached bindings as reconciling during boot and publishes legacy
+    // unpublished expired Batch-4 approvals if default session-data is not explicitly disabled.
+    this.nativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
+    if (!this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)) {
+      for (const approval of this.store.listUnpublishedExpiredApprovals()) {
+        this.publishExpiredApproval(approval);
+        if (
+          this.store.getSession(approval.sessionId)?.status === 'awaiting_approval' &&
+          this.store.listPendingApprovals(approval.sessionId).length === 0
+        ) {
+          this.setSessionStatus(approval.sessionId, 'idle');
+        }
+      }
+    }
     this.nativeRegistry?.bindTurnSettlementSink({
-      settleTurn: (params) => this.settleHeldNativeTurn(params),
+      settleTurn: (params) => {
+        if (this.runtimeController?.isActive()) {
+          return this.runtimeController.settleHeldNativeTurn(params);
+        }
+        return this.settleHeldNativeTurn(params);
+      },
     });
+  }
+
+  attachRuntimeController(controller: SessionRuntimeDefaultController | null): void {
+    this.runtimeController = controller;
+  }
+
+  getRuntimeController(): SessionRuntimeDefaultController | null {
+    return this.runtimeController;
+  }
+
+  attachCompressorForRuntime(): void {
+    this.attachActiveCompressorHooks();
+  }
+
+  getOrchestratorIfEnabled(): OrchestratorService | undefined {
+    return this.getActiveOrchestrator() ?? undefined;
+  }
+
+  private assertDefaultDataEnabledForSyncRead(): void {
+    if (
+      this.pluginManager.hasLoadedRegistry() &&
+      this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)
+    ) {
+      throw new PluginApiError(
+        'E_PLUGIN_DISABLED',
+        `默认会话数据插件 (${SESSION_DATA_DEFAULT_PLUGIN_ID}) 已停用`,
+      );
+    }
   }
 
   private handleKey(sessionId: string, harnessId: string): string {
@@ -231,7 +401,24 @@ export class SessionManager {
     sessionId: string,
     opts?: { afterSeq?: number; turnId?: string; blockTypes?: string[]; limit?: number },
   ): TurnBlockRecord[] {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.listTurnItems(sessionId, opts);
+  }
+
+  async getSessionTurnItemsAsync(
+    sessionId: string,
+    opts?: { afterSeq?: number; turnId?: string; blockTypes?: string[]; limit?: number },
+  ): Promise<TurnBlockRecord[]> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) {
+      if (this.pluginManager.hasLoadedRegistry()) return [];
+      return this.store.listTurnItems(sessionId, opts);
+    }
+    const res = unwrapPeerServiceResult(
+      await found.provider.service.listTurnItems({ sessionId, ...opts }),
+    );
+    return res.items.map(turnBlockDtoToModel);
   }
 
   getSessionTurnItemSlice(
@@ -246,6 +433,7 @@ export class SessionManager {
     nextTextOffset: number | null;
     hasMore: boolean;
   } | null {
+    this.assertDefaultDataEnabledForSyncRead();
     const item = this.store.getTurnItem(itemId);
     if (!item || item.sessionId !== sessionId) return null;
     let fullText = item.textBody;
@@ -276,8 +464,71 @@ export class SessionManager {
     };
   }
 
+  async getSessionTurnItemSliceAsync(
+    sessionId: string,
+    itemId: string,
+    opts: { textOffset: number; maxChars: number },
+  ): Promise<{
+    item: TurnBlockRecord;
+    text: string;
+    totalChars: number;
+    textOffset: number;
+    nextTextOffset: number | null;
+    hasMore: boolean;
+  } | null> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) {
+      if (this.pluginManager.hasLoadedRegistry()) return null;
+      return this.getSessionTurnItemSlice(sessionId, itemId, opts);
+    }
+    const sliceRes = unwrapPeerServiceResult(await found.provider.service.getTurnItem({ sessionId, itemId }));
+    if (!sliceRes) return null;
+    const item = turnBlockDtoToModel(sliceRes.item);
+    let fullText = item.textBody;
+    const toolCallId =
+      typeof item.payload?.toolCallId === 'string'
+        ? item.payload.toolCallId
+        : item.itemId.startsWith('tool:')
+          ? item.itemId.slice(5)
+          : undefined;
+    if (toolCallId) {
+      const liveSnap = this.commandOutputHub.getSnapshot(sessionId, toolCallId);
+      if (liveSnap && liveSnap.text.length > fullText.length) {
+        fullText = liveSnap.text;
+      }
+    }
+    const totalChars = fullText.length;
+    const start = Math.min(Math.max(0, opts.textOffset), totalChars);
+    const end = Math.min(start + Math.max(1, opts.maxChars), totalChars);
+    const text = fullText.slice(start, end);
+    const hasMore = end < totalChars;
+    return {
+      item: { ...item, textBody: text },
+      text,
+      totalChars,
+      textOffset: start,
+      nextTextOffset: hasMore ? end : null,
+      hasMore,
+    };
+  }
+
   getSessionRuns(sessionId: string, limit = 100): SessionRunRecord[] {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.listSessionRuns(sessionId, limit);
+  }
+
+  async getSessionRunsAsync(sessionId: string, limit = 100): Promise<SessionRunRecord[]> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) {
+      if (this.pluginManager.hasLoadedRegistry()) return [];
+      return this.store.listSessionRuns(sessionId, limit);
+    }
+    const res = unwrapPeerServiceResult(
+      await found.provider.service.listSessionRuns({ sessionId, limit }),
+    );
+    return res.runs.map(runDtoToModel);
   }
 
   // ── Session Checkpoints & Atomic Revert ──────────────────────────────
@@ -376,17 +627,25 @@ export class SessionManager {
       supportsNativeRollback,
       turnsToRollback: turnsSinceTarget,
       performNativeRollback: async (numTurns: number) => {
-        const key = this.handleKey(sessionId, session.harnessId);
-        const existing = this.liveHandles.get(key);
-        const entry = existing ?? (await this.ensureLiveHandle(sessionId, session.harnessId, false));
-        if (!entry.handle.runNativeCommand) {
+        const runtimeProvider = resolveSessionRuntimeProvider(this.pluginManager, {
+          sessionId,
+          workspaceId: session.workspaceId,
+        });
+        if (runtimeProvider.instanceId !== SESSION_RUNTIME_DEFAULT_PLUGIN_ID || !this.runtimeController?.isActive()) {
+          throw new CheckpointError(
+            'E_NATIVE_ROLLBACK_FAILED',
+            '当前会话未绑定默认运行时插件，无法执行原生对话回滚',
+          );
+        }
+        const handle = this.runtimeController.getLiveHandle(sessionId, session.harnessId);
+        if (!handle?.runNativeCommand) {
           throw new CheckpointError(
             'E_NATIVE_ROLLBACK_FAILED',
             `当前驱动 (${session.harnessId}) 未暴露原生回滚接口，已中止回滚且未修改任何工作区文件`,
           );
         }
         try {
-          await entry.handle.runNativeCommand('rollback', String(numTurns));
+          await handle.runNativeCommand('rollback', String(numTurns));
         } catch (err) {
           throw new CheckpointError(
             'E_NATIVE_ROLLBACK_FAILED',
@@ -395,7 +654,7 @@ export class SessionManager {
         }
       },
       resetNativeBinding: async () => {
-        await this.disposeLiveHandle(sessionId, session.harnessId);
+        await this.disposeSessionHandles(sessionId);
         this.store.updateSession(sessionId, { nativeSessionId: null });
         const existingBinding = this.store.getSessionBinding(sessionId, session.harnessId);
         this.store.upsertSessionBinding({
@@ -622,9 +881,9 @@ export class SessionManager {
       createSession: (req) => this.createSession(req),
       addWorkspace: (rootPath, name) => this.addWorkspace(rootPath, name),
       tryNativeFork: async (source, _fromTurnSeq) => {
-        const entry = this.liveHandles.get(this.handleKey(source.id, source.harnessId));
-        if (entry?.handle.runNativeCommand) {
-          const out = await entry.handle.runNativeCommand('fork', source.nativeSessionId ?? '');
+        const handle = this.runtimeController?.getLiveHandle(source.id, source.harnessId);
+        if (handle?.runNativeCommand) {
+          const out = await handle.runNativeCommand('fork', source.nativeSessionId ?? '');
           const trimmed = out.trim();
           if (trimmed && !/\s/.test(trimmed)) return trimmed;
         }
@@ -816,53 +1075,122 @@ export class SessionManager {
 
   // ── Workspaces ───────────────────────────────────────────────────────
 
-  async addWorkspace(rootPath: string, name?: string): Promise<Workspace> {
+  async addWorkspace(rootPath: string, name?: string, dataInstanceId?: string): Promise<Workspace> {
+    await this.pluginManager.ensureBootstrapped();
     const resolved = path.resolve(rootPath);
     if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
       throw new Error(`Workspace directory does not exist: ${resolved}`);
     }
 
-    const existing = this.store.getWorkspaceByPath(resolved);
-    if (existing) {
+    const provider = resolveSessionDataProvider(
+      this.pluginManager,
+      dataInstanceId ? { explicitInstanceId: dataInstanceId } : undefined,
+    );
+    const existingRes = unwrapPeerServiceResult(await provider.service.getWorkspaceByPath({ rootPath: resolved }));
+    if (existingRes.workspace) {
+      const existing = existingRes.workspace;
+      recordResourceOwner(this.store, 'workspace', existing.id, provider.instanceId, existing.id);
+      if (dataInstanceId) {
+        await this.pluginManager.setWorkspaceBinding(existing.id, PEER_CONTRACTS.sessionData, provider.instanceId).catch(() => {});
+      }
       const gitProvider = resolveOptionalGitWorkspaceProvider(this.pluginManager, { workspaceId: existing.id });
       const git = await gitProvider?.inspect(resolved, existing.id).catch(() => undefined);
-      if (git) this.store.updateWorkspaceGit(existing.id, git.isGitRepo, git.branch);
-      return this.store.getWorkspace(existing.id)!;
+      if (git) {
+        const updatedRes = unwrapPeerServiceResult(
+          await provider.service.updateWorkspaceGit({
+            workspaceId: existing.id,
+            isGitRepo: git.isGitRepo,
+            gitBranch: git.branch,
+          }),
+        );
+        if (updatedRes.workspace) return workspaceDtoToModel(updatedRes.workspace);
+      }
+      return workspaceDtoToModel(existing);
     }
 
     const gitProvider = resolveOptionalGitWorkspaceProvider(this.pluginManager);
     const git = (await gitProvider?.inspect(resolved).catch(() => undefined)) ?? { isGitRepo: false, branch: null };
-    const registeredWhileInspecting = this.store.getWorkspaceByPath(resolved);
-    if (registeredWhileInspecting) return registeredWhileInspecting;
-    const ws: Workspace = {
-      id: `ws_${crypto.randomBytes(6).toString('hex')}`,
-      name: name?.trim() || path.basename(resolved) || resolved,
-      rootPath: resolved,
-      isGitRepo: git.isGitRepo,
-      gitBranch: git.branch,
-      createdAt: Date.now(),
-    };
-    return this.store.createWorkspace(ws);
+    const createdRes = unwrapPeerServiceResult(
+      await provider.service.createWorkspace({
+        id: `ws_${crypto.randomBytes(6).toString('hex')}`,
+        name: name?.trim() || path.basename(resolved) || resolved,
+        rootPath: resolved,
+        isGitRepo: git.isGitRepo,
+        gitBranch: git.branch,
+        createdAt: Date.now(),
+      }),
+    );
+    recordResourceOwner(
+      this.store,
+      'workspace',
+      createdRes.workspace.id,
+      provider.instanceId,
+      createdRes.workspace.id,
+    );
+    if (dataInstanceId) {
+      await this.pluginManager.setWorkspaceBinding(
+        createdRes.workspace.id,
+        PEER_CONTRACTS.sessionData,
+        provider.instanceId,
+      ).catch(() => {});
+    }
+    return workspaceDtoToModel(createdRes.workspace);
   }
 
   listWorkspaces(): Workspace[] {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.listWorkspaces();
   }
 
-  async deleteWorkspace(id: string): Promise<boolean> {
-    const ws = this.store.getWorkspace(id);
-    await this.terminalWorkspace?.closeWorkspaceTerminals(id);
-    if (ws) {
-      await releaseTerminalsUsingPath(this.pluginManager, ws.rootPath, id).catch(() => {});
+  async listWorkspacesAsync(): Promise<Workspace[]> {
+    await this.pluginManager.ensureBootstrapped();
+    const providers = listActiveSessionDataProviders(this.pluginManager);
+    if (providers.length === 0) {
+      this.assertDefaultDataEnabledForSyncRead();
+      if (this.pluginManager.hasLoadedRegistry()) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '当前没有可用的会话数据插件实例');
+      }
+      return this.store.listWorkspaces();
     }
-    const sessions = this.store.listSessions({ workspaceId: id, includeArchived: true });
-    for (const s of sessions) {
+    const seen = new Map<string, Workspace>();
+    for (const provider of providers) {
+      const res = await provider.service.listWorkspaces();
+      if (!res.ok) continue;
+      for (const ws of res.value.workspaces) {
+        if (!seen.has(ws.id)) seen.set(ws.id, workspaceDtoToModel(ws));
+      }
+    }
+    return [...seen.values()].sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  async getWorkspaceAsync(id: string): Promise<Workspace | null> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findWorkspaceWithProvider(this.pluginManager, id);
+    return found ? workspaceDtoToModel(found.workspace) : null;
+  }
+
+  async deleteWorkspace(id: string): Promise<boolean> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findWorkspaceWithProvider(this.pluginManager, id);
+    if (!found) return false;
+    const { provider, workspace: ws } = found;
+    await this.terminalWorkspace?.closeWorkspaceTerminals(id);
+    await releaseTerminalsUsingPath(this.pluginManager, ws.rootPath, id).catch(() => {});
+    const sessRes = unwrapPeerServiceResult(
+      await provider.service.listSessions({ workspaceId: id, includeArchived: true }),
+    );
+    for (const s of sessRes.sessions) {
       if (s.cwd) {
         await releaseTerminalsUsingPath(this.pluginManager, s.cwd, id).catch(() => {});
       }
       await this.disposeSessionHandles(s.id);
+      removeResourceOwner(this.store, 'session', s.id);
     }
-    return this.store.deleteWorkspace(id);
+    const deletedRes = unwrapPeerServiceResult(await provider.service.deleteWorkspace({ workspaceId: id }));
+    if (deletedRes.deleted) {
+      removeResourceOwner(this.store, 'workspace', id);
+    }
+    return deletedRes.deleted;
   }
 
   recordTerminalEvent(
@@ -898,18 +1226,101 @@ export class SessionManager {
   // ── Sessions ─────────────────────────────────────────────────────────
 
   listSessions(filter?: { workspaceId?: string; harnessId?: string; includeArchived?: boolean }): Session[] {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.listSessions(filter);
   }
 
+  async listSessionsAsync(filter?: {
+    workspaceId?: string;
+    harnessId?: string;
+    includeArchived?: boolean;
+  }): Promise<Session[]> {
+    await this.pluginManager.ensureBootstrapped();
+    if (filter?.workspaceId) {
+      const wsFound = await findWorkspaceWithProvider(this.pluginManager, filter.workspaceId);
+      if (!wsFound) {
+        if (this.pluginManager.hasLoadedRegistry()) return [];
+        return this.store.listSessions(filter);
+      }
+      const res = unwrapPeerServiceResult(await wsFound.provider.service.listSessions(filter));
+      return res.sessions.map(sessionDtoToModel);
+    }
+    const providers = listActiveSessionDataProviders(this.pluginManager);
+    if (providers.length === 0) {
+      this.assertDefaultDataEnabledForSyncRead();
+      if (this.pluginManager.hasLoadedRegistry()) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '当前没有可用的会话数据插件实例');
+      }
+      return this.store.listSessions(filter);
+    }
+    const seen = new Map<string, Session>();
+    for (const provider of providers) {
+      const res = await provider.service.listSessions(filter ?? {});
+      if (!res.ok) continue;
+      for (const s of res.value.sessions) {
+        if (!seen.has(s.id)) seen.set(s.id, sessionDtoToModel(s));
+      }
+    }
+    return [...seen.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
   getSession(id: string): Session | null {
+    this.assertDefaultDataEnabledForSyncRead();
+    return this.store.getSession(id);
+  }
+
+  async getSessionAsync(id: string): Promise<Session | null> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, id);
+    if (found) return sessionDtoToModel(found.session);
+    if (this.pluginManager.hasLoadedRegistry()) return null;
     return this.store.getSession(id);
   }
 
   getSessionEvents(sessionId: string, afterSeq = 0): CanonicalEvent[] {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.getEventsAfter(sessionId, afterSeq);
   }
 
+  async getSessionEventsAsync(sessionId: string, afterSeq = 0): Promise<CanonicalEvent[]> {
+    const page = await this.getSessionEventsPageAsync(sessionId, afterSeq);
+    return page.events;
+  }
+
+  async getSessionEventsPageAsync(sessionId: string, afterSeq = 0): Promise<{
+    events: CanonicalEvent[];
+    lastSeq: number;
+    hasMore: boolean;
+    stream: SessionDataStreamIdentity | null;
+  }> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) {
+      if (this.pluginManager.hasLoadedRegistry()) {
+        return { events: [], lastSeq: 0, hasMore: false, stream: null };
+      }
+      const events = this.store.getEventsAfter(sessionId, afterSeq);
+      const sess = this.store.getSession(sessionId);
+      return {
+        events,
+        lastSeq: sess?.lastSeq ?? 0,
+        hasMore: false,
+        stream: null,
+      };
+    }
+    const res = unwrapPeerServiceResult(
+      await found.provider.service.listEvents({ sessionId, afterSeq }),
+    );
+    return {
+      events: res.events.map(eventDtoToModel),
+      lastSeq: res.lastSeq,
+      hasMore: res.hasMore,
+      stream: res.stream,
+    };
+  }
+
   iterateSessionEvents(sessionId: string, afterSeq = 0): Iterable<CanonicalEvent> {
+    this.assertDefaultDataEnabledForSyncRead();
     return this.store.iterateEvents(sessionId, afterSeq);
   }
 
@@ -918,13 +1329,65 @@ export class SessionManager {
   }
 
   async createSession(req: CreateSessionRequest): Promise<Session> {
-    const session = await this.buildSession(req);
-    const created = this.store.createSession(session);
-    this.emitCanonical(created.id, 'session.status', { status: 'idle' });
+    await this.pluginManager.ensureBootstrapped();
+    const wsFound = await findWorkspaceWithProvider(this.pluginManager, req.workspaceId);
+    if (!wsFound) {
+      throw new Error(`Workspace not found: ${req.workspaceId}`);
+    }
+    const session = await this.buildSessionFromWorkspace(req, workspaceDtoToModel(wsFound.workspace));
+    const createdRes = unwrapPeerServiceResult(
+      await wsFound.provider.service.createSession({
+        session: {
+          id: session.id,
+          workspaceId: session.workspaceId,
+          harnessId: session.harnessId,
+          harnessKind: session.harnessKind,
+          nativeSessionId: session.nativeSessionId,
+          parentSessionId: session.parentSessionId ?? null,
+          forkedFromTurnSeq: session.forkedFromTurnSeq ?? null,
+          forkMode:
+            session.forkMode === 'native'
+              ? 'clean_fork'
+              : session.forkMode === 'portable'
+                ? 'with_context'
+                : null,
+          importMode: session.importMode ?? null,
+          importSource: session.importSource ?? null,
+          participatingHarnesses: session.participatingHarnesses,
+          contextSyncMode: session.contextSyncMode,
+          cwd: session.cwd,
+          worktreeBranch: session.worktreeBranch ?? null,
+          title: session.title,
+          status: session.status,
+          model: session.model,
+          actualModel: session.actualModel ?? null,
+          modelReroutedReason: session.modelReroutedReason ?? null,
+          reasoningEffort: session.reasoningEffort ?? null,
+          permissionMode: session.permissionMode,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+        },
+      }),
+    );
+    const created = sessionDtoToModel(createdRes.session);
+    recordResourceOwner(this.store, 'session', created.id, wsFound.provider.instanceId, created.workspaceId);
+
+    const statusEvRes = unwrapPeerServiceResult(
+      await wsFound.provider.service.appendEvent({
+        sessionId: created.id,
+        type: 'session.status',
+        turnId: null,
+        payload: { status: 'idle' },
+      }),
+    );
+    const statusEv = eventDtoToModel(statusEvRes.event);
+    this.eventBus.publishEvent(statusEv);
+    this.pluginManager?.notifyEvent(statusEv, created.workspaceId);
 
     await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.created', created), created.workspaceId);
 
-    return this.store.getSession(created.id)!;
+    const latestRes = unwrapPeerServiceResult(await wsFound.provider.service.getSession({ sessionId: created.id }));
+    return latestRes.session ? sessionDtoToModel(latestRes.session) : created;
   }
 
   async importNativeSession(req: ImportNativeSessionRequest): Promise<Session> {
@@ -1010,9 +1473,12 @@ export class SessionManager {
   }
 
   private async buildSession(req: CreateSessionRequest): Promise<Session> {
-    const ws = this.store.getWorkspace(req.workspaceId);
-    if (!ws) throw new Error(`Workspace not found: ${req.workspaceId}`);
+    const found = await findWorkspaceWithProvider(this.pluginManager, req.workspaceId);
+    if (!found) throw new Error(`Workspace not found: ${req.workspaceId}`);
+    return this.buildSessionFromWorkspace(req, workspaceDtoToModel(found.workspace));
+  }
 
+  private async buildSessionFromWorkspace(req: CreateSessionRequest, ws: Workspace): Promise<Session> {
     let adapter = req.harnessId ? this.registry.get(req.harnessId) : undefined;
     if (!adapter && !req.harnessId) {
       // Pick first ready harness (fallback to first registered)
@@ -1062,40 +1528,56 @@ export class SessionManager {
   }
 
   async updateSession(id: string, req: UpdateSessionRequest, configAlreadyApplied = false): Promise<Session> {
-    const current = this.store.getSession(id);
-    if (!current) throw new Error(`Session not found: ${id}`);
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, id);
+    if (!found) throw new Error(`Session not found: ${id}`);
+    const { provider, session: currentDto } = found;
+    const current = sessionDtoToModel(currentDto);
 
     const configChanged =
       (req.model !== undefined && req.model !== current.model) ||
       (req.reasoningEffort !== undefined && req.reasoningEffort !== current.reasoningEffort) ||
       (req.permissionMode !== undefined && req.permissionMode !== current.permissionMode);
 
-    const updated = this.store.updateSession(id, {
-      title: req.title,
-      model: req.model,
-      reasoningEffort: req.reasoningEffort,
-      permissionMode: req.permissionMode,
-      contextSyncMode: req.contextSyncMode,
-      ...(req.model !== undefined && req.model !== current.model
-        ? { actualModel: null, modelReroutedReason: null }
-        : {}),
-      status: req.archived === true ? 'archived' : req.archived === false ? 'idle' : undefined,
-    });
-    if (!updated) throw new Error(`Failed to update session: ${id}`);
+    const updatedRes = unwrapPeerServiceResult(
+      await provider.service.updateSession({
+        sessionId: id,
+        patch: {
+          title: req.title,
+          model: req.model,
+          reasoningEffort: req.reasoningEffort,
+          permissionMode: req.permissionMode,
+          contextSyncMode: req.contextSyncMode,
+          ...(req.model !== undefined && req.model !== current.model
+            ? { actualModel: null, modelReroutedReason: null }
+            : {}),
+          status: req.archived === true ? 'archived' : req.archived === false ? 'idle' : undefined,
+        },
+      }),
+    );
+    if (!updatedRes.session) throw new Error(`Failed to update session: ${id}`);
+    const updated = sessionDtoToModel(updatedRes.session);
 
     // Mirror model/effort preference into active harness binding
-    this.store.upsertSessionBinding({
-      sessionId: id,
-      harnessId: updated.harnessId,
-      harnessKind: updated.harnessKind,
-      nativeSessionId: updated.nativeSessionId,
-      lastModel: updated.model,
-      lastActualModel: updated.actualModel ?? null,
-      lastEffort: updated.reasoningEffort,
-      syncedUpToSeq: this.store.getSessionBinding(id, updated.harnessId)?.syncedUpToSeq ?? 0,
-      driverUsed: null,
-      updatedAt: Date.now(),
-    });
+    const prevBinding = unwrapPeerServiceResult(
+      await provider.service.getHarnessBinding({ sessionId: id, harnessId: updated.harnessId }),
+    ).binding;
+    unwrapPeerServiceResult(
+      await provider.service.upsertHarnessBinding({
+        binding: {
+          sessionId: id,
+          harnessId: updated.harnessId,
+          harnessKind: updated.harnessKind,
+          nativeSessionId: updated.nativeSessionId,
+          lastModel: updated.model,
+          lastActualModel: updated.actualModel ?? null,
+          lastEffort: updated.reasoningEffort,
+          syncedUpToSeq: prevBinding?.syncedUpToSeq ?? 0,
+          driverUsed: null,
+          updatedAt: Date.now(),
+        },
+      }),
+    );
 
     if (req.archived !== undefined) {
       if (req.archived === true) {
@@ -1103,16 +1585,26 @@ export class SessionManager {
       }
       await this.disposeSessionHandles(id);
     } else if (!configAlreadyApplied && configChanged && current.status === 'idle') {
-      const live = this.liveHandles.get(this.handleKey(id, updated.harnessId));
-      if (live) {
-        if (live.handle.updateConfig) {
-          await live.handle.updateConfig({
-            model: updated.model,
-            reasoningEffort: updated.reasoningEffort,
-            permissionMode: updated.permissionMode,
-          });
-        } else {
-          await this.disposeLiveHandle(id, updated.harnessId);
+      const runtimeRes = this.pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, {
+        sessionId: id,
+        workspaceId: updated.workspaceId,
+        allowSingleCandidate: true,
+      });
+      if (runtimeRes.status === 'ready' && runtimeRes.instanceId) {
+        const runtimeSvc = this.pluginManager.host.getServiceByInstance<
+          import('@harnessmate/plugin-api').SessionRuntimeServiceV1
+        >(runtimeRes.instanceId, PEER_CONTRACTS.sessionRuntime);
+        if (runtimeSvc) {
+          unwrapPeerServiceResult(
+            await runtimeSvc.applyConfig({
+              sessionId: id,
+              patch: {
+                model: updated.model,
+                reasoningEffort: updated.reasoningEffort,
+                permissionMode: updated.permissionMode,
+              },
+            }),
+          );
         }
       }
     }
@@ -1125,15 +1617,23 @@ export class SessionManager {
       summary: 'Session updated',
       timestamp: Date.now(),
     });
-    return this.store.getSession(id)!;
+    const refreshed = unwrapPeerServiceResult(await provider.service.getSession({ sessionId: id })).session;
+    return refreshed ? sessionDtoToModel(refreshed) : updated;
   }
 
   async deleteSession(id: string): Promise<boolean> {
-    const session = this.store.getSession(id);
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, id);
+    if (!found) return false;
+    const session = sessionDtoToModel(found.session);
     await this.getActiveOrchestrator()?.cascadeStopChildren(id, 'Parent session deleted');
-    if (session) await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
+    await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
     await this.disposeSessionHandles(id);
-    return this.store.deleteSession(id);
+    const deletedRes = unwrapPeerServiceResult(await found.provider.service.deleteSession({ sessionId: id }));
+    if (deletedRes.deleted) {
+      removeResourceOwner(this.store, 'session', id);
+    }
+    return deletedRes.deleted;
   }
 
   // ── Seamless In-Session Harness Switching & Context Bridge ───────────
@@ -1292,10 +1792,10 @@ export class SessionManager {
     });
 
     // If a warm handle for target harness exists with stale model config, apply config now
-    const warmTarget = this.liveHandles.get(this.handleKey(sessionId, targetAdapter.id));
-    if (warmTarget && warmTarget.handle.updateConfig) {
+    const warmHandle = this.runtimeController?.getLiveHandle(sessionId, targetAdapter.id);
+    if (warmHandle && warmHandle.updateConfig) {
       try {
-        await warmTarget.handle.updateConfig({
+        await warmHandle.updateConfig({
           model: resolvedModel,
           reasoningEffort: resolvedEffort,
           permissionMode: updated.permissionMode,
@@ -1326,30 +1826,28 @@ export class SessionManager {
     req: FailoverRequest,
     provenance?: AgyDispatchProvenance,
   ): Promise<{ session: Session; retriedTurnId: string | null }> {
-    return this.withSessionStartup(sessionId, async () => {
-      const current = this.store.getSession(sessionId);
-      if (!current) throw new Error(`Session not found: ${sessionId}`);
-      const targetAdapter = this.registry.get(req.targetHarnessId);
-      if (!targetAdapter) throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
-      this.assertDispatchTarget(targetAdapter.id, targetAdapter.kind, provenance);
+    const current = await this.getSessionAsync(sessionId);
+    if (!current) throw new Error(`Session not found: ${sessionId}`);
+    const targetAdapter = this.registry.get(req.targetHarnessId);
+    if (!targetAdapter) throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
+    this.assertDispatchTarget(targetAdapter.id, targetAdapter.kind, provenance);
 
-      const failover = selectedHarnessService<FailoverContract>(this.pluginManager, failoverContract, { sessionId });
-      const retry = req.retryLastFailedTurn === false ? undefined : await failover?.retryInput(sessionId);
+    const failover = selectedHarnessService<FailoverContract>(this.pluginManager, failoverContract, { sessionId });
+    const retry = req.retryLastFailedTurn === false ? undefined : await failover?.retryInput(sessionId);
 
-      if (current.status === 'error') this.setSessionStatus(sessionId, 'idle');
-      const { session: switched } = await this.switchHarnessInternal(sessionId, {
-        targetHarnessId: targetAdapter.id,
-        targetModel: req.targetModel,
-      });
-
-      if (retry) {
-        const { turnId } = await this.startTurn(sessionId, retry.text, retry.attachments, {
-          dispatchProvenance: provenance,
-        });
-        return { session: this.store.getSession(sessionId)!, retriedTurnId: turnId };
-      }
-      return { session: switched, retriedTurnId: null };
+    if (current.status === 'error') await this.setSessionStatusAsync(sessionId, 'idle');
+    const { session: switched } = await this.switchHarnessInternal(sessionId, {
+      targetHarnessId: targetAdapter.id,
+      targetModel: req.targetModel,
     });
+
+    if (retry) {
+      const { turnId } = await this.sendTurn(sessionId, retry.text, retry.attachments, {
+        dispatchProvenance: provenance,
+      });
+      return { session: (await this.getSessionAsync(sessionId)) ?? switched, retriedTurnId: turnId };
+    }
+    return { session: switched, retriedTurnId: null };
   }
 
   /**
@@ -1536,16 +2034,16 @@ export class SessionManager {
     const count = tools.length;
     if (!count) return { count, status: 'none' as const };
     if (!this.registry.get(session.harnessId)?.pluginMcpTransport) return { count, status: 'unsupported' as const };
-    const handle = this.liveHandles.get(this.handleKey(session.id, session.harnessId));
-    if (!handle || handle.pluginToolKey !== this.pluginToolKey(router, tools)) return { count, status: 'next_turn' as const };
-    if (!handle.pluginToolLease) return { count, status: 'unsupported' as const };
-    if (!this.pluginCapabilities?.isLeaseActive(handle.pluginToolLease)) return { count, status: 'next_turn' as const };
-    return { count, status: handle.pluginToolLease.discovered ? 'connected' as const : 'configured' as const };
+    const handleInfo = this.runtimeController?.getLiveHandleInfo(session.id, session.harnessId);
+    if (!handleInfo || handleInfo.pluginToolKey !== this.pluginToolKey(router, tools)) return { count, status: 'next_turn' as const };
+    if (!handleInfo.pluginToolLease) return { count, status: 'unsupported' as const };
+    if (!this.pluginCapabilities?.isLeaseActive(handleInfo.pluginToolLease)) return { count, status: 'next_turn' as const };
+    return { count, status: handleInfo.pluginToolLease.discovered ? 'connected' as const : 'configured' as const };
   }
 
   async runPluginAction(sessionId: string, req: RunPluginActionRequest): Promise<HarnessCommandResult> {
     return this.withSessionStartup(sessionId, async () => {
-      const session = this.store.getSession(sessionId);
+      const session = await this.getSessionAsync(sessionId);
       const capabilities = this.pluginCapabilities;
       if (!session || !capabilities) throw new Error('会话或插件动作服务不存在');
       if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
@@ -1596,7 +2094,7 @@ export class SessionManager {
   private async executeHarnessCommand(
     sessionId: string, req: RunHarnessCommandRequest, provenance?: AgyDispatchProvenance,
   ): Promise<HarnessCommandResult> {
-    const session = this.store.getSession(sessionId);
+    const session = await this.getSessionAsync(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
     if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
@@ -1614,14 +2112,20 @@ export class SessionManager {
     const turnOpts = { dispatchProvenance: provenance };
     const tools = this.service<NativeCommandsService>('native-commands').tools;
 
-    const result = (output: string, turnId?: string): HarnessCommandResult => ({
-      output, turnId, session: this.store.getSession(sessionId)!,
+    const result = async (output: string, turnId?: string): Promise<HarnessCommandResult> => ({
+      output,
+      turnId,
+      session: (await this.getSessionAsync(sessionId)) ?? session,
     });
     const rawCommand = async (text: string) => {
-      const { turnId } = await this.startTurn(sessionId, text, undefined, turnOpts, { cliCommand: text });
+      const { turnId } = await this.sendTurn(sessionId, text, undefined, { ...turnOpts, cliCommand: text });
       return result('', turnId);
     };
-    const getHandle = async () => (await this.ensureLiveHandle(sessionId, session.harnessId, false)).handle;
+    const getHandle = async () => {
+      const existing = this.runtimeController?.getLiveHandle(sessionId, session.harnessId);
+      if (existing) return existing;
+      return (await this.ensureLiveHandle(sessionId, session.harnessId, false)).handle;
+    };
     const { command, args } = req;
     switch (command) {
       case 'model': {
@@ -1643,7 +2147,7 @@ export class SessionManager {
           return result('已退出计划模式');
         }
         await this.updateSession(sessionId, { permissionMode: 'plan' });
-        const turn = args ? await this.startTurn(sessionId, args, undefined, turnOpts) : undefined;
+        const turn = args ? await this.sendTurn(sessionId, args, undefined, turnOpts) : undefined;
         return result('已启用计划模式', turn?.turnId);
       }
       case 'compact': {
@@ -1669,7 +2173,9 @@ export class SessionManager {
       case 'plugin': {
         if (args === 'reload' && session.harnessKind === 'claude') return rawCommand('/reload-plugins');
         const output = await tools.runPluginCommand(session, args);
-        if (args.startsWith('install ')) await this.disposeLiveHandle(sessionId, session.harnessId);
+        if (args.startsWith('install ')) {
+          await this.runtimeController?.disposeLiveHandle(sessionId, session.harnessId);
+        }
         return result(output);
       }
       case 'skills':
@@ -1689,8 +2195,10 @@ export class SessionManager {
         const skillArgs = words.join(' ');
         if (session.harnessKind === 'codex') {
           if (!skill.path) throw new Error('Codex 未返回技能路径');
-          const { turnId } = await this.startTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, turnOpts,
-            { nativeSkill: { name, path: skill.path } });
+          const { turnId } = await this.sendTurn(sessionId, skillArgs || `调用技能 ${name}`, undefined, {
+            ...turnOpts,
+            nativeSkill: { name, path: skill.path },
+          });
           return result('', turnId);
         }
         return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
@@ -1701,10 +2209,17 @@ export class SessionManager {
   withIdleNativeHandle<T>(
     binding: RuntimeBinding, handle: AdapterSessionHandle, apply: () => Promise<T>,
   ): Promise<T> {
+    const runtimeProvider = resolveSessionRuntimeProvider(this.pluginManager, { sessionId: binding.sessionId });
+    if (runtimeProvider.instanceId !== SESSION_RUNTIME_DEFAULT_PLUGIN_ID || !this.runtimeController?.isActive()) {
+      throw new PluginApiError('E_SERVICE_UNAVAILABLE', '当前会话未绑定默认运行时插件，无法附着 AGY 原生句柄');
+    }
     return this.withSessionStartup(binding.sessionId, () => {
       const session = this.store.getSession(binding.sessionId);
-      if (session?.status !== 'idle' || session.harnessId !== binding.instanceId ||
-          this.liveHandles.get(this.handleKey(binding.sessionId, binding.instanceId))?.handle !== handle) {
+      if (
+        session?.status !== 'idle' ||
+        session.harnessId !== binding.instanceId ||
+        !this.runtimeController?.hasLiveHandle(binding.sessionId, binding.instanceId, handle)
+      ) {
         throw new Error('The bound AGY session is no longer idle and attached');
       }
       return apply();
@@ -1716,12 +2231,79 @@ export class SessionManager {
     text: string,
     attachments?: Attachment[],
     turnOpts?: TurnOptions,
-  ): Promise<{ turnId: string }> {
-    return this.withSessionStartup(sessionId, () => this.startTurn(sessionId, text, attachments, turnOpts));
+  ): Promise<{
+    turnId: string;
+    runId?: string;
+    requestId?: string;
+    deduplicated?: boolean;
+    dataInstanceId?: string;
+    runtimeInstanceId?: string;
+  }> {
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) throw new Error(`Session not found: ${sessionId}`);
+    const targetHarnessId = found.session.status === 'running'
+      ? found.session.harnessId
+      : turnOpts?.harnessId ?? found.session.harnessId;
+    this.assertDispatchTarget(targetHarnessId, found.session.harnessKind, turnOpts?.dispatchProvenance);
+    const runtimeProvider = resolveSessionRuntimeProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: found.session.workspaceId,
+    });
+    const req: import('@harnessmate/plugin-api').SendTurnRuntimeRequest = {
+      sessionId,
+      requestId: turnOpts?.requestId,
+      text,
+      attachments: attachments as import('@harnessmate/plugin-api').PublicDriverTurnInput['attachments'],
+      harnessId: turnOpts?.harnessId,
+      model: turnOpts?.model,
+      turnOptions: turnOpts?.turnOptions as Record<string, string | number | boolean> | undefined,
+      omitHandoff: turnOpts?.omitHandoff,
+      literalText: turnOpts?.literalText,
+      mode: turnOpts?.mode,
+      terminalContexts: turnOpts?.terminalContexts as import('@harnessmate/plugin-api').SendTurnRuntimeRequest['terminalContexts'],
+      cliCommand: turnOpts?.cliCommand,
+      nativeSkill: turnOpts?.nativeSkill,
+    };
+    if (turnOpts?.expectedNativeHandle || turnOpts?.verifyNativeDispatch || turnOpts?.dispatchProvenance) {
+      if (runtimeProvider.instanceId === SESSION_RUNTIME_DEFAULT_PLUGIN_ID && this.runtimeController?.isActive()) {
+        const receipt = await this.runtimeController.sendTurnWithLegacyOptions(req, {
+          dispatchProvenance: turnOpts.dispatchProvenance,
+          expectedNativeHandle: turnOpts.expectedNativeHandle,
+          verifyNativeDispatch: turnOpts.verifyNativeDispatch,
+        });
+        return {
+          turnId: receipt.turnId,
+          runId: receipt.runId,
+          requestId: receipt.requestId,
+          deduplicated: receipt.disposition === 'reused',
+          dataInstanceId: receipt.dataInstanceId,
+          runtimeInstanceId: receipt.runtimeInstanceId,
+        };
+      }
+      if (turnOpts?.expectedNativeHandle || turnOpts?.verifyNativeDispatch) {
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'AGY 原生直发要求默认会话运行插件处于启用状态');
+      }
+    }
+    const receipt = unwrapPeerServiceResult(await runtimeProvider.service.sendTurn(req));
+    return {
+      turnId: receipt.turnId,
+      runId: receipt.runId,
+      requestId: receipt.requestId,
+      deduplicated: receipt.disposition === 'reused',
+      dataInstanceId: receipt.dataInstanceId,
+      runtimeInstanceId: receipt.runtimeInstanceId,
+    };
+  }
+
+  async previewTurnSuggestionAsync(sessionId: string, text: string, attachments?: Attachment[]) {
+    const session = await this.getSessionAsync(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    return this.pluginManager.suggestBeforeTurn({ sessionId, harnessId: session.harnessId, cwd: session.cwd, text, attachments });
   }
 
   previewTurnSuggestion(sessionId: string, text: string, attachments?: Attachment[]) {
-    const session = this.store.getSession(sessionId);
+    const session = this.getSession(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     return this.pluginManager.suggestBeforeTurn({ sessionId, harnessId: session.harnessId, cwd: session.cwd, text, attachments });
   }
@@ -2077,35 +2659,19 @@ export class SessionManager {
   }
 
   async interruptSession(sessionId: string): Promise<void> {
-    this.deltaCoalescer.flushSession(sessionId);
-    const session = this.store.getSession(sessionId);
-    const meta = this.activeTurnMeta.get(sessionId);
-    const targetHarnessId = meta?.harnessId ?? session?.harnessId;
-    if (targetHarnessId) {
-      const entry = this.liveHandles.get(this.handleKey(sessionId, targetHarnessId));
-      if (entry) {
-        const nativeFlags = this.nativeRegistry?.getFeatureFlags();
-        if (entry.nativeBinding && entry.handle.requestNativeSessionCancel &&
-          nativeFlags?.enabled && nativeFlags.nativeLifecycle &&
-          this.nativeRegistry?.getLifecyclePort()?.onCancelRequested && entry.handle.requestNativeSessionCancel()) {
-          this.nativeRegistry.notifyCancelRequested(entry.nativeBinding);
-          return;
-        }
-        await entry.handle.interrupt();
-      }
-    }
-    if (meta) {
-      this.store.finishSessionRun(meta.runId, { status: 'cancelled' });
-    }
-    this.store.settleRunningTurnItems(sessionId, 'interrupted');
-    this.activeTurnMeta.delete(sessionId);
-    this.cancelSessionApprovals(sessionId, '轮次已中断');
-    this.setSessionStatus(sessionId, 'idle');
-    const orch = this.getActiveOrchestrator();
-    if (orch) {
-      await orch.cascadeStopChildren(sessionId, 'Parent session interrupted');
-      await orch.handleChildTurnCancelled(sessionId);
-    }
+    await this.pluginManager.ensureBootstrapped();
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found) throw new Error(`Session not found: ${sessionId}`);
+    const runtimeProvider = resolveSessionRuntimeProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: found.session.workspaceId,
+    });
+    unwrapPeerServiceResult(
+      await runtimeProvider.service.interrupt({
+        sessionId,
+        reason: '用户手动中断',
+      }),
+    );
   }
 
   // ── Atomic Approval, Question & Secret Broker ────────────────────────
@@ -2197,22 +2763,13 @@ export class SessionManager {
       this.clearApprovalTimer(approval.id);
 
       // Deliver secret directly to live adapter memory/stdin; NEVER emit or log plaintext
-      for (const entry of this.liveHandles.values()) {
-        if (
-          entry.sessionId === approval.sessionId &&
-          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
-        ) {
-          entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-          if (denied) {
-            await entry.handle.resolveApproval(approval.nativeRequestId, 'deny', '用户拒绝提供凭据');
-          } else if (entry.handle.resolveSecret) {
-            await entry.handle.resolveSecret(approval.nativeRequestId, secretPayload!);
-          } else {
-            await entry.handle.resolveApproval(approval.nativeRequestId, 'allow_once', secretPayload!);
-          }
-          break;
-        }
-      }
+      await this.runtimeController?.resolveApprovalOnLiveHandle(
+        approval.sessionId,
+        approval.nativeRequestId,
+        denied ? 'deny' : 'allow_once',
+        denied ? '用户拒绝提供凭据' : req.comment,
+        secretPayload,
+      );
 
       const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
         approvalId: approval.id,
@@ -2261,26 +2818,14 @@ export class SessionManager {
             .join(' | ')
         : req.comment;
 
-      let written = false;
-      for (const entry of this.liveHandles.values()) {
-        if (
-          entry.sessionId === approval.sessionId &&
-          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
-        ) {
-          entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-          if (!denied && entry.handle.resolveQuestion && answer) {
-            await entry.handle.resolveQuestion(approval.nativeRequestId, answer);
-          } else {
-            await entry.handle.resolveApproval(
-              approval.nativeRequestId,
-              denied ? 'deny' : 'allow_once',
-              formattedAnswer,
-            );
-          }
-          written = true;
-          break;
-        }
-      }
+      const written = (await this.runtimeController?.resolveApprovalOnLiveHandle(
+        approval.sessionId,
+        approval.nativeRequestId,
+        denied ? 'deny' : 'allow_once',
+        formattedAnswer,
+        undefined,
+        !denied ? answer : undefined,
+      )) ?? false;
       finalizeNativeReceipt(written);
 
       const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
@@ -2329,18 +2874,12 @@ export class SessionManager {
     this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
 
     // Deliver approval to whichever warm handle in this session owns nativeRequestId
-    let deliveredToLiveHandle = false;
-    for (const entry of this.liveHandles.values()) {
-      if (
-        entry.sessionId === approval.sessionId &&
-        entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) === approval.id
-      ) {
-        entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-        await entry.handle.resolveApproval(approval.nativeRequestId, decision, req.comment);
-        deliveredToLiveHandle = true;
-        break;
-      }
-    }
+    const deliveredToLiveHandle = (await this.runtimeController?.resolveApprovalOnLiveHandle(
+      approval.sessionId,
+      approval.nativeRequestId,
+      decision,
+      req.comment,
+    )) ?? false;
     finalizeNativeReceipt(deliveredToLiveHandle);
 
     this.resumeSessionAfterApprovalIfClear(approval.sessionId);
@@ -2371,7 +2910,7 @@ export class SessionManager {
       itemId: `rtreq:${approval.id}`,
       schemaVersion: 2,
       sessionId: approval.sessionId,
-      turnId: this.activeTurnMeta.get(approval.sessionId)?.turnId ?? `rtreq_${seq}`,
+      turnId: this.runtimeController?.getActiveTurnId(approval.sessionId) ?? `rtreq_${seq}`,
       seq,
       instanceId: approval.instanceId ?? session.harnessId,
       driverId: session.harnessKind,
@@ -2391,8 +2930,8 @@ export class SessionManager {
     this.store.createApproval(approval);
     const session = this.store.getSession(approval.sessionId);
     if (!session) return;
-    const turnId = this.activeTurnMeta.get(session.id)?.turnId;
-    this.deltaCoalescer.flushSession(session.id);
+    const turnId = this.runtimeController?.getActiveTurnId(session.id);
+    this.runtimeController?.flushSessionDeltas(session.id);
     this.setSessionStatus(session.id, 'awaiting_approval');
     this.emitCanonical(session.id, 'approval.requested', { approval }, turnId);
     this.emitCanonical(session.id, 'runtime_request.updated', { request: approval }, turnId);
@@ -2431,7 +2970,7 @@ export class SessionManager {
     if (remaining.length === 0) {
       const sess = this.store.getSession(sessionId);
       if (sess && sess.status === 'awaiting_approval') {
-        this.setSessionStatus(sessionId, this.activeTurnMeta.has(sessionId) ? 'running' : 'idle');
+        this.setSessionStatus(sessionId, this.runtimeController?.hasActiveTurn(sessionId) ? 'running' : 'idle');
       }
       this.getActiveOrchestrator()?.handleChildApprovalResolved(sessionId);
     }
@@ -2450,17 +2989,12 @@ export class SessionManager {
       });
       this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
       this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
-      for (const entry of this.liveHandles.values()) {
-        if (
-          entry.sessionId !== approval.sessionId ||
-          entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) !== approval.id
-        ) {
-          continue;
-        }
-        entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-        void entry.handle.resolveApproval(approval.nativeRequestId, 'deny', reason).catch(() => {});
-        break;
-      }
+      void this.runtimeController?.resolveApprovalOnLiveHandle(
+        approval.sessionId,
+        approval.nativeRequestId,
+        'deny',
+        reason,
+      ).catch(() => {});
     }
     this.resumeSessionAfterApprovalIfClear(sessionId);
   }
@@ -2480,15 +3014,18 @@ export class SessionManager {
     this.clearApprovalTimer(approval.id);
     if (!this.store.expireApprovalIfPending(approval.id)) return;
     this.publishExpiredApproval({ ...approval, resolvedAt: Date.now() });
-    for (const entry of this.liveHandles.values()) {
-      if (entry.sessionId !== approval.sessionId || entry.nativeToGlobalApprovalId.get(approval.nativeRequestId) !== approval.id) continue;
-      entry.nativeToGlobalApprovalId.delete(approval.nativeRequestId);
-      void entry.handle.resolveApproval(approval.nativeRequestId, 'deny', '审批已过期').catch(() => {});
-      break;
-    }
+    void this.runtimeController?.resolveApprovalOnLiveHandle(
+      approval.sessionId,
+      approval.nativeRequestId,
+      'deny',
+      '审批已过期',
+    ).catch(() => {});
     if (this.store.getSession(approval.sessionId)?.status === 'awaiting_approval' &&
         this.store.listPendingApprovals(approval.sessionId).length === 0) {
-      this.setSessionStatus(approval.sessionId, this.activeTurnMeta.has(approval.sessionId) ? 'running' : 'idle');
+      this.setSessionStatus(
+        approval.sessionId,
+        this.runtimeController?.hasActiveTurn(approval.sessionId) ? 'running' : 'idle',
+      );
     }
   }
 
@@ -2497,24 +3034,21 @@ export class SessionManager {
   }
 
   async shutdown(): Promise<void> {
-    this.deltaCoalescer.flushAll();
-    this.deltaCoalescer.dispose();
     await this.terminalWorkspace?.disposeAll();
-    this.store.settleRunningTurnItems(undefined, 'interrupted');
-    this.expireSessionApprovals();
-    const entries = Array.from(this.liveHandles.values());
-    this.liveHandles.clear();
-    await Promise.all([...new Set(entries.map(({ sessionId }) => sessionId))].map(async (sessionId) => {
-      const session = this.store.getSession(sessionId);
-      if (session) await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.closing', session), session.workspaceId);
-    }));
-    await Promise.all(
-      entries.map(async (entry) => {
-        entry.unsubscribe();
-        entry.pluginToolLease?.release();
-        await entry.handle.dispose();
-      }),
-    );
+    const runtimeProviders = this.pluginManager.host.listServiceProviders(PEER_CONTRACTS.sessionRuntime);
+    for (const prov of runtimeProviders) {
+      if (this.pluginManager.isInstanceKnownDisabled(prov.instanceId)) continue;
+      const svc = this.pluginManager.host.getServiceByInstance<
+        import('@harnessmate/plugin-api').SessionRuntimeServiceV1
+      >(prov.instanceId, PEER_CONTRACTS.sessionRuntime);
+      if (svc) {
+        await svc.drainAndStop({ reason: 'daemon_shutdown' }).catch(() => {});
+      }
+    }
+    if (!this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)) {
+      this.store.settleRunningTurnItems(undefined, 'interrupted');
+      this.expireSessionApprovals();
+    }
   }
 
   // ── Warm Multi-Handle Runtime Pool ───────────────────────────────────
@@ -2716,19 +3250,37 @@ export class SessionManager {
   }
 
   async closeSessionsForHarness(harnessId: string): Promise<void> {
-    const matching = Array.from(this.liveHandles.values()).filter(
-      (entry) => entry.harnessId === harnessId,
-    );
-    for (const entry of matching) {
-      await this.disposeLiveHandle(entry.sessionId, entry.harnessId);
+    const runtimeProviders = this.pluginManager.host.listServiceProviders(PEER_CONTRACTS.sessionRuntime);
+    for (const prov of runtimeProviders) {
+      if (this.pluginManager.isInstanceKnownDisabled(prov.instanceId)) continue;
+      const svc = this.pluginManager.host.getServiceByInstance<
+        import('@harnessmate/plugin-api').SessionRuntimeServiceV1
+      >(prov.instanceId, PEER_CONTRACTS.sessionRuntime);
+      if (svc) {
+        await svc.closeHarnessSessions({ harnessId }).catch(() => {});
+      }
+    }
+    if (this.runtimeController?.isActive()) {
+      await this.runtimeController.closeSessionsForHarness(harnessId);
     }
   }
 
   private async disposeSessionHandles(sessionId: string): Promise<void> {
     this.expireSessionApprovals(sessionId);
-    const matching = Array.from(this.liveHandles.values()).filter((e) => e.sessionId === sessionId);
-    for (const entry of matching) {
-      await this.disposeLiveHandle(entry.sessionId, entry.harnessId);
+    const runtimeRes = this.pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, {
+      sessionId,
+      allowSingleCandidate: true,
+    });
+    if (runtimeRes.status === 'ready' && runtimeRes.instanceId) {
+      const svc = this.pluginManager.host.getServiceByInstance<
+        import('@harnessmate/plugin-api').SessionRuntimeServiceV1
+      >(runtimeRes.instanceId, PEER_CONTRACTS.sessionRuntime);
+      if (svc) {
+        await svc.closeSession({ sessionId, reason: 'handle_disposed' }).catch(() => {});
+      }
+    }
+    if (this.runtimeController?.isActive()) {
+      await this.runtimeController.disposeSessionHandles(sessionId);
     }
   }
 
@@ -3518,10 +4070,28 @@ export class SessionManager {
   }
 
   private setSessionStatus(sessionId: string, status: SessionStatus): void {
+    this.assertDefaultDataEnabledForSyncRead();
     const current = this.store.getSession(sessionId);
     if (!current || current.status === status) return;
     this.store.updateSession(sessionId, { status });
     this.emitCanonical(sessionId, 'session.status', { status });
+  }
+
+  private async setSessionStatusAsync(sessionId: string, status: SessionStatus): Promise<void> {
+    const found = await findSessionWithProvider(this.pluginManager, sessionId);
+    if (!found || found.session.status === status) return;
+    unwrapPeerServiceResult(await found.provider.service.updateSession({ sessionId, patch: { status } }));
+    const ev = unwrapPeerServiceResult(
+      await found.provider.service.appendEvent({
+        sessionId,
+        type: 'session.status',
+        turnId: null,
+        payload: { status },
+      }),
+    ).event;
+    const modelEv = eventDtoToModel(ev);
+    this.eventBus.publishEvent(modelEv);
+    this.pluginManager?.notifyEvent(modelEv, found.session.workspaceId);
   }
 
   async annotatePendingApproval(
@@ -3594,9 +4164,8 @@ export class SessionManager {
     payload: Record<string, unknown>,
     turnId: string | null = null,
   ): CanonicalEvent {
-    const meta = this.activeTurnMeta.get(sessionId);
-    const body = meta?.maintenance && turnId === meta.turnId ? { ...payload, maintenance: true } : payload;
-    const event = this.store.appendEvent(sessionId, type, body, turnId);
+    this.assertDefaultDataEnabledForSyncRead();
+    const event = this.store.appendEvent(sessionId, type, payload, turnId);
     this.eventBus.publishEvent(event);
     const workspaceId = this.store.getSession(sessionId)?.workspaceId;
     this.pluginManager?.notifyEvent(event, workspaceId);

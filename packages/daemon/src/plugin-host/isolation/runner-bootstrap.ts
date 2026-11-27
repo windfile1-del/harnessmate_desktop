@@ -69,6 +69,8 @@ const redactListeners = new Set();
 const configListeners = new Set();
 const driverHandlers = new Map();
 const driverSessions = new Map();
+const serviceChannelListeners = new Map();
+const leasedHarnessSessions = new Map();
 const cliProcesses = new Map();
 const earlyCliEvents = new Map();
 const netStreams = new Map();
@@ -204,6 +206,22 @@ function buildContext(handshake) {
         args: Array.isArray(args) ? args : [],
         ...(opts && typeof opts === 'object' ? opts : {}),
       }),
+      publish: (contract, payload) => rpcNotify('services.publish', { contract, payload }),
+      subscribe: (contract, listener) => registerEffect(() => {
+        const key = String(contract || '').trim();
+        if (!key) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名');
+        const set = serviceChannelListeners.get(key) || new Set();
+        serviceChannelListeners.set(key, set);
+        set.add(listener);
+        rpcNotify('services.subscribe', { contract: key });
+        return () => {
+          set.delete(listener);
+          if (set.size === 0) {
+            serviceChannelListeners.delete(key);
+            rpcNotify('services.unsubscribe', { contract: key });
+          }
+        };
+      }),
     },
     routes: {
       register(pathPrefix, handler) {
@@ -291,6 +309,66 @@ function buildContext(handshake) {
         });
       },
       listInstances: () => rpcCall('harnesses.listInstances', {}),
+      openSession: async (harnessId, config) => {
+        const opened = await rpcCall('harnesses.openSession', {
+          harnessId,
+          config: config && typeof config === 'object' ? config : {},
+        });
+        const leaseId = String(opened && opened.leaseId ? opened.leaseId : '');
+        const listeners = new Set();
+        const entry = {
+          leaseId,
+          nativeSessionId: opened && opened.nativeSessionId ? opened.nativeSessionId : null,
+          listeners,
+          disposed: false,
+        };
+        leasedHarnessSessions.set(leaseId, entry);
+        let disposeEffect = null;
+        const handle = {
+          get nativeSessionId() { return entry.nativeSessionId; },
+          pluginMcpAvailable: Boolean(opened && opened.pluginMcpAvailable),
+          sendTurn: async (input) => {
+            const res = await rpcCall('harnesses.session.sendTurn', { leaseId, input: input || {} });
+            if (res && 'nativeSessionId' in res) entry.nativeSessionId = res.nativeSessionId || null;
+            return res;
+          },
+          ...(opened && opened.supportsSteer ? {
+            steerTurn: (input) => rpcCall('harnesses.session.steerTurn', { leaseId, input: input || {} }).then(() => undefined),
+          } : {}),
+          interrupt: () => rpcCall('harnesses.session.interrupt', { leaseId }).then(() => undefined),
+          resolveApproval: (nativeRequestId, decision, comment) => rpcCall('harnesses.session.resolveApproval', {
+            leaseId,
+            nativeRequestId,
+            decision,
+            ...(comment !== undefined ? { comment } : {}),
+          }).then(() => undefined),
+          updateConfig: (patch) => rpcCall('harnesses.session.updateConfig', { leaseId, patch: patch || {} }).then(() => undefined),
+          dispose: async () => {
+            if (entry.disposed) return;
+            entry.disposed = true;
+            leasedHarnessSessions.delete(leaseId);
+            listeners.clear();
+            if (disposeEffect) {
+              const fn = disposeEffect;
+              disposeEffect = null;
+              fn();
+            }
+            await rpcCall('harnesses.session.dispose', { leaseId }).catch(() => {});
+          },
+          onEvent: (listener) => {
+            listeners.add(listener);
+            return () => { listeners.delete(listener); };
+          },
+        };
+        disposeEffect = registerEffect(() => () => {
+          if (entry.disposed) return;
+          entry.disposed = true;
+          leasedHarnessSessions.delete(leaseId);
+          listeners.clear();
+          rpcNotify('harnesses.session.dispose', { leaseId });
+        });
+        return handle;
+      },
     },
     runtime: {
       trustedLocal: handshake.trustedLocal === true,
@@ -590,6 +668,8 @@ function buildContext(handshake) {
 
 function disposeAll() {
   disposed = true;
+  serviceChannelListeners.clear();
+  leasedHarnessSessions.clear();
   for (const undo of [...effects].reverse()) {
     try { undo(); } catch {}
   }
@@ -688,6 +768,24 @@ async function handleMessage(message) {
     } else if (method === 'host.event') {
       const listeners = [...(eventListeners.get(params.event.type) || [])];
       for (const listener of listeners) await listener(params.event);
+      result = { ok: true };
+    } else if (method === 'host.service.channel') {
+      const ev = params.event || {};
+      const listeners = [...(serviceChannelListeners.get(ev.contract) || [])];
+      for (const listener of listeners) await listener(ev);
+      result = { ok: true };
+    } else if (method === 'host.harnessSession.event') {
+      const leaseId = String(params.leaseId || '');
+      const sess = leasedHarnessSessions.get(leaseId);
+      const ev = params.event;
+      if (sess && ev && !sess.disposed) {
+        if (ev.type === 'native_session_ready' && typeof ev.nativeSessionId === 'string') {
+          sess.nativeSessionId = ev.nativeSessionId;
+        }
+        for (const listener of [...sess.listeners]) {
+          try { await listener(ev); } catch {}
+        }
+      }
       result = { ok: true };
     } else if (method === 'host.command') {
       const handler = commandHandlers.get(String(params.command));

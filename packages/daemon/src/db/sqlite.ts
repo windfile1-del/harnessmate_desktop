@@ -51,6 +51,39 @@ import {
   Workspace,
 } from '@harnessmate/protocol';
 
+export interface ResourceOwnerRecord {
+  resourceType: 'workspace' | 'session';
+  resourceId: string;
+  contract: string;
+  instanceId: string;
+  workspaceId: string | null;
+  updatedAt: number;
+}
+
+export interface SessionTurnReceiptRecord {
+  sessionId: string;
+  requestId: string;
+  requestHash: string;
+  turnId: string;
+  runId: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown';
+  runtimeInstanceId: string;
+  runtimeRunId: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SqlTransactionContext {
+  exec(sql: string): void;
+  prepare(sql: string): ReturnType<DatabaseSync['prepare']>;
+  markCommittedSeq(seq: number): void;
+}
+
+export interface SqlTransactionAccess {
+  runImmediate<T>(fn: (tx: SqlTransactionContext) => T): T;
+  runRead<T>(fn: (tx: { prepare(sql: string): ReturnType<DatabaseSync['prepare']> }) => T): T;
+}
+
 interface WorkspaceRow {
   id: string;
   name: string;
@@ -368,7 +401,7 @@ export class HarnessMateStore {
         ON session_events(session_id, json_extract(payload_json, '$.approvalId')) WHERE type = 'approval.resolved';
 
       CREATE TABLE IF NOT EXISTS plugin_permissions (
-        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL,
         plugin_id TEXT NOT NULL,
         digest TEXT NOT NULL,
         capability TEXT NOT NULL,
@@ -453,7 +486,7 @@ export class HarnessMateStore {
         ON session_harness_bindings(session_id, updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS session_task_state (
-        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        session_id TEXT PRIMARY KEY,
         objective TEXT NOT NULL DEFAULT '',
         steps_json TEXT NOT NULL DEFAULT '[]',
         decisions_json TEXT NOT NULL DEFAULT '[]',
@@ -662,6 +695,36 @@ export class HarnessMateStore {
         ON session_change_log(workspace_id, change_seq ASC);
       CREATE INDEX IF NOT EXISTS idx_session_change_log_session
         ON session_change_log(session_id, change_seq ASC);
+
+      CREATE TABLE IF NOT EXISTS resource_owners (
+        resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        contract TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        workspace_id TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (resource_type, resource_id, contract)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_resource_owners_instance
+        ON resource_owners(instance_id, contract);
+
+      CREATE TABLE IF NOT EXISTS session_turn_receipts (
+        session_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL DEFAULT '',
+        turn_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        runtime_instance_id TEXT NOT NULL,
+        runtime_run_id TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, request_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_turn_receipts_status
+        ON session_turn_receipts(status, runtime_instance_id);
     `);
 
     // Safe additive column migrations for existing user databases
@@ -702,6 +765,26 @@ export class HarnessMateStore {
     if (!permCols.has('declared_permissions_json')) {
       this.db.exec('ALTER TABLE plugin_permissions ADD COLUMN declared_permissions_json TEXT;');
     }
+    const permTableSql = (
+      this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plugin_permissions'").get() as { sql?: string } | undefined
+    )?.sql;
+    if (permTableSql && /REFERENCES\s+workspaces/i.test(permTableSql)) {
+      this.db.exec(`
+        CREATE TABLE plugin_permissions_v2 (
+          workspace_id TEXT NOT NULL,
+          plugin_id TEXT NOT NULL,
+          digest TEXT NOT NULL,
+          capability TEXT NOT NULL,
+          cover_future INTEGER NOT NULL DEFAULT 0,
+          declared_permissions_json TEXT,
+          PRIMARY KEY (workspace_id, plugin_id, capability)
+        );
+        INSERT INTO plugin_permissions_v2 (workspace_id, plugin_id, digest, capability, cover_future, declared_permissions_json)
+        SELECT workspace_id, plugin_id, digest, capability, cover_future, declared_permissions_json FROM plugin_permissions;
+        DROP TABLE plugin_permissions;
+        ALTER TABLE plugin_permissions_v2 RENAME TO plugin_permissions;
+      `);
+    }
     const approvalCols = new Set((this.db.prepare('PRAGMA table_info(approvals)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!approvalCols.has('annotations_json')) {
       this.db.exec('ALTER TABLE approvals ADD COLUMN annotations_json TEXT;');
@@ -733,6 +816,41 @@ export class HarnessMateStore {
     const taskCols = new Set((this.db.prepare('PRAGMA table_info(session_task_state)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!taskCols.has('failed_attempts_json')) {
       this.db.exec("ALTER TABLE session_task_state ADD COLUMN failed_attempts_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    const taskTableSql = (
+      this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_task_state'").get() as { sql?: string } | undefined
+    )?.sql;
+    if (taskTableSql && /REFERENCES\s+sessions/i.test(taskTableSql)) {
+      this.db.exec(`
+        CREATE TABLE session_task_state_v2 (
+          session_id TEXT PRIMARY KEY,
+          objective TEXT NOT NULL DEFAULT '',
+          steps_json TEXT NOT NULL DEFAULT '[]',
+          decisions_json TEXT NOT NULL DEFAULT '[]',
+          touched_files_json TEXT NOT NULL DEFAULT '[]',
+          verifications_json TEXT NOT NULL DEFAULT '[]',
+          blockers_json TEXT NOT NULL DEFAULT '[]',
+          pinned_facts_json TEXT NOT NULL DEFAULT '[]',
+          failed_attempts_json TEXT NOT NULL DEFAULT '[]',
+          rolling_summary TEXT NOT NULL DEFAULT '',
+          summarized_up_to_seq INTEGER NOT NULL DEFAULT 0,
+          version INTEGER NOT NULL DEFAULT 1,
+          ledger_file_path TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO session_task_state_v2 (
+          session_id, objective, steps_json, decisions_json, touched_files_json,
+          verifications_json, blockers_json, pinned_facts_json, failed_attempts_json,
+          rolling_summary, summarized_up_to_seq, version, ledger_file_path, updated_at
+        )
+        SELECT
+          session_id, objective, steps_json, decisions_json, touched_files_json,
+          verifications_json, blockers_json, pinned_facts_json, failed_attempts_json,
+          rolling_summary, summarized_up_to_seq, version, ledger_file_path, updated_at
+        FROM session_task_state;
+        DROP TABLE session_task_state;
+        ALTER TABLE session_task_state_v2 RENAME TO session_task_state;
+      `);
     }
     const bindingCols = new Set((this.db.prepare('PRAGMA table_info(session_harness_bindings)').all() as unknown as Array<{ name: string }>).map((c) => c.name));
     if (!bindingCols.has('continuation_key')) {
@@ -3535,6 +3653,256 @@ export class HarnessMateStore {
     } catch {
       return { hits: runLikeFallback(), fallbackUsed: true };
     }
+  }
+
+  getSqlTransactionAccess(): SqlTransactionAccess {
+    return {
+      runImmediate: <T>(fn: (tx: SqlTransactionContext) => T): T =>
+        this.runInImmediateTransaction((db) =>
+          fn({
+            exec: (sql) => db.exec(sql),
+            prepare: (sql) => db.prepare(sql),
+            markCommittedSeq: (seq) => {
+              this.pendingCommitSeq = this.pendingCommitSeq === null ? seq : Math.max(this.pendingCommitSeq, seq);
+            },
+          })),
+      runRead: <T>(fn: (tx: { prepare(sql: string): ReturnType<DatabaseSync['prepare']> }) => T): T =>
+        this.runInReadTransaction((db) =>
+          fn({
+            prepare: (sql) => db.prepare(sql),
+          })),
+    };
+  }
+
+  upsertResourceOwner(input: Omit<ResourceOwnerRecord, 'updatedAt'> & { updatedAt?: number }): ResourceOwnerRecord {
+    const updatedAt = input.updatedAt ?? Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO resource_owners (resource_type, resource_id, contract, instance_id, workspace_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(resource_type, resource_id, contract) DO UPDATE SET
+           instance_id = excluded.instance_id,
+           workspace_id = COALESCE(excluded.workspace_id, resource_owners.workspace_id),
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.resourceType,
+        input.resourceId,
+        input.contract,
+        input.instanceId,
+        input.workspaceId ?? null,
+        updatedAt,
+      );
+    return {
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      contract: input.contract,
+      instanceId: input.instanceId,
+      workspaceId: input.workspaceId ?? null,
+      updatedAt,
+    };
+  }
+
+  getResourceOwner(
+    resourceType: 'workspace' | 'session',
+    resourceId: string,
+    contract: string,
+  ): ResourceOwnerRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT resource_type, resource_id, contract, instance_id, workspace_id, updated_at
+         FROM resource_owners
+         WHERE resource_type = ? AND resource_id = ? AND contract = ?`,
+      )
+      .get(resourceType, resourceId, contract) as
+      | {
+          resource_type: string;
+          resource_id: string;
+          contract: string;
+          instance_id: string;
+          workspace_id: string | null;
+          updated_at: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      resourceType: row.resource_type as 'workspace' | 'session',
+      resourceId: row.resource_id,
+      contract: row.contract,
+      instanceId: row.instance_id,
+      workspaceId: row.workspace_id,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  deleteResourceOwner(
+    resourceType: 'workspace' | 'session',
+    resourceId: string,
+    contract?: string,
+  ): void {
+    if (contract) {
+      this.db
+        .prepare('DELETE FROM resource_owners WHERE resource_type = ? AND resource_id = ? AND contract = ?')
+        .run(resourceType, resourceId, contract);
+      return;
+    }
+    this.db
+      .prepare('DELETE FROM resource_owners WHERE resource_type = ? AND resource_id = ?')
+      .run(resourceType, resourceId);
+  }
+
+  listResourceOwners(filter?: {
+    resourceType?: 'workspace' | 'session';
+    contract?: string;
+    instanceId?: string;
+    workspaceId?: string;
+  }): ResourceOwnerRecord[] {
+    const clauses: string[] = [];
+    const args: Array<string> = [];
+    if (filter?.resourceType) {
+      clauses.push('resource_type = ?');
+      args.push(filter.resourceType);
+    }
+    if (filter?.contract) {
+      clauses.push('contract = ?');
+      args.push(filter.contract);
+    }
+    if (filter?.instanceId) {
+      clauses.push('instance_id = ?');
+      args.push(filter.instanceId);
+    }
+    if (filter?.workspaceId) {
+      clauses.push('workspace_id = ?');
+      args.push(filter.workspaceId);
+    }
+    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(
+        `SELECT resource_type, resource_id, contract, instance_id, workspace_id, updated_at
+         FROM resource_owners
+         ${whereSql}
+         ORDER BY updated_at ASC`,
+      )
+      .all(...args) as Array<{
+      resource_type: string;
+      resource_id: string;
+      contract: string;
+      instance_id: string;
+      workspace_id: string | null;
+      updated_at: number;
+    }>;
+    return rows.map((row) => ({
+      resourceType: row.resource_type as 'workspace' | 'session',
+      resourceId: row.resource_id,
+      contract: row.contract,
+      instanceId: row.instance_id,
+      workspaceId: row.workspace_id,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getSessionTurnReceipt(sessionId: string, requestId: string): SessionTurnReceiptRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT session_id, request_id, request_hash, turn_id, run_id, status, runtime_instance_id, runtime_run_id, created_at, updated_at
+         FROM session_turn_receipts
+         WHERE session_id = ? AND request_id = ?`,
+      )
+      .get(sessionId, requestId) as
+      | {
+          session_id: string;
+          request_id: string;
+          request_hash: string;
+          turn_id: string;
+          run_id: string;
+          status: string;
+          runtime_instance_id: string;
+          runtime_run_id: string;
+          created_at: number;
+          updated_at: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      sessionId: row.session_id,
+      requestId: row.request_id,
+      requestHash: row.request_hash,
+      turnId: row.turn_id,
+      runId: row.run_id,
+      status: row.status as SessionTurnReceiptRecord['status'],
+      runtimeInstanceId: row.runtime_instance_id,
+      runtimeRunId: row.runtime_run_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  upsertSessionTurnReceipt(input: Omit<SessionTurnReceiptRecord, 'createdAt' | 'updatedAt'> & {
+    createdAt?: number;
+    updatedAt?: number;
+  }): SessionTurnReceiptRecord {
+    const now = Date.now();
+    const createdAt = input.createdAt ?? now;
+    const updatedAt = input.updatedAt ?? now;
+    this.db
+      .prepare(
+        `INSERT INTO session_turn_receipts (
+           session_id, request_id, request_hash, turn_id, run_id, status, runtime_instance_id, runtime_run_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, request_id) DO UPDATE SET
+           request_hash = excluded.request_hash,
+           turn_id = excluded.turn_id,
+           run_id = excluded.run_id,
+           status = excluded.status,
+           runtime_instance_id = excluded.runtime_instance_id,
+           runtime_run_id = excluded.runtime_run_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.sessionId,
+        input.requestId,
+        input.requestHash,
+        input.turnId,
+        input.runId,
+        input.status,
+        input.runtimeInstanceId,
+        input.runtimeRunId,
+        createdAt,
+        updatedAt,
+      );
+    return {
+      ...input,
+      createdAt,
+      updatedAt,
+    };
+  }
+
+  updateSessionTurnReceiptStatus(
+    sessionId: string,
+    requestId: string,
+    patch: {
+      turnId?: string;
+      runId?: string;
+      status: SessionTurnReceiptRecord['status'];
+    },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE session_turn_receipts
+         SET turn_id = COALESCE(?, turn_id),
+             run_id = COALESCE(?, run_id),
+             status = ?,
+             updated_at = ?
+         WHERE session_id = ? AND request_id = ?`,
+      )
+      .run(
+        patch.turnId ?? null,
+        patch.runId ?? null,
+        patch.status,
+        Date.now(),
+        sessionId,
+        requestId,
+      );
   }
 }
 

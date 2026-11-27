@@ -1,3 +1,4 @@
+import { sessionDataStreamKey } from '@harnessmate/plugin-api';
 import {
   SessionTriageMetaSchema,
   TriageSnoozeExpiredSchema,
@@ -56,10 +57,19 @@ export class TriageInboxService {
     const unsubscribeAttention = bus.subscribeAttention(({ kind, sessionId }) => {
       if (kind === 'session_updated') enqueue(sessionId);
     });
+    let currentStreamKey = 'hm.plugin.session-data-default::sqlite-main';
     let cursor = changes?.getLatestSeq() ?? 0;
-    const unsubscribeChanges = changes?.onCommitted(() => {
+    const unsubscribeChanges = changes?.onCommitted((_latest, ev) => {
+      if (ev?.stream) {
+        const nextKey = sessionDataStreamKey(ev.stream);
+        if (nextKey !== currentStreamKey) {
+          currentStreamKey = nextKey;
+          cursor = 0;
+        }
+        if (ev.sessionId) enqueue(ev.sessionId);
+      }
       let more = true;
-      while (more && active) {
+      while (more && active && changes) {
         const page = changes.readCommittedChanges({ afterSeq: cursor });
         for (const change of page.changes) {
           if (change.kind === 'delete_session') {

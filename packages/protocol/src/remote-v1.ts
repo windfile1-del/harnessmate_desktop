@@ -112,6 +112,7 @@ export interface HarnessCommandResult {
 export const CreateWorkspaceRequestSchema = z.object({
   rootPath: z.string().min(1),
   name: z.string().min(1).max(120).optional(),
+  dataInstanceId: z.string().min(1).max(160).optional(),
 });
 export type CreateWorkspaceRequest = z.infer<typeof CreateWorkspaceRequestSchema>;
 
@@ -424,11 +425,18 @@ export type RemoteAccessStatus = z.infer<typeof RemoteAccessStatusSchema>;
 
 // ── WebSocket Multiplexing Protocol (HM-Remote v1) ─────────────────────
 
+export const SessionDataStreamIdentitySchema = z.object({
+  providerInstanceId: z.string().min(1),
+  streamId: z.string().min(1),
+  runId: z.string().min(1).optional(),
+});
+
 export const WsClientFrameSchema = z.discriminatedUnion('op', [
   z.object({
     op: z.literal('subscribe'),
     sessionId: z.string(),
     afterSeq: z.number().int().nonnegative().default(0),
+    stream: SessionDataStreamIdentitySchema.optional(),
   }),
   z.object({
     op: z.literal('unsubscribe'),
@@ -505,6 +513,8 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
     op: z.literal('replay_complete'),
     sessionId: z.string(),
     lastSeq: z.number().int().nonnegative(),
+    stream: SessionDataStreamIdentitySchema.optional(),
+    streamMismatch: z.boolean().optional(),
   }),
   z.object({
     op: z.literal('attention'),

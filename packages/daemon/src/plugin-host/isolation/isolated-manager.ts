@@ -24,6 +24,7 @@ import {
   type PublicHarnessDriverDescriptor,
   type PublicHarnessProbeResult,
   type ResolveServiceSelectionOptions,
+  type ServiceChannelEvent,
   type ServiceResolutionV1,
 } from '@harnessmate/plugin-api';
 import type {
@@ -34,6 +35,8 @@ import type {
   InstalledPluginInfo,
   Session,
 } from '@harnessmate/protocol';
+import { AgyAdapter } from '../../harnesses/agy/agy-driver.js';
+import { evaluateAgyConsumerProvenance, mintAgyDispatchProvenance } from '../../harnesses/agy/native/wiring/provenance.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type {
@@ -86,6 +89,14 @@ interface ProxyDriverSessionEntry {
   listeners: Set<(event: NormalizedAdapterEvent) => void>;
 }
 
+interface LeasedHarnessSessionEntry {
+  leaseId: string;
+  harnessId: string;
+  handle: AdapterSessionHandle;
+  unsubscribe: () => void;
+  disposed: boolean;
+}
+
 export interface ActiveIsolatedPlugin {
   pluginId: string;
   instanceId: string;
@@ -94,6 +105,7 @@ export interface ActiveIsolatedPlugin {
   process: IsolatedPluginProcess;
   handshake: PluginHandshakeResponse;
   subscribedEvents: Set<string>;
+  subscribedServiceChannels: Map<string, () => void>;
   commands: Set<string>;
   routes: Set<string>;
   serviceMeta: Record<string, { version?: string; metadata?: Record<string, unknown> }>;
@@ -104,6 +116,7 @@ export interface ActiveIsolatedPlugin {
   declaredDrivers: Map<string, PublicHarnessDriverDescriptor>;
   registeredDrivers: Map<string, HarnessAdapter>;
   driverSessions: Map<string, ProxyDriverSessionEntry>;
+  leasedHarnessSessions: Map<string, LeasedHarnessSessionEntry>;
   hasHandoffCompose: boolean;
   hasHandoffShouldOffer: boolean;
   hasApprovalAnnotate: boolean;
@@ -215,6 +228,116 @@ export class IsolatedPluginManager {
         if (!entry || entry.runId !== runId) return;
         if (subscribed) entry.subscribedEvents.add(event);
         else entry.subscribedEvents.delete(event);
+      },
+      onServiceChannelSubscriptionChange: (pluginId, runId, contract, subscribed) => {
+        const entry = this.active.get(pluginId);
+        if (!entry || entry.runId !== runId) return;
+        const existing = entry.subscribedServiceChannels.get(contract);
+        if (subscribed) {
+          if (existing) return;
+          const dispose = this.opts.host.subscribeServiceChannel(contract, (event: ServiceChannelEvent) => {
+            if (!entry.process.alive || entry.runId !== runId) return;
+            entry.process.notify('host.service.channel', { event }, runId);
+          });
+          entry.subscribedServiceChannels.set(contract, dispose);
+        } else if (existing) {
+          entry.subscribedServiceChannels.delete(contract);
+          existing();
+        }
+      },
+      openHarnessSession: async (plugin, instanceId, runId, input) => {
+        const entry = this.active.get(instanceId);
+        if (!entry || entry.runId !== runId || !entry.process.alive) {
+          throw new PluginApiError('E_STALE_RUN', '插件实例已过期或未运行');
+        }
+        const configWithWs = input.config as AdapterSessionConfig & { workspaceId?: unknown };
+        const scope = typeof configWithWs.workspaceId === 'string' && configWithWs.workspaceId.trim()
+          ? configWithWs.workspaceId.trim()
+          : GLOBAL_WORKSPACE_SCOPE;
+        this.opts.permissions.assertGranted(plugin, 'session:send', scope);
+        const registry = this.getRegistry();
+        if (!registry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'Harness 注册表不可用');
+        const adapter = registry.get(input.harnessId);
+        if (!adapter) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `Harness 实例 ${input.harnessId} 不存在`);
+        const decision = evaluateAgyConsumerProvenance({
+          instanceId: adapter.id,
+          driverId: adapter.driverId ?? adapter.kind,
+          profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
+        }, mintAgyDispatchProvenance('plugin_automated', 'plugin', `harnesses.openSession:${instanceId}`));
+        if (!decision.allowed) {
+          throw new PluginApiError('E_PERMISSION_DENIED', decision.reason ?? 'AGY dispatch provenance denied');
+        }
+        const leaseId = randomUUID();
+        const handle = await adapter.createSession(input.config);
+        const lease: LeasedHarnessSessionEntry = {
+          leaseId,
+          harnessId: adapter.id,
+          handle,
+          unsubscribe: () => {},
+          disposed: false,
+        };
+        lease.unsubscribe = handle.onEvent((event) => {
+          if (lease.disposed || !entry.process.alive || entry.runId !== runId) return;
+          entry.process.notify('host.harnessSession.event', { leaseId, event }, runId);
+        });
+        entry.leasedHarnessSessions.set(leaseId, lease);
+        return {
+          leaseId,
+          nativeSessionId: handle.nativeSessionId ?? null,
+          pluginMcpAvailable: handle.pluginMcpAvailable ?? false,
+          supportsSteer: typeof handle.steerTurn === 'function',
+          supportsInjectContext: typeof handle.injectContext === 'function',
+        };
+      },
+      harnessSessionCall: async (instanceId, runId, leaseId, op, payload) => {
+        const entry = this.active.get(instanceId);
+        if (!entry || entry.runId !== runId) {
+          throw new PluginApiError('E_STALE_RUN', '插件实例已过期');
+        }
+        const lease = entry.leasedHarnessSessions.get(leaseId);
+        if (!lease || lease.disposed) {
+          throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话句柄已失效或已撤销');
+        }
+        if (op === 'dispose') {
+          entry.leasedHarnessSessions.delete(leaseId);
+          lease.disposed = true;
+          try { lease.unsubscribe(); } catch {}
+          await lease.handle.dispose().catch(() => {});
+          return { ok: true };
+        }
+        if (op === 'sendTurn') {
+          const res = await lease.handle.sendTurn(payload.input as TurnInput);
+          return {
+            nativeSessionId: lease.handle.nativeSessionId ?? null,
+            driverUsed: res?.driverUsed,
+          };
+        }
+        if (op === 'steerTurn') {
+          if (typeof lease.handle.steerTurn !== 'function') {
+            throw new PluginApiError('E_NOT_SUPPORTED', '当前驱动不支持 steerTurn');
+          }
+          await lease.handle.steerTurn(payload.input as TurnInput);
+          return { ok: true };
+        }
+        if (op === 'interrupt') {
+          await lease.handle.interrupt();
+          return { ok: true };
+        }
+        if (op === 'updateConfig') {
+          if (typeof lease.handle.updateConfig === 'function') {
+            await lease.handle.updateConfig((payload.patch ?? {}) as Partial<AdapterSessionConfig>);
+          }
+          return { ok: true };
+        }
+        if (op === 'resolveApproval') {
+          await lease.handle.resolveApproval(
+            String(payload.nativeRequestId ?? ''),
+            payload.decision as ApprovalDecision,
+            typeof payload.comment === 'string' ? payload.comment : undefined,
+          );
+          return { ok: true };
+        }
+        throw new PluginApiError('E_NOT_SUPPORTED', `未知驱动会话操作 ${op}`);
       },
       onDynamicUnregister: (instanceId, runId, kind, name) => {
         const entry = this.active.get(instanceId);
@@ -432,6 +555,7 @@ export class IsolatedPluginManager {
           process: proc,
           handshake: { sdkVersion: '4.0.0' },
           subscribedEvents: new Set(),
+          subscribedServiceChannels: new Map(),
           commands: new Set(),
           routes: new Set(),
           serviceMeta: {},
@@ -442,6 +566,7 @@ export class IsolatedPluginManager {
           declaredDrivers: new Map(),
           registeredDrivers: new Map(),
           driverSessions: new Map(),
+          leasedHarnessSessions: new Map(),
           hasHandoffCompose: false,
           hasHandoffShouldOffer: false,
           hasApprovalAnnotate: false,
@@ -927,6 +1052,16 @@ export class IsolatedPluginManager {
   }
 
   private cleanupPluginDrivers(entry: ActiveIsolatedPlugin, crashReason?: string): void {
+    for (const disposeChannel of entry.subscribedServiceChannels.values()) {
+      try { disposeChannel(); } catch { /* ignore */ }
+    }
+    entry.subscribedServiceChannels.clear();
+    for (const lease of entry.leasedHarnessSessions.values()) {
+      lease.disposed = true;
+      try { lease.unsubscribe(); } catch { /* ignore */ }
+      void lease.handle.dispose().catch(() => {});
+    }
+    entry.leasedHarnessSessions.clear();
     for (const driverId of [...entry.registeredDrivers.keys()]) {
       this.unregisterSinglePluginDriver(entry, driverId, crashReason);
     }

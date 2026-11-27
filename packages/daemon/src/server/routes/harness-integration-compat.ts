@@ -5,6 +5,7 @@ import {
 } from '@harnessmate/protocol';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { PluginApiError } from '@harnessmate/plugin-api';
+import { findSessionWithProvider } from '../../core/session-peer-router.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import {
@@ -49,7 +50,9 @@ export function registerHarnessIntegrationCompat(
     const scope = request.query as { sessionId?: string; workspaceId?: string; harnessInstanceId?: string };
     const service = mcp(scope);
     if (!service) return unavailable(reply, 'MCP 配置');
-    const session = scope.sessionId ? store.getSession(scope.sessionId) : undefined;
+    const session = scope.sessionId
+      ? (await findSessionWithProvider(plugins, scope.sessionId))?.session ?? store.getSession(scope.sessionId)
+      : undefined;
     if (scope.sessionId && !session) return reply.code(404).send({ error: 'Session not found' });
     const instanceId = scope.harnessInstanceId;
     if (instanceId && !isMcpTarget(instanceId)) return reply.code(400).send({ error: 'Unsupported harness for MCP listing' });
@@ -118,7 +121,7 @@ export function registerHarnessIntegrationCompat(
 
   app.get('/api/v1/sessions/:id/failover-recommendation', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = store.getSession(id);
+    const session = (await findSessionWithProvider(plugins, id))?.session ?? store.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const service = failover({ sessionId: id });
     if (!service) return unavailable(reply, 'Failover ');
@@ -134,7 +137,7 @@ export function registerHarnessIntegrationCompat(
 
   app.get('/api/v1/sessions/:id/model-candidates', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = store.getSession(id);
+    const session = (await findSessionWithProvider(plugins, id))?.session ?? store.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const { refresh } = request.query as { refresh?: string };
     const scope = { sessionId: id };

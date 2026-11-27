@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 export const requires = ['ui.workspace.pages'];
 
-const READ_MODEL_CONTRACTS = ['hm.session-data.v1', 'session.readModel.v1', 'session.changes.v1'];
+const READ_MODEL_CONTRACTS = ['session.data.v1', 'hm.session-data.v1', 'session.readModel.v1', 'session.changes.v1'];
 const MAX_STORAGE_CHUNK_BYTES = 180 * 1024;
 const DEFAULT_BATCH_SIZE = 20;
 
@@ -162,6 +162,7 @@ function initDatabase(db, isFileBacked) {
       snapshot_watermark INTEGER,
       snapshot_cursor TEXT,
       scoped_skips_json TEXT NOT NULL DEFAULT '[]',
+      stream_key TEXT NOT NULL DEFAULT '',
       reindex_state TEXT NOT NULL DEFAULT 'idle',
       job_json TEXT,
       updated_at INTEGER NOT NULL
@@ -170,6 +171,9 @@ function initDatabase(db, isFileBacked) {
   const cols = db.prepare('PRAGMA table_info(search_sync_state)').all();
   if (!cols.some((c) => c.name === 'scoped_skips_json')) {
     db.exec("ALTER TABLE search_sync_state ADD COLUMN scoped_skips_json TEXT NOT NULL DEFAULT '[]';");
+  }
+  if (!cols.some((c) => c.name === 'stream_key')) {
+    db.exec("ALTER TABLE search_sync_state ADD COLUMN stream_key TEXT NOT NULL DEFAULT '';");
   }
   db.prepare(
     `INSERT OR IGNORE INTO search_sync_state (id, cursor_seq, scoped_skips_json, reindex_state, updated_at)
@@ -264,7 +268,7 @@ export async function apply(ctx, config = {}) {
   function readSyncRow() {
     return db
       .prepare(
-        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, scoped_skips_json, reindex_state, job_json, updated_at
+        `SELECT cursor_seq, snapshot_id, snapshot_watermark, snapshot_cursor, scoped_skips_json, stream_key, reindex_state, job_json, updated_at
          FROM search_sync_state WHERE id = 1`,
       )
       .get();
@@ -600,10 +604,27 @@ export async function apply(ctx, config = {}) {
     }
   }
 
-  async function resolveReadModelContract() {
+  async function resolveReadModelContract(workspaceId) {
     const providers = await ctx.services.list().catch(() => []);
     if (readModelContractOverride && providers.some((p) => p.contract === readModelContractOverride)) {
       return readModelContractOverride;
+    }
+    if (typeof ctx.services.resolve === 'function') {
+      const scope = workspaceId ? { workspaceId } : undefined;
+      const resData = await ctx.services.resolve('session.data.v1', scope).catch(() => null);
+      const resCompat = await ctx.services.resolve('hm.session-data.v1', scope).catch(() => null);
+      if (resData?.status === 'ready' && ['explicit', 'session', 'workspace'].includes(resData.source)) {
+        return 'session.data.v1';
+      }
+      if (
+        resCompat?.status === 'ready' &&
+        ['explicit', 'session', 'workspace', 'composition'].includes(resCompat.source) &&
+        resCompat.instanceId !== resData?.instanceId
+      ) {
+        return 'hm.session-data.v1';
+      }
+      if (resData?.status === 'ready') return 'session.data.v1';
+      if (resCompat?.status === 'ready') return 'hm.session-data.v1';
     }
     for (const contract of READ_MODEL_CONTRACTS) {
       if (providers.some((p) => p.contract === contract)) return contract;
@@ -611,10 +632,25 @@ export async function apply(ctx, config = {}) {
     return null;
   }
 
+  function unwrapReadModelResponse(res, method) {
+    if (res && typeof res === 'object' && 'ok' in res && typeof res.ok === 'boolean') {
+      if (!res.ok) throw new Error(res.error?.message || `${method} 失败`);
+      return res.value;
+    }
+    return res;
+  }
+
+  function formatStreamKey(stream) {
+    if (!stream || typeof stream.providerInstanceId !== 'string' || typeof stream.streamId !== 'string') return '';
+    return `${stream.providerInstanceId}::${stream.streamId}`;
+  }
+
   async function readSnapshotViaHost(opts) {
-    const contract = await resolveReadModelContract();
+    const contract = await resolveReadModelContract(opts?.workspaceId);
     if (contract) {
-      return await ctx.services.call(contract, 'readSearchSnapshot', [opts]);
+      const callOpts = opts?.workspaceId ? { workspaceId: opts.workspaceId } : undefined;
+      const raw = await ctx.services.call(contract, 'readSearchSnapshot', [opts], callOpts);
+      return unwrapReadModelResponse(raw, 'readSearchSnapshot');
     }
     // Fallback to public ctx.sessions API when no read-model service is mounted
     const sessions = await ctx.sessions.list(opts?.workspaceId ? { workspaceId: opts.workspaceId } : {});
@@ -657,11 +693,13 @@ export async function apply(ctx, config = {}) {
   }
 
   async function readChangesViaHost(afterSeq, workspaceId) {
-    const contract = await resolveReadModelContract();
+    const contract = await resolveReadModelContract(workspaceId);
     if (contract) {
-      return await ctx.services.call(contract, 'readCommittedChanges', [
+      const callOpts = workspaceId ? { workspaceId } : undefined;
+      const raw = await ctx.services.call(contract, 'readCommittedChanges', [
         { afterSeq, limit: batchSize, ...(workspaceId ? { workspaceId } : {}) },
-      ]);
+      ], callOpts);
+      return unwrapReadModelResponse(raw, 'readCommittedChanges');
     }
     const sessions = await ctx.sessions.list(workspaceId ? { workspaceId } : {});
     const changes = [];
@@ -719,23 +757,37 @@ export async function apply(ctx, config = {}) {
 
     while (!disposed && generation === startGen) {
       const state = readSyncRow();
-      const page = await readChangesViaHost(state.cursor_seq);
+      const prevStreamKey = state.stream_key || '';
+      let page = await readChangesViaHost(state.cursor_seq);
       if (disposed || generation !== startGen) break;
+      const pageStreamKey = formatStreamKey(page?.stream);
+      let effectiveCursor = state.cursor_seq;
+      let effectiveSkipsJson = state.scoped_skips_json;
+      if (pageStreamKey && prevStreamKey && pageStreamKey !== prevStreamKey) {
+        // Different stream identity: reset cursor to 0 instead of comparing foreign seqs
+        effectiveCursor = 0;
+        effectiveSkipsJson = '[]';
+        page = await readChangesViaHost(0);
+        if (disposed || generation !== startGen) break;
+      }
+      const targetStreamKey = pageStreamKey || prevStreamKey;
       const list = Array.isArray(page?.changes) ? page.changes : [];
       if (list.length === 0) {
-        if (typeof page?.latestSeq === 'number' && page.latestSeq > state.cursor_seq) {
-          const pruned = pruneScopedSkips(parseScopedSkips(state.scoped_skips_json), page.latestSeq);
-          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+        if (typeof page?.latestSeq === 'number' && (page.latestSeq > effectiveCursor || targetStreamKey !== prevStreamKey)) {
+          const pruned = pruneScopedSkips(parseScopedSkips(effectiveSkipsJson), page.latestSeq);
+          db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, stream_key = ?, updated_at = ? WHERE id = 1').run(
             page.latestSeq,
             JSON.stringify(pruned),
+            targetStreamKey,
             Date.now(),
           );
           try {
             await persistMemoryState();
           } catch (err) {
-            db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+            db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, stream_key = ?, updated_at = ? WHERE id = 1').run(
               state.cursor_seq,
               state.scoped_skips_json ?? '[]',
+              prevStreamKey,
               Date.now(),
             );
             throw err;
@@ -745,7 +797,7 @@ export async function apply(ctx, config = {}) {
       }
 
       const maxBatchSeq = list[list.length - 1].changeSeq;
-      const skips = parseScopedSkips(state.scoped_skips_json);
+      const skips = parseScopedSkips(effectiveSkipsJson);
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const change of list) {
@@ -753,11 +805,12 @@ export async function apply(ctx, config = {}) {
           applyChangeInTx(change);
           appliedChanges += 1;
         }
-        const nextCursor = Math.max(state.cursor_seq, Number(maxBatchSeq || 0));
+        const nextCursor = Math.max(effectiveCursor, Number(maxBatchSeq || 0));
         const prunedSkips = pruneScopedSkips(skips, nextCursor);
-        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, stream_key = ?, updated_at = ? WHERE id = 1').run(
           nextCursor,
           JSON.stringify(prunedSkips),
+          targetStreamKey,
           Date.now(),
         );
         db.exec('COMMIT');
@@ -770,9 +823,10 @@ export async function apply(ctx, config = {}) {
         await persistMemoryState();
       } catch (err) {
         // Revert in-memory cursor_seq so memory state does not outrun failed chunk persistence
-        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, updated_at = ? WHERE id = 1').run(
+        db.prepare('UPDATE search_sync_state SET cursor_seq = ?, scoped_skips_json = ?, stream_key = ?, updated_at = ? WHERE id = 1').run(
           state.cursor_seq,
           state.scoped_skips_json ?? '[]',
+          prevStreamKey,
           Date.now(),
         );
         throw err;
@@ -1246,9 +1300,10 @@ export async function apply(ctx, config = {}) {
     try {
       const contract = await resolveReadModelContract();
       if (contract) {
-        const page = await ctx.services.call(contract, 'readCommittedChanges', [
+        const rawPage = await ctx.services.call(contract, 'readCommittedChanges', [
           { afterSeq: row.cursor_seq, limit: 1 },
         ]);
+        const page = unwrapReadModelResponse(rawPage, 'readCommittedChanges');
         if (typeof page?.latestSeq === 'number' && Number.isFinite(page.latestSeq)) {
           latestSourceSeq = page.latestSeq;
         }
@@ -1315,6 +1370,11 @@ export async function apply(ctx, config = {}) {
 
   for (const eventName of ['turn.completed', 'message.user', 'message.assistant.completed', 'session.created']) {
     ctx.events.on(eventName, () => {
+      scheduleCatchup();
+    });
+  }
+  if (typeof ctx.services?.subscribe === 'function') {
+    ctx.services.subscribe('session.data.v1', () => {
       scheduleCatchup();
     });
   }

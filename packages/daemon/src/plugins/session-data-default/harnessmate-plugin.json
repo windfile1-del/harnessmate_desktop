@@ -1,0 +1,13 @@
+{
+  "id": "hm.plugin.session-data-default",
+  "name": "默认会话数据插件 (SQLite)",
+  "version": "1.0.0",
+  "description": "负责工作区、会话、事件流、轮次块、运行记录、驱动续接绑定、导入事务与已提交变更流的默认持久化实现。",
+  "author": "HarnessMate Core",
+  "category": "workflow",
+  "provides": [
+    "session.data.v1",
+    "hm.session-data.v1"
+  ],
+  "contributes": {}
+}

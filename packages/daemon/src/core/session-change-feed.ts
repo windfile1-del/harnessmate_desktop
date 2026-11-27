@@ -1,11 +1,20 @@
 import { randomUUID } from 'node:crypto';
-import { PluginApiError } from '@harnessmate/plugin-api';
+import {
+  PluginApiError,
+  SESSION_DATA_CONTRACT,
+  sessionDataStreamKey,
+  type SessionCanonicalEventDto,
+  type SessionDataChannelEvent,
+  type SessionDataCursor,
+  type SessionDataStreamIdentity,
+} from '@harnessmate/plugin-api';
 import type {
   CommittedChangeRawRow,
   HarnessMateStore,
   SessionChangeKind,
   SnapshotTurnItemRow,
 } from '../db/sqlite.js';
+import type { PluginHost } from '../plugin-host/runtime/lifecycle.js';
 
 export type SearchSnapshotItem = SnapshotTurnItemRow;
 
@@ -150,11 +159,58 @@ function mapChangeRow(row: CommittedChangeRawRow): CommittedSessionChange {
  */
 export class SessionChangeFeedService {
   private readonly snapshots = new Map<string, SnapshotEntry>();
+  private readonly streamCursors = new Map<string, SessionDataCursor>();
+  private readonly channelListeners = new Set<(latestSeq: number, event?: SessionDataChannelEvent) => void>();
+  private hostChannelUnsub?: () => void;
 
   constructor(private readonly store: HarnessMateStore) {}
 
-  onCommitted(listener: (latestSeq: number) => void): () => void {
-    return this.store.onSessionChangeCommitted(listener);
+  attachPluginHost(host: PluginHost): () => void {
+    this.hostChannelUnsub?.();
+    const unsub = host.subscribeServiceChannel(SESSION_DATA_CONTRACT, (rawEvent) => {
+      const ev = rawEvent.payload as unknown as SessionDataChannelEvent | undefined;
+      if (!ev || !ev.stream) return;
+      const key = sessionDataStreamKey(ev.stream);
+      const prev = this.streamCursors.get(key);
+      const nextSeq = Math.max(prev?.seq ?? 0, typeof ev.changeSeq === 'number' ? ev.changeSeq : 0);
+      this.streamCursors.set(key, {
+        providerInstanceId: ev.stream.providerInstanceId,
+        streamId: ev.stream.streamId,
+        seq: nextSeq,
+      });
+      for (const listener of [...this.channelListeners]) {
+        try {
+          listener(nextSeq, ev);
+        } catch {
+          // Isolate subscriber errors from committed channel notifications
+        }
+      }
+    });
+    this.hostChannelUnsub = unsub;
+    return unsub;
+  }
+
+  getStreamCursors(): SessionDataCursor[] {
+    return [...this.streamCursors.values()];
+  }
+
+  getStreamCursor(stream: SessionDataStreamIdentity): SessionDataCursor | undefined {
+    return this.streamCursors.get(sessionDataStreamKey(stream));
+  }
+
+  onCommitted(listener: (latestSeq: number, event?: SessionDataChannelEvent) => void): () => void {
+    this.channelListeners.add(listener);
+    const storeUnsub = this.store.onSessionChangeCommitted((seq) => {
+      try {
+        listener(seq);
+      } catch {
+        // Isolate subscriber errors
+      }
+    });
+    return () => {
+      this.channelListeners.delete(listener);
+      storeUnsub();
+    };
   }
 
   getLatestSeq(): number {

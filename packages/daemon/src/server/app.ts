@@ -63,6 +63,7 @@ import {
   SetPluginPermissionRequestSchema,
   UploadAttachmentRequestSchema,
   UpsertAgyInstanceRequestSchema,
+  type CanonicalEvent,
   type ContextSyncMode,
   type RemoteAccessStatus,
 } from '@harnessmate/protocol';
@@ -128,6 +129,8 @@ import { RemoteAuthService, isLocalBrowserRequest, isLoopbackAddress } from './a
 import { WsGateway } from './ws.js';
 import { SessionChangeFeedService } from '../core/session-change-feed.js';
 import { HistoryImportAdapter } from '../core/history-import-adapter.js';
+import { findSessionWithProvider, findWorkspaceWithProvider, listActiveSessionRuntimeProviders } from '../core/session-peer-router.js';
+import { httpStatusForPluginError } from '../core/w1-service-helpers.js';
 import { registerServiceResolutionRoute } from '../plugin-host/composition/resolve-route.js';
 import { registerHistoryImportCompatRoutes } from './routes/history-import-compat.js';
 import { registerSessionSearchCompatRoutes } from './routes/session-search-compat.js';
@@ -190,8 +193,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const pluginSecrets = new PluginSecretStore();
   const terminalWorkspace = new TerminalWorkspaceService(store, { initialActive: false });
   const terminalSessionOwners = new Map<string, string>();
+  const commandOutputHub = new CommandOutputHub();
   const sessionChangeFeed = new SessionChangeFeedService(store);
   const historyImportAdapter = new HistoryImportAdapter(store, registry, sessionChangeFeed);
+  let nativeRegistry: AgyNativeRuntimeRegistry | undefined;
+  let sessionManager: SessionManager;
+  let pendingRuntimeController: import('../plugins/session-runtime-default/index.js').SessionRuntimeDefaultController | null = null;
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
     registry,
@@ -207,12 +214,43 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         readLedger: (session) => readSessionLedger(pluginManager, store, session.id),
         report: (error) => app.log.error(error),
         ledgerUpdated: (state) => {
-          if (!store.getSession(state.sessionId)) return;
-          eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', {
-            version: state.version, objective: state.objective, stepsCount: state.steps.length,
+          const payload = {
+            version: state.version,
+            objective: state.objective,
+            stepsCount: state.steps.length,
             doneStepsCount: state.steps.filter(({ status }) => status === 'done').length,
-            touchedFilesCount: state.touchedFiles.length, ledgerFilePath: state.ledgerFilePath ?? null,
-          }));
+            touchedFilesCount: state.touchedFiles.length,
+            ledgerFilePath: state.ledgerFilePath ?? null,
+          };
+          if (store.getSession(state.sessionId)) {
+            eventBus.publishEvent(store.appendEvent(state.sessionId, 'task.state_updated', payload));
+            return;
+          }
+          if (!pluginManager.hasLoadedRegistry()) return;
+          void findSessionWithProvider(pluginManager, state.sessionId)
+            .then(async (found) => {
+              if (!found) return;
+              const appended = await found.provider.service.appendEvent({
+                sessionId: state.sessionId,
+                type: 'task.state_updated',
+                turnId: null,
+                payload,
+              });
+              if (appended.ok) {
+                const ev = appended.value.event;
+                eventBus.publishEvent({
+                  sessionId: ev.sessionId,
+                  seq: ev.seq,
+                  turnId: ev.turnId,
+                  type: ev.type as CanonicalEvent['type'],
+                  payload: ev.payload,
+                  createdAt: ev.createdAt,
+                });
+              }
+            })
+            .catch((error) => {
+              app.log.error(error);
+            });
         },
         inboxUpdated: (session, event) => {
           wsGateway.notifyTriage({ op: 'triage_updated', session, event });
@@ -238,6 +276,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       paths.attachmentsDir,
       () => pluginCapabilities,
       () => pluginManager,
+      {
+        eventBus,
+        changeFeed: sessionChangeFeed,
+        commandOutputHub,
+        getNativeRegistry: () => nativeRegistry,
+        getApprovalCenter: () => sessionManager.getApprovalCenter(),
+        getOrchestrator: () => sessionManager.getOrchestratorIfEnabled(),
+        onAnnotatePendingApproval: async (session, approval) => {
+          await sessionManager.annotatePendingApproval(session, approval);
+        },
+        onAttachCompressorHooks: () => sessionManager.attachCompressorForRuntime(),
+        onRuntimeControllerReady: (ctrl) => {
+          pendingRuntimeController = ctrl;
+          sessionManager?.attachRuntimeController?.(ctrl);
+        },
+      },
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
@@ -246,11 +300,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
 
   let boundPort = config.port;
-  const commandOutputHub = new CommandOutputHub();
   const outboxWorker = new EffectOutboxWorker(store);
-  const nativeRegistry = new AgyNativeRuntimeRegistry(store, opts.nativeFeatureFlags);
+  nativeRegistry = new AgyNativeRuntimeRegistry(store, opts.nativeFeatureFlags);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
-  const sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
+  sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
+  sessionChangeFeed.attachPluginHost(pluginManager.host);
+  if (pendingRuntimeController) {
+    sessionManager.attachRuntimeController(pendingRuntimeController);
+  }
   historyImportAdapter.attachHooks({
     addWorkspace: (rootPath, name) => sessionManager.addWorkspace(rootPath, name),
     onSessionImported: (importedSession, meta) => {
@@ -327,7 +384,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   };
   syncTerminalOwnerListeners();
   pluginManager.isolated?.setNativeCommandRunner(async (sessionId, command, args) => {
-    const session = store.getSession(sessionId);
+    const session = await sessionManager.getSessionAsync(sessionId);
     if (!session) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
     try {
       const result = await sessionManager.runHarnessCommand(sessionId, {
@@ -398,7 +455,16 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: '插件管理仅在本机可用' });
     }
     (request as unknown as { principal: typeof principal }).principal = principal;
+    await pluginManager.ensureBootstrapped();
   });
+
+  const sendPluginError = (reply: import('fastify').FastifyReply, err: unknown, fallbackStatus = 400) => {
+    if (err instanceof PluginApiError) {
+      const mapped = httpStatusForPluginError(err);
+      return reply.code(mapped.status).send({ error: mapped.message, code: mapped.code });
+    }
+    return reply.code(fallbackStatus).send({ error: err instanceof Error ? err.message : String(err) });
+  };
 
   // ── Health & Harnesses ───────────────────────────────────────────────
 
@@ -707,7 +773,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   registerServiceResolutionRoute(app, pluginManager);
   app.get('/api/v1/plugins/composition', async (request) => {
     const { workspaceId } = request.query as { workspaceId?: string };
-    const workspace = typeof workspaceId === 'string' ? store.getWorkspace(workspaceId) : undefined;
+    const workspace = typeof workspaceId === 'string'
+      ? ((await findWorkspaceWithProvider(pluginManager, workspaceId).catch(() => null))?.workspace ?? store.getWorkspace(workspaceId))
+      : undefined;
     return {
       ...pluginManager.getComposition(),
       filePreviewProviders: pluginManager.listFilePreviewProviders(workspace?.id),
@@ -722,10 +790,15 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.get('/api/v1/plugins/:id/permissions', async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId } = request.query as { workspaceId?: string };
-    if (typeof workspaceId !== 'string' || (workspaceId !== GLOBAL_WORKSPACE_SCOPE && !store.getWorkspace(workspaceId))) {
+    const wsExists = typeof workspaceId === 'string' && (
+      workspaceId === GLOBAL_WORKSPACE_SCOPE ||
+      Boolean(await findWorkspaceWithProvider(pluginManager, workspaceId).catch(() => null)) ||
+      Boolean(store.getWorkspace(workspaceId))
+    );
+    if (!wsExists) {
       return reply.code(404).send({ error: '工作区不存在' });
     }
-    return { permissions: pluginCapabilities.listPermissions(workspaceId, id) };
+    return { permissions: pluginCapabilities.listPermissions(workspaceId as string, id) };
   });
 
   app.put('/api/v1/plugins/:id/permissions', async (request, reply) => {
@@ -1074,7 +1147,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.put('/api/v1/plugins/composition/file-preview', async (request, reply) => {
     const { pluginId, workspaceId } = (request.body ?? {}) as { pluginId?: unknown; workspaceId?: unknown };
-    if (pluginId !== null && (typeof pluginId !== 'string' || typeof workspaceId !== 'string' || !store.getWorkspace(workspaceId))) {
+    const wsExists = typeof workspaceId === 'string' && (
+      Boolean(await findWorkspaceWithProvider(pluginManager, workspaceId).catch(() => null)) ||
+      Boolean(store.getWorkspace(workspaceId))
+    );
+    if (pluginId !== null && (typeof pluginId !== 'string' || !wsExists)) {
       return reply.code(400).send({ error: '请选择文件预览提供方和工作区' });
     }
     try {
@@ -1157,11 +1234,18 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/workspaces/:id/bindings', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    try {
+      const wsFound = await findWorkspaceWithProvider(pluginManager, id);
+      if (!wsFound) return reply.code(404).send({ error: 'Workspace not found' });
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     return {
       workspaceId: id,
       bindings: store.listCapabilityBindings('workspace', id),
       resolved: {
+        'session.data.v1': pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionData, { workspaceId: id, allowSingleCandidate: true }),
+        'session.runtime.v1': pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, { workspaceId: id, allowSingleCandidate: true }),
         'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { workspaceId: id }),
         'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { workspaceId: id }),
         'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { workspaceId: id }),
@@ -1180,7 +1264,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.put('/api/v1/workspaces/:id/bindings', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!store.getWorkspace(id)) return reply.code(404).send({ error: 'Workspace not found' });
+    try {
+      const wsFound = await findWorkspaceWithProvider(pluginManager, id);
+      if (!wsFound) return reply.code(404).send({ error: 'Workspace not found' });
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     const { contract, instanceId } = (request.body ?? {}) as { contract?: unknown; instanceId?: unknown };
     if (typeof contract !== 'string' || !contract.trim() || (instanceId !== null && typeof instanceId !== 'string')) {
       return reply.code(400).send({ error: '请提供有效的契约名与实例 ID' });
@@ -1193,18 +1282,25 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         resolved: pluginManager.resolveCapabilityBinding(contract.trim(), { workspaceId: id }),
       };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      return sendPluginError(reply, error, 400);
     }
   });
 
   app.get('/api/v1/sessions/:id/bindings', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     return {
       sessionId: id,
       bindings: store.listCapabilityBindings('session', id),
       resolved: {
+        'session.data.v1': pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionData, { sessionId: id, workspaceId: session.workspaceId, allowSingleCandidate: true }),
+        'session.runtime.v1': pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, { sessionId: id, workspaceId: session.workspaceId, allowSingleCandidate: true }),
         'browser.v1': pluginManager.resolveCapabilityBinding('browser.v1', { sessionId: id, workspaceId: session.workspaceId }),
         'filePreview.v1': pluginManager.resolveCapabilityBinding('filePreview.v1', { sessionId: id, workspaceId: session.workspaceId }),
         'approval.policy.v1': pluginManager.resolveCapabilityBinding('approval.policy.v1', { sessionId: id, workspaceId: session.workspaceId }),
@@ -1221,7 +1317,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.put('/api/v1/sessions/:id/bindings', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const { contract, instanceId } = (request.body ?? {}) as { contract?: unknown; instanceId?: unknown };
     if (typeof contract !== 'string' || !contract.trim() || (instanceId !== null && typeof instanceId !== 'string')) {
@@ -1235,7 +1336,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         resolved: pluginManager.resolveCapabilityBinding(contract.trim(), { sessionId: id, workspaceId: session.workspaceId }),
       };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      return sendPluginError(reply, error, 400);
     }
   });
 
@@ -1441,9 +1542,13 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   // ── Workspaces ───────────────────────────────────────────────────────
 
-  app.get('/api/v1/workspaces', async () => ({
-    workspaces: sessionManager.listWorkspaces(),
-  }));
+  app.get('/api/v1/workspaces', async (_request, reply) => {
+    try {
+      return { workspaces: await sessionManager.listWorkspacesAsync() };
+    } catch (err) {
+      return sendPluginError(reply, err, 500);
+    }
+  });
 
   app.post('/api/v1/workspaces', async (request, reply) => {
     const parsed = CreateWorkspaceRequestSchema.safeParse(request.body);
@@ -1451,34 +1556,46 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid workspace' });
     }
     try {
-      const workspace = await sessionManager.addWorkspace(parsed.data.rootPath, parsed.data.name);
+      const workspace = await sessionManager.addWorkspace(
+        parsed.data.rootPath,
+        parsed.data.name,
+        parsed.data.dataInstanceId,
+      );
       return reply.code(201).send({ workspace });
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
   app.delete('/api/v1/workspaces/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const deleted = await sessionManager.deleteWorkspace(id);
-    if (!deleted) return reply.code(404).send({ error: 'Workspace not found' });
-    return { deleted: true };
+    try {
+      const deleted = await sessionManager.deleteWorkspace(id);
+      if (!deleted) return reply.code(404).send({ error: 'Workspace not found' });
+      return { deleted: true };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   registerSessionAssistanceCompatRoutes(app, pluginManager, store);
 
-  app.get('/api/v1/sessions', async (request) => {
+  app.get('/api/v1/sessions', async (request, reply) => {
     const q = request.query as {
       workspaceId?: string;
       harnessId?: string;
       includeArchived?: string;
     };
-    const sessions = sessionManager.listSessions({
-      workspaceId: q.workspaceId,
-      harnessId: q.harnessId,
-      includeArchived: q.includeArchived === '1' || q.includeArchived === 'true',
-    });
-    return { sessions };
+    try {
+      const sessions = await sessionManager.listSessionsAsync({
+        workspaceId: q.workspaceId,
+        harnessId: q.harnessId,
+        includeArchived: q.includeArchived === '1' || q.includeArchived === 'true',
+      });
+      return { sessions };
+    } catch (err) {
+      return sendPluginError(reply, err, 500);
+    }
   });
 
   app.post('/api/v1/sessions', async (request, reply) => {
@@ -1490,13 +1607,18 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const session = await sessionManager.createSession(parsed.data);
       return reply.code(201).send({ session });
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
   app.get('/api/v1/sessions/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const pendingApprovals = sessionManager.listPendingApprovals(id);
     const taskState = await readSessionLedger(pluginManager, store, id);
@@ -1513,32 +1635,50 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const session = await sessionManager.updateSession(id, parsed.data);
       return { session };
     } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 404);
     }
   });
 
   app.delete('/api/v1/sessions/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const deleted = await sessionManager.deleteSession(id);
-    if (!deleted) return reply.code(404).send({ error: 'Session not found' });
-    return { deleted: true };
+    try {
+      const deleted = await sessionManager.deleteSession(id);
+      if (!deleted) return reply.code(404).send({ error: 'Session not found' });
+      return { deleted: true };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   app.get('/api/v1/sessions/:id/events', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const q = request.query as { afterSeq?: string };
     const parsedSeq = Number(q.afterSeq ?? 0);
     if (!Number.isSafeInteger(parsedSeq) || parsedSeq < 0) return reply.code(400).send({ error: 'Invalid event cursor' });
     const afterSeq = parsedSeq;
-    const events = sessionManager.getSessionEvents(id, afterSeq);
-    return { events, lastSeq: session.lastSeq };
+    try {
+      const page = await sessionManager.getSessionEventsPageAsync(id, afterSeq);
+      return {
+        events: page.events,
+        lastSeq: page.lastSeq,
+        hasMore: page.hasMore,
+        ...(page.stream ? { stream: page.stream } : {}),
+      };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   app.get('/api/v1/sessions/:id/plugin-panels/:pluginId/:panelId', async (request, reply) => {
     const { id, pluginId, panelId } = request.params as { id: string; pluginId: string; panelId: string };
-    const session = sessionManager.getSession(id);
+    const session = await sessionManager.getSessionAsync(id);
     const contribution = pluginManager.getDataPanel(pluginId, panelId);
     if (!session || !contribution) return reply.code(404).send({ error: '会话或插件面板不存在' });
     const query = PluginPanelQuerySchema.safeParse(request.query);
@@ -1548,7 +1688,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/sessions/:id/commands', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    const session = await sessionManager.getSessionAsync(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const pluginCommands = pluginManager.isolated?.listCommands().map(({ pluginId, pluginName, command, description, argumentHint }) =>
       ({ pluginId, pluginName, command, description, argumentHint })) ?? [];
@@ -1581,6 +1721,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const principal = (request as unknown as { principal?: { kind: 'local' | 'device' } }).principal;
       const actor = principal?.kind === 'device' ? 'mobile' : 'desktop';
       const result = await sessionManager.sendTurn(id, parsed.data.text, parsed.data.attachments, {
+        requestId: parsed.data.requestId,
         harnessId: parsed.data.harnessId,
         model: parsed.data.model,
         turnOptions: parsed.data.turnOptions,
@@ -1592,7 +1733,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       });
       return reply.code(202).send(result);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1602,9 +1743,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const parsed = SendTurnRequestSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: '消息草稿无效' });
     try {
-      return { suggestion: await sessionManager.previewTurnSuggestion(id, parsed.data.text, parsed.data.attachments) };
+      return { suggestion: await sessionManager.previewTurnSuggestionAsync(id, parsed.data.text, parsed.data.attachments) };
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1651,11 +1792,21 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.post('/api/v1/sessions/:id/interrupt', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!sessionManager.getSession(id)) {
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
+    if (!session) {
       return reply.code(404).send({ error: 'Session not found' });
     }
-    await sessionManager.interruptSession(id);
-    return { interrupted: true };
+    try {
+      await sessionManager.interruptSession(id);
+      return { interrupted: true };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   registerFilesAttachmentsRulesCompatRoutes(app, {
@@ -1667,7 +1818,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.post('/api/v1/sessions/:id/browser/open', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    const session = await sessionManager.getSessionAsync(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const { url, instanceId: explicitInstanceId } = (request.body ?? {}) as { url?: unknown; instanceId?: unknown };
     if (typeof url !== 'string' || !url.trim()) {
@@ -2214,10 +2365,15 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/sessions/:id/items', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const q = request.query as { afterSeq?: string; turnId?: string; limit?: string };
-    const rawItems = sessionManager.getSessionTurnItems(id, {
+    const rawItems = await sessionManager.getSessionTurnItemsAsync(id, {
       afterSeq: q.afterSeq !== undefined ? Number(q.afterSeq) : undefined,
       turnId: q.turnId || undefined,
       limit: q.limit !== undefined ? Number(q.limit) : undefined,
@@ -2232,21 +2388,31 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   app.get('/api/v1/sessions/:id/items/:itemId', async (request, reply) => {
     const { id, itemId } = request.params as { id: string; itemId: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const q = request.query as { textOffset?: string; maxChars?: string };
     const textOffset = Math.max(0, Number(q.textOffset ?? 0) || 0);
     const maxChars = Math.min(262_144, Math.max(256, Number(q.maxChars ?? 65_536) || 65_536));
-    const slice = sessionManager.getSessionTurnItemSlice(id, itemId, { textOffset, maxChars });
+    const slice = await sessionManager.getSessionTurnItemSliceAsync(id, itemId, { textOffset, maxChars });
     if (!slice) return reply.code(404).send({ error: 'Turn item not found' });
     return slice;
   });
 
   app.get('/api/v1/sessions/:id/runs', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = sessionManager.getSession(id);
+    let session;
+    try {
+      session = await sessionManager.getSessionAsync(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    return { runs: sessionManager.getSessionRuns(id) };
+    return { runs: await sessionManager.getSessionRunsAsync(id) };
   });
 
   app.get('/api/v1/sessions/:id/agy/subagents', async (request, reply) => {
@@ -2358,6 +2524,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     async start() {
       await pluginManager.reloadAll();
       pluginManager.takeRegistryChanged();
+      for (const rt of listActiveSessionRuntimeProviders(pluginManager)) {
+        await rt.service.recoverStaleRuns().catch(() => {});
+      }
       await app.listen({ port: config.port, host: boundHost });
       const addrObj = app.server.address();
       if (addrObj && typeof addrObj === 'object') {

@@ -121,6 +121,8 @@ export class PluginManager {
   private readonly restartGeneration = new Map<string, number>();
   private readonly permissionRevision = new Map<string, number>();
   private readonly hostLogs = new Map<string, PluginLogEntryDto[]>();
+  private hasLoadedRegistryFlag = false;
+  private bootstrapPromise: Promise<void> | null = null;
   private readonly dataDir: string;
   private readonly store?: HarnessMateStore;
   private readonly bundledPluginsDir?: string;
@@ -294,7 +296,7 @@ export class PluginManager {
     return true;
   }
 
-  private isInstanceKnownDisabled(instanceId: string): boolean {
+  isInstanceKnownDisabled(instanceId: string): boolean {
     const inst = this.instances.get(instanceId);
     if (inst) return !inst.info.enabled;
     const pkg = this.plugins.get(instanceId);
@@ -387,7 +389,9 @@ export class PluginManager {
   setWorkspaceBinding(workspaceId: string, contract: string, instanceId: string | null): Promise<void> {
     return this.serialize(async () => {
       if (!this.store) throw new PluginApiError('E_NOT_SUPPORTED', '未启用持久化存储');
-      if (!this.store.getWorkspace(workspaceId)) throw new PluginApiError('E_INVALID_INPUT', '工作区不存在');
+      const existsInStore = Boolean(this.store.getWorkspace(workspaceId));
+      const existsInOwner = Boolean(this.store.getResourceOwner('workspace', workspaceId, 'session.data.v1'));
+      if (!existsInStore && !existsInOwner) throw new PluginApiError('E_INVALID_INPUT', '工作区不存在');
       this.store.setCapabilityBinding('workspace', workspaceId, contract, instanceId);
     });
   }
@@ -395,7 +399,9 @@ export class PluginManager {
   setSessionBinding(sessionId: string, contract: string, instanceId: string | null): Promise<void> {
     return this.serialize(async () => {
       if (!this.store) throw new PluginApiError('E_NOT_SUPPORTED', '未启用持久化存储');
-      if (!this.store.getSession(sessionId)) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
+      const existsInStore = Boolean(this.store.getSession(sessionId));
+      const existsInOwner = Boolean(this.store.getResourceOwner('session', sessionId, 'session.data.v1'));
+      if (!existsInStore && !existsInOwner) throw new PluginApiError('E_INVALID_INPUT', '会话不存在');
       this.store.setCapabilityBinding('session', sessionId, contract, instanceId);
     });
   }
@@ -688,6 +694,22 @@ export class PluginManager {
     return changed;
   }
 
+  hasLoadedRegistry(): boolean {
+    return this.hasLoadedRegistryFlag;
+  }
+
+  ensureBootstrapped(): Promise<void> {
+    if (this.hasLoadedRegistryFlag) return Promise.resolve();
+    if (!this.bootstrapPromise) {
+      this.bootstrapPromise = this.reloadAll()
+        .then(() => undefined)
+        .finally(() => {
+          this.bootstrapPromise = null;
+        });
+    }
+    return this.bootstrapPromise;
+  }
+
   reloadAll(): Promise<InstalledPluginInfo[]> {
     return this.serialize(async () => {
       await this.loadRegistry();
@@ -696,6 +718,7 @@ export class PluginManager {
   }
 
   private async loadRegistry(): Promise<void> {
+    this.hasLoadedRegistryFlag = true;
     const next = new Map<string, LoadedPluginRecord>();
     try {
       this.composition.reload(this.getDisabledIds(), Boolean(this.safeComposition));

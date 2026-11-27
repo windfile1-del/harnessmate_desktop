@@ -97,8 +97,13 @@ export function resolveServiceSelection(params: ResolveServiceSelectionParams): 
   const explicitId = options?.explicitInstanceId?.trim() || undefined;
   const sessionId = options?.sessionId?.trim() || undefined;
   const explicitWorkspaceId = options?.workspaceId?.trim() || undefined;
+  const ownerWorkspaceRecord = sessionId && store
+    ? store.getResourceOwner('session', sessionId, 'session.data.v1')
+    : undefined;
   const effectiveWorkspaceId = explicitWorkspaceId
-    ?? (sessionId && store ? store.getSession(sessionId)?.workspaceId : undefined);
+    ?? (sessionId && store ? store.getSession(sessionId)?.workspaceId : undefined)
+    ?? ownerWorkspaceRecord?.workspaceId
+    ?? undefined;
 
   let selected: { instanceId: string; source: Exclude<SelectionSource, 'none' | 'single'> } | undefined;
   if (explicitId) {
@@ -107,6 +112,17 @@ export function resolveServiceSelection(params: ResolveServiceSelectionParams): 
     const sessionBinding = store.getCapabilityBinding('session', sessionId, contract);
     if (sessionBinding?.instanceId) {
       selected = { instanceId: sessionBinding.instanceId, source: 'session' };
+    } else if (contract === 'session.data.v1' || contract === 'hm.session-data.v1') {
+      const owner = store.getResourceOwner('session', sessionId, 'session.data.v1');
+      if (owner?.instanceId) {
+        selected = { instanceId: owner.instanceId, source: 'session' };
+      }
+    }
+  }
+  if (!selected && store && !sessionId && effectiveWorkspaceId && (contract === 'session.data.v1' || contract === 'hm.session-data.v1')) {
+    const wsOwner = store.getResourceOwner('workspace', effectiveWorkspaceId, 'session.data.v1');
+    if (wsOwner?.instanceId) {
+      selected = { instanceId: wsOwner.instanceId, source: 'workspace' };
     }
   }
   if (!selected && store && effectiveWorkspaceId) {

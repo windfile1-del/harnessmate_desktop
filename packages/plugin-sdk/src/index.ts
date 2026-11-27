@@ -31,14 +31,17 @@ import {
   type PluginRuntimeSlotDescriptor,
   type PublicAdapterSessionConfig,
   type PublicApprovalDecision,
+  type PublicContextInjectionDriver,
   type PublicDriverContextSyncPayload,
   type PublicDriverTurnInput,
   type PublicHarnessDriverDescriptor,
   type PublicNetStreamHandle,
   type PublicNetStreamInit,
+  type PublicNormalizedAdapterEvent,
   type PublicSlotRegistration,
   type ResolveServiceSelectionOptions,
   type ServiceCallOptions,
+  type ServiceChannelEvent,
   type ServiceImplementation,
   type ServiceProvideMeta,
   type ServiceProviderDescriptor,
@@ -94,6 +97,13 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
     driverId: string;
     handle: PluginHarnessSessionHandle;
     unsubscribeEvent: Disposer;
+  }>();
+  const serviceChannelListeners = new Map<string, Set<(event: ServiceChannelEvent) => void>>();
+  const leasedHarnessSessions = new Map<string, {
+    leaseId: string;
+    nativeSessionId: string | null;
+    listeners: Set<(event: PublicNormalizedAdapterEvent) => void>;
+    disposed: boolean;
   }>();
   const cliProcesses = new Map<string, {
     stdoutListeners: Set<(chunk: string) => void>;
@@ -230,6 +240,25 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           rpcCall<ServiceResolutionV1>('services.resolve', { contract, ...(opts ?? {}) }),
         call: <T = unknown>(contract: string, method: string, args: unknown[] = [], opts?: ServiceCallOptions) =>
           rpcCall<T>('services.call', { contract, method, args, ...(opts ?? {}) }),
+        publish: (contract: string, payload: Record<string, unknown>) => {
+          rpcNotify('services.publish', { contract, payload });
+        },
+        subscribe: (contract: string, listener: (event: ServiceChannelEvent) => void): Disposer =>
+          registerEffect(() => {
+            const key = contract.trim();
+            if (!key) throw new PluginApiError('E_INVALID_INPUT', '缺少服务契约名');
+            const set = serviceChannelListeners.get(key) ?? new Set<(event: ServiceChannelEvent) => void>();
+            serviceChannelListeners.set(key, set);
+            set.add(listener);
+            rpcNotify('services.subscribe', { contract: key });
+            return () => {
+              set.delete(listener);
+              if (set.size === 0) {
+                serviceChannelListeners.delete(key);
+                rpcNotify('services.unsubscribe', { contract: key });
+              }
+            };
+          }),
       },
       routes: {
         register: (pathPrefix: string, handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse): Disposer =>
@@ -307,6 +336,88 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           };
         }),
         listInstances: () => rpcCall('harnesses.listInstances', {}),
+        openSession: async (harnessId: string, config: PublicAdapterSessionConfig): Promise<PluginHarnessSessionHandle> => {
+          const opened = await rpcCall<{
+            leaseId: string;
+            nativeSessionId: string | null;
+            pluginMcpAvailable: boolean;
+            supportsSteer: boolean;
+          }>('harnesses.openSession', {
+            harnessId,
+            config: config as unknown as Record<string, unknown>,
+          });
+          const leaseId = opened.leaseId;
+          const listeners = new Set<(event: PublicNormalizedAdapterEvent) => void>();
+          const entry = {
+            leaseId,
+            nativeSessionId: opened.nativeSessionId ?? null,
+            listeners,
+            disposed: false,
+          };
+          leasedHarnessSessions.set(leaseId, entry);
+          let disposeEffect: Disposer | null = null;
+          const handle: PluginHarnessSessionHandle = {
+            get nativeSessionId() { return entry.nativeSessionId; },
+            pluginMcpAvailable: opened.pluginMcpAvailable,
+            sendTurn: async (input) => {
+              const res = await rpcCall<{ nativeSessionId?: string | null; driverUsed?: PublicContextInjectionDriver }>('harnesses.session.sendTurn', {
+                leaseId,
+                input: input as unknown as Record<string, unknown>,
+              });
+              if (res && 'nativeSessionId' in res) entry.nativeSessionId = res.nativeSessionId ?? null;
+              return res?.driverUsed ? { driverUsed: res.driverUsed } : undefined;
+            },
+            ...(opened.supportsSteer ? {
+              steerTurn: async (input: PublicDriverTurnInput) => {
+                await rpcCall('harnesses.session.steerTurn', {
+                  leaseId,
+                  input: input as unknown as Record<string, unknown>,
+                });
+              },
+            } : {}),
+            interrupt: async () => {
+              await rpcCall('harnesses.session.interrupt', { leaseId });
+            },
+            resolveApproval: async (nativeRequestId, decision, comment) => {
+              await rpcCall('harnesses.session.resolveApproval', {
+                leaseId,
+                nativeRequestId,
+                decision,
+                ...(comment !== undefined ? { comment } : {}),
+              });
+            },
+            updateConfig: async (patch) => {
+              await rpcCall('harnesses.session.updateConfig', {
+                leaseId,
+                patch: patch as Record<string, unknown>,
+              });
+            },
+            dispose: async () => {
+              if (entry.disposed) return;
+              entry.disposed = true;
+              leasedHarnessSessions.delete(leaseId);
+              listeners.clear();
+              if (disposeEffect) {
+                const fn = disposeEffect;
+                disposeEffect = null;
+                fn();
+              }
+              await rpcCall('harnesses.session.dispose', { leaseId }).catch(() => {});
+            },
+            onEvent: (listener) => {
+              listeners.add(listener);
+              return () => { listeners.delete(listener); };
+            },
+          };
+          disposeEffect = registerEffect(() => () => {
+            if (entry.disposed) return;
+            entry.disposed = true;
+            leasedHarnessSessions.delete(leaseId);
+            listeners.clear();
+            rpcNotify('harnesses.session.dispose', { leaseId });
+          });
+          return handle;
+        },
       },
       runtime: {
         trustedLocal: handshake.trustedLocal === true,
@@ -594,6 +705,8 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
 
   const disposeAll = () => {
     disposed = true;
+    serviceChannelListeners.clear();
+    leasedHarnessSessions.clear();
     for (const undo of [...effects].reverse()) {
       try { undo(); } catch { /* best-effort cleanup */ }
     }
@@ -684,6 +797,26 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
         const event = params.event as PluginEventV4;
         const listeners = [...(eventListeners.get(event.type) ?? [])];
         for (const listener of listeners) await listener(event);
+        result = { ok: true };
+      } else if (method === 'host.service.channel') {
+        const event = params.event as ServiceChannelEvent | undefined;
+        if (event && typeof event.contract === 'string') {
+          const listeners = [...(serviceChannelListeners.get(event.contract) ?? [])];
+          for (const listener of listeners) listener(event);
+        }
+        result = { ok: true };
+      } else if (method === 'host.harnessSession.event') {
+        const leaseId = String(params.leaseId ?? '');
+        const sess = leasedHarnessSessions.get(leaseId);
+        const ev = params.event as PublicNormalizedAdapterEvent | undefined;
+        if (sess && ev && !sess.disposed) {
+          if (ev.type === 'native_session_ready' && typeof ev.nativeSessionId === 'string') {
+            sess.nativeSessionId = ev.nativeSessionId;
+          }
+          for (const listener of [...sess.listeners]) {
+            try { listener(ev); } catch { /* listener isolation */ }
+          }
+        }
         result = { ok: true };
       } else if (method === 'host.command') {
         const handler = commandHandlers.get(String(params.command));

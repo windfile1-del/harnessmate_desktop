@@ -1429,6 +1429,7 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
         resolve(contract: string, opts?: ResolveServiceSelectionOptions): Promise<ServiceResolutionV1>;
         call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: ServiceCallOptions): Promise<T>;
         publish?(contract: string, payload: Record<string, unknown>): void;
+        subscribe?(contract: string, listener: (event: ServiceChannelEvent) => void): Disposer;
     };
     readonly routes: {
         register(pathPrefix: string, handler: (req: PluginRouteRequest) => Promise<PluginRouteResponse> | PluginRouteResponse): Disposer;

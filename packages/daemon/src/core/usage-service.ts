@@ -1,3 +1,4 @@
+import type { SessionDataServiceV1 } from '@harnessmate/plugin-api';
 import type {
   DailyTokenBucket,
   HarnessAccountUsage,
@@ -12,6 +13,8 @@ export interface UsageServiceOptions {
   ttlMs?: number;
   /** Clock override for deterministic unit tests. */
   now?: () => number;
+  /** Active `session.data.v1` providers for decoupled usage aggregation. */
+  getSessionDataServices?: () => SessionDataServiceV1[];
 }
 
 export interface SessionContextMeterSnapshot {
@@ -45,6 +48,7 @@ const DEFAULT_CONTEXT_WINDOW = 200_000;
 export class UsageService {
   private readonly ttlMs: number;
   private readonly now: () => number;
+  private readonly getSessionDataServices?: () => SessionDataServiceV1[];
   private readonly remoteCache = new Map<string, CachedRemoteUsage>();
   private readonly inflight = new Map<HarnessAdapter, Promise<CachedRemoteUsage | null>>();
   private stopped = false;
@@ -55,9 +59,49 @@ export class UsageService {
     opts?: UsageServiceOptions | Record<string, string>,
   ) {
     const structured =
-      opts && ('ttlMs' in opts || 'now' in opts) ? (opts as UsageServiceOptions) : undefined;
+      opts && ('ttlMs' in opts || 'now' in opts || 'getSessionDataServices' in opts)
+        ? (opts as UsageServiceOptions)
+        : undefined;
     this.ttlMs = structured?.ttlMs ?? DEFAULT_USAGE_TTL_MS;
     this.now = structured?.now ?? (() => Date.now());
+    this.getSessionDataServices = structured?.getSessionDataServices;
+  }
+
+  private async readLocalAggregates(): Promise<Map<string, LocalInstanceUsageAggregate>> {
+    const services = this.getSessionDataServices?.() ?? [];
+    if (services.length === 0) {
+      return this.store.getUsageAggregatesByInstance();
+    }
+    const merged = new Map<string, LocalInstanceUsageAggregate>();
+    for (const svc of services) {
+      const res = await svc.getUsageAggregatesByInstance().catch(() => null);
+      if (!res?.ok) continue;
+      for (const agg of res.value.aggregates) {
+        const prev = merged.get(agg.instanceId);
+        if (!prev) {
+          merged.set(agg.instanceId, {
+            instanceId: agg.instanceId,
+            harnessId: agg.harnessId,
+            sessionCount: agg.sessionCount,
+            inputTokens: agg.inputTokens,
+            outputTokens: agg.outputTokens,
+            cachedTokens: agg.cachedTokens,
+            costUsd: agg.costUsd,
+            dailyBuckets: agg.dailyBuckets.map((b) => ({
+              date: b.date,
+              tokens: b.inputTokens + b.outputTokens,
+            })),
+          });
+        } else {
+          prev.sessionCount += agg.sessionCount;
+          prev.inputTokens += agg.inputTokens;
+          prev.outputTokens += agg.outputTokens;
+          prev.cachedTokens += agg.cachedTokens;
+          prev.costUsd += agg.costUsd;
+        }
+      }
+    }
+    return merged;
   }
 
   /**
@@ -66,7 +110,10 @@ export class UsageService {
    */
   async collectAccountUsage(opts?: { forceRefresh?: boolean }): Promise<HarnessAccountUsage[]> {
     const forceRefresh = opts?.forceRefresh === true;
-    const localAggs = this.store.getUsageAggregatesByInstance();
+    const services = this.getSessionDataServices?.() ?? [];
+    const localAggs = services.length === 0
+      ? this.store.getUsageAggregatesByInstance()
+      : await this.readLocalAggregates();
     const adapters = this.registry.listAdapters();
 
     return Promise.all(
@@ -84,7 +131,11 @@ export class UsageService {
     opts?: { forceRefresh?: boolean },
   ): Promise<HarnessAccountUsage> {
     const forceRefresh = opts?.forceRefresh === true;
-    const local = this.store.getUsageAggregatesByInstance().get(instanceId);
+    const services = this.getSessionDataServices?.() ?? [];
+    const local = (services.length === 0
+      ? this.store.getUsageAggregatesByInstance()
+      : await this.readLocalAggregates()
+    ).get(instanceId);
     const adapter = this.registry.get(instanceId);
     if (!adapter) {
       return this.buildOfflineFallback(instanceId, local);

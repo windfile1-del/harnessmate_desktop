@@ -1,4 +1,5 @@
 import {
+  PEER_CONTRACTS,
   PluginApiError,
   isBuiltinPublicService,
   isReservedServiceName,
@@ -269,7 +270,10 @@ export class PluginPermissionService {
   }
 
   setPermission(plugin: InstalledPluginInfo, request: SetPluginPermissionRequest): PluginPermission[] {
-    if (request.workspaceId !== GLOBAL_WORKSPACE_SCOPE && !this.store.getWorkspace(request.workspaceId)) {
+    const workspaceExists =
+      Boolean(this.store.getWorkspace(request.workspaceId)) ||
+      Boolean(this.store.getResourceOwner('workspace', request.workspaceId, PEER_CONTRACTS.sessionData));
+    if (request.workspaceId !== GLOBAL_WORKSPACE_SCOPE && !workspaceExists) {
       throw new PluginApiError('E_INVALID_INPUT', '工作区不存在');
     }
     if (!plugin.packageDigest || plugin.packageDigest !== request.digest) {

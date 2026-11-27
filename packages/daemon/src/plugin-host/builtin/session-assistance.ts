@@ -1,6 +1,10 @@
+import type { SessionRecordDto } from '@harnessmate/plugin-api';
 import {
   TRIAGE_INBOX_PLUGIN_ID,
+  type PermissionMode,
+  type ReasoningEffort,
   type Session,
+  type SessionStatus,
   type SessionTaskState,
   type SessionTriageState,
   type TriageSnoozeExpired,
@@ -8,6 +12,7 @@ import {
 } from '@harnessmate/protocol';
 import type { DaemonEventBus } from '../../core/event-bus.js';
 import type { SessionChangeFeedService } from '../../core/session-change-feed.js';
+import { findSessionWithProvider } from '../../core/session-peer-router.js';
 import { startTaskLedgerProjection } from '../../core/task-ledger-projection.js';
 import { TaskLedgerService } from '../../core/task-ledger-service.js';
 import { TriageInboxService } from '../../core/triage-inbox-service.js';
@@ -72,20 +77,56 @@ export function registerSessionAssistance(
         return result.status;
       }, dataId);
       ctx.provide('ledger', ledger);
-      const requireSession = (id: string) => {
-        const session = store.getSession(id);
+      const resolveSession = async (id: string): Promise<Session | undefined> => {
+        const local = store.getSession(id);
+        if (local) return local;
+        if (!plugins().hasLoadedRegistry()) return undefined;
+        const found = await findSessionWithProvider(plugins(), id);
+        if (!found) return undefined;
+        const dto: SessionRecordDto = found.session;
+        return {
+          id: dto.id,
+          workspaceId: dto.workspaceId,
+          harnessId: dto.harnessId,
+          harnessKind: dto.harnessKind,
+          nativeSessionId: dto.nativeSessionId,
+          parentSessionId: dto.parentSessionId ?? null,
+          forkedFromTurnSeq: dto.forkedFromTurnSeq ?? null,
+          forkMode: dto.forkMode === 'clean_fork' ? 'native' : dto.forkMode === 'with_context' ? 'portable' : null,
+          importMode: dto.importMode ?? null,
+          importSource: dto.importSource ?? null,
+          participatingHarnesses: dto.participatingHarnesses ?? [dto.harnessId],
+          contextSyncMode: dto.contextSyncMode ?? 'auto',
+          cwd: dto.cwd,
+          worktreeBranch: dto.worktreeBranch ?? null,
+          title: dto.title,
+          status: dto.status as SessionStatus,
+          model: dto.model,
+          actualModel: dto.actualModel ?? null,
+          modelReroutedReason: dto.modelReroutedReason ?? null,
+          reasoningEffort: (dto.reasoningEffort as ReasoningEffort | null) ?? null,
+          permissionMode: dto.permissionMode as PermissionMode,
+          lastSeq: dto.lastSeq,
+          usage: dto.usage ?? null,
+          pendingApprovalCount: dto.pendingApprovalCount,
+          createdAt: dto.createdAt,
+          updatedAt: dto.updatedAt,
+        };
+      };
+      const requireSession = async (id: string) => {
+        const session = await resolveSession(id);
         if (!session || !owns(LEDGER, instanceId, session)) throw new Error('Session ledger is unavailable');
         return session;
       };
       ctx.provide(LEDGER, {
-        get: (id: string) => ledger.getOrCreate(requireSession(id)),
-        update: (id: string, patch: UpdateTaskStateRequest) => {
-          const state = ledger.updateManual(requireSession(id), patch);
+        get: async (id: string) => ledger.getOrCreate(await requireSession(id)),
+        update: async (id: string, patch: UpdateTaskStateRequest) => {
+          const state = ledger.updateManual(await requireSession(id), patch);
           ledgerUpdated(state);
           return state;
         },
-        summarize: (id: string) => {
-          const session = requireSession(id);
+        summarize: async (id: string) => {
+          const session = await requireSession(id);
           if (selected(SUMMARY, session).status !== 'ready') throw new Error('会话任务摘要已停用');
           const state = ledger.generateDeterministicDigest(session);
           ledgerUpdated(state);
@@ -162,8 +203,9 @@ export function registerSessionAssistance(
     provides: [NOTIFICATIONS],
     apply(ctx) {
       ctx.provide(NOTIFICATIONS, {
-        plan: (intent: SessionNotificationIntent) => {
-          const session = store.getSession(intent.sessionId);
+        plan: async (intent: SessionNotificationIntent) => {
+          const session = store.getSession(intent.sessionId)
+            ?? (plugins().hasLoadedRegistry() ? (await findSessionWithProvider(plugins(), intent.sessionId))?.session : undefined);
           if (!session) return null;
           return {
             id: [intent.kind, session.id, intent.identity].join(':'),

@@ -1,3 +1,4 @@
+import { sessionDataStreamKey } from '@harnessmate/plugin-api';
 import type { Session, SessionTaskState } from '@harnessmate/protocol';
 import type { HarnessMateStore } from '../db/sqlite.js';
 import { GLOBAL_WORKSPACE_SCOPE } from '../plugin-host/permissions/permissions.js';
@@ -6,6 +7,7 @@ import type { SessionChangeFeedService } from './session-change-feed.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
 
 const cursorKey = (id: string) => `projection:${id}`;
+const streamCursorKey = (id: string) => `projection_stream:${id}`;
 const terminalEvents = new Set(['turn.completed', 'turn.failed', 'turn.cancelled']);
 const syncEvents = new Set(['checkpoint.reverted', 'session.harness_switched']);
 
@@ -24,6 +26,7 @@ export function startTaskLedgerProjection(options: {
   const pending = new Set(store.listSessionIds());
   const startupMirrors = new Set(pending);
   const deleted = new Set<string>();
+  let currentStreamKey = 'hm.plugin.session-data-default::sqlite-main';
   let changeSeq = changes.getLatestSeq();
   let active = true;
   let running = false;
@@ -32,14 +35,26 @@ export function startTaskLedgerProjection(options: {
   async function project(id: string) {
     const session = store.getSession(id);
     if (!session || !owns(session)) return;
-    const value = store.getPluginStorageValue(scope, instanceId, cursorKey(id));
-    let cursor = typeof value === 'number' ? value : 0;
+    const rawValue = store.getPluginStorageValue(scope, instanceId, cursorKey(id));
+    const storedStream = store.getPluginStorageValue(scope, instanceId, streamCursorKey(id));
+    let cursor = 0;
+    if (typeof storedStream === 'string' && storedStream !== currentStreamKey) {
+      cursor = 0;
+    } else if (typeof rawValue === 'number') {
+      cursor = rawValue;
+    } else if (rawValue && typeof rawValue === 'object' && 'seq' in rawValue) {
+      const stored = rawValue as { streamKey?: unknown; seq?: unknown };
+      if ((!stored.streamKey || stored.streamKey === currentStreamKey) && typeof stored.seq === 'number') {
+        cursor = stored.seq;
+      }
+    }
     if (cursor > session.lastSeq) cursor = 0;
     const records = store.readCommittedLedgerEvents(id, { afterSeq: cursor, throughSeq: session.lastSeq })
       .filter((event) => event.payload.maintenance !== true);
     if (records.length === 0) {
-      if (value === undefined) {
+      if (rawValue === undefined) {
         ledger.syncSession(session);
+        store.setPluginStorageValue(scope, instanceId, streamCursorKey(id), currentStreamKey);
         store.setPluginStorageValue(scope, instanceId, cursorKey(id), 0);
       } else if (startupMirrors.has(id) && cursor > 0) {
         ledger.syncSession(session);
@@ -61,6 +76,7 @@ export function startTaskLedgerProjection(options: {
         } else {
           ledger.syncSession(current);
         }
+        store.setPluginStorageValue(scope, instanceId, streamCursorKey(id), currentStreamKey);
         store.setPluginStorageValue(scope, instanceId, cursorKey(id), event.seq);
         return updated;
       });
@@ -99,6 +115,7 @@ export function startTaskLedgerProjection(options: {
       for (const id of deleted) {
         store.runInImmediateTransaction(() => {
           store.deletePluginStorageValue(scope, instanceId, cursorKey(id));
+          store.deletePluginStorageValue(scope, instanceId, streamCursorKey(id));
           if (instanceId !== 'core.task-ledger') store.deletePluginStorageValue(id, instanceId, 'task-state');
         });
         deleted.delete(id);
@@ -122,7 +139,19 @@ export function startTaskLedgerProjection(options: {
     }
   }
 
-  const unsubChanges = changes.onCommitted(() => schedule());
+  const unsubChanges = changes.onCommitted((_latestSeq, ev) => {
+    if (ev?.stream) {
+      const nextKey = sessionDataStreamKey(ev.stream);
+      if (nextKey !== currentStreamKey) {
+        currentStreamKey = nextKey;
+        changeSeq = 0;
+      }
+      if (ev.sessionId && ev.kind === 'events_committed') {
+        pending.add(ev.sessionId);
+      }
+    }
+    schedule();
+  });
   const unsubEvents = events.subscribeEvents((event) => {
     if (!terminalEvents.has(event.type) && !syncEvents.has(event.type)) return;
     pending.add(event.sessionId);
