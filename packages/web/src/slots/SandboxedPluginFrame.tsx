@@ -430,10 +430,10 @@ export function SandboxedPluginFrame({
           type: 'hm:context', session: sessionDtoRef.current, props: safePropsRef.current,
         } satisfies PluginSlotBridgeHostMessage, '*');
       }}
-      className={slot === 'workspace.pages'
+      className={slot === 'workspace.pages' || slot === 'session.stage.embedded'
         ? 'block size-full border-0 bg-transparent'
         : 'w-full rounded-xl border border-[var(--border-hairline)] bg-transparent'}
-      style={slot === 'workspace.pages' ? undefined : { height: `${height}px` }}
+      style={slot === 'workspace.pages' || slot === 'session.stage.embedded' ? undefined : { height: `${height}px` }}
     />
   );
 }

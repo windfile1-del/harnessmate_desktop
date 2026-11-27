@@ -21,8 +21,12 @@ import {
   type NativeApiErrorCode,
   type NativeControlTargetType,
 } from '@harnessmate/protocol';
+import { PluginApiError } from '@harnessmate/plugin-api';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { resolveAgyRuntimeProvider } from '../../../../core/agy-peer-router.js';
 import type { SessionManager } from '../../../../core/session-manager.js';
+import type { HarnessMateStore } from '../../../../db/sqlite.js';
+import type { PluginManager } from '../../../../plugins/plugin-manager.js';
 import type { HarnessRegistry } from '../../../registry.js';
 import { isLoopbackAddress } from '../../../../server/auth.js';
 import { AgyAdapter } from '../../agy-driver.js';
@@ -37,7 +41,10 @@ import type { AgyNativeRuntimeRegistry } from './registry.js';
 export interface NativeRoutesDeps {
   readonly sessionManager: SessionManager;
   readonly harnessRegistry: HarnessRegistry;
-  readonly nativeRegistry: AgyNativeRuntimeRegistry;
+  /** Optional direct registry for standalone unit tests; production daemon routes via `pluginManager`. */
+  readonly nativeRegistry?: AgyNativeRuntimeRegistry;
+  readonly pluginManager?: PluginManager;
+  readonly store?: HarnessMateStore;
 }
 
 function sendNativeError(
@@ -78,11 +85,118 @@ function checkSchemaGate(nativeRegistry: AgyNativeRuntimeRegistry, reply: Fastif
   return true;
 }
 
+function mapPeerErrorToNativeReply(
+  reply: FastifyReply,
+  error: { code: string; message: string },
+) {
+  switch (error.code) {
+    case 'plugin_disabled':
+    case 'E_PLUGIN_DISABLED':
+      return reply.code(409).send({ code: 'E_PLUGIN_DISABLED', error: error.message });
+    case 'NATIVE_SCHEMA_NEWER_THAN_READER':
+      return sendNativeError(reply, 503, 'NATIVE_SCHEMA_NEWER_THAN_READER', error.message, { retryable: false });
+    case 'NATIVE_RUNTIME_DISABLED':
+      return sendNativeError(reply, 503, 'NATIVE_RUNTIME_DISABLED', error.message);
+    case 'NOT_FOUND':
+    case 'not_found':
+      return sendNativeError(reply, 404, 'NOT_FOUND', error.message);
+    case 'UNSUPPORTED_ACTION':
+    case 'not_supported':
+      return sendNativeError(reply, 422, 'UNSUPPORTED_ACTION', error.message);
+    case 'CONSUMER_PROVENANCE_BLOCKED':
+    case 'permission_denied':
+      return sendNativeError(reply, 403, 'CONSUMER_PROVENANCE_BLOCKED', error.message);
+    case 'STALE_BINDING':
+      return sendNativeError(reply, 409, 'STALE_BINDING', error.message, { retryable: true });
+    case 'IDEMPOTENCY_CONFLICT':
+      return sendNativeError(reply, 409, 'IDEMPOTENCY_CONFLICT', error.message);
+    case 'ALREADY_RESOLVED':
+      return sendNativeError(reply, 409, 'ALREADY_RESOLVED', error.message);
+    case 'BUSY':
+      return sendNativeError(reply, 409, 'BUSY', error.message, { retryable: true });
+    case 'DELIVERY_UNKNOWN':
+      return sendNativeError(reply, 409, 'DELIVERY_UNKNOWN', error.message, { retryable: false });
+    default:
+      return sendNativeError(reply, 400, 'INVALID_REQUEST', error.message);
+  }
+}
+
+function sendPeerNativePayload(reply: FastifyReply, payload: Record<string, unknown>) {
+  const errObj = payload.__nativeError as
+    | {
+        statusCode: number;
+        code: NativeApiErrorCode;
+        message: string;
+        retryable?: boolean;
+        details?: Record<string, string | number | boolean | null>;
+      }
+    | undefined;
+  if (errObj) {
+    return sendNativeError(reply, errObj.statusCode, errObj.code, errObj.message, {
+      retryable: errObj.retryable,
+      details: errObj.details,
+    });
+  }
+  if (typeof payload.statusCode === 'number' && 'body' in payload) {
+    return reply.code(payload.statusCode).send(payload.body);
+  }
+  return payload;
+}
+
+function resolvePeerRuntimeForRoute(
+  deps: NativeRoutesDeps,
+  sessionId: string,
+  reply: FastifyReply,
+) {
+  if (!deps.pluginManager) return null;
+  const session = deps.sessionManager.getSession(sessionId);
+  if (!session) {
+    sendNativeError(reply, 404, 'NOT_FOUND', 'Session not found');
+    return { handled: true as const };
+  }
+  if (session.harnessKind !== 'agy') {
+    sendNativeError(
+      reply,
+      422,
+      'UNSUPPORTED_ACTION',
+      'Native AGY runtime routes are only available for AGY sessions',
+    );
+    return { handled: true as const };
+  }
+  try {
+    const adapter = deps.harnessRegistry.get(session.harnessId);
+    const provider = resolveAgyRuntimeProvider(deps.pluginManager, {
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+      driverProviderInstanceId: adapter?.providerInstanceId,
+      store: deps.store,
+      allowSingleCandidate: true,
+    });
+    return { handled: false as const, session, provider };
+  } catch (err) {
+    if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+      reply.code(409).send({ code: 'E_PLUGIN_DISABLED', error: err.message });
+      return { handled: true as const };
+    }
+    sendNativeError(
+      reply,
+      503,
+      'NATIVE_RUNTIME_DISABLED',
+      err instanceof Error ? err.message : 'AGY native runtime provider is unavailable',
+    );
+    return { handled: true as const };
+  }
+}
+
 function resolveAgySessionContext(
   deps: NativeRoutesDeps,
   sessionId: string,
   reply: FastifyReply,
 ) {
+  if (!deps.nativeRegistry) {
+    sendNativeError(reply, 503, 'NATIVE_RUNTIME_DISABLED', 'Native AGY runtime is not mounted');
+    return null;
+  }
   if (!checkSchemaGate(deps.nativeRegistry, reply)) return null;
   const session = deps.sessionManager.getSession(sessionId);
   if (!session) {
@@ -101,6 +215,7 @@ function resolveAgySessionContext(
   const adapter = deps.harnessRegistry.get(session.harnessId);
   return {
     session,
+    nativeRegistry: deps.nativeRegistry,
     adapter: adapter instanceof AgyAdapter ? adapter : null,
   };
 }
@@ -157,10 +272,20 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   // ── GET /api/v1/sessions/:id/native/snapshot ─────────────────────────
   app.get('/api/v1/sessions/:id/native/snapshot', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      const res = await peer.provider.service.getSnapshot({
+        sessionId: peer.session.id,
+        harnessId: peer.session.harnessId,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return res.value.snapshot;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const projection = deps.nativeRegistry.getProjectionForSession(
+    const projection = ctx.nativeRegistry.getProjectionForSession(
       ctx.session.id,
       ctx.session.harnessId,
     );
@@ -175,19 +300,74 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   // ── GET /api/v1/sessions/:id/native/capabilities ─────────────────────
   app.get('/api/v1/sessions/:id/native/capabilities', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      const res = await peer.provider.service.getCapabilities({
+        sessionId: peer.session.id,
+        harnessId: peer.session.harnessId,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return res.value.capabilities;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    return deps.nativeRegistry.getCapabilitiesForSession(ctx.session.id, ctx.session.harnessId);
+    return ctx.nativeRegistry.getCapabilitiesForSession(ctx.session.id, ctx.session.harnessId);
   });
 
   // ── GET /api/v1/sessions/:id/native/events ───────────────────────────
   app.get('/api/v1/sessions/:id/native/events', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const query = NativeEventsQuerySchema.safeParse(request.query ?? {});
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      if (!query.success) {
+        return sendNativeError(
+          reply,
+          400,
+          'INVALID_REQUEST',
+          query.error.issues[0]?.message ?? 'Invalid native events query parameters',
+        );
+      }
+      const res = await peer.provider.service.readEvents({
+        sessionId: peer.session.id,
+        harnessId: peer.session.harnessId,
+        afterSeq: query.data.after,
+        limit: query.data.limit,
+        cursor: query.data.cursor,
+        generation: query.data.generation,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      const data = res.value as {
+        resyncRequired?: boolean;
+        reason?: string;
+        latestSeq?: number;
+        currentGeneration?: string | null;
+      };
+      if (data.resyncRequired) {
+        return sendNativeError(
+          reply,
+          410,
+          'RESYNC_REQUIRED',
+          `Native event cursor requires snapshot resync (${data.reason ?? 'cursor_invalid'})`,
+          {
+            retryable: true,
+            details: {
+              reason: data.reason ?? 'cursor_invalid',
+              latestSeq: data.latestSeq ?? 0,
+              currentGeneration: data.currentGeneration ?? null,
+            },
+          },
+        );
+      }
+      const { stream: _stream, ...rest } = res.value;
+      return rest;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const query = NativeEventsQuerySchema.safeParse(request.query ?? {});
     if (!query.success) {
       return sendNativeError(
         reply,
@@ -197,7 +377,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const res = deps.nativeRegistry.readEventsForSession(ctx.session.id, ctx.session.harnessId, {
+    const res = ctx.nativeRegistry.readEventsForSession(ctx.session.id, ctx.session.harnessId, {
       afterSeq: query.data.after,
       limit: query.data.limit,
       cursor: query.data.cursor,
@@ -237,10 +417,26 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   // ── GET /api/v1/sessions/:id/native/activity/:activityId/timeline ────
   app.get('/api/v1/sessions/:id/native/activity/:activityId/timeline', async (request, reply) => {
     const { id, activityId } = request.params as { id: string; activityId: string };
+    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      if (!query.success) {
+        return sendNativeError(reply, 400, 'INVALID_REQUEST', query.error.issues[0]?.message ?? 'Invalid timeline query');
+      }
+      const res = await peer.provider.service.readTimeline({
+        sessionId: peer.session.id,
+        scopeKind: 'activity',
+        scopeId: activityId,
+        pageToken: query.data.pageToken,
+        limit: query.data.limit,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return res.value;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
     if (!query.success) {
       return sendNativeError(
         reply,
@@ -250,12 +446,12 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const projection = deps.nativeRegistry.getProjectionForSession(
+    const projection = ctx.nativeRegistry.getProjectionForSession(
       ctx.session.id,
       ctx.session.harnessId,
     );
-    const flags = deps.nativeRegistry.getFeatureFlags();
-    const reader = flags.enabled ? deps.nativeRegistry.getTimelineReaderPort() : null;
+    const flags = ctx.nativeRegistry.getFeatureFlags();
+    const reader = flags.enabled ? ctx.nativeRegistry.getTimelineReaderPort() : null;
     const page = reader
       ? reader.readTimeline({
           binding: projection.binding,
@@ -292,10 +488,26 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   // ── GET /api/v1/sessions/:id/native/agents/:agentId/timeline ─────────
   app.get('/api/v1/sessions/:id/native/agents/:agentId/timeline', async (request, reply) => {
     const { id, agentId } = request.params as { id: string; agentId: string };
+    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      if (!query.success) {
+        return sendNativeError(reply, 400, 'INVALID_REQUEST', query.error.issues[0]?.message ?? 'Invalid timeline query');
+      }
+      const res = await peer.provider.service.readTimeline({
+        sessionId: peer.session.id,
+        scopeKind: 'agent',
+        scopeId: agentId,
+        pageToken: query.data.pageToken,
+        limit: query.data.limit,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return res.value;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
     if (!query.success) {
       return sendNativeError(
         reply,
@@ -305,12 +517,12 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const projection = deps.nativeRegistry.getProjectionForSession(
+    const projection = ctx.nativeRegistry.getProjectionForSession(
       ctx.session.id,
       ctx.session.harnessId,
     );
-    const flags = deps.nativeRegistry.getFeatureFlags();
-    const reader = flags.enabled ? deps.nativeRegistry.getTimelineReaderPort() : null;
+    const flags = ctx.nativeRegistry.getFeatureFlags();
+    const reader = flags.enabled ? ctx.nativeRegistry.getTimelineReaderPort() : null;
     const page = reader
       ? reader.readTimeline({
           binding: projection.binding,
@@ -353,10 +565,30 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         workflowId: string;
         resource: string;
       };
+      const parsedResource = NativeWorkflowResourceKindSchema.safeParse(resource);
+      const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
+      const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+      if (peer) {
+        if (peer.handled) return;
+        if (!parsedResource.success) {
+          return sendNativeError(reply, 400, 'INVALID_REQUEST', 'Workflow resource must be one of: board, phases, logs, artifacts');
+        }
+        if (!query.success) {
+          return sendNativeError(reply, 400, 'INVALID_REQUEST', query.error.issues[0]?.message ?? 'Invalid workflow resource query');
+        }
+        const res = await peer.provider.service.readWorkflowResource({
+          sessionId: peer.session.id,
+          workflowId,
+          resource: parsedResource.data,
+          pageToken: query.data.pageToken,
+          limit: query.data.limit,
+        });
+        if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+        return sendPeerNativePayload(reply, res.value);
+      }
       const ctx = resolveAgySessionContext(deps, id, reply);
       if (!ctx) return;
 
-      const parsedResource = NativeWorkflowResourceKindSchema.safeParse(resource);
       if (!parsedResource.success) {
         return sendNativeError(
           reply,
@@ -366,7 +598,6 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         );
       }
 
-      const query = NativeTimelineQuerySchema.safeParse(request.query ?? {});
       if (!query.success) {
         return sendNativeError(
           reply,
@@ -376,13 +607,13 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         );
       }
 
-      const projection = deps.nativeRegistry.getProjectionForSession(
+      const projection = ctx.nativeRegistry.getProjectionForSession(
         ctx.session.id,
         ctx.session.harnessId,
       );
       const parsedWorkflowId = asWorkflowId(workflowId);
-      const flags = deps.nativeRegistry.getFeatureFlags();
-      const reader = flags.enabled ? deps.nativeRegistry.getWorkflowResourceReaderPort() : null;
+      const flags = ctx.nativeRegistry.getFeatureFlags();
+      const reader = flags.enabled ? ctx.nativeRegistry.getWorkflowResourceReaderPort() : null;
       const page = reader
         ? reader.readWorkflowResource({
             binding: projection.binding,
@@ -432,10 +663,27 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   app.post('/api/v1/sessions/:id/native/commands', async (request, reply) => {
     if (!requireLocalWriteBoundary(request, reply)) return;
     const { id } = request.params as { id: string };
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      const res = await peer.provider.service.submitCommand({
+        sessionId: peer.session.id,
+        body: (request.body ?? {}) as Record<string, unknown>,
+        provenance: {
+          channel: 'human_direct',
+          actor: 'desktop',
+          issuedAt: Date.now(),
+          reason: 'POST /native/commands',
+          verifiedByHost: true,
+        },
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return sendPeerNativePayload(reply, res.value);
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const flags = deps.nativeRegistry.getFeatureFlags();
+    const flags = ctx.nativeRegistry.getFeatureFlags();
     if (!flags.enabled || !flags.nativeCommands) {
       return sendNativeError(
         reply,
@@ -471,7 +719,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       throw err;
     }
 
-    const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+    const binding = ctx.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
     if (!binding || binding.generation !== parsed.data.bindingGeneration) {
       return sendNativeError(
         reply,
@@ -485,7 +733,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const caps = deps.nativeRegistry.getCapabilitiesForSession(
+    const caps = ctx.nativeRegistry.getCapabilitiesForSession(
       ctx.session.id,
       ctx.session.harnessId,
     );
@@ -502,7 +750,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const router = deps.nativeRegistry.getCommandRouterPort();
+    const router = ctx.nativeRegistry.getCommandRouterPort();
     if (!router) {
       return sendNativeError(
         reply,
@@ -538,7 +786,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
 
     let claimed;
     try {
-      claimed = deps.nativeRegistry.persistence.claimIdempotentReceipt({
+      claimed = ctx.nativeRegistry.persistence.claimIdempotentReceipt({
         binding,
         kind: 'command',
         idempotencyKey: parsed.data.idempotencyKey,
@@ -595,7 +843,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         receiptId: claimed.receipt.receiptId,
       });
       const validatedResponse = NativeCommandResponseSchema.parse(rawResponse);
-      const completed = deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      const completed = ctx.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'completed',
         validatedResponse,
@@ -610,7 +858,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         .code(validatedResponse.kind === 'accepted' ? 202 : 200)
         .send(validatedResponse);
     } catch {
-      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      ctx.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'delivery_unknown',
         { error: 'command_execution_failed' },
@@ -632,10 +880,20 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
   app.post('/api/v1/sessions/:id/native/control', async (request, reply) => {
     if (!requireLocalWriteBoundary(request, reply)) return;
     const { id } = request.params as { id: string };
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      const res = await peer.provider.service.dispatchControl({
+        sessionId: peer.session.id,
+        body: (request.body ?? {}) as Record<string, unknown>,
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return sendPeerNativePayload(reply, res.value);
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
 
-    const flags = deps.nativeRegistry.getFeatureFlags();
+    const flags = ctx.nativeRegistry.getFeatureFlags();
     if (!flags.enabled || !flags.nativeCommands) {
       return sendNativeError(
         reply,
@@ -655,7 +913,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+    const binding = ctx.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
     if (!binding || binding.generation !== parsed.data.generation) {
       return sendNativeError(
         reply,
@@ -669,7 +927,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
     }
 
-    const router = deps.nativeRegistry.getCommandRouterPort();
+    const router = ctx.nativeRegistry.getCommandRouterPort();
     if (!router) {
       return sendNativeError(
         reply,
@@ -681,7 +939,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
 
     // R2 Closed-Loop Control Authorization:
     // 1. Verify current capability catalog actually opens control for this target type & action
-    const caps = deps.nativeRegistry.getCapabilitiesForSession(
+    const caps = ctx.nativeRegistry.getCapabilitiesForSession(
       ctx.session.id,
       ctx.session.harnessId,
     );
@@ -699,7 +957,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       if (parsed.data.target.id !== binding.runtimeId) {
         return sendNativeError(reply, 404, 'NOT_FOUND', 'Control target runtime does not match session binding');
       }
-      const storedBinding = deps.nativeRegistry.persistence.getBinding(binding.runtimeId);
+      const storedBinding = ctx.nativeRegistry.persistence.getBinding(binding.runtimeId);
       if (!storedBinding || storedBinding.asOfSeq !== parsed.data.expectedRevision) {
         return sendNativeError(
           reply,
@@ -713,7 +971,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         );
       }
     } else {
-      const entityMeta = deps.nativeRegistry.persistence.getEntityMeta(
+      const entityMeta = ctx.nativeRegistry.persistence.getEntityMeta(
         binding.runtimeId,
         parsed.data.target.type,
         parsed.data.target.id,
@@ -758,7 +1016,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
 
     let claimed;
     try {
-      claimed = deps.nativeRegistry.persistence.claimIdempotentReceipt({
+      claimed = ctx.nativeRegistry.persistence.claimIdempotentReceipt({
         binding,
         kind: 'control',
         idempotencyKey: parsed.data.idempotencyKey,
@@ -815,7 +1073,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         receiptId: claimed.receipt.receiptId,
       });
       const validatedResponse = NativeControlResponseSchema.parse(rawResponse);
-      const completed = deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      const completed = ctx.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'completed',
         validatedResponse,
@@ -828,7 +1086,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       }
       return reply.code(200).send(validatedResponse);
     } catch {
-      deps.nativeRegistry.persistence.completeIdempotentReceipt(
+      ctx.nativeRegistry.persistence.completeIdempotentReceipt(
         claimed.receipt.receiptId,
         'delivery_unknown',
         { error: 'control_execution_failed' },
@@ -851,18 +1109,28 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       return sendNativeError(reply, 403, 'FORBIDDEN', 'Native request details require local desktop access');
     }
     const { id } = request.params as { id: string };
+    const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+    if (peer) {
+      if (peer.handled) return;
+      const res = await peer.provider.service.getRequestDetails({
+        sessionId: peer.session.id,
+        requestId: '',
+      });
+      if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+      return res.value;
+    }
     const ctx = resolveAgySessionContext(deps, id, reply);
     if (!ctx) return;
-    const flags = deps.nativeRegistry.getFeatureFlags();
+    const flags = ctx.nativeRegistry.getFeatureFlags();
     if (!flags.enabled || !flags.nativePermissions) {
       return sendNativeError(reply, 503, 'NATIVE_RUNTIME_DISABLED', 'Native request routing is disabled');
     }
-    const binding = deps.nativeRegistry.getActiveBinding(id, ctx.session.harnessId);
+    const binding = ctx.nativeRegistry.getActiveBinding(id, ctx.session.harnessId);
     if (!binding) return sendNativeError(reply, 404, 'NOT_FOUND', 'No native binding for this session');
     return NativeRequestDetailsResponseSchema.parse({
       schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
       binding,
-      requests: deps.nativeRegistry.getPermissionPort()?.listRequestDetails?.(binding) ?? [],
+      requests: ctx.nativeRegistry.getPermissionPort()?.listRequestDetails?.(binding) ?? [],
     });
   });
 
@@ -872,10 +1140,21 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
     async (request, reply) => {
       if (!requireLocalWriteBoundary(request, reply)) return;
       const { id, approvalId } = request.params as { id: string; approvalId: string };
+      const peer = resolvePeerRuntimeForRoute(deps, id, reply);
+      if (peer) {
+        if (peer.handled) return;
+        const res = await peer.provider.service.resolveNativeRequest({
+          sessionId: peer.session.id,
+          requestId: approvalId,
+          body: (request.body ?? {}) as Record<string, unknown>,
+        });
+        if (!res.ok) return mapPeerErrorToNativeReply(reply, res.error);
+        return sendPeerNativePayload(reply, res.value);
+      }
       const ctx = resolveAgySessionContext(deps, id, reply);
       if (!ctx) return;
 
-      const flags = deps.nativeRegistry.getFeatureFlags();
+      const flags = ctx.nativeRegistry.getFeatureFlags();
       if (!flags.enabled || !flags.nativePermissions) {
         return sendNativeError(
           reply,
@@ -895,7 +1174,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         );
       }
 
-      const binding = deps.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
+      const binding = ctx.nativeRegistry.getActiveBinding(ctx.session.id, ctx.session.harnessId);
       if (!binding || binding.generation !== parsed.data.generation) {
         return sendNativeError(
           reply,
@@ -909,7 +1188,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         );
       }
 
-      const permissionPort = deps.nativeRegistry.getPermissionPort();
+      const permissionPort = ctx.nativeRegistry.getPermissionPort();
       if (!permissionPort) {
         return sendNativeError(
           reply,
@@ -929,7 +1208,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
       );
       if (!matchingPending) {
         const existingReceipt =
-          deps.nativeRegistry.persistence.getApprovalReceiptByApprovalId(approvalId);
+          ctx.nativeRegistry.persistence.getApprovalReceiptByApprovalId(approvalId);
         if (existingReceipt && existingReceipt.sessionId === ctx.session.id) {
           return sendNativeError(
             reply,
@@ -992,7 +1271,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
 
       // Ensure durable receipt exists and acquire authoritative DB CAS BEFORE calling permissionPort!
       try {
-        deps.nativeRegistry.persistence.createPendingApprovalReceipt({
+        ctx.nativeRegistry.persistence.createPendingApprovalReceipt({
           binding,
           approvalId,
         });
@@ -1003,7 +1282,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         throw err;
       }
 
-      const cas = deps.nativeRegistry.persistence.claimApprovalReceiptCas({
+      const cas = ctx.nativeRegistry.persistence.claimApprovalReceiptCas({
         approvalId,
         expectedGeneration: binding.generation,
         expectedSessionId: ctx.session.id,
@@ -1038,7 +1317,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         });
 
         const finalState = outcome.receiptState;
-        const transition = deps.nativeRegistry.persistence.transitionApprovalReceiptState(
+        const transition = ctx.nativeRegistry.persistence.transitionApprovalReceiptState(
           cas.receipt.receiptId,
           ['claimed'],
           finalState,
@@ -1064,7 +1343,7 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         }
         return reply.code(200).send(body);
       } catch {
-        deps.nativeRegistry.persistence.transitionApprovalReceiptState(
+        ctx.nativeRegistry.persistence.transitionApprovalReceiptState(
           cas.receipt.receiptId,
           ['claimed'],
           'delivery_unknown',

@@ -40,8 +40,7 @@ import type {
   InstalledPluginInfo,
   Session,
 } from '@harnessmate/protocol';
-import { AgyAdapter } from '../../harnesses/agy/agy-driver.js';
-import { evaluateAgyConsumerProvenance, mintAgyDispatchProvenance } from '../../harnesses/agy/native/wiring/provenance.js';
+import { AGY_RUNTIME_CONTRACT, type AgyRuntimeServiceV1 } from '@harnessmate/plugin-api';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type {
@@ -284,13 +283,28 @@ export class IsolatedPluginManager {
         });
         const adapter = resolved?.adapter ?? registry.get(input.harnessId);
         if (!adapter) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `Harness 实例 ${input.harnessId} 不存在`);
-        const decision = evaluateAgyConsumerProvenance({
-          instanceId: adapter.id,
-          driverId: adapter.driverId ?? adapter.kind,
-          profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
-        }, mintAgyDispatchProvenance('plugin_automated', 'plugin', `harnesses.openSession:${instanceId}`));
-        if (!decision.allowed) {
-          throw new PluginApiError('E_PERMISSION_DENIED', decision.reason ?? 'AGY dispatch provenance denied');
+        const targetDriverId = adapter.driverId ?? adapter.kind;
+        if (targetDriverId === 'agy' && adapter.providerInstanceId) {
+          const agyRuntime = this.opts.host.getServiceByInstance<AgyRuntimeServiceV1>(
+            adapter.providerInstanceId,
+            AGY_RUNTIME_CONTRACT,
+          );
+          if (agyRuntime?.verifyDispatchProvenance) {
+            const check = await agyRuntime.verifyDispatchProvenance({
+              harnessId: adapter.id,
+              driverId: targetDriverId,
+              provenance: {
+                channel: 'plugin_automated',
+                actor: 'plugin',
+                issuedAt: Date.now(),
+                reason: `harnesses.openSession:${instanceId}`,
+                verifiedByHost: true,
+              },
+            });
+            if (check.ok && !check.value.allowed) {
+              throw new PluginApiError('E_PERMISSION_DENIED', check.value.reason ?? 'AGY dispatch provenance denied');
+            }
+          }
         }
         const leaseId = randomUUID();
         const handle = await adapter.createSession(input.config);
@@ -1009,9 +1023,6 @@ export class IsolatedPluginManager {
       throw new PluginApiError('E_INVALID_INPUT', `非法的 Harness 驱动 ID: ${String(driver?.driverId ?? '')}`);
     }
     const registry = this.getRegistry();
-    if (registry?.isReserved(driverId) || driverId === 'agy') {
-      throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖保留 AGY 原生驱动: ${driverId}`);
-    }
     if (driver.harnessId?.trim()) {
       const requestedHarnessId = driver.harnessId.trim();
       const existingOwner = registry?.getEntry(requestedHarnessId);
@@ -1035,9 +1046,9 @@ export class IsolatedPluginManager {
       return requested;
     }
     const driverId = desc.driverId.trim();
-    // Built-in categories (codex/claude/acp) always receive deterministic provider-scoped harnessId
+    // Built-in categories (codex/claude/acp/agy) always receive deterministic provider-scoped harnessId
     // so external implementations coexist with default plugins independent of load order.
-    if (driverId === 'codex' || driverId === 'claude' || driverId === 'acp') {
+    if (driverId === 'codex' || driverId === 'claude' || driverId === 'acp' || driverId === 'agy') {
       return `${entry.instanceId}:${driverId}`;
     }
     const existingEntry = registry.getEntry(driverId);

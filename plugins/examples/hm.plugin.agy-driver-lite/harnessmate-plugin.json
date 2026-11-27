@@ -1,0 +1,48 @@
+{
+  "id": "hm.plugin.agy-driver-lite",
+  "name": "外部 AGY 同类驱动与工作台样例 (Lite)",
+  "version": "1.0.0",
+  "description": "纯公开 SDK 实现的外部 AGY 同类驱动、账号、原生协议回放与轻量工作台插件，用于验证 AGY 驱动类别无内核保留、多工作区/多账号并行及外部同类可替换性。",
+  "author": "HarnessMate Examples",
+  "category": "harness",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "harness.driver.v1",
+    "harness.driver.agy.v1",
+    "agy.runtime.v1",
+    "agy.accounts.v1",
+    "agy.workbench.v1"
+  ],
+  "permissions": [
+    "harness:driver:register",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "session.stage.embedded",
+        "id": "agy-lite-workbench",
+        "title": "AGY Lite Workbench",
+        "ui": "ui/workbench.html"
+      },
+      {
+        "slot": "workspace.pages",
+        "id": "agy-lite-page",
+        "title": "AGY Lite",
+        "ui": "ui/workbench.html"
+      },
+      {
+        "slot": "composer.actions",
+        "id": "agy-lite-mode",
+        "title": "AGY Lite Mode",
+        "ui": "ui/composer.html",
+        "order": 60,
+        "height": 48
+      }
+    ]
+  }
+}

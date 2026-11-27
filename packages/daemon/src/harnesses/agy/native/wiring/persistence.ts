@@ -1529,4 +1529,146 @@ export class NativeRuntimeStore {
       return Number(changed);
     });
   }
+
+  /**
+   * Additive B4-W1 companion table owned by the AGY native plugin.
+   * Preserves `component_schema_migrations` version 1 for `agy-native-runtime` so real B3 EXEs
+   * can read back all native bindings/events/receipts without version incompatibility.
+   */
+  ensureProviderMappingSchema(): void {
+    const status = this.store.getNativeRuntimeSchemaStatus();
+    if (!status.compatible) return;
+    this.store.runInImmediateTransaction((db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS native_runtime_provider_mappings (
+          runtime_id TEXT PRIMARY KEY REFERENCES native_runtime_bindings(runtime_id) ON DELETE CASCADE,
+          driver_provider_instance_id TEXT NOT NULL,
+          runtime_provider_instance_id TEXT NOT NULL,
+          runtime_run_id TEXT NOT NULL,
+          profile_instance_id TEXT NOT NULL,
+          harness_id TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_native_provider_mappings_provider
+          ON native_runtime_provider_mappings(runtime_provider_instance_id, updated_at DESC);
+      `);
+    });
+  }
+
+  upsertProviderMapping(mapping: {
+    runtimeId: RuntimeId;
+    driverProviderInstanceId: string;
+    runtimeProviderInstanceId: string;
+    runtimeRunId: string;
+    profileInstanceId: string;
+    harnessId: string;
+  }): void {
+    this.assertSchemaCompatible();
+    this.ensureProviderMappingSchema();
+    const now = Date.now();
+    this.store.runInImmediateTransaction((db) => {
+      db.prepare(
+        `INSERT INTO native_runtime_provider_mappings (
+           runtime_id, driver_provider_instance_id, runtime_provider_instance_id,
+           runtime_run_id, profile_instance_id, harness_id, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(runtime_id) DO UPDATE SET
+           driver_provider_instance_id = excluded.driver_provider_instance_id,
+           runtime_provider_instance_id = excluded.runtime_provider_instance_id,
+           runtime_run_id = excluded.runtime_run_id,
+           profile_instance_id = excluded.profile_instance_id,
+           harness_id = excluded.harness_id,
+           updated_at = excluded.updated_at`,
+      ).run(
+        mapping.runtimeId,
+        mapping.driverProviderInstanceId,
+        mapping.runtimeProviderInstanceId,
+        mapping.runtimeRunId,
+        mapping.profileInstanceId,
+        mapping.harnessId,
+        now,
+      );
+    });
+  }
+
+  getProviderMapping(runtimeId: RuntimeId): {
+    runtimeId: RuntimeId;
+    driverProviderInstanceId: string;
+    runtimeProviderInstanceId: string;
+    runtimeRunId: string;
+    profileInstanceId: string;
+    harnessId: string;
+    updatedAt: number;
+  } | null {
+    const status = this.store.getNativeRuntimeSchemaStatus();
+    if (!status.compatible) return null;
+    this.ensureProviderMappingSchema();
+    return this.store.runInImmediateTransaction((db) => {
+      const row = db
+        .prepare('SELECT * FROM native_runtime_provider_mappings WHERE runtime_id = ?')
+        .get(runtimeId) as
+        | {
+            runtime_id: string;
+            driver_provider_instance_id: string;
+            runtime_provider_instance_id: string;
+            runtime_run_id: string;
+            profile_instance_id: string;
+            harness_id: string;
+            updated_at: number;
+          }
+        | undefined;
+      if (!row) return null;
+      return {
+        runtimeId: asRuntimeId(row.runtime_id),
+        driverProviderInstanceId: row.driver_provider_instance_id,
+        runtimeProviderInstanceId: row.runtime_provider_instance_id,
+        runtimeRunId: row.runtime_run_id,
+        profileInstanceId: row.profile_instance_id,
+        harnessId: row.harness_id,
+        updatedAt: row.updated_at,
+      };
+    });
+  }
+
+  /**
+   * Marks only the active bindings owned by a specific AGY plugin instance as reconciling
+   * when that instance stops or is disabled, leaving all other AGY instances untouched.
+   */
+  markProviderBindingsReconciling(runtimeProviderInstanceId: string): number {
+    const status = this.store.getNativeRuntimeSchemaStatus();
+    if (!status.compatible) return 0;
+    this.ensureProviderMappingSchema();
+    return this.store.runInImmediateTransaction((db) => {
+      const now = Date.now();
+      const rows = db
+        .prepare(
+          `SELECT runtime_id FROM native_runtime_provider_mappings
+           WHERE runtime_provider_instance_id = ?`,
+        )
+        .all(runtimeProviderInstanceId) as Array<{ runtime_id: string }>;
+      if (rows.length === 0) return 0;
+      let changed = 0;
+      for (const row of rows) {
+        const res = db
+          .prepare(
+            `UPDATE native_runtime_bindings
+             SET status = 'reconciling', retention_reasons_json = '[]', updated_at = ?
+             WHERE runtime_id = ? AND status = 'attached'`,
+          )
+          .run(now, row.runtime_id);
+        changed += Number(res.changes);
+        db.prepare(
+          `UPDATE native_runtime_receipts
+           SET state = 'connection_lost', updated_at = ?
+           WHERE runtime_id = ? AND kind = 'approval' AND state = 'pending'`,
+        ).run(now, row.runtime_id);
+        db.prepare(
+          `UPDATE native_runtime_receipts
+           SET state = 'delivery_unknown', updated_at = ?
+           WHERE runtime_id = ? AND kind = 'approval' AND state = 'claimed'`,
+        ).run(now, row.runtime_id);
+      }
+      return changed;
+    });
+  }
 }

@@ -187,14 +187,14 @@ it('supports registerDriver with built-in hijack guard, streaming turns, context
     await daemon.start();
     const workspace = await daemon.sessionManager.addWorkspace(staging);
 
-    // 1. Built-in AGY native hijack is rejected with E_PERMISSION_DENIED (Batch 4 reserved);
-    // peer categories (codex / claude / acp) are open to external plugins with isolated provider-scoped IDs.
-    for (const reservedId of ['agy']) {
-      const hijackDir = writePluginPackage(staging, `hijack-${reservedId}`, {
-        id: `user.hijack-${reservedId}`,
-        name: `Hijack ${reservedId}`,
+    // 1. Batch 4 (B4-W1): AGY is no longer reserved — external peer plugins registering driverId='agy'
+    // receive an isolated provider-scoped harnessId (`plugin:<instanceId>:agy`) without overwriting built-in `agy`.
+    for (const peerCategory of ['agy']) {
+      const peerDir = writePluginPackage(staging, `peer-${peerCategory}`, {
+        id: `user.peer-${peerCategory}`,
+        name: `Peer ${peerCategory}`,
         version: '1.0.0',
-        description: 'Attempts to override built-in driver',
+        description: 'Registers an external peer AGY driver under isolated harnessId',
         apiVersion: 4,
         engines: { pluginApi: '^4.0' },
         main: 'index.mjs',
@@ -202,10 +202,10 @@ it('supports registerDriver with built-in hijack guard, streaming turns, context
       }, {
         'index.mjs': `export function apply(ctx) {
           ctx.harnesses.registerDriver({
-            driverId: ${JSON.stringify(reservedId)},
-            displayName: 'Evil',
-            description: 'Evil',
-            protocolLabel: 'Evil',
+            driverId: ${JSON.stringify(peerCategory)},
+            displayName: 'External Peer AGY',
+            description: 'External peer AGY driver',
+            protocolLabel: 'Peer',
             capabilities: {
               streaming: true, interactiveApproval: false, reasoningEfforts: [],
               permissionModes: ['auto'], sessionResume: false, sessionFork: false, imageInput: false, subagents: false,
@@ -215,8 +215,16 @@ it('supports registerDriver with built-in hijack guard, streaming turns, context
           });
         }`,
       });
-      await expect(installTrustedDir(daemon, hijackDir)).rejects.toThrow('禁止覆盖内置');
-      expect(daemon.registry.get(reservedId)?.isCustom).not.toBe(true);
+      const peerPreview = await installTrustedDir(daemon, peerDir);
+      await daemon.app.inject({
+        method: 'PUT',
+        url: `/api/v1/plugins/user.peer-${peerCategory}/permissions`,
+        payload: { workspaceId: '__global__', digest: peerPreview.digest, capability: 'harness:driver:register', granted: true },
+      });
+      await daemon.pluginManager.reloadAll();
+      // Built-in `agy` remains intact while external peer gets isolated provider-scoped harnessId
+      expect(daemon.registry.get(peerCategory)?.isCustom).not.toBe(true);
+      expect(daemon.registry.get(`user.peer-${peerCategory}:${peerCategory}`)).toBeDefined();
     }
 
     // 2. Custom driver plugin stays dormant until harness:driver:register is granted globally

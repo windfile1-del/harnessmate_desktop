@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AGY Lite Mode</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 4px;
+        font-family: system-ui, sans-serif;
+        background: transparent;
+        color: #e2e8f0;
+      }
+      select {
+        background: #1e293b;
+        color: #e2e8f0;
+        border: 1px solid #475569;
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <select id="mode-select" aria-label="AGY Lite Mode">
+      <option value="normal">Lite: Normal</option>
+      <option value="plan">Lite: Plan</option>
+      <option value="fast">Lite: Fast</option>
+    </select>
+    <script>
+      const sel = document.getElementById('mode-select');
+      const bridge = window.harnessMate;
+      sel.addEventListener('change', async () => {
+        if (!bridge || !bridge.session) return;
+        await bridge.services.call(
+          'agy.runtime.v1',
+          'submitCommand',
+          [
+            {
+              sessionId: bridge.session.id,
+              catalogRevision: 1,
+              capabilityId: 'agy.lite.mode',
+              actionKey: 'set_mode',
+              args: { mode: sel.value },
+              idempotencyKey: 'mode_' + Date.now(),
+            },
+          ],
+          { instanceId: bridge.instanceId, sessionId: bridge.session.id },
+        );
+      });
+    </script>
+  </body>
+</html>

@@ -6,16 +6,29 @@ import type {
   Session,
   TerminalContextChip,
 } from '@harnessmate/protocol';
-import { PluginApiError } from '@harnessmate/plugin-api';
-import type { HarnessMateStore } from '../db/sqlite.js';
-import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
 import {
+  AGY_RUNTIME_CONTRACT,
+  PluginApiError,
+  type AgyRuntimeBindingDto,
+} from '@harnessmate/plugin-api';
+import type { HarnessMateStore } from '../db/sqlite.js';
+import {
+  AgyConsumerProvenanceError,
   assertAgyConsumerProvenance,
+  isVerifiedAgyDispatchProvenance,
   type AgyDispatchProvenance,
 } from '../harnesses/agy/native/wiring/provenance.js';
-import type { AgyNativeRuntimeRegistry } from '../harnesses/agy/native/wiring/registry.js';
+import type { NativeTurnSettlementSink } from '../harnesses/agy/native/wiring/types.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
 import type { AdapterSessionConfig, HarnessAdapter } from '../harnesses/types.js';
+import {
+  AGY_RUNTIME_INTERNAL_SERVICE,
+  type AgyRuntimeInternalHandle,
+} from '../plugins/harness-agy-default/index.js';
+import {
+  recordAgyRuntimeOwner,
+  resolveOptionalAgyRuntimeProvider,
+} from './agy-peer-router.js';
 import {
   failoverContract,
   modelToolsContract,
@@ -52,7 +65,6 @@ export interface HostRuntimePortDeps {
   eventBus: DaemonEventBus;
   getPluginManager: () => PluginManager;
   getPluginCapabilities?: () => PluginCapabilities | undefined;
-  getNativeRegistry?: () => AgyNativeRuntimeRegistry | undefined;
   getApprovalCenter?: () => ApprovalCenterService;
   getOrchestrator?: () => OrchestratorService | undefined;
   onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
@@ -66,6 +78,31 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
   collabPort: CollaborationBridgePort;
 } {
   const approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let pendingSettlementSink: NativeTurnSettlementSink | null = null;
+
+  const resolveActiveAgyInternal = (scope?: {
+    sessionId?: string;
+    workspaceId?: string;
+    driverProviderInstanceId?: string | null;
+  }): AgyRuntimeInternalHandle | undefined => {
+    const pm = deps.getPluginManager();
+    const resolved = resolveOptionalAgyRuntimeProvider(pm, {
+      sessionId: scope?.sessionId,
+      workspaceId: scope?.workspaceId,
+      driverProviderInstanceId: scope?.driverProviderInstanceId,
+      store: deps.store,
+      allowSingleCandidate: true,
+    });
+    if (!resolved) return undefined;
+    const handle = pm.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+      resolved.instanceId,
+      AGY_RUNTIME_INTERNAL_SERVICE,
+    );
+    if (handle && pendingSettlementSink) {
+      handle.bindTurnSettlementSink(pendingSettlementSink);
+    }
+    return handle;
+  };
 
   const clearApprovalTimer = (id: string) => {
     const t = approvalTimers.get(id);
@@ -94,24 +131,56 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
     },
     assertDispatchTarget(instanceId, fallbackKind, provenance?: AgyDispatchProvenance, scope?) {
       let adapter = deps.registry.get(instanceId);
+      let resolvedProviderInstanceId = scope?.driverProviderInstanceId ?? adapter?.providerInstanceId;
       try {
-        adapter = resolveDriverForScope(deps.getPluginManager(), deps.registry, {
+        const resolved = resolveDriverForScope(deps.getPluginManager(), deps.registry, {
           harnessId: instanceId,
           sessionId: scope?.sessionId,
           workspaceId: scope?.workspaceId,
           driverProviderInstanceId: scope?.driverProviderInstanceId,
           store: deps.store,
-        }).adapter;
+        });
+        adapter = resolved.adapter;
+        resolvedProviderInstanceId = resolved.providerInstanceId ?? resolvedProviderInstanceId;
       } catch (err) {
         if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
           throw err;
         }
       }
-      assertAgyConsumerProvenance({
-        instanceId,
-        driverId: adapter?.driverId ?? adapter?.kind ?? fallbackKind,
-        profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
-      }, provenance);
+      const driverId = adapter?.driverId ?? adapter?.kind ?? fallbackKind;
+      if (driverId !== 'agy') return;
+
+      // Delegate product provenance policy to the owning AGY plugin instance (no vendor instanceof in kernel).
+      const pm = deps.getPluginManager();
+      const internal = resolvedProviderInstanceId
+        ? pm.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+            resolvedProviderInstanceId,
+            AGY_RUNTIME_INTERNAL_SERVICE,
+          )
+        : resolveActiveAgyInternal({ ...scope, driverProviderInstanceId: resolvedProviderInstanceId });
+      if (internal) {
+        if (internal.provenancePolicy === 'permissive') return;
+        const ownedAdapter = internal.getAdapterByHarnessId(instanceId);
+        assertAgyConsumerProvenance(
+          {
+            instanceId,
+            driverId,
+            profile: ownedAdapter?.getProfile() ?? null,
+          },
+          provenance,
+        );
+        return;
+      }
+      // External AGY driver plugins (e.g. agy-driver-lite) define their own policy; kernel only verifies host provenance if sealed.
+      if (resolvedProviderInstanceId && resolvedProviderInstanceId !== 'harness-agy') {
+        return;
+      }
+      // Unowned/mock legacy AGY adapter fallback (e.g. unit tests registering a custom mock AGY adapter directly)
+      if (!isVerifiedAgyDispatchProvenance(provenance)) {
+        assertAgyConsumerProvenance({ instanceId, driverId, profile: null }, provenance);
+      } else {
+        assertAgyConsumerProvenance({ instanceId, driverId, profile: null }, provenance);
+      }
     },
     async openSession(harnessId, config: AdapterSessionConfig, scope) {
       const resolved = resolveDriverForScope(deps.getPluginManager(), deps.registry, {
@@ -126,21 +195,22 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
   };
 
   const nativePort: NativeRuntimePort = {
-    isEnabled: () => Boolean(deps.getNativeRegistry?.()?.getFeatureFlags().enabled),
-    isNativeLifecycleEnabled: () => {
-      const flags = deps.getNativeRegistry?.()?.getFeatureFlags();
+    isEnabled: (scope) => Boolean(resolveActiveAgyInternal(scope)?.nativeRegistry.getFeatureFlags().enabled),
+    isNativeLifecycleEnabled: (scope) => {
+      const flags = resolveActiveAgyInternal(scope)?.nativeRegistry.getFeatureFlags();
       return Boolean(flags?.enabled && flags.nativeLifecycle);
     },
-    hasCancelHook: () => Boolean(deps.getNativeRegistry?.()?.getLifecyclePort()?.onCancelRequested),
-    isNativePermissionsEnabled: () => {
-      const flags = deps.getNativeRegistry?.()?.getFeatureFlags();
+    hasCancelHook: (scope) => Boolean(resolveActiveAgyInternal(scope)?.nativeRegistry.getLifecyclePort()?.onCancelRequested),
+    isNativePermissionsEnabled: (scope) => {
+      const flags = resolveActiveAgyInternal(scope)?.nativeRegistry.getFeatureFlags();
       return Boolean(flags?.enabled && flags.nativePermissions);
     },
-    isObservatoryTapEnabled: () => Boolean(deps.getNativeRegistry?.()?.getFeatureFlags().observatoryTap),
-    isSchemaCompatible: () => Boolean(deps.getNativeRegistry?.()?.getSchemaStatus().compatible),
-    prepareSessionBinding({ sessionId, instanceId, sourceRef }) {
-      const nativeRegistry = deps.getNativeRegistry?.();
-      if (!nativeRegistry) return null;
+    isObservatoryTapEnabled: (scope) => Boolean(resolveActiveAgyInternal(scope)?.nativeRegistry.getFeatureFlags().observatoryTap),
+    isSchemaCompatible: (scope) => Boolean(resolveActiveAgyInternal(scope)?.nativeRegistry.getSchemaStatus().compatible),
+    prepareSessionBinding({ sessionId, workspaceId, instanceId, driverProviderInstanceId, sourceRef }) {
+      const internal = resolveActiveAgyInternal({ sessionId, workspaceId, driverProviderInstanceId });
+      if (!internal || !internal.isAccepting()) return null;
+      const nativeRegistry = internal.nativeRegistry;
       const storedBinding = nativeRegistry.ensureRuntimeBinding({
         sessionId,
         instanceId,
@@ -149,34 +219,73 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
         advanceGeneration: true,
         status: 'attached',
       });
+      nativeRegistry.persistence.upsertProviderMapping({
+        runtimeId: storedBinding.runtimeId,
+        driverProviderInstanceId: driverProviderInstanceId ?? internal.instanceId,
+        runtimeProviderInstanceId: internal.instanceId,
+        runtimeRunId: internal.runId,
+        profileInstanceId: instanceId,
+        harnessId: instanceId,
+      });
+      recordAgyRuntimeOwner(deps.store, sessionId, internal.instanceId, workspaceId);
       const binding = {
         runtimeId: storedBinding.runtimeId,
         sessionId: storedBinding.sessionId,
         instanceId: storedBinding.instanceId,
         generation: storedBinding.generation,
       };
+      const bindingDto: AgyRuntimeBindingDto = {
+        ...binding,
+        driverProviderInstanceId: driverProviderInstanceId ?? internal.instanceId,
+        runtimeProviderInstanceId: internal.instanceId,
+        runtimeRunId: internal.runId,
+        bindingRevision: storedBinding.bindingRevision,
+      };
       return {
         binding,
+        bindingDto,
+        bindingRef: `agy-binding:${internal.instanceId}:${internal.runId}:${binding.runtimeId}:${binding.generation}`,
+        providerInstanceId: internal.instanceId,
         hooks: nativeRegistry.createAdapterRuntimeHooks(binding),
       };
     },
-    createObservatoryHooks(sessionId, harnessId) {
-      return deps.getNativeRegistry?.()?.createObservatoryOnlyHooks(sessionId, harnessId);
+    createObservatoryHooks(sessionId, harnessId, scope) {
+      return resolveActiveAgyInternal({ ...scope, sessionId })?.createObservatoryHooks(sessionId, harnessId);
     },
-    notifyReconnect(binding, mode) {
-      deps.getNativeRegistry?.()?.notifyReconnect(binding, mode);
+    notifyReconnect(binding, mode, scope) {
+      resolveActiveAgyInternal({ ...scope, sessionId: binding.sessionId })?.nativeRegistry.notifyReconnect(binding, mode);
     },
-    notifyCancelRequested(binding) {
-      deps.getNativeRegistry?.()?.notifyCancelRequested(binding);
+    notifyCancelRequested(binding, scope) {
+      resolveActiveAgyInternal({ ...scope, sessionId: binding.sessionId })?.nativeRegistry.notifyCancelRequested(binding);
     },
-    decideTurnSettlement(turnId, binding) {
-      return deps.getNativeRegistry?.()?.decideTurnSettlement(turnId, binding) ?? null;
+    decideTurnSettlement(turnId, binding, scope) {
+      const internal = resolveActiveAgyInternal({ ...scope, sessionId: binding?.sessionId });
+      return internal?.nativeRegistry.decideTurnSettlement(turnId, binding) ?? null;
     },
-    getActiveBinding(sessionId) {
-      return deps.getNativeRegistry?.()?.getActiveBinding(sessionId) ?? null;
+    async decideTurnSettlementDto(turnId, binding, scope) {
+      const resolved = resolveOptionalAgyRuntimeProvider(deps.getPluginManager(), {
+        sessionId: scope?.sessionId ?? binding?.sessionId,
+        workspaceId: scope?.workspaceId,
+        driverProviderInstanceId: scope?.driverProviderInstanceId ?? binding?.driverProviderInstanceId,
+        store: deps.store,
+      });
+      if (!resolved) return null;
+      const res = await resolved.service.decideTurnSettlement({ turnId, binding });
+      return res.ok ? res.value : null;
+    },
+    getActiveBinding(sessionId, scope) {
+      return resolveActiveAgyInternal({ ...scope, sessionId })?.nativeRegistry.getActiveBinding(sessionId) ?? null;
     },
     bindTurnSettlementSink(sink) {
-      deps.getNativeRegistry?.()?.bindTurnSettlementSink(sink);
+      pendingSettlementSink = sink;
+      const pm = deps.getPluginManager();
+      for (const prov of pm.host.listServiceProviders(AGY_RUNTIME_CONTRACT)) {
+        const internal = pm.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+          prov.instanceId,
+          AGY_RUNTIME_INTERNAL_SERVICE,
+        );
+        internal?.bindTurnSettlementSink(sink);
+      }
     },
   };
 

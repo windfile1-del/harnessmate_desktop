@@ -1,0 +1,78 @@
+{
+  "id": "hm.plugin.agy-workbench-default",
+  "name": "AGY 原生工作台",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": { "pluginApi": "^4.0" },
+  "permissions": ["storage:plugin"],
+  "category": "ui",
+  "main": "index.mjs",
+  "provides": [
+    "agy.workbench.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "session.stage.embedded",
+        "id": "agy-workbench",
+        "title": "AGY 原生工作台",
+        "ui": "ui/index.html"
+      },
+      {
+        "slot": "workspace.pages",
+        "id": "agy-workbench",
+        "title": "AGY 工作台",
+        "ui": "ui/index.html"
+      },
+      {
+        "slot": "composer.actions",
+        "id": "agy-composer",
+        "title": "AGY 原生控制",
+        "ui": "ui/index.html",
+        "order": 60,
+        "height": 56
+      },
+      {
+        "slot": "inspector.tabs",
+        "id": "agy-artifacts",
+        "title": "Artifact 审阅",
+        "key": "agy-artifacts",
+        "ui": "ui/index.html",
+        "order": 85
+      },
+      {
+        "slot": "inspector.tabs",
+        "id": "agy-ecosystem",
+        "title": "AGY 生态边界",
+        "key": "agy-ecosystem",
+        "ui": "ui/index.html",
+        "order": 88
+      },
+      {
+        "slot": "inspector.tabs",
+        "id": "agy-native-runtime",
+        "title": "AGY Native Runtime",
+        "key": "agy-native-runtime",
+        "ui": "ui/index.html",
+        "order": 80
+      },
+      {
+        "slot": "harness.settings",
+        "id": "agy-settings",
+        "title": "AGY 多账号隔离与官方认证",
+        "key": "agy",
+        "ui": "ui/index.html",
+        "order": 50
+      },
+      {
+        "slot": "session.sidebar.badge",
+        "id": "agy-native-badge",
+        "title": "AGY 原生运行时状态徽标",
+        "ui": "ui/index.html",
+        "order": 40,
+        "height": 48
+      }
+    ]
+  },
+  "description": "提供可替换的 AGY 原生工作台（运行时、子代理、Swarm、Boost、Teamwork、动态工作流、目标/定时任务）、Composer 控件与 Artifact 审阅视图。"
+}

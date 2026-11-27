@@ -1,4 +1,4 @@
-import { useBoundSessionPlugin } from '../../slots/BoundSessionSurface';
+import { BoundSessionSurface, useBoundSessionPlugin } from '../../slots/BoundSessionSurface';
 import { useShallow } from 'zustand/react/shallow';
 import type {
   ApprovalRequest,
@@ -63,6 +63,7 @@ import { bridge } from './transport';
 import { AttachmentImage } from './AttachmentImage';
 import { copyText } from '../../lib/clipboard';
 import {
+  AGY_WORKBENCH_CONTRACT,
   SESSION_ATTACHMENTS_CONTRACT,
   WORKSPACE_FILES_CONTRACT,
   isContractAvailableClientSide,
@@ -93,7 +94,6 @@ import { useAppStore } from './store';
 import type { FileLink } from '../../lib/file-links';
 import { Slot, SlotTurnProvider } from '../../slots';
 import {
-  AgyWorkbenchShell,
   DEFAULT_WORKBENCH_ROUTE,
   EntityStatusBadge,
   NativeActivityLink,
@@ -321,8 +321,12 @@ export function ChatStage() {
   const visibleTurnItems = turnItems ?? NO_TURN_ITEMS;
   const taskState = selectedTaskState ?? null;
   const contextPreview = selectedContextPreview ?? null;
+  const embeddedWorkbenchPlugin = useBoundSessionPlugin(AGY_WORKBENCH_CONTRACT, session);
+  const embeddedWorkbenchSlot = embeddedWorkbenchPlugin?.contributes.slots?.find(
+    (s) => s.slot === 'session.stage.embedded' && Boolean(s.ui),
+  );
   const nativeWorkbenchActive = Boolean(
-    session && session.harnessKind === 'agy' && agyNativeWorkbenchEnabled,
+    session && embeddedWorkbenchPlugin && embeddedWorkbenchSlot,
   );
   const nativeProjection = nativeWorkbenchActive ? (selectedNativeRuntime?.projection ?? null) : null;
   const nativeSyncState = nativeWorkbenchActive ? (selectedNativeRuntime?.syncState ?? null) : null;
@@ -999,9 +1003,14 @@ export function ChatStage() {
 
   return (
     <div className="flex h-full min-w-0 flex-1 overflow-hidden">
-      {showFullWorkbench ? (
+      {showFullWorkbench && embeddedWorkbenchPlugin && embeddedWorkbenchSlot ? (
         <div className="flex h-full min-w-0 flex-1 overflow-hidden">
-          <AgyWorkbenchShell {...sharedWorkbenchProps} isNarrowViewport={false} />
+          <BoundSessionSurface
+            plugin={embeddedWorkbenchPlugin}
+            surface={embeddedWorkbenchSlot.id}
+            session={session}
+            props={{ layout: 'full', surface: nativeRoute.surface }}
+          />
         </div>
       ) : (
       <div
@@ -1996,15 +2005,20 @@ export function ChatStage() {
       </div>
       )}
 
-      {showSplitOrSheetWorkbench && (
+      {showSplitOrSheetWorkbench && embeddedWorkbenchPlugin && embeddedWorkbenchSlot && (
         <div
           className={
             isNarrowViewport
-              ? ''
+              ? 'h-full w-full'
               : 'h-full w-[440px] max-w-[48vw] shrink-0 overflow-hidden'
           }
         >
-          <AgyWorkbenchShell {...sharedWorkbenchProps} isNarrowViewport={isNarrowViewport} />
+          <BoundSessionSurface
+            plugin={embeddedWorkbenchPlugin}
+            surface={embeddedWorkbenchSlot.id}
+            session={session}
+            props={{ layout: 'split', surface: nativeRoute.surface }}
+          />
         </div>
       )}
 

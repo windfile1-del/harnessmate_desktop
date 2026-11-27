@@ -57,6 +57,10 @@ import {
   createAcpDriverPlugin,
 } from '../../plugins/harness-acp-default/index.js';
 import {
+  HARNESS_AGY_PLUGIN_ID,
+  createAgyDriverPlugin,
+} from '../../plugins/harness-agy-default/index.js';
+import {
   SESSION_HANDOFF_DEFAULT_PLUGIN_ID,
   createSessionHandoffPlugin,
   handoffConfigSchema,
@@ -75,7 +79,9 @@ import {
   createOrchestratorPlugin,
 } from '../../plugins/orchestrator-default/index.js';
 import { createHostRuntimePorts } from '../../core/host-runtime-ports.js';
-import type { AgyNativeRuntimeRegistry } from '../../harnesses/agy/native/wiring/registry.js';
+import type { AgyNativeFeatureFlags, NativeTurnSettlementSink } from '../../harnesses/agy/native/wiring/types.js';
+import type { SessionManager } from '../../core/session-manager.js';
+import type { AgyAuthState } from '@harnessmate/protocol';
 import { CommandOutputHub } from '../../core/command-output-hub.js';
 import { DaemonEventBus } from '../../core/event-bus.js';
 import type { ApprovalRequest, Session } from '@harnessmate/protocol';
@@ -111,7 +117,6 @@ import type { PluginCapabilities } from '../../plugins/plugin-capabilities.js';
 import type { PluginManager } from '../../plugins/plugin-manager.js';
 import { createHarnessIntegrationPlugins, selectedHarnessService, usageContract } from './harness-integration.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
-import { createAgyDriverFactory } from '../../harnesses/agy/agy-driver.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type { HarnessAdapter } from '../../harnesses/types.js';
 import type { HostPlugin } from '../runtime/lifecycle.js';
@@ -462,7 +467,12 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     eventBus: import('../../core/event-bus.js').DaemonEventBus;
     changeFeed?: SessionChangeFeedService;
     commandOutputHub?: CommandOutputHub;
-    getNativeRegistry?: () => AgyNativeRuntimeRegistry | undefined;
+    initialNativeFeatureFlags?: Partial<AgyNativeFeatureFlags>;
+    getSessionManager?: () => SessionManager | undefined;
+    onConfigSave?: () => void;
+    onAuthStateChanged?: (state: AgyAuthState) => void;
+    onUsageCacheInvalidate?: (harnessId: string) => void;
+    getPendingSettlementSink?: () => NativeTurnSettlementSink | undefined;
     getApprovalCenter?: () => ApprovalCenterService;
     getOrchestrator?: () => OrchestratorService | undefined;
     onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
@@ -497,148 +507,23 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     HARNESS_CLAUDE_PLUGIN_ID,
     createClaudeDriverPlugin({ registry, config, overrides }),
   );
-  plugins.set('core.harness.agy', {
-    provides: [HARNESS_DRIVER_CONTRACT, HARNESS_DRIVER_AGY_CONTRACT, 'harness.agy'],
-    apply(ctx) {
-      ctx.host?.setRegistryBridge(registry);
-      const providerInstanceId = ctx.instanceId ?? 'harness-agy';
-      const profiles = config.agyProfiles ?? [];
-      const driverFactory = createAgyDriverFactory({
-        profilesRootDir: resolvedAgyProfilesDir,
-        binaryOverride: config.binaryOverrides.agy,
-        getProfileConfig: (instanceId) => profiles.find((p) => p.instanceId === instanceId),
-      });
-      registry.registerDriver('agy', driverFactory);
-
-      const registered: Array<{ id: string; adapter: HarnessAdapter }> = [];
-      const overrideAgy = overrides.find((candidate) => candidate.id === 'agy');
-      const primaryProfile = profiles.find((p) => p.instanceId === 'agy');
-      let primaryAdapter: HarnessAdapter;
-      if (overrideAgy) {
-        overrideAgy.providerPluginId ??= 'core.harness.agy';
-        overrideAgy.providerInstanceId ??= providerInstanceId;
-        registry.register(overrideAgy);
-        primaryAdapter = overrideAgy;
-      } else {
-        primaryAdapter = registry.registerInstance({
-          instanceId: 'agy',
-          driverId: 'agy',
-          displayName: primaryProfile?.displayName ?? 'Antigravity CLI',
-          description:
-            primaryProfile?.description ?? 'Google Antigravity CLI via native Agent Client Protocol (ACP)',
-          binaryPath: primaryProfile?.binaryPath ?? config.binaryOverrides.agy,
-          homeDir: primaryProfile?.geminiDir,
-          enabled: primaryProfile?.enabled ?? true,
-        });
-        primaryAdapter.providerPluginId = 'core.harness.agy';
-        primaryAdapter.providerInstanceId = providerInstanceId;
-      }
-      registered.push({ id: 'agy', adapter: primaryAdapter });
-      registry.registerProviderDriver({
-        pluginId: 'core.harness.agy',
-        providerInstanceId,
-        providerRunId: 'agy-native',
-        driverId: 'agy',
-        harnessId: 'agy',
-        isDefault: true,
-        adapter: primaryAdapter,
-        instanceConfig: {
-          binaryPath: primaryProfile?.binaryPath ?? config.binaryOverrides.agy,
-          homeDir: primaryProfile?.geminiDir,
-          displayName: primaryAdapter.displayName,
-          description: primaryAdapter.description,
-          enabled: primaryProfile?.enabled ?? true,
-        },
-      });
-
-      for (const profile of profiles) {
-        if (profile.instanceId === 'agy' || !profile.enabled) continue;
-        const adapter = registry.registerInstance({
-          instanceId: profile.instanceId,
-          driverId: 'agy',
-          displayName: profile.displayName,
-          description: profile.description,
-          binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
-          homeDir: profile.geminiDir,
-          enabled: profile.enabled,
-        });
-        adapter.providerPluginId = 'core.harness.agy';
-        adapter.providerInstanceId = providerInstanceId;
-        registry.registerProviderDriver({
-          pluginId: 'core.harness.agy',
-          providerInstanceId,
-          providerRunId: 'agy-native',
-          driverId: 'agy',
-          harnessId: profile.instanceId,
-          isDefault: false,
-          adapter,
-          instanceConfig: {
-            binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
-            homeDir: profile.geminiDir,
-            displayName: profile.displayName,
-            description: profile.description,
-            enabled: profile.enabled,
-          },
-        });
-        registered.push({ id: profile.instanceId, adapter });
-      }
-
-      for (const instance of config.harnessInstances ?? []) {
-        if (instance.driverId !== 'agy' || !instance.enabled) continue;
-        if (registered.some((r) => r.id === instance.instanceId)) continue;
-        const adapter = registry.registerInstance(instance);
-        adapter.providerPluginId = 'core.harness.agy';
-        adapter.providerInstanceId = providerInstanceId;
-        registry.registerProviderDriver({
-          pluginId: 'core.harness.agy',
-          providerInstanceId,
-          providerRunId: 'agy-native',
-          driverId: 'agy',
-          harnessId: instance.instanceId,
-          isDefault: false,
-          adapter,
-          instanceConfig: instance,
-        });
-        registered.push({ id: instance.instanceId, adapter });
-      }
-
-      ctx.effect(() => () => {
-        registry.unregisterProviderDriver(providerInstanceId);
-        for (const { id, adapter } of registered) {
-          if (registry.get(id) === adapter) registry.unregister(id);
-        }
-        registry.unregisterDriver('agy');
-      });
-      ctx.provide('harness.agy', primaryAdapter);
-      const agyDriverMeta = {
-        getProviderInfo: async () => ({
-          ok: true as const,
-          value: { pluginId: 'core.harness.agy', instanceId: providerInstanceId, runId: 'agy-native' },
-        }),
-        listRegistrations: async () => ({
-          ok: true as const,
-          value: {
-            drivers: registered.map(({ id, adapter }) => ({
-              pluginId: 'core.harness.agy',
-              providerInstanceId: providerInstanceId,
-              providerRunId: 'agy-native',
-              driverId: 'agy',
-              harnessId: id,
-              isDefault: id === 'agy',
-              displayName: adapter.displayName,
-              description: adapter.description,
-              protocolLabel: adapter.protocolLabel,
-              capabilities: adapter.capabilities,
-              capabilitiesV2: adapter.capabilitiesV2,
-              supportedCommands: adapter.supportedCommands,
-            })),
-          },
-        }),
-      };
-      ctx.provide(HARNESS_DRIVER_CONTRACT, agyDriverMeta, { version: HARNESS_DRIVER_CONTRACT_VERSION });
-      ctx.provide(HARNESS_DRIVER_AGY_CONTRACT, agyDriverMeta, { version: HARNESS_DRIVER_CONTRACT_VERSION });
-    },
-  });
+  plugins.set(
+    HARNESS_AGY_PLUGIN_ID,
+    createAgyDriverPlugin({
+      store,
+      registry,
+      config,
+      profilesRootDir: resolvedAgyProfilesDir,
+      overrides,
+      initialNativeFeatureFlags: runtimeBridge?.initialNativeFeatureFlags,
+      getSessionManager: runtimeBridge?.getSessionManager,
+      getPluginManager,
+      onConfigSave: runtimeBridge?.onConfigSave,
+      onAuthStateChanged: runtimeBridge?.onAuthStateChanged,
+      onUsageCacheInvalidate: runtimeBridge?.onUsageCacheInvalidate,
+      getPendingSettlementSink: runtimeBridge?.getPendingSettlementSink,
+    }),
+  );
   plugins.set(
     HARNESS_ACP_PLUGIN_ID,
     createAcpDriverPlugin({ registry, config }),
@@ -726,7 +611,6 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       eventBus: runtimeBridge.eventBus,
       getPluginManager,
       getPluginCapabilities: getCapabilities,
-      getNativeRegistry: runtimeBridge.getNativeRegistry,
       getApprovalCenter: runtimeBridge.getApprovalCenter,
       getOrchestrator: runtimeBridge.getOrchestrator,
       onAnnotatePendingApproval: runtimeBridge.onAnnotatePendingApproval,

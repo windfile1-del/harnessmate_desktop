@@ -18,3 +18,4 @@ data/
 *.sqlite-wal
 *.log
 plugins/bundled/hm.plugin.chat-default/ui/
+plugins/bundled/hm.plugin.agy-workbench-default/ui/

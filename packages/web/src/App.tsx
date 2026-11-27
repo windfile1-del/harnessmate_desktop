@@ -5,13 +5,6 @@ import type { DiagnosticEntry } from './lib/projector';
 import { BoundSessionSurface, useBoundSessionPlugin } from './slots/BoundSessionSurface';
 import { InspectorDrawer } from './components/InspectorDrawer';
 import { KernelRecoveryView } from './components/KernelRecoveryView';
-import { registerAgyNativeRuntimeView } from './components/agy/native/runtime';
-import { registerSubagentManagerView } from './components/agy/native/child/register';
-import { registerSwarmStudioView } from './components/agy/native/swarm/register';
-import { registerBoostStudioView } from './components/agy/native/boost/register';
-import { registerTeamworkStudioView } from './components/agy/native/teamwork/register';
-import { registerDynamicWorkflowStudioView } from './components/agy/native/workflow';
-import { registerNativeTasksView } from './components/agy/native/tasks/register';
 import { PluginWorkspaceStage } from './slots/PluginWorkspace';
 import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
@@ -79,8 +72,6 @@ export function App() {
     toasts,
     dismissToast,
     emptyComposition,
-    agyNativeWorkbenchEnabled,
-    setNativeWorkbenchRoute,
   } = useAppStore(useShallow((state) => ({
     init: state.init,
     sessions: state.sessions,
@@ -94,8 +85,6 @@ export function App() {
     toasts: state.toasts,
     dismissToast: state.dismissToast,
     emptyComposition: state.emptyComposition,
-    agyNativeWorkbenchEnabled: state.agyNativeWorkbenchEnabled,
-    setNativeWorkbenchRoute: state.setNativeWorkbenchRoute,
   })));
 
   const selectedSession = useMemo(
@@ -108,20 +97,6 @@ export function App() {
   }, [init]);
 
   useEffect(() => trackComposition(window, composing), []);
-
-  useEffect(() => {
-    if (!agyNativeWorkbenchEnabled) return;
-    const unregister = [
-      registerAgyNativeRuntimeView(),
-      registerSubagentManagerView(),
-      registerSwarmStudioView(),
-      registerBoostStudioView(),
-      registerTeamworkStudioView(),
-      registerDynamicWorkflowStudioView(),
-      registerNativeTasksView(),
-    ];
-    return () => unregister.reverse().forEach((dispose) => dispose());
-  }, [agyNativeWorkbenchEnabled]);
 
   useEffect(() => {
     if (!triageEnabled) {
@@ -157,19 +132,6 @@ export function App() {
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
         e.preventDefault();
         setInspectorOpen(!inspectorOpen);
-      } else if (
-        agyNativeWorkbenchEnabled &&
-        selectedSession?.harnessKind === 'agy' &&
-        !activeModal &&
-        ((e.altKey && e.shiftKey && e.key.toLowerCase() === 'a') ||
-          ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'g'))
-      ) {
-        e.preventDefault();
-        const curSurface =
-          useAppStore.getState().nativeRuntimeBySession[selectedSession.id]?.route.surface ?? 'chat';
-        setNativeWorkbenchRoute(selectedSession.id, {
-          surface: curSurface === 'chat' ? 'runtime' : 'chat',
-        });
       } else if (e.key === 'Escape' && activeModal) {
         openModal(null);
       }
@@ -180,12 +142,9 @@ export function App() {
     sidebarCollapsed,
     inspectorOpen,
     activeModal,
-    agyNativeWorkbenchEnabled,
-    selectedSession,
     setSidebarCollapsed,
     setInspectorOpen,
     openModal,
-    setNativeWorkbenchRoute,
   ]);
 
   return (

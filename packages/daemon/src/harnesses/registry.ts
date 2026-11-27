@@ -69,11 +69,11 @@ export class HarnessRegistry {
   private cachedProbes = new Map<string, HarnessInfo>();
 
   /**
-   * Only AGY native remains reserved in Batch 3 (full AGY migration is Batch 4).
-   * Codex, Claude, and ACP are open to peer plugin implementations.
+   * Batch 4: No vendor driver categories are reserved in the kernel.
+   * Codex, Claude, ACP, and AGY are all open to peer plugin implementations.
    */
-  isReserved(id: string): boolean {
-    return id === 'agy';
+  isReserved(_id: string): boolean {
+    return false;
   }
 
   setCustomAcpFactory(factory: ((config: CustomAcpHarnessConfig) => HarnessAdapter) | null): void {

@@ -1,4 +1,8 @@
 import type {
+  AgyRuntimeBindingDto,
+  AgyTurnSettlementDecisionDto,
+} from '@harnessmate/plugin-api';
+import type {
   ApprovalDecision,
   ApprovalRequest,
   Attachment,
@@ -49,33 +53,49 @@ export interface RuntimeDriverPort {
 }
 
 /**
- * Narrow bridge for AGY native lifecycle, held turn settlement, provenance,
- * and CAS-guarded permission receipts (full migration deferred to Batch 4).
+ * Narrow client over public `agy.runtime.v1` DTOs and serializable resource references.
+ * Never passes vendor classes or `instanceof` checks across plugin boundaries;
+ * in-process hook attachment is resolved strictly inside the owning AGY plugin via `bindingRef`.
  */
 export interface NativeRuntimePort {
-  isEnabled(): boolean;
-  isNativeLifecycleEnabled(): boolean;
-  hasCancelHook?(): boolean;
-  isNativePermissionsEnabled(): boolean;
-  isObservatoryTapEnabled(): boolean;
-  isSchemaCompatible(): boolean;
+  isEnabled(scope?: DriverResolutionScope): boolean;
+  isNativeLifecycleEnabled(scope?: DriverResolutionScope): boolean;
+  hasCancelHook?(scope?: DriverResolutionScope): boolean;
+  isNativePermissionsEnabled(scope?: DriverResolutionScope): boolean;
+  isObservatoryTapEnabled(scope?: DriverResolutionScope): boolean;
+  isSchemaCompatible(scope?: DriverResolutionScope): boolean;
   prepareSessionBinding(params: {
     sessionId: string;
+    workspaceId?: string;
     instanceId: string;
+    driverProviderInstanceId?: string | null;
     nativeSessionId: string | null;
     sourceRef: string;
   }): {
     binding: RuntimeBinding;
+    bindingDto?: AgyRuntimeBindingDto;
+    bindingRef?: string;
+    providerInstanceId?: string;
     hooks: AdapterSessionConfig['nativeRuntimeHooks'];
   } | null;
   createObservatoryHooks(
     sessionId: string,
     harnessId: string,
+    scope?: DriverResolutionScope,
   ): AdapterSessionConfig['nativeRuntimeHooks'] | undefined;
-  notifyReconnect(binding: RuntimeBinding, mode: 'resume' | 'fresh'): void;
-  notifyCancelRequested(binding: RuntimeBinding): void;
-  decideTurnSettlement(turnId: string, binding: RuntimeBinding | null): TurnSettlement | null;
-  getActiveBinding(sessionId: string): RuntimeBinding | null;
+  notifyReconnect(binding: RuntimeBinding, mode: 'resume' | 'fresh', scope?: DriverResolutionScope): void;
+  notifyCancelRequested(binding: RuntimeBinding, scope?: DriverResolutionScope): void;
+  decideTurnSettlement(
+    turnId: string,
+    binding: RuntimeBinding | null,
+    scope?: DriverResolutionScope,
+  ): TurnSettlement | null;
+  decideTurnSettlementDto?(
+    turnId: string,
+    binding: AgyRuntimeBindingDto | null,
+    scope?: DriverResolutionScope,
+  ): Promise<AgyTurnSettlementDecisionDto | null>;
+  getActiveBinding(sessionId: string, scope?: DriverResolutionScope): RuntimeBinding | null;
   bindTurnSettlementSink(sink: NativeTurnSettlementSink): void;
 }
 

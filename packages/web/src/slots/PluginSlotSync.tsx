@@ -12,17 +12,6 @@ import {
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
 import { RuntimeRequestReceiptBlock } from '../components/ApprovalCenter';
-import {
-  AgyArtifactReviewPanel,
-  AgyEcosystemPanel,
-} from '../components/agy/AgyArtifactReviewPanel';
-import { AgyComposerControls } from '../components/agy/AgyComposerControls';
-import { AgySettingsSlot } from '../components/agy/AgySettingsSlot';
-import { AgyStudioBlockCard } from '../components/agy/AgyStudioBlocks';
-import {
-  AgyWorkbenchShell,
-  DEFAULT_WORKBENCH_ROUTE,
-} from '../components/agy/native/shared';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
@@ -48,6 +37,7 @@ import {
   TERMINAL_WORKSPACE_CONTRACT,
   WORKSPACE_FILES_CONTRACT,
   WORKSPACE_RULES_CONTRACT,
+  AGY_WORKBENCH_CONTRACT,
   isPluginInstanceReady,
   pluginProvidesContract,
   resolveServiceSelectionClientSide,
@@ -225,6 +215,7 @@ const SINGLE_OWNER_W1_SLOTS: Partial<Record<AnyPluginSlotKey, string>> = {
   'inspector.diff': GIT_WORKSPACE_CONTRACT,
   'inspector.files': WORKSPACE_FILES_CONTRACT,
   'inspector.rules': WORKSPACE_RULES_CONTRACT,
+  'session.stage.embedded': AGY_WORKBENCH_CONTRACT,
 };
 
 export function registerPluginIframeSlots(
@@ -440,90 +431,6 @@ function collectPluginIframeSlots(
  * Effect-driven synchronizer that projects installed/active plugins (V1 panels, V2 dataPanels,
  * V4/V5 manifest/runtime iframe slots, and built-in adapters) into the typed UI SlotRegistry.
  */
-function AgyNativeSidebarBadge({ session }: { session: Session }) {
-  const slice = useAppStore((state) => state.nativeRuntimeBySession[session.id]);
-  const pendingApprovals = useAppStore((state) => state.pendingApprovals);
-  if (session.harnessKind !== 'agy' || !slice?.projection) return null;
-  const runningCount = slice.projection.work.filter(
-    (w) => w.state.kind === 'known' && (w.state.value === 'running' || w.state.value === 'waiting'),
-  ).length;
-  const pendingCount = pendingApprovals.filter(
-    (a) => a.sessionId === session.id && a.status === 'pending',
-  ).length;
-  if (runningCount === 0 && pendingCount === 0 && slice.projection.status === 'attached') {
-    return null;
-  }
-  return (
-    <span
-      data-testid="agy-native-sidebar-badge"
-      title={`AGY 原生运行时：${runningCount} 活跃任务 · ${pendingCount} 待处理`}
-      className="rounded px-1 py-0.2 font-mono-code text-[9.5px]"
-      style={{
-        backgroundColor:
-          pendingCount > 0 ? 'var(--accent-star-soft)' : 'var(--accent-indigo-soft)',
-        color: pendingCount > 0 ? 'var(--accent-star)' : 'var(--accent-indigo)',
-      }}
-    >
-      {pendingCount > 0 ? `需操作 ${pendingCount}` : slice.projection.status === 'reconciling' ? '校准中' : `原生 ${runningCount}`}
-    </span>
-  );
-}
-
-function AgyNativeInspectorAdapter({ session }: { session: Session }) {
-  const slice = useAppStore((state) => state.nativeRuntimeBySession[session.id]);
-  const pendingApprovals = useAppStore((state) => state.pendingApprovals);
-  const setRoute = useAppStore((state) => state.setNativeWorkbenchRoute);
-  const hydrate = useAppStore((state) => state.hydrateNativeRuntime);
-  const resolveRuntimeRequest = useAppStore((state) => state.resolveRuntimeRequest);
-  const dispatchControl = useAppStore((state) => state.dispatchNativeControl);
-  const loadNativeTimeline = useAppStore((state) => state.loadNativeTimeline);
-  const loadNativeWorkflowResource = useAppStore((state) => state.loadNativeWorkflowResource);
-
-  const stableLoadTimeline = useMemo(
-    () => (scope: { kind: 'activity' | 'agent'; id: string }, pageToken?: string | null, signal?: AbortSignal) =>
-      loadNativeTimeline(session.id, scope, pageToken, signal),
-    [session.id, loadNativeTimeline],
-  );
-  const stableLoadWorkflowResource = useMemo(
-    () => (workflowId: import('../lib/native-client').WorkflowId, resource: string, pageToken?: string | null, signal?: AbortSignal) =>
-      loadNativeWorkflowResource(session.id, workflowId, resource, pageToken, signal),
-    [session.id, loadNativeWorkflowResource],
-  );
-
-  if (session.harnessKind !== 'agy') {
-    return (
-      <div className="p-3 text-[12px] text-[var(--text-muted)]">
-        AGY 原生工作台仅在 AGY 会话中可用。
-      </div>
-    );
-  }
-
-  const sessionPending = pendingApprovals.filter(
-    (a) => a.sessionId === session.id && a.status === 'pending',
-  );
-
-  return (
-    <div className="h-[520px] min-h-0">
-      <AgyWorkbenchShell
-        session={session}
-        projection={slice?.projection ?? null}
-        syncState={slice?.syncState ?? null}
-        capabilities={slice?.capabilities ?? []}
-        pendingApprovals={sessionPending}
-        route={slice?.route ?? { ...DEFAULT_WORKBENCH_ROUTE, surface: 'runtime' }}
-        isNarrowViewport={false}
-        onNavigate={(patch) => setRoute(session.id, patch)}
-        onBackToChat={() => setRoute(session.id, { surface: 'chat' })}
-        onRefresh={() => void hydrate(session.id)}
-        onResolveRequest={resolveRuntimeRequest}
-        onDispatchControl={(req) => dispatchControl(session.id, req)}
-        loadTimeline={stableLoadTimeline}
-        loadWorkflowResource={stableLoadWorkflowResource}
-      />
-    </div>
-  );
-}
-
 export function PluginSlotSync() {
   const plugins = useAppStore((state) => state.plugins);
   const sessions = useAppStore((state) => state.sessions);
@@ -533,7 +440,6 @@ export function PluginSlotSync() {
   const compositionBindings = useAppStore((state) => state.compositionBindings);
   const workspaceBindingsByWorkspace = useAppStore((state) => state.workspaceBindingsByWorkspace);
   const sessionBindingsBySession = useAppStore((state) => state.sessionBindingsBySession);
-  const agyNativeWorkbenchEnabled = useAppStore((state) => state.agyNativeWorkbenchEnabled);
   const registry = useSlotRegistry();
 
   useEffect(() => {
@@ -969,139 +875,9 @@ export function PluginSlotSync() {
       }
     }
 
-    // Built-in V5 Antigravity Native Experience & Account Isolation slots
-    const agyHarnessPlugin = plugins.find((p) => p.id === 'core.harness.agy');
-    if (!agyHarnessPlugin || isPluginActive(agyHarnessPlugin)) {
-      disposers.push(
-        registry.register({
-          slot: 'harness.settings',
-          id: 'agy-account-settings',
-          pluginId: 'core.harness.agy',
-          pluginName: 'Antigravity (AGY)',
-          title: 'AGY 多账号隔离与官方认证',
-          key: 'agy',
-          order: 50,
-          sourceKind: 'builtin',
-          render: ({ harness, onRefresh }) => <AgySettingsSlot harness={harness} onRefresh={onRefresh} />,
-        }),
-      );
-
-      disposers.push(
-        registry.register({
-          slot: 'composer.actions',
-          id: 'agy-composer-controls',
-          pluginId: 'core.harness.agy',
-          pluginName: 'Antigravity (AGY)',
-          title: 'AGY 原生控制条与手动切换',
-          order: 60,
-          sourceKind: 'builtin',
-          render: ({ session, isRunning }) => (
-            <AgyComposerControls session={session} isRunning={isRunning} />
-          ),
-        }),
-      );
-
-      const agyBlockSpecs: ReadonlyArray<{
-        id: string;
-        key:
-          | 'ext:agy.plan'
-          | 'ext:agy.subagent_batch'
-          | 'ext:agy.background_task'
-          | 'ext:agy.artifact_card'
-          | 'ext:agy.goal_status';
-        title: string;
-      }> = [
-        { id: 'agy-block-plan', key: 'ext:agy.plan', title: 'AGY Plan 卡片' },
-        { id: 'agy-block-subagent', key: 'ext:agy.subagent_batch', title: 'AGY 子 Agent 批次卡' },
-        { id: 'agy-block-background', key: 'ext:agy.background_task', title: 'AGY 后台任务卡' },
-        { id: 'agy-block-artifact', key: 'ext:agy.artifact_card', title: 'AGY Artifact 摘要卡' },
-        { id: 'agy-block-goal', key: 'ext:agy.goal_status', title: 'AGY Goal 状态卡' },
-      ];
-
-      for (const spec of agyBlockSpecs) {
-        disposers.push(
-          registry.register({
-            slot: 'chat.block',
-            id: spec.id,
-            pluginId: 'core.harness.agy',
-            pluginName: 'Antigravity (AGY)',
-            title: spec.title,
-            key: spec.key,
-            order: 95,
-            sourceKind: 'builtin',
-            render: ({ session, block }) => {
-              if (
-                block.type !== 'ext:agy.plan' &&
-                block.type !== 'ext:agy.subagent_batch' &&
-                block.type !== 'ext:agy.background_task' &&
-                block.type !== 'ext:agy.artifact_card' &&
-                block.type !== 'ext:agy.goal_status'
-              ) {
-                return null;
-              }
-              return <AgyStudioBlockCard session={session} block={block} />;
-            },
-          }),
-        );
-      }
-
-      disposers.push(
-        registry.register({
-          slot: 'inspector.tabs',
-          id: 'agy-artifacts',
-          pluginId: 'core.harness.agy',
-          pluginName: 'Antigravity (AGY)',
-          title: 'Artifact 审阅',
-          key: 'agy-artifacts',
-          order: 85,
-          sourceKind: 'builtin',
-          render: ({ session }) => <AgyArtifactReviewPanel session={session} />,
-        }),
-      );
-
-      disposers.push(
-        registry.register({
-          slot: 'inspector.tabs',
-          id: 'agy-ecosystem',
-          pluginId: 'core.harness.agy',
-          pluginName: 'Antigravity (AGY)',
-          title: 'AGY 生态边界',
-          key: 'agy-ecosystem',
-          order: 88,
-          sourceKind: 'builtin',
-          render: ({ session }) => <AgyEcosystemPanel session={session} />,
-        }),
-      );
-
-      if (agyNativeWorkbenchEnabled) {
-        disposers.push(
-          registry.register({
-            slot: 'inspector.tabs',
-            id: 'agy-native-runtime',
-            pluginId: 'core.harness.agy',
-            pluginName: 'Antigravity (AGY)',
-            title: 'AGY Native Runtime',
-            key: 'agy-native-runtime',
-            order: 80,
-            sourceKind: 'builtin',
-            render: ({ session }) => <AgyNativeInspectorAdapter session={session} />,
-          }),
-        );
-
-        disposers.push(
-          registry.register({
-            slot: 'session.sidebar.badge',
-            id: 'agy-native-runtime-badge',
-            pluginId: 'core.harness.agy',
-            pluginName: 'Antigravity (AGY)',
-            title: 'AGY 原生运行时状态徽标',
-            order: 40,
-            sourceKind: 'builtin',
-            render: ({ session }) => <AgyNativeSidebarBadge session={session} />,
-          }),
-        );
-      }
-    }
+    // AGY Workbench / Composer / Artifact / Ecosystem / Settings / Badge slots are now contributed
+    // generically by whichever `agy.workbench.v1` plugin is enabled & bound (e.g. hm.plugin.agy-workbench-default
+    // or external hm.plugin.agy-driver-lite) via `registerPluginIframeSlots` — zero host vendor slot creation.
 
     // 1. V2 dataPanels -> inspector.tabs, sidebar.tools, composer.actions
     const dataPanels = listPluginPanels(plugins);
@@ -1239,7 +1015,6 @@ export function PluginSlotSync() {
     compositionBindings,
     workspaceBindingsByWorkspace,
     sessionBindingsBySession,
-    agyNativeWorkbenchEnabled,
     registry,
   ]);
 

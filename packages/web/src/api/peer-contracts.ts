@@ -14,6 +14,9 @@ export const TERMINAL_RUNNER_CONTRACT = 'terminal.runner.v1';
 export const WORKSPACE_FILES_CONTRACT = 'workspace.files.v1';
 export const SESSION_ATTACHMENTS_CONTRACT = 'session.attachments.v1';
 export const WORKSPACE_RULES_CONTRACT = 'workspace.rules.v1';
+export const AGY_RUNTIME_CONTRACT = 'agy.runtime.v1';
+export const AGY_ACCOUNTS_CONTRACT = 'agy.accounts.v1';
+export const AGY_WORKBENCH_CONTRACT = 'agy.workbench.v1';
 
 export const HISTORY_IMPORT_PAGE_SLOT_ID = 'history-import';
 export const SESSION_SEARCH_PAGE_SLOT_ID = 'session-search';

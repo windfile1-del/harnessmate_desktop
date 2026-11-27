@@ -91,24 +91,35 @@ import {
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type GitService } from '../plugin-host/builtin/services.js';
 import { GitOperationError } from '../core/git-service.js';
-import { FILE_PREVIEW_PERMISSION, HARNESS_DRIVER_ACP_CONTRACT, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
+import {
+  AGY_ACCOUNTS_CONTRACT,
+  AGY_RUNTIME_CONTRACT,
+  AGY_WORKBENCH_CONTRACT,
+  FILE_PREVIEW_PERMISSION,
+  HARNESS_DRIVER_ACP_CONTRACT,
+  PLUGIN_EVENT_VERSION,
+  PluginApiError,
+} from '@harnessmate/plugin-api';
 import type { AcpPluginFacade } from '../plugins/harness-acp-default/index.js';
+import {
+  AGY_RUNTIME_INTERNAL_SERVICE,
+  type AgyRuntimeInternalHandle,
+} from '../plugins/harness-agy-default/index.js';
+import {
+  listActiveAgyAccountsProviders,
+  resolveAgyAccountsProvider,
+  resolveAgyRuntimeProvider,
+  resolveOptionalAgyRuntimeProvider,
+} from '../core/agy-peer-router.js';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
-import { AgyAuthService } from '../harnesses/agy/agy-auth-service.js';
-import { listAgySessionArtifacts, readAgySessionArtifact } from '../harnesses/agy/agy-artifacts.js';
-import { listAgySubagentRecords, readAgySubagentDetail } from '../harnesses/agy/agy-child-work.js';
-import { AgyAdapter } from '../harnesses/agy/agy-driver.js';
-import { collectAgyEcosystemSnapshot } from '../harnesses/agy/agy-ecosystem.js';
-import { resolveAgyProfileDirectories } from '../harnesses/agy/agy-profile-manager.js';
 import {
-  AgyNativeRuntimeRegistry,
   NativeWsFeedGateway,
   AgyConsumerProvenanceError,
   mintAgyDispatchProvenance,
   registerAgyNativeRoutes,
+  type AgyNativeRuntimeRegistry,
 } from '../harnesses/agy/native/wiring/index.js';
-import { wireAgyNativeRuntime } from '../harnesses/agy/native/wiring/composition.js';
 import type { AgyNativeFeatureFlags } from '../harnesses/agy/native/wiring/types.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
@@ -198,8 +209,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const commandOutputHub = new CommandOutputHub();
   const sessionChangeFeed = new SessionChangeFeedService(store);
   const historyImportAdapter = new HistoryImportAdapter(store, registry, sessionChangeFeed);
-  let nativeRegistry: AgyNativeRuntimeRegistry | undefined;
   let sessionManager: SessionManager;
+  let wsGateway: WsGateway;
   let pendingRuntimeController: import('../plugins/session-runtime-default/index.js').SessionRuntimeDefaultController | null = null;
   const pluginManager: PluginManager = new PluginManager(
     paths.pluginsDir,
@@ -282,7 +293,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         eventBus,
         changeFeed: sessionChangeFeed,
         commandOutputHub,
-        getNativeRegistry: () => nativeRegistry,
+        initialNativeFeatureFlags: opts.nativeFeatureFlags,
+        getSessionManager: () => sessionManager,
+        onConfigSave: () => saveConfig(paths.configPath, config),
+        onAuthStateChanged: (state) => wsGateway?.notifyAgyAuthState(state),
+        onUsageCacheInvalidate: (instanceId) => invalidateAccountUsage(pluginManager, instanceId),
+        getPendingSettlementSink: () => sessionManager?.createSettlementSink(),
         getApprovalCenter: () => sessionManager.getApprovalCenter(),
         getOrchestrator: () => sessionManager.getOrchestratorIfEnabled(),
         onAnnotatePendingApproval: async (session, approval) => {
@@ -330,9 +346,10 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
 
   let boundPort = config.port;
   const outboxWorker = new EffectOutboxWorker(store);
-  nativeRegistry = new AgyNativeRuntimeRegistry(store, opts.nativeFeatureFlags);
   const pluginCapabilities = new PluginCapabilities(store, pluginManager, () => `http://127.0.0.1:${boundPort}${pluginMcpPath}`, pluginPermissions);
-  sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace, nativeRegistry);
+  sessionManager = new SessionManager(store, registry, eventBus, pluginManager, pluginCapabilities, commandOutputHub, terminalWorkspace);
+  pluginManager.bootstrapFirstPartySync();
+  sessionManager.bindSettlementSinkToActiveAgy();
   sessionChangeFeed.attachPluginHost(pluginManager.host);
   if (pendingRuntimeController) {
     sessionManager.attachRuntimeController(pendingRuntimeController);
@@ -348,27 +365,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         summary: `Imported session (${String(meta.mode ?? 'attach')})`,
         timestamp: Date.now(),
       });
-    },
-  });
-  const disposeNativeRuntime = wireAgyNativeRuntime(nativeRegistry, sessionManager, registry, config.binaryOverrides);
-  const agyAuthService = new AgyAuthService({
-    getAdapter: (instanceId) => {
-      const adapter = registry.get(instanceId);
-      return adapter instanceof AgyAdapter ? adapter : undefined;
-    },
-    stopInstanceSessions: (instanceId) => sessionManager.closeSessionsForHarness(instanceId),
-    onIdentityUpdated: (instanceId, identity) => {
-      const idx = config.agyProfiles.findIndex((p) => p.instanceId === instanceId);
-      if (idx >= 0) {
-        config.agyProfiles[idx] = { ...config.agyProfiles[idx]!, identity };
-        saveConfig(paths.configPath, config);
-      }
-    },
-    onUsageCacheInvalidate: (instanceId) => {
-      invalidateAccountUsage(pluginManager, instanceId);
-    },
-    onStateChanged: (state) => {
-      wsGateway.notifyAgyAuthState(state);
     },
   });
   const terminalOwnerStatusUnsubs = new Map<string, () => void>();
@@ -428,7 +424,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
   const auth = new RemoteAuthService(store, config.localToken);
-  const wsGateway = new WsGateway({
+  wsGateway = new WsGateway({
     desktopId: config.desktopId,
     desktopName: config.desktopName,
     auth,
@@ -437,8 +433,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     terminalWorkspace,
     pluginManager,
   });
-  pluginManager.host.events.on('plugin.state', ({ data }) => {
+  pluginManager.host.events.on('plugin.state', () => {
     syncTerminalOwnerListeners();
+    sessionManager.bindSettlementSinkToActiveAgy();
     wsGateway.notifyPluginsChanged();
   });
   pluginPermissions.onChange(({ capability }) => {
@@ -447,7 +444,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   const nativeWsGateway = new NativeWsFeedGateway({
     auth,
     sessionManager,
-    nativeRegistry,
+    pluginManager,
+    store,
   });
 
   const app = Fastify({ logger: false, bodyLimit: 24 * 1024 * 1024 });
@@ -528,7 +526,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         pluginBuilderV2.cancel();
         await terminalWorkspace.disposeAll();
         await sessionManager.shutdown();
-        disposeNativeRuntime();
         await app.close();
         await pluginManager.close();
         store.close();
@@ -614,90 +611,134 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     adapter: historyImportAdapter,
   });
 
-  // ── Phase AGY-2: Multi-Account Profiles & Official Auth Endpoints ────
+  // ── AGY Accounts & Auth Compat Routes (forwarded to `agy.accounts.v1` peer plugins) ──
 
-  app.get('/api/v1/harnesses/agy/instances', async () => {
-    const instances = registry
-      .listAdapters()
-      .filter((adapter): adapter is AgyAdapter => adapter instanceof AgyAdapter)
-      .map((adapter) => ({
-        profile: adapter.getProfile(),
-        authState: agyAuthService.getState(adapter.id),
-      }));
-    return { instances };
+  const mapAgyPeerError = (reply: import('fastify').FastifyReply, error: { code: string; message: string }) => {
+    switch (error.code) {
+      case 'plugin_disabled':
+      case 'E_PLUGIN_DISABLED':
+        return reply.code(409).send({ error: error.message, code: 'E_PLUGIN_DISABLED' });
+      case 'conflict':
+        return reply.code(409).send({ error: error.message, code: 'E_CONFLICT' });
+      case 'not_found':
+      case 'NOT_FOUND':
+        return reply.code(404).send({ error: error.message });
+      case 'not_supported':
+      case 'UNSUPPORTED_ACTION':
+        return reply.code(400).send({ error: error.message });
+      default:
+        return reply.code(400).send({ error: error.message });
+    }
+  };
+
+  const resolveAccountsProviderForProfile = async (
+    profileId: string,
+    explicitProviderInstanceId?: string,
+  ) => {
+    if (explicitProviderInstanceId) {
+      return resolveAgyAccountsProvider(pluginManager, {
+        explicitInstanceId: explicitProviderInstanceId,
+      });
+    }
+    const entry = registry.getEntry(profileId);
+    if (entry?.providerInstanceId) {
+      return resolveAgyAccountsProvider(pluginManager, {
+        explicitInstanceId: entry.providerInstanceId,
+      });
+    }
+    const activeProviders = listActiveAgyAccountsProviders(pluginManager);
+    for (const prov of activeProviders) {
+      const info = await prov.service.getProviderInfo();
+      if (info.ok && info.value.managedHarnessIds.includes(profileId)) {
+        return prov;
+      }
+    }
+    return resolveAgyAccountsProvider(pluginManager, { allowSingleCandidate: true });
+  };
+
+  const toLegacyAuthState = (state: {
+    instanceId: string;
+    phase: string;
+    flowId?: string | null;
+    authUrl?: string | null;
+    message?: string | null;
+    error?: string | null;
+  }) => ({
+    instanceId: state.instanceId,
+    phase: state.phase,
+    flowId: state.flowId ?? null,
+    authorizationUrl: state.authUrl ?? null,
+    expiresAt: null,
+    message: state.message ?? state.error ?? null,
+  });
+
+  app.get('/api/v1/harnesses/agy/instances', async (request, reply) => {
+    const q = request.query as { providerInstanceId?: string; workspaceId?: string };
+    try {
+      if (q.providerInstanceId || q.workspaceId) {
+        const provider = resolveAgyAccountsProvider(pluginManager, {
+          explicitInstanceId: q.providerInstanceId,
+          workspaceId: q.workspaceId,
+          allowSingleCandidate: true,
+        });
+        const res = await provider.service.listInstances();
+        if (!res.ok) return mapAgyPeerError(reply, res.error);
+        return {
+          instances: res.value.instances.map((item) => ({
+            identity: item.identity,
+            profile: item.profile,
+            authState: toLegacyAuthState(item.authState),
+          })),
+        };
+      }
+      const providers = listActiveAgyAccountsProviders(pluginManager);
+      if (providers.length === 0) {
+        // Trigger exact E_PLUGIN_DISABLED / E_SERVICE_UNAVAILABLE when disabled (zero fallback)
+        resolveAgyAccountsProvider(pluginManager, { allowSingleCandidate: true });
+      }
+      const instances: Array<Record<string, unknown>> = [];
+      for (const provider of providers) {
+        const res = await provider.service.listInstances();
+        if (!res.ok) continue;
+        for (const item of res.value.instances) {
+          instances.push({
+            identity: item.identity,
+            profile: item.profile,
+            authState: toLegacyAuthState(item.authState),
+          });
+        }
+      }
+      return { instances };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
+    }
   });
 
   app.post('/api/v1/harnesses/agy/instances', async (request, reply) => {
     if (!isLoopbackAddress(request.socket.remoteAddress)) {
       return reply.code(403).send({ error: 'AGY profiles can only be modified locally from Desktop' });
     }
-    const parsed = UpsertAgyInstanceRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid AGY profile payload' });
-    }
-    const req = parsed.data;
-    if (req.instanceId === 'codex' || req.instanceId === 'claude') {
-      return reply.code(409).send({ error: `Harness ID "${req.instanceId}" 已被内置引擎保留` });
-    }
-    const existingAdapter = registry.get(req.instanceId);
-    if (existingAdapter && existingAdapter.driverId !== 'agy' && existingAdapter.kind !== 'agy') {
-      return reply.code(409).send({ error: `Harness ID "${req.instanceId}" 已被其他引擎占用` });
-    }
-
-    const existingIdx = config.agyProfiles.findIndex((p) => p.instanceId === req.instanceId);
-    const existingProfile = existingIdx >= 0 ? config.agyProfiles[existingIdx] : undefined;
-    const isolationMode =
-      req.instanceId === 'agy' ? (req.isolationMode ?? existingProfile?.isolationMode ?? 'official_default') : 'profile_isolated';
-
-    const profile: AgyProfileConfig = {
-      instanceId: req.instanceId,
-      displayName: req.displayName,
-      description: req.description,
-      isolationMode,
-      authMethod: req.authMethod,
-      geminiDir: req.geminiDir?.trim() || existingProfile?.geminiDir,
-      appDataDirName: req.appDataDirName,
-      binaryPath: req.binaryPath?.trim() || undefined,
-      gcpProject: req.gcpProject?.trim() || undefined,
-      gcpLocation: req.gcpLocation?.trim() || undefined,
-      defaults: req.defaults ?? existingProfile?.defaults ?? {
-        linkGlobalSkills: true,
-        syncGlobalRules: true,
-        additionalDirectories: [],
-      },
-      identity: existingProfile?.identity,
-      enabled: req.enabled,
-    };
-
-    if (existingIdx >= 0) {
-      config.agyProfiles[existingIdx] = profile;
-    } else {
-      config.agyProfiles.push(profile);
-    }
-    saveConfig(paths.configPath, config);
-
-    await sessionManager.closeSessionsForHarness(profile.instanceId);
-    if (profile.enabled && registry.hasDriver('agy')) {
-      registry.registerInstance({
-        instanceId: profile.instanceId,
-        driverId: 'agy',
-        displayName: profile.displayName,
-        description: profile.description,
-        binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
-        homeDir: profile.geminiDir,
-        enabled: profile.enabled,
+    const q = request.query as { providerInstanceId?: string; workspaceId?: string };
+    try {
+      const provider = resolveAgyAccountsProvider(pluginManager, {
+        explicitInstanceId: q.providerInstanceId,
+        workspaceId: q.workspaceId,
+        allowSingleCandidate: true,
       });
-    } else {
-      registry.unregister(profile.instanceId);
+      const res = await provider.service.upsertInstance({
+        profile: (request.body ?? {}) as Record<string, unknown>,
+      });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      const harnesses = await registry.probeAll(true);
+      return {
+        identity: res.value.identity,
+        profile: res.value.profile,
+        authState: toLegacyAuthState(res.value.authState),
+        harnesses,
+      };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    invalidateAccountUsage(pluginManager, profile.instanceId);
-
-    const harnesses = await registry.probeAll(true);
-    return {
-      profile,
-      authState: agyAuthService.getState(profile.instanceId),
-      harnesses,
-    };
   });
 
   app.delete('/api/v1/harnesses/agy/instances/:id', async (request, reply) => {
@@ -705,48 +746,32 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: 'AGY profiles can only be deleted locally from Desktop' });
     }
     const { id } = request.params as { id: string };
-    const q = request.query as { purgeData?: string };
-    if (id === 'agy') {
-      return reply.code(400).send({ error: '不能删除内置主 AGY 实例，仅可删除自定义隔离账号或修改其模式。' });
+    const q = request.query as { purgeData?: string; providerInstanceId?: string };
+    try {
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.deleteInstance({
+        profileInstanceId: id,
+        purgeData: q.purgeData === '1' || q.purgeData === 'true',
+      });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      const harnesses = await registry.probeAll(false);
+      return { deleted: res.value.deleted, instanceId: res.value.instanceId, harnesses };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    const idx = config.agyProfiles.findIndex((p) => p.instanceId === id);
-    const existingAdapter = registry.get(id);
-    if (idx < 0 && !(existingAdapter instanceof AgyAdapter)) {
-      return reply.code(404).send({ error: 'AGY profile not found' });
-    }
-
-    await agyAuthService.cancelLogin(id).catch(() => {});
-    await sessionManager.closeSessionsForHarness(id);
-
-    if (idx >= 0) {
-      config.agyProfiles.splice(idx, 1);
-      saveConfig(paths.configPath, config);
-    }
-    registry.unregister(id);
-    invalidateAccountUsage(pluginManager, id);
-
-    if (q.purgeData === '1' || q.purgeData === 'true') {
-      const dirs = resolveAgyProfileDirectories(paths.agyProfilesDir, id);
-      const profilesRootResolved = path.resolve(paths.agyProfilesDir);
-      if (path.resolve(dirs.geminiDir).startsWith(`${profilesRootResolved}${path.sep}`)) {
-        fs.rmSync(dirs.geminiDir, { recursive: true, force: true });
-      }
-      if (path.resolve(dirs.runtimeTempDir).startsWith(`${profilesRootResolved}${path.sep}`)) {
-        fs.rmSync(dirs.runtimeTempDir, { recursive: true, force: true });
-      }
-    }
-
-    const harnesses = await registry.probeAll(false);
-    return { deleted: true, instanceId: id, harnesses };
   });
 
   app.get('/api/v1/harnesses/agy/instances/:id/auth/state', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const adapter = registry.get(id);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(404).send({ error: 'AGY instance not found' });
+    const q = request.query as { providerInstanceId?: string };
+    try {
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.getAuthState({ profileInstanceId: id });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return { state: toLegacyAuthState(res.value.state) };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    return { state: agyAuthService.getState(id) };
   });
 
   app.post('/api/v1/harnesses/agy/instances/:id/auth/start', async (request, reply) => {
@@ -754,11 +779,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: 'AGY login can only be started locally from Desktop' });
     }
     const { id } = request.params as { id: string };
+    const q = request.query as { providerInstanceId?: string };
     try {
-      const state = await agyAuthService.startLogin(id);
-      return { state };
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.startLogin({ profileInstanceId: id });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return { state: toLegacyAuthState(res.value.state) };
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 409);
     }
   });
 
@@ -767,16 +795,23 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: 'AGY login code can only be submitted locally from Desktop' });
     }
     const { id } = request.params as { id: string };
+    const q = request.query as { providerInstanceId?: string };
     const parsed = AgyAuthRespondRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid login response payload' });
     }
     try {
-      const state = await agyAuthService.respondLogin(id, parsed.data.flowId, parsed.data.codeOrUrl);
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.respondLogin({
+        profileInstanceId: id,
+        flowId: parsed.data.flowId,
+        codeOrUrl: parsed.data.codeOrUrl,
+      });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
       const harnesses = await registry.probeAll(true);
-      return { state, harnesses };
+      return { state: toLegacyAuthState(res.value.state), harnesses };
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 409);
     }
   });
 
@@ -785,12 +820,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: 'AGY login cancellation is local only' });
     }
     const { id } = request.params as { id: string };
+    const q = request.query as { providerInstanceId?: string };
     const parsed = AgyAuthCancelRequestSchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.code(400).send({ error: 'Invalid cancel payload' });
     }
-    const state = await agyAuthService.cancelLogin(id, parsed.data.flowId);
-    return { state };
+    try {
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.cancelLogin({
+        profileInstanceId: id,
+        flowId: parsed.data.flowId,
+      });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return { state: toLegacyAuthState(res.value.state) };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
+    }
   });
 
   app.post('/api/v1/harnesses/agy/instances/:id/auth/logout', async (request, reply) => {
@@ -798,16 +843,22 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(403).send({ error: 'AGY logout can only be triggered locally from Desktop' });
     }
     const { id } = request.params as { id: string };
+    const q = request.query as { providerInstanceId?: string };
     const parsed = AgyAuthLogoutRequestSchema.safeParse(request.body ?? {});
     if (!parsed.success) {
       return reply.code(400).send({ error: 'Invalid logout payload' });
     }
     try {
-      const state = await agyAuthService.logout(id, parsed.data);
+      const provider = await resolveAccountsProviderForProfile(id, q.providerInstanceId);
+      const res = await provider.service.logout({
+        profileInstanceId: id,
+        confirmSharedKeyring: parsed.data.confirmSharedKeyring,
+      });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
       const harnesses = await registry.probeAll(true);
-      return { state, harnesses };
+      return { state: toLegacyAuthState(res.value.state), harnesses };
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 409);
     }
   });
 
@@ -1329,6 +1380,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         'harness.driver.claude.v1': pluginManager.resolveServiceSelection('harness.driver.claude.v1', { workspaceId: id, allowSingleCandidate: true }),
         'harness.driver.acp.v1': pluginManager.resolveServiceSelection('harness.driver.acp.v1', { workspaceId: id, allowSingleCandidate: true }),
         'harness.driver.agy.v1': pluginManager.resolveServiceSelection('harness.driver.agy.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'agy.runtime.v1': pluginManager.resolveServiceSelection(AGY_RUNTIME_CONTRACT, { workspaceId: id, allowSingleCandidate: true }),
+        'agy.accounts.v1': pluginManager.resolveServiceSelection(AGY_ACCOUNTS_CONTRACT, { workspaceId: id, allowSingleCandidate: true }),
+        'agy.workbench.v1': pluginManager.resolveServiceSelection(AGY_WORKBENCH_CONTRACT, { workspaceId: id, allowSingleCandidate: true }),
         'session.handoff.v1': pluginManager.resolveServiceSelection('session.handoff.v1', { workspaceId: id, allowSingleCandidate: true }),
         'session.compression.v1': pluginManager.resolveServiceSelection('session.compression.v1', { workspaceId: id, allowSingleCandidate: true }),
         'session.collaboration.v1': pluginManager.resolveServiceSelection('session.collaboration.v1', { workspaceId: id, allowSingleCandidate: true }),
@@ -2520,92 +2574,117 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const adapter = registry.get(session.harnessId);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    if (session.harnessKind !== 'agy') return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    try {
+      const provider = resolveAgyRuntimeProvider(pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        driverProviderInstanceId: registry.get(session.harnessId)?.providerInstanceId,
+        store,
+        allowSingleCandidate: true,
+      });
+      if (!provider.service.listSubagents) return { subagents: [] };
+      const res = await provider.service.listSubagents({ sessionId: session.id });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return res.value;
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    if (!session.nativeSessionId) {
-      return { subagents: [] };
-    }
-    const ctx = adapter.getLaunchContextSync();
-    return { subagents: listAgySubagentRecords(ctx.appDataPath, session.nativeSessionId) };
   });
 
   app.get('/api/v1/sessions/:id/agy/subagents/:subagentId', async (request, reply) => {
     const { id, subagentId } = request.params as { id: string; subagentId: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const adapter = registry.get(session.harnessId);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    if (session.harnessKind !== 'agy') return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    try {
+      const provider = resolveAgyRuntimeProvider(pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        driverProviderInstanceId: registry.get(session.harnessId)?.providerInstanceId,
+        store,
+        allowSingleCandidate: true,
+      });
+      if (!provider.service.readSubagentDetail) return reply.code(404).send({ error: 'Subagent trace not found' });
+      const res = await provider.service.readSubagentDetail({ sessionId: session.id, subagentId });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return res.value;
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    if (!session.nativeSessionId) {
-      return reply.code(404).send({ error: 'Native session not initialized' });
-    }
-    const ctx = adapter.getLaunchContextSync();
-    const detail = readAgySubagentDetail(ctx.appDataPath, session.nativeSessionId, subagentId);
-    if (!detail) {
-      return reply.code(404).send({ error: 'Subagent trace not found' });
-    }
-    return { subagent: detail };
   });
 
   app.get('/api/v1/sessions/:id/agy/artifacts', async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const adapter = registry.get(session.harnessId);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    if (session.harnessKind !== 'agy') return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    try {
+      const provider = resolveAgyRuntimeProvider(pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        driverProviderInstanceId: registry.get(session.harnessId)?.providerInstanceId,
+        store,
+        allowSingleCandidate: true,
+      });
+      if (!provider.service.listArtifacts) return { artifacts: [] };
+      const res = await provider.service.listArtifacts({ sessionId: session.id });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return res.value;
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    if (!session.nativeSessionId) {
-      return { artifacts: [] };
-    }
-    const ctx = adapter.getLaunchContextSync();
-    return { artifacts: listAgySessionArtifacts(ctx.appDataPath, session.nativeSessionId) };
   });
 
   app.get('/api/v1/sessions/:id/agy/artifacts/:name', async (request, reply) => {
     const { id, name } = request.params as { id: string; name: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const adapter = registry.get(session.harnessId);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    if (session.harnessKind !== 'agy') return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    try {
+      const provider = resolveAgyRuntimeProvider(pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        driverProviderInstanceId: registry.get(session.harnessId)?.providerInstanceId,
+        store,
+        allowSingleCandidate: true,
+      });
+      if (!provider.service.readArtifact) return reply.code(404).send({ error: 'Artifact not found' });
+      const res = await provider.service.readArtifact({ sessionId: session.id, name });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return res.value;
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    if (!session.nativeSessionId) {
-      return reply.code(404).send({ error: 'Native session not initialized' });
-    }
-    const ctx = adapter.getLaunchContextSync();
-    const artifact = readAgySessionArtifact(ctx.appDataPath, session.nativeSessionId, name);
-    if (!artifact) {
-      return reply.code(404).send({ error: 'Artifact not found' });
-    }
-    return { artifact };
   });
 
   app.get('/api/v1/sessions/:id/agy/ecosystem', async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = sessionManager.getSession(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const adapter = registry.get(session.harnessId);
-    if (!(adapter instanceof AgyAdapter)) {
-      return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    if (session.harnessKind !== 'agy') return reply.code(400).send({ error: 'Session is not bound to an AGY adapter' });
+    try {
+      const provider = resolveAgyRuntimeProvider(pluginManager, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        driverProviderInstanceId: registry.get(session.harnessId)?.providerInstanceId,
+        store,
+        allowSingleCandidate: true,
+      });
+      if (!provider.service.getEcosystem) return reply.code(404).send({ error: 'AGY ecosystem snapshot unavailable' });
+      const res = await provider.service.getEcosystem({ sessionId: session.id });
+      if (!res.ok) return mapAgyPeerError(reply, res.error);
+      return res.value;
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
     }
-    const profile = adapter.getProfile();
-    const snapshot = collectAgyEcosystemSnapshot({
-      launchContext: adapter.getLaunchContextSync(),
-      workspaceRoot: session.cwd,
-      additionalDirectories: profile.defaults?.additionalDirectories ?? [],
-      harnessMateActivePluginsCount: pluginManager.listInstalled().filter((p) => p.enabled).length,
-    });
-    return { ecosystem: snapshot };
   });
 
   registerAgyNativeRoutes(app, {
     sessionManager,
     harnessRegistry: registry,
-    nativeRegistry,
+    pluginManager,
+    store,
   });
 
   return {
@@ -2615,7 +2694,16 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     pluginManager,
     pluginSecrets,
     sessionManager,
-    nativeRegistry,
+    get nativeRegistry(): AgyNativeRuntimeRegistry {
+      const resolved = resolveOptionalAgyRuntimeProvider(pluginManager, { allowSingleCandidate: true });
+      const internal = resolved
+        ? pluginManager.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+            resolved.instanceId,
+            AGY_RUNTIME_INTERNAL_SERVICE,
+          )
+        : undefined;
+      return internal?.nativeRegistry as AgyNativeRuntimeRegistry;
+    },
     commandOutputHub,
     terminalWorkspace,
     outboxWorker,
@@ -2625,6 +2713,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     async start() {
       await pluginManager.reloadAll();
       pluginManager.takeRegistryChanged();
+      sessionManager.bindSettlementSinkToActiveAgy();
       for (const rt of listActiveSessionRuntimeProviders(pluginManager)) {
         await rt.service.recoverStaleRuns().catch(() => {});
       }
@@ -2640,10 +2729,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       wsGateway.close();
       pluginAuthoring.cancel();
       pluginBuilderV2.cancel();
-      await agyAuthService.dispose();
       await terminalWorkspace.disposeAll();
       await sessionManager.shutdown();
-      disposeNativeRuntime();
       await app.close();
       await pluginManager.close();
       store.close();

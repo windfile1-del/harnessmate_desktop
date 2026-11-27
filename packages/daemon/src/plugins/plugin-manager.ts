@@ -698,6 +698,50 @@ export class PluginManager {
     return this.hasLoadedRegistryFlag;
   }
 
+  /**
+   * Synchronously reconciles enabled first-party built-in plugins in the active composition
+   * so in-process peer plugins (such as `core.harness.agy`) are live immediately after
+   * `createDaemon()` returns without restarting on the subsequent async `reloadAll()`.
+   */
+  bootstrapFirstPartySync(): void {
+    if (this.hasLoadedRegistryFlag || this.isEmptyComposition()) return;
+    const disabled = new Set(this.getDisabledIds());
+    const builtinMap = new Map(BUILTIN_PLUGINS.map((m) => [m.id, m]));
+    const composition = this.safeComposition?.resolve([]) ?? this.composition.resolve([]);
+    this.host.setDefaultBindings(composition.bindings ?? {});
+    const definitions: HostPlugin[] = [];
+    for (const entry of composition.entries) {
+      const manifest = builtinMap.get(entry.name) ?? builtinMap.get(entry.id);
+      if (!manifest) continue;
+      const core = this.firstParty.get(manifest.id);
+      if (!core) continue;
+      const enabled = !entry.disabled && !disabled.has(manifest.id) && !disabled.has(entry.id);
+      const revision = JSON.stringify([
+        undefined,
+        false,
+        entry.config,
+        entry.bindings,
+        manifest.inject,
+        manifest.provides,
+        this.restartGeneration.get(entry.id) ?? this.restartGeneration.get(manifest.id) ?? 0,
+        this.permissionRevision.get(manifest.id) ?? 0,
+      ]);
+      definitions.push({
+        id: entry.id,
+        pluginId: manifest.id,
+        enabled,
+        revision,
+        inject: core.inject ?? manifest.inject,
+        provides: core.provides,
+        dependencies: manifest.dependencies ? Object.values(manifest.dependencies) : undefined,
+        bindings: entry.bindings,
+        apply: core.apply,
+        config: entry.config,
+      });
+    }
+    this.host.reconcile(definitions);
+  }
+
   ensureBootstrapped(): Promise<void> {
     if (this.hasLoadedRegistryFlag) return Promise.resolve();
     if (!this.bootstrapPromise) {

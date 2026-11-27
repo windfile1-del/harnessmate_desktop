@@ -5,6 +5,7 @@
 第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 或 `harness:driver:register` 并获授权后提供公共契约、`harness.driver.<driverId>.v1` 同类驱动（含 `codex`/`claude`/`acp`/`agy`）、`agy.runtime.v1`、`agy.accounts.v1`、`agy.workbench.v1` 或自定义命名空间服务。公开契约见下表。
 
 - `agy.accounts.v1`
+- `agy.runtime.internal`
 - `agy.runtime.v1`
 - `agy.workbench.v1`
 - `approval-center`

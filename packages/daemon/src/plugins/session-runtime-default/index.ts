@@ -1102,15 +1102,20 @@ export function createDefaultSessionRuntimePlugin(
             }
 
             case 'turn.completed': {
-              if (!opts?.bypassNativeHold && eventHarnessKind === 'agy' && deps.nativePort.isEnabled()) {
+              const nativeScope = {
+                sessionId,
+                driverProviderInstanceId: entry.providerInstanceId,
+              };
+              if (!opts?.bypassNativeHold && eventHarnessKind === 'agy' && deps.nativePort.isEnabled(nativeScope)) {
                 const settlement = deps.nativePort.decideTurnSettlement(
                   ev.turnId,
                   entry.nativeBinding ?? null,
+                  nativeScope,
                 );
                 if (settlement?.kind === 'held') {
                   break;
                 }
-                if (deps.nativePort.isNativeLifecycleEnabled() && meta && meta.turnId !== ev.turnId) {
+                if (deps.nativePort.isNativeLifecycleEnabled(nativeScope) && meta && meta.turnId !== ev.turnId) {
                   break;
                 }
               }
@@ -1443,12 +1448,19 @@ export function createDefaultSessionRuntimePlugin(
 
         let nativeBinding: RuntimeBinding | undefined;
         let nativeRuntimeHooks: AdapterSessionConfig['nativeRuntimeHooks'];
-        if (adapter.kind === 'agy' && deps.nativePort.isEnabled()) {
-          if (deps.nativePort.isNativeLifecycleEnabled() && deps.nativePort.isSchemaCompatible()) {
+        const nativeScope = {
+          sessionId: sessionDto.id,
+          workspaceId: sessionDto.workspaceId,
+          driverProviderInstanceId: adapter.providerInstanceId,
+        };
+        if (adapter.kind === 'agy' && deps.nativePort.isEnabled(nativeScope)) {
+          if (deps.nativePort.isNativeLifecycleEnabled(nativeScope) && deps.nativePort.isSchemaCompatible(nativeScope)) {
             try {
               const prepared = deps.nativePort.prepareSessionBinding({
                 sessionId: sessionDto.id,
+                workspaceId: sessionDto.workspaceId,
                 instanceId: adapter.id,
+                driverProviderInstanceId: adapter.providerInstanceId,
                 nativeSessionId,
                 sourceRef: nativeHistory?.source ?? 'acp',
               });
@@ -1460,8 +1472,8 @@ export function createDefaultSessionRuntimePlugin(
               nativeBinding = undefined;
               nativeRuntimeHooks = undefined;
             }
-          } else if (deps.nativePort.isObservatoryTapEnabled()) {
-            nativeRuntimeHooks = deps.nativePort.createObservatoryHooks(sessionDto.id, adapter.id);
+          } else if (deps.nativePort.isObservatoryTapEnabled(nativeScope)) {
+            nativeRuntimeHooks = deps.nativePort.createObservatoryHooks(sessionDto.id, adapter.id, nativeScope);
           }
         }
 
@@ -1545,7 +1557,7 @@ export function createDefaultSessionRuntimePlugin(
           void handleAdapterEvent(entry, ev);
         });
         if (nativeBinding) {
-          deps.nativePort.notifyReconnect(nativeBinding, nativeSessionId ? 'resume' : 'fresh');
+          deps.nativePort.notifyReconnect(nativeBinding, nativeSessionId ? 'resume' : 'fresh', nativeScope);
         }
         if (resolvedNativeId) {
           await enqueueSessionCommit(sessionDto.id, async () =>
@@ -2194,15 +2206,19 @@ export function createDefaultSessionRuntimePlugin(
             const entry = liveHandles.get(handleKey(req.sessionId, targetHarnessId));
             if (entry && !entry.disposed) {
               interruptedHandle = true;
+              const cancelScope = {
+                sessionId: req.sessionId,
+                driverProviderInstanceId: entry.providerInstanceId,
+              };
               if (
                 entry.nativeBinding &&
                 entry.handle.requestNativeSessionCancel &&
-                deps.nativePort.isEnabled() &&
-                deps.nativePort.isNativeLifecycleEnabled() &&
-                deps.nativePort.hasCancelHook?.() &&
+                deps.nativePort.isEnabled(cancelScope) &&
+                deps.nativePort.isNativeLifecycleEnabled(cancelScope) &&
+                deps.nativePort.hasCancelHook?.(cancelScope) &&
                 entry.handle.requestNativeSessionCancel()
               ) {
-                deps.nativePort.notifyCancelRequested(entry.nativeBinding);
+                deps.nativePort.notifyCancelRequested(entry.nativeBinding, cancelScope);
                 return peerOk({ interrupted: true });
               }
               await entry.handle.interrupt().catch(() => {});

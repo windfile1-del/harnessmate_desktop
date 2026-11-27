@@ -53,8 +53,7 @@ import type { ContextCompiler } from '../../core/context-compiler.js';
 import type { TaskLedgerService } from '../../core/task-ledger-service.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import type { AdapterSessionConfig } from '../../harnesses/types.js';
-import { AgyAdapter } from '../../harnesses/agy/agy-driver.js';
-import { evaluateAgyConsumerProvenance, mintAgyDispatchProvenance } from '../../harnesses/agy/native/wiring/provenance.js';
+import { AGY_RUNTIME_CONTRACT, type AgyRuntimeServiceV1 } from '@harnessmate/plugin-api';
 import { handoffRedactionMap, type GitService } from '../builtin/services.js';
 import { GLOBAL_WORKSPACE_SCOPE, type PluginPermissionService } from '../permissions/permissions.js';
 import type { PluginHost } from '../runtime/lifecycle.js';
@@ -1067,12 +1066,29 @@ export class IsolatedPluginRpcRouter {
         if (!targetAdapter) {
           throw new PluginApiError('E_INVALID_INPUT', `目标 Harness 实例不存在: ${targetId}`);
         }
-        const decision = evaluateAgyConsumerProvenance({
-          instanceId: targetAdapter.id,
-          driverId: targetAdapter.driverId ?? targetAdapter.kind,
-          profile: targetAdapter instanceof AgyAdapter ? targetAdapter.getProfile() : null,
-        }, mintAgyDispatchProvenance('plugin_automated', 'plugin', 'sessions.switchInstance'));
-        if (!decision.allowed) throw new PluginApiError('E_PERMISSION_DENIED', decision.reason ?? 'AGY switch provenance denied');
+        const targetDriverId = targetAdapter.driverId ?? targetAdapter.kind;
+        if (targetDriverId === 'agy' && targetAdapter.providerInstanceId) {
+          const agyRuntime = this.deps.host.getServiceByInstance<AgyRuntimeServiceV1>(
+            targetAdapter.providerInstanceId,
+            AGY_RUNTIME_CONTRACT,
+          );
+          if (agyRuntime?.verifyDispatchProvenance) {
+            const check = await agyRuntime.verifyDispatchProvenance({
+              harnessId: targetAdapter.id,
+              driverId: targetDriverId,
+              provenance: {
+                channel: 'plugin_automated',
+                actor: 'plugin',
+                issuedAt: Date.now(),
+                reason: 'sessions.switchInstance',
+                verifiedByHost: true,
+              },
+            });
+            if (check.ok && !check.value.allowed) {
+              throw new PluginApiError('E_PERMISSION_DENIED', check.value.reason ?? 'AGY switch provenance denied');
+            }
+          }
+        }
         const forceFresh = opts.forceFreshNativeSession === true;
         if (resolved.service) {
           const existingRes = await resolved.service.getHarnessBinding({ sessionId: session.id, harnessId: targetAdapter.id });

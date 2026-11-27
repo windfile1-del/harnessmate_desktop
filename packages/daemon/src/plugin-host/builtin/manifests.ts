@@ -5,6 +5,7 @@ import { SESSION_RUNTIME_DEFAULT_MANIFEST } from '../../plugins/session-runtime-
 
 export const BUNDLED_PLUGIN_IDS = [
   'hm.plugin.chat-default',
+  'hm.plugin.agy-workbench-default',
   'hm.plugin.message-studio',
   'hm.plugin.browser-desktop',
   'hm.plugin.browser-headless',
@@ -42,10 +43,16 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     id: 'core.harness.agy',
     name: 'Antigravity CLI (ACP) 引擎插件',
     version: '1.0.0',
-    description: '接入本机 agy CLI 原生 ACP 协议，支持动态模型、思考档位校验与权限确认。',
+    description: '接入本机 agy CLI 原生 ACP 协议，提供 AGY 驱动、多账号认证、原生运行时与工作流观测。',
     author: 'HarnessMate Core',
     category: 'harness',
-    provides: ['harness.driver.v1', 'harness.driver.agy.v1', 'harness.agy'],
+    provides: [
+      'harness.driver.v1',
+      'harness.driver.agy.v1',
+      'agy.runtime.v1',
+      'agy.accounts.v1',
+      'harness.agy',
+    ],
     contributes: { uiSlots: ['modal'] },
   },
   {

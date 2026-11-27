@@ -7,8 +7,16 @@ import {
   type NativeCanonicalEvent,
   type NativeWsServerFrame,
 } from '@harnessmate/protocol';
+import { PluginApiError } from '@harnessmate/plugin-api';
 import { WebSocket, WebSocketServer } from 'ws';
+import { resolveAgyRuntimeProvider } from '../../../../core/agy-peer-router.js';
 import type { SessionManager } from '../../../../core/session-manager.js';
+import type { HarnessMateStore } from '../../../../db/sqlite.js';
+import type { PluginManager } from '../../../../plugins/plugin-manager.js';
+import {
+  AGY_RUNTIME_INTERNAL_SERVICE,
+  type AgyRuntimeInternalHandle,
+} from '../../../../plugins/harness-agy-default/index.js';
 import {
   isLocalBrowserRequest,
   type RemoteAuthService,
@@ -19,7 +27,9 @@ import type { AgyNativeRuntimeRegistry } from './registry.js';
 export interface NativeWsFeedGatewayDeps {
   readonly auth: RemoteAuthService;
   readonly sessionManager: SessionManager;
-  readonly nativeRegistry: AgyNativeRuntimeRegistry;
+  readonly nativeRegistry?: AgyNativeRuntimeRegistry;
+  readonly pluginManager?: PluginManager;
+  readonly store?: HarnessMateStore;
   readonly maxReplayEvents?: number;
   readonly maxLiveBuffer?: number;
   readonly maxBufferedBytes?: number;
@@ -113,8 +123,40 @@ export class NativeWsFeedGateway {
       return true;
     }
 
+    let resolvedRegistry = this.deps.nativeRegistry;
+    if (!resolvedRegistry && this.deps.pluginManager) {
+      try {
+        const provider = resolveAgyRuntimeProvider(this.deps.pluginManager, {
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+          store: this.deps.store,
+          allowSingleCandidate: true,
+        });
+        const internal = this.deps.pluginManager.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+          provider.instanceId,
+          AGY_RUNTIME_INTERNAL_SERVICE,
+        );
+        resolvedRegistry = internal?.nativeRegistry;
+      } catch (err) {
+        if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+          socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
+          socket.destroy();
+          return true;
+        }
+        socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+        socket.destroy();
+        return true;
+      }
+    }
+    if (!resolvedRegistry) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
+      return true;
+    }
+
+    const activeRegistry = resolvedRegistry;
     this.wss.handleUpgrade(request, socket, head, (ws) => {
-      this.handleConnection(ws, session.id, session.harnessId);
+      this.handleConnection(ws, session.id, session.harnessId, activeRegistry);
     });
     return true;
   }
@@ -126,13 +168,18 @@ export class NativeWsFeedGateway {
     this.wss.close();
   }
 
-  private handleConnection(ws: WebSocket, sessionId: string, instanceId: string): void {
+  private handleConnection(
+    ws: WebSocket,
+    sessionId: string,
+    instanceId: string,
+    nativeRegistry: AgyNativeRuntimeRegistry,
+  ): void {
     let activeUnsub: (() => void) | null = null;
-    const schemaStatus = this.deps.nativeRegistry.getSchemaStatus();
-    const enabled = this.deps.nativeRegistry.isEnabled();
+    const schemaStatus = nativeRegistry.getSchemaStatus();
+    const enabled = nativeRegistry.isEnabled();
     const binding =
       schemaStatus.compatible && enabled
-        ? this.deps.nativeRegistry.getActiveBinding(sessionId, instanceId)
+        ? nativeRegistry.getActiveBinding(sessionId, instanceId)
         : null;
 
     this.send(ws, {
@@ -196,7 +243,7 @@ export class NativeWsFeedGateway {
           activeUnsub?.();
           activeUnsub = null;
 
-          if (!this.deps.nativeRegistry.getSchemaStatus().compatible) {
+          if (!nativeRegistry.getSchemaStatus().compatible) {
             this.send(ws, {
               op: 'native_error',
               schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
@@ -230,7 +277,7 @@ export class NativeWsFeedGateway {
             });
           };
 
-          activeUnsub = this.deps.nativeRegistry.subscribeSession(sessionId, (event) => {
+          activeUnsub = nativeRegistry.subscribeSession(sessionId, (event) => {
             if (replaying) {
               if (liveBuffer.length >= this.maxLiveBuffer) {
                 bufferOverflowed = true;
@@ -271,7 +318,7 @@ export class NativeWsFeedGateway {
           let finalCursor = '';
 
           while (true) {
-            const page = this.deps.nativeRegistry.readEventsForSession(sessionId, instanceId, {
+            const page = nativeRegistry.readEventsForSession(sessionId, instanceId, {
               afterSeq: nextAfterSeq,
               limit: DEFAULT_REPLAY_PAGE_SIZE,
               cursor: cursorForFirstPage,
@@ -328,7 +375,7 @@ export class NativeWsFeedGateway {
           }
 
           if (bufferOverflowed || ws.bufferedAmount > this.maxBufferedBytes) {
-            const latest = this.deps.nativeRegistry.getActiveBinding(sessionId, instanceId);
+            const latest = nativeRegistry.getActiveBinding(sessionId, instanceId);
             abortWithResync(
               'slow_consumer_overflow',
               maxSentSeq,

@@ -314,9 +314,6 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           if (!driverId) {
             throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
           }
-          if (driverId === 'agy') {
-            throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 AGY 原生驱动: ${driverId}`);
-          }
           if (driverHandlers.has(driverId)) {
             throw new PluginApiError('E_CONFLICT', `驱动 ${driverId} 已注册`);
           }

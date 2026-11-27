@@ -739,10 +739,11 @@ describe('Batch 3 · W2 Universal Drivers & Session Collaboration', () => {
     });
     expect(branchCheck).toContain(subagent.branchName);
 
-    // 5. AGY native regression: reserved driver ID, service contract, and consumer provenance intact
+    // 5. AGY native regression (updated for Batch 4 B4-W1): AGY is now a peer driver with no reserved category,
+    // while service contracts (`harness.driver.agy.v1`, `agy.runtime.v1`, `agy.accounts.v1`) and consumer provenance remain intact.
     const agyServiceProviders = daemon.pluginManager.listServiceProviders('harness.driver.agy.v1');
     expect(agyServiceProviders.some((p) => p.pluginId === 'core.harness.agy')).toBe(true);
-    expect(daemon.registry.isReserved('agy')).toBe(true);
+    expect(daemon.registry.isReserved('agy')).toBe(false);
     expect(daemon.registry.isReserved('codex')).toBe(false);
     const agyGuard = evaluateAgyConsumerProvenance(
       { instanceId: 'agy', driverId: 'agy', profile: null },

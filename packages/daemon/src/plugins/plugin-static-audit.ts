@@ -8,7 +8,7 @@ import type {
 import { describePermission } from '../plugin-host/permissions/permissions.js';
 
 const FORBIDDEN_PLUGIN_PREFIXES = ['core.', 'broken.'] as const;
-const FORBIDDEN_DRIVER_IDS = new Set(['agy']);
+const FORBIDDEN_DRIVER_IDS = new Set<string>();
 const RESERVED_CORE_SERVICES = new Set([
   'auth',
   'permissions',

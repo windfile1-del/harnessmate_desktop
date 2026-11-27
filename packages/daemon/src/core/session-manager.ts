@@ -93,6 +93,7 @@ import {
 } from './terminal-workspace-service.js';
 import { TextDeltaCoalescer } from './text-delta-coalescer.js';
 import {
+  AGY_RUNTIME_CONTRACT,
   PEER_CONTRACTS,
   PluginApiError,
   type PublicTurnBlock,
@@ -102,6 +103,11 @@ import {
   type SessionRunRecordDto,
   type SessionWorkspaceDto,
 } from '@harnessmate/plugin-api';
+import {
+  AGY_RUNTIME_INTERNAL_SERVICE,
+  type AgyRuntimeInternalHandle,
+} from '../plugins/harness-agy-default/index.js';
+import { resolveOptionalAgyRuntimeProvider } from './agy-peer-router.js';
 import type { GitService, NativeCommandsService } from '../plugin-host/builtin/services.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
 import { dispatchTurn } from './outbound-gate.js';
@@ -299,7 +305,7 @@ export class SessionManager {
     private readonly pluginCapabilities?: PluginCapabilities,
     commandOutputHub?: CommandOutputHub,
     private readonly terminalWorkspace?: TerminalWorkspaceService,
-    private readonly nativeRegistry?: AgyNativeRuntimeRegistry,
+    private readonly explicitNativeRegistry?: AgyNativeRuntimeRegistry,
   ) {
     this.commandOutputHub = commandOutputHub ?? new CommandOutputHub();
     this.deltaCoalescer = new TextDeltaCoalescer({
@@ -324,9 +330,8 @@ export class SessionManager {
       },
     });
     // Stale running/turn crash recovery is owned by session.runtime.v1 & session.data.v1 plugins.
-    // Host only marks AGY native attached bindings as reconciling during boot and publishes legacy
-    // unpublished expired Batch-4 approvals if default session-data is not explicitly disabled.
-    this.nativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
+    // AGY native binding recovery is owned by core.harness.agy on plugin activation.
+    this.explicitNativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
     if (!this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)) {
       for (const approval of this.store.listUnpublishedExpiredApprovals()) {
         this.publishExpiredApproval(approval);
@@ -338,14 +343,34 @@ export class SessionManager {
         }
       }
     }
-    this.nativeRegistry?.bindTurnSettlementSink({
-      settleTurn: (params) => {
+    this.bindSettlementSinkToActiveAgy();
+  }
+
+  createSettlementSink() {
+    return {
+      settleTurn: (params: Parameters<SessionManager['settleHeldNativeTurn']>[0]) => {
         if (this.runtimeController?.isActive()) {
           return this.runtimeController.settleHeldNativeTurn(params);
         }
         return this.settleHeldNativeTurn(params);
       },
-    });
+    };
+  }
+
+  bindSettlementSinkToActiveAgy(): void {
+    const sink = this.createSettlementSink();
+    this.explicitNativeRegistry?.bindTurnSettlementSink(sink);
+    for (const prov of this.pluginManager.host.listServiceProviders(AGY_RUNTIME_CONTRACT)) {
+      const internal = this.pluginManager.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+        prov.instanceId,
+        AGY_RUNTIME_INTERNAL_SERVICE,
+      );
+      internal?.bindTurnSettlementSink(sink);
+    }
+  }
+
+  private get nativeRegistry(): AgyNativeRuntimeRegistry | undefined {
+    return this.getNativeRegistry();
   }
 
   attachRuntimeController(controller: SessionRuntimeDefaultController | null): void {
@@ -390,8 +415,18 @@ export class SessionManager {
     }
   }
 
-  getNativeRegistry(): AgyNativeRuntimeRegistry | undefined {
-    return this.nativeRegistry;
+  getNativeRegistry(sessionId?: string): AgyNativeRuntimeRegistry | undefined {
+    if (this.explicitNativeRegistry) return this.explicitNativeRegistry;
+    const resolved = resolveOptionalAgyRuntimeProvider(this.pluginManager, {
+      sessionId,
+      store: this.store,
+      allowSingleCandidate: true,
+    });
+    if (!resolved) return undefined;
+    return this.pluginManager.host.getServiceByInstance<AgyRuntimeInternalHandle>(
+      resolved.instanceId,
+      AGY_RUNTIME_INTERNAL_SERVICE,
+    )?.nativeRegistry;
   }
 
   private recoverStaleSessions(): void {
