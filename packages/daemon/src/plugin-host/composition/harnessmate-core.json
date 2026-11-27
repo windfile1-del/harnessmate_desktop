@@ -25,7 +25,15 @@
     "harness.model-catalog.v1": "usage",
     "session.failover.v1": "core.auto-failover",
     "harness.mcp-config.v1": "core.mcp-hub",
-    "session.model-tools.v1": "core.session-model-tools"
+    "session.model-tools.v1": "core.session-model-tools",
+    "harness.driver.codex.v1": "harness-codex",
+    "harness.driver.claude.v1": "harness-claude",
+    "harness.driver.acp.v1": "harness-acp",
+    "harness.driver.agy.v1": "harness-agy",
+    "session.handoff.v1": "handoff",
+    "session.collaboration.v1": "hm.plugin.session-explorer",
+    "session.orchestration.v1": "hm.plugin.multi-harness-orchestrator",
+    "session.compression.v1": "hm.plugin.context-compression"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

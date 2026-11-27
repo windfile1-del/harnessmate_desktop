@@ -1,3 +1,4 @@
+import { isPeerContractName } from '@harnessmate/plugin-api';
 import type {
   PluginAuditIssue,
   PluginAuditPermissionSummary,
@@ -7,7 +8,7 @@ import type {
 import { describePermission } from '../plugin-host/permissions/permissions.js';
 
 const FORBIDDEN_PLUGIN_PREFIXES = ['core.', 'broken.'] as const;
-const FORBIDDEN_DRIVER_IDS = new Set(['codex', 'claude', 'agy', 'acp']);
+const FORBIDDEN_DRIVER_IDS = new Set(['agy']);
 const RESERVED_CORE_SERVICES = new Set([
   'auth',
   'permissions',
@@ -226,13 +227,13 @@ export function auditPluginPackage(
   }
 
   for (const svc of provides) {
-    if (RESERVED_CORE_SERVICES.has(svc) || svc.startsWith('harness.')) {
+    if (RESERVED_CORE_SERVICES.has(svc) || (svc.startsWith('harness.') && !isPeerContractName(svc))) {
       blockingIssues.push({
         code: 'AUDIT_RESERVED_SERVICE',
         severity: 'error',
         file: 'harnessmate-plugin.json',
         message: `禁止在 provides 中覆盖核心保留服务: ${svc}`,
-        suggestion: '第三方自定义服务请使用命名空间前缀（例如 acme.helper）。',
+        suggestion: '第三方自定义服务请使用命名空间前缀（例如 acme.helper）或 harness.driver.<driverId>.v1。',
       });
     }
   }
@@ -240,7 +241,7 @@ export function auditPluginPackage(
   for (const cap of permissions) {
     if (cap.startsWith('service:provide:')) {
       const target = cap.slice('service:provide:'.length);
-      if (RESERVED_CORE_SERVICES.has(target) || target.startsWith('harness.')) {
+      if (RESERVED_CORE_SERVICES.has(target) || (target.startsWith('harness.') && !isPeerContractName(target))) {
         blockingIssues.push({
           code: 'AUDIT_RESERVED_SERVICE',
           severity: 'error',
@@ -321,7 +322,7 @@ export function auditPluginPackage(
       }
 
       if (!isTest) {
-        // Check built-in driver hijacking via registerDriver({ driverId: 'codex' ... }) or DRIVER_ID = 'codex'
+        // Check built-in driver hijacking via registerDriver({ driverId: 'agy' ... }) or DRIVER_ID = 'agy'
         const regDriverMatch = /registerDriver\s*\(\s*\{[\s\S]{0,600}?driverId\s*:\s*['"]([a-z0-9_-]+)['"]/i.exec(stripped);
         if (regDriverMatch?.[1] && FORBIDDEN_DRIVER_IDS.has(regDriverMatch[1].toLowerCase())) {
           blockingIssues.push({
@@ -329,8 +330,8 @@ export function auditPluginPackage(
             severity: 'error',
             file: filePath,
             line: lineNumberAt(stripped, regDriverMatch.index),
-            message: `禁止通过 registerDriver 劫持内置 Harness 驱动 ID: "${regDriverMatch[1]}"`,
-            suggestion: '第三方驱动必须使用独立的新 driverId（不可为 codex/claude/agy/acp）。',
+            message: `禁止通过 registerDriver 劫持保留 AGY 原生驱动 ID: "${regDriverMatch[1]}"`,
+            suggestion: 'AGY 原生驱动留待第四批解耦；codex/claude/acp 与自定义 driverId 可正常注册。',
           });
         }
         const driverConstMatch = /\bDRIVER_ID\s*=\s*['"]([a-z0-9_-]+)['"]/i.exec(stripped);
@@ -340,7 +341,7 @@ export function auditPluginPackage(
             severity: 'error',
             file: filePath,
             line: lineNumberAt(stripped, driverConstMatch.index),
-            message: `禁止将 DRIVER_ID 设为内置保留驱动 "${driverConstMatch[1]}"`,
+            message: `禁止将 DRIVER_ID 设为保留 AGY 原生驱动 "${driverConstMatch[1]}"`,
           });
         }
 
@@ -349,7 +350,7 @@ export function auditPluginPackage(
         let pm: RegExpExecArray | null;
         while ((pm = provideMatch.exec(stripped)) !== null) {
           const svcName = pm[1] ?? '';
-          if (RESERVED_CORE_SERVICES.has(svcName) || svcName.startsWith('harness.')) {
+          if (RESERVED_CORE_SERVICES.has(svcName) || (svcName.startsWith('harness.') && !isPeerContractName(svcName))) {
             blockingIssues.push({
               code: 'AUDIT_RESERVED_SERVICE',
               severity: 'error',

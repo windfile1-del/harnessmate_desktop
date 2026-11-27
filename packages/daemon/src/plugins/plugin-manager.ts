@@ -943,8 +943,11 @@ export class PluginManager {
     this.instances = nextInstances;
 
     const wanted = new Map<string, NonNullable<PluginManifest['contributes']['harnesses']>[number]>();
+    const hasAcpProvider = Boolean(
+      this.host.get('harness.acp') || this.host.listServiceProviders('harness.driver.acp.v1').length > 0,
+    );
     for (const [instanceId, rec] of nextInstances) {
-      if (!rec.info.enabled || this.host.status(instanceId)?.state !== 'ACTIVE' || !this.host.get('harness.acp')) continue;
+      if (!rec.info.enabled || this.host.status(instanceId)?.state !== 'ACTIVE' || !hasAcpProvider) continue;
       for (const config of rec.info.contributes.harnesses ?? []) wanted.set(config.id, config);
     }
     for (const [id, record] of this.pluginHarnesses) {

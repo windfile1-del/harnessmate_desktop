@@ -28,6 +28,15 @@ export const PEER_CONTRACTS = {
   sessionData: 'session.data.v1',
   sessionRuntime: 'session.runtime.v1',
   hmSessionData: 'hm.session-data.v1',
+  harnessDriver: 'harness.driver.v1',
+  harnessDriverCodex: 'harness.driver.codex.v1',
+  harnessDriverClaude: 'harness.driver.claude.v1',
+  harnessDriverAcp: 'harness.driver.acp.v1',
+  harnessDriverAgy: 'harness.driver.agy.v1',
+  sessionHandoff: 'session.handoff.v1',
+  sessionCompression: 'session.compression.v1',
+  sessionCollaboration: 'session.collaboration.v1',
+  sessionOrchestration: 'session.orchestration.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
   'browser.v1',
@@ -51,15 +60,31 @@ export const PEER_CONTRACT_NAMES = [
   'session.data.v1',
   'session.runtime.v1',
   'hm.session-data.v1',
+  'harness.driver.v1',
+  'harness.driver.codex.v1',
+  'harness.driver.claude.v1',
+  'harness.driver.acp.v1',
+  'harness.driver.agy.v1',
+  'session.handoff.v1',
+  'session.compression.v1',
+  'session.collaboration.v1',
+  'session.orchestration.v1',
 ] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 
+const DYNAMIC_DRIVER_CONTRACT_PATTERN = /^harness\.driver\.[a-z0-9][a-z0-9._-]{0,47}\.v1$/i;
+
+export function isDynamicDriverPeerContract(name: string): boolean {
+  return DYNAMIC_DRIVER_CONTRACT_PATTERN.test(name);
+}
+
 export function isPeerContractName(name: string): name is PeerContractName {
-  return (PEER_CONTRACT_NAMES as readonly string[]).includes(name);
+  return (PEER_CONTRACT_NAMES as readonly string[]).includes(name) || isDynamicDriverPeerContract(name);
 }
 
 export const PluginServiceNameSchema = z.union([
   z.enum(PEER_CONTRACT_NAMES),
+  z.string().max(100).regex(DYNAMIC_DRIVER_CONTRACT_PATTERN),
   z.string().max(100).regex(/^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*$/),
 ]);
 const services = z.array(PluginServiceNameSchema).max(32).refine((names) => new Set(names).size === names.length);

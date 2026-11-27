@@ -855,7 +855,7 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
           requirePermission('harness:driver:register');
           const driverId = typeof driver?.driverId === 'string' ? driver.driverId.trim() : '';
           if (!driverId) throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
-          if (driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
+          if (driverId === 'agy') {
             throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置驱动 ID: ${driverId}`);
           }
           if (drivers.has(driverId)) throw new PluginApiError('E_CONFLICT', `驱动 ${driverId} 已注册`);

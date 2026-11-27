@@ -187,8 +187,9 @@ it('supports registerDriver with built-in hijack guard, streaming turns, context
     await daemon.start();
     const workspace = await daemon.sessionManager.addWorkspace(staging);
 
-    // 1. Built-in driver hijack is rejected with E_PERMISSION_DENIED
-    for (const reservedId of ['codex', 'claude', 'agy', 'acp']) {
+    // 1. Built-in AGY native hijack is rejected with E_PERMISSION_DENIED (Batch 4 reserved);
+    // peer categories (codex / claude / acp) are open to external plugins with isolated provider-scoped IDs.
+    for (const reservedId of ['agy']) {
       const hijackDir = writePluginPackage(staging, `hijack-${reservedId}`, {
         id: `user.hijack-${reservedId}`,
         name: `Hijack ${reservedId}`,

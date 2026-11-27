@@ -5,26 +5,72 @@ import type { AgyLaunchContext } from '../harnesses/agy/agy-launch-context.js';
 import { formatAgyUsageSummary } from '../harnesses/agy/agy-usage.js';
 import { execCliQuick, resolveBinary } from '../harnesses/process.js';
 import type { HarnessRegistry } from '../harnesses/registry.js';
-import type { NativeSkill } from '../harnesses/types.js';
+import type { HarnessAdapter, NativeSkill } from '../harnesses/types.js';
 import type { UsageService } from './usage-service.js';
 
-export function listHarnessCommands(kind: HarnessKind, agyDesktop: boolean): HarnessCommandInfo[] {
-  if (kind !== 'codex' && kind !== 'claude' && kind !== 'agy') return [];
+export function listHarnessCommands(
+  kind: HarnessKind,
+  agyDesktop: boolean,
+  adapter?: HarnessAdapter,
+): HarnessCommandInfo[] {
+  if (adapter?.supportedCommands && adapter.supportedCommands.length > 0) {
+    return adapter.supportedCommands
+      .filter((cmd) => !(agyDesktop && ['compact', 'goal', 'plugin', 'skills', 'skill'].includes(cmd.command)))
+      .map((cmd) => ({
+        command: cmd.command,
+        description: cmd.description,
+        ...(cmd.argumentHint ? { argumentHint: cmd.argumentHint } : {}),
+        supported: cmd.supported,
+        ...(cmd.reason ? { reason: cmd.reason } : {}),
+        source: cmd.source ?? 'driver',
+      }));
+  }
+  if (kind !== 'codex' && kind !== 'claude' && kind !== 'agy') {
+    if (!adapter) return [];
+    const commands: HarnessCommandInfo[] = [
+      {
+        command: 'model',
+        description: '查看列表或切换当前会话的模型',
+        argumentHint: '[模型 ID | default]',
+        supported: true,
+        source: 'driver',
+      },
+      {
+        command: 'plan',
+        description: '进入计划模式，或用 off 退出',
+        argumentHint: '[任务 | off]',
+        supported: adapter.capabilities.permissionModes.includes('plan'),
+        ...(!adapter.capabilities.permissionModes.includes('plan')
+          ? { reason: `驱动 ${adapter.id} 未声明 plan 权限模式` }
+          : {}),
+        source: 'driver',
+      },
+    ];
+    if (adapter.capabilitiesV2?.supportsUsageLimits) {
+      commands.push({
+        command: 'usage',
+        description: '查看底层 CLI 提供的用量或额度',
+        supported: true,
+        source: 'driver',
+      });
+    }
+    return commands;
+  }
   const commands: HarnessCommandInfo[] = [
-    { command: 'model', description: '查看列表或切换当前会话的模型', argumentHint: '[模型 ID | default]' },
-    { command: 'plan', description: '进入计划模式，或用 off 退出', argumentHint: '[任务 | off]' },
-    { command: 'usage', description: '查看底层 CLI 提供的用量或额度' },
+    { command: 'model', description: '查看列表或切换当前会话的模型', argumentHint: '[模型 ID | default]', supported: true, source: 'builtin' },
+    { command: 'plan', description: '进入计划模式，或用 off 退出', argumentHint: '[任务 | off]', supported: true, source: 'builtin' },
+    { command: 'usage', description: '查看底层 CLI 提供的用量或额度', supported: true, source: 'builtin' },
   ];
   if (!agyDesktop) {
     commands.push(
       { command: 'compact', description: '压缩原生会话的模型上下文',
-        ...(kind === 'claude' ? { argumentHint: '[摘要重点]' } : {}) },
+        ...(kind === 'claude' ? { argumentHint: '[摘要重点]' } : {}), supported: true, source: 'builtin' },
       { command: 'goal', description: '查看或设置原生目标',
-        argumentHint: kind === 'agy' ? '<目标>' : '[目标 | status | pause | resume | clear]' },
+        argumentHint: kind === 'agy' ? '<目标>' : '[目标 | status | pause | resume | clear]', supported: true, source: 'builtin' },
       { command: 'plugin', description: '列出或安装底层 CLI 插件',
-        argumentHint: kind === 'claude' ? '[list | install ID | reload]' : '[list | install ID]' },
-      { command: 'skills', description: '列出此工作区可调用的原生技能' },
-      { command: 'skill', description: '调用指定技能', argumentHint: '<名称> [参数]' },
+        argumentHint: kind === 'claude' ? '[list | install ID | reload]' : '[list | install ID]', supported: true, source: 'builtin' },
+      { command: 'skills', description: '列出此工作区可调用的原生技能', supported: true, source: 'builtin' },
+      { command: 'skill', description: '调用指定技能', argumentHint: '<名称> [参数]', supported: true, source: 'builtin' },
     );
   }
   return commands;

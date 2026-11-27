@@ -135,6 +135,59 @@ export class PluginHost {
     return this.defaultBindings;
   }
 
+  /**
+   * Registers a runtime-discovered peer service (e.g. from `ctx.harnesses.registerDriver`)
+   * under an active or loading plugin instance, bound to its current run generation.
+   */
+  registerDynamicService(
+    instanceId: string,
+    contract: string,
+    value: object,
+    opts?: ServiceProvideOptions,
+  ): Disposer {
+    const instance = this.instances.get(instanceId);
+    if (!instance || (instance.status.state !== 'LOADING' && instance.status.state !== 'ACTIVE')) {
+      throw new PluginApiError('E_STALE_RUN', `插件实例 ${instanceId} 未处于加载或活动状态`);
+    }
+    const pluginId = instance.definition.pluginId ?? instanceId;
+    const run = instance.run;
+    const bucket = this.servicesByContract.get(contract) ?? new Map<string, ServiceRecord>();
+    const existing = bucket.get(instanceId);
+    if (existing && existing.owner === instance && existing.runId === opts?.runId) {
+      return () => {};
+    }
+    const record: ServiceRecord = {
+      pluginId,
+      instanceId,
+      contract,
+      version: opts?.version ?? '1.0.0',
+      ...(opts?.metadata ? { metadata: opts.metadata } : {}),
+      ...(opts?.runId ? { runId: opts.runId } : {}),
+      owner: instance,
+      value,
+    };
+    bucket.set(instanceId, record);
+    this.servicesByContract.set(contract, bucket);
+    this.notifyServicesChanged();
+
+    const dispose = () => {
+      const currentBucket = this.servicesByContract.get(contract);
+      if (currentBucket?.get(instanceId) === record) {
+        currentBucket.delete(instanceId);
+        if (currentBucket.size === 0) this.servicesByContract.delete(contract);
+        this.notifyServicesChanged();
+        if (instance.run === run) {
+          this.stopDependents(instanceId, [contract]);
+        }
+      }
+    };
+    const undo = () => {
+      if (instance.effects.delete(undo)) dispose();
+    };
+    instance.effects.add(undo);
+    return undo;
+  }
+
   private satisfiesVersion(version: string, range?: string): boolean {
     if (!range || range === '*') return true;
     return Boolean(semver.validRange(range) && semver.valid(version) && semver.satisfies(version, range));

@@ -173,6 +173,9 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
 
   const toDriverDescriptor = (driver: PluginHarnessDriverRegistration): PublicHarnessDriverDescriptor => ({
     driverId: driver.driverId,
+    ...(driver.harnessId ? { harnessId: driver.harnessId } : {}),
+    ...(driver.instanceId ? { instanceId: driver.instanceId } : {}),
+    ...(driver.pluginId ? { pluginId: driver.pluginId } : {}),
     displayName: driver.displayName,
     description: driver.description,
     protocolLabel: driver.protocolLabel,
@@ -180,6 +183,7 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
     ...(driver.capabilitiesV2 ? { capabilitiesV2: driver.capabilitiesV2 } : {}),
     ...(driver.presentation ? { presentation: driver.presentation } : {}),
     ...(driver.pluginMcpTransport ? { pluginMcpTransport: driver.pluginMcpTransport } : {}),
+    ...(driver.supportedCommands ? { supportedCommands: driver.supportedCommands } : {}),
   });
 
   const buildContext = (handshake: PluginHandshakeRequest): IsolatedPluginContextV5 => {
@@ -310,8 +314,8 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
           if (!driverId) {
             throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
           }
-          if (driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
-            throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 Harness 驱动: ${driverId}`);
+          if (driverId === 'agy') {
+            throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 AGY 原生驱动: ${driverId}`);
           }
           if (driverHandlers.has(driverId)) {
             throw new PluginApiError('E_CONFLICT', `驱动 ${driverId} 已注册`);
@@ -1033,9 +1037,15 @@ export function createIsolatedPluginSession<Ctx extends IsolatedPluginContext = 
       } else if (method === 'host.driver.updateConfig') {
         const sess = driverSessions.get(String(params.handleId ?? ''));
         if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
-        if (sess.handle.updateConfig) {
-          await sess.handle.updateConfig((params.patch ?? {}) as Partial<PublicAdapterSessionConfig>);
-        }
+        const receipt = sess.handle.updateConfig
+          ? await sess.handle.updateConfig((params.patch ?? {}) as Partial<PublicAdapterSessionConfig>)
+          : undefined;
+        result = receipt && typeof receipt === 'object' ? { ok: true, receipt } : { ok: true };
+      } else if (method === 'host.driver.steerTurn') {
+        const sess = driverSessions.get(String(params.handleId ?? ''));
+        if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+        if (!sess.handle.steerTurn) throw new PluginApiError('E_NOT_SUPPORTED', '驱动不支持 steerTurn');
+        await sess.handle.steerTurn((params.input ?? {}) as PublicDriverTurnInput);
         result = { ok: true };
       } else if (method === 'host.driver.listSkills') {
         const sess = driverSessions.get(String(params.handleId ?? ''));

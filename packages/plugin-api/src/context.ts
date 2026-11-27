@@ -17,6 +17,18 @@ import {
   SESSION_DATA_CONTRACT_VERSION,
   SESSION_RUNTIME_CONTRACT_VERSION,
 } from './session-contracts.js';
+import {
+  HARNESS_DRIVER_CONTRACT_VERSION,
+  type DriverCommandCapability,
+  type DriverCommandReceipt,
+  type DriverConfigReceipt,
+} from './driver-contracts.js';
+import {
+  SESSION_COLLABORATION_CONTRACT_VERSION,
+  SESSION_COMPRESSION_CONTRACT_VERSION,
+  SESSION_HANDOFF_CONTRACT_VERSION,
+  SESSION_ORCHESTRATION_CONTRACT_VERSION,
+} from './collaboration-contracts.js';
 
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
@@ -341,6 +353,9 @@ export interface PublicHarnessModelInfo {
 
 export interface PublicHarnessDriverDescriptor {
   driverId: string;
+  harnessId?: string;
+  instanceId?: string;
+  pluginId?: string;
   displayName: string;
   description: string;
   protocolLabel: string;
@@ -348,16 +363,22 @@ export interface PublicHarnessDriverDescriptor {
   capabilitiesV2?: PublicHarnessCapabilitiesV2;
   presentation?: PublicHarnessPresentationMeta;
   pluginMcpTransport?: 'http' | 'acp';
+  supportedCommands?: DriverCommandCapability[];
 }
 
 export interface PublicHarnessInstanceInfo {
   id: string;
   driverId: string;
+  pluginId?: string;
+  providerInstanceId?: string;
+  runId?: string;
+  isDefault?: boolean;
   displayName: string;
   description: string;
   protocolLabel: string;
   enabled: boolean;
   isCustom?: boolean;
+  supportedCommands?: DriverCommandCapability[];
 }
 
 export interface PublicAdapterSessionConfig {
@@ -534,11 +555,11 @@ export interface PluginHarnessSessionHandle {
   sendTurn(input: PublicDriverTurnInput): Promise<{ driverUsed?: PublicContextInjectionDriver } | void>;
   steerTurn?(input: PublicDriverTurnInput): Promise<void>;
   listSkills?(): Promise<Array<{ name: string; path?: string; description?: string; enabled?: boolean }>>;
-  runNativeCommand?(command: string, args: string): Promise<string>;
+  runNativeCommand?(command: string, args: string): Promise<string | DriverCommandReceipt>;
   injectContext?(payload: PublicDriverContextSyncPayload): Promise<PublicContextInjectionDriver>;
   interrupt(): Promise<void>;
   resolveApproval(nativeRequestId: string, decision: PublicApprovalDecision, comment?: string): Promise<void>;
-  updateConfig?(patch: Partial<PublicAdapterSessionConfig>): Promise<void>;
+  updateConfig?(patch: Partial<PublicAdapterSessionConfig>): Promise<DriverConfigReceipt | void>;
   dispose(): Promise<void>;
   onEvent(listener: (event: PublicNormalizedAdapterEvent) => void): Disposer;
 }
@@ -751,6 +772,15 @@ export const PEER_CONTRACT_VERSIONS = {
   'session.data.v1': SESSION_DATA_CONTRACT_VERSION,
   'session.runtime.v1': SESSION_RUNTIME_CONTRACT_VERSION,
   'hm.session-data.v1': LEGACY_SESSION_DATA_CONTRACT_VERSION,
+  'harness.driver.v1': HARNESS_DRIVER_CONTRACT_VERSION,
+  'harness.driver.codex.v1': HARNESS_DRIVER_CONTRACT_VERSION,
+  'harness.driver.claude.v1': HARNESS_DRIVER_CONTRACT_VERSION,
+  'harness.driver.acp.v1': HARNESS_DRIVER_CONTRACT_VERSION,
+  'harness.driver.agy.v1': HARNESS_DRIVER_CONTRACT_VERSION,
+  'session.handoff.v1': SESSION_HANDOFF_CONTRACT_VERSION,
+  'session.compression.v1': SESSION_COMPRESSION_CONTRACT_VERSION,
+  'session.collaboration.v1': SESSION_COLLABORATION_CONTRACT_VERSION,
+  'session.orchestration.v1': SESSION_ORCHESTRATION_CONTRACT_VERSION,
 } as const;
 
 export interface ServiceChannelEvent<T = Record<string, unknown>> {

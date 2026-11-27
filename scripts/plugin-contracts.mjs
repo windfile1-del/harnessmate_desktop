@@ -50,11 +50,24 @@ const producers = {
 };
 const mapper = read(`${daemon}/plugin-host/runtime/map-event.ts`);
 const builtin = read(`${daemon}/plugin-host/builtin/services.ts`);
-const builtinSources = fs.readdirSync(path.join(root, daemon, 'plugin-host/builtin'))
-  .filter((file) => file.endsWith('.ts'))
-  .sort()
-  .map((file) => 'plugin-host/builtin/' + file)
-  .map((file) => ({ file, source: read(`${daemon}/${file}`) }));
+const handoffPluginSource = read(`${daemon}/plugins/session-handoff-default/index.ts`);
+const pluginIndexSources = fs.existsSync(path.join(root, daemon, 'plugins'))
+  ? fs.readdirSync(path.join(root, daemon, 'plugins'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(root, daemon, 'plugins', entry.name, 'index.ts')))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((entry) => ({
+        file: `plugins/${entry.name}/index.ts`,
+        source: read(`${daemon}/plugins/${entry.name}/index.ts`),
+      }))
+  : [];
+const builtinSources = [
+  ...fs.readdirSync(path.join(root, daemon, 'plugin-host/builtin'))
+    .filter((file) => file.endsWith('.ts'))
+    .sort()
+    .map((file) => 'plugin-host/builtin/' + file)
+    .map((file) => ({ file, source: read(`${daemon}/${file}`) })),
+  ...pluginIndexSources,
+];
 const eventRows = Object.entries(pluginEventContracts).map(([name, { mode, permission }]) => {
   const producer = producers[name] ?? (mapper.includes(`'${name}'`) ? 'plugin-host/runtime/map-event.ts' : null);
   const listener = builtinSources.find(({ source }) => source.includes(`ctx.on('${name}'`))?.file;
@@ -74,9 +87,9 @@ const serviceNames = [...new Set([
     );
   }),
 ])].sort();
-const handoffConfig = builtin.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
+const handoffConfig = handoffPluginSource.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
-  '第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 并获授权后提供公共契约或自定义命名空间服务。`harness.*` 下的原生驱动注册保留给第一方，公开契约见下表。\n\n' +
+  '第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 或 `harness:driver:register` 并获授权后提供公共契约、`harness.driver.<driverId>.v1` 同类驱动或自定义命名空间服务。`harness.agy` 原生驱动暂保留至第四批，公开契约见下表。\n\n' +
   serviceNames.map((name) => `- \`${name}\`\n`).join('') +
   '\n## 交接配置\n\n```ts\n' + (handoffConfig?.[1] ?? '') + '\n```\n');
 
@@ -86,7 +99,7 @@ output.set('slots.md', heading('公共 UI 插槽') +
   '第一方与内核级插件可直接注册 React 组件；第三方插件在 `contributes.slots` 或 `ctx.slots.register()` 中声明包内 HTML 入口，由宿主在 `sandbox="allow-scripts"` 沙箱 iframe 中渲染。包含全部 V4 与 V5 插槽契约。\n\n' +
   '| 插槽 | 基数 | 作用域 | 说明 |\n| --- | --- | --- | --- |\n' + slotRows.join('\n') + '\n');
 
-const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
+const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts', 'driver-contracts', 'collaboration-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
   .split('\n').filter((line) => !line.startsWith('//# sourceMappingURL')).join('\n').trim()).join('\n\n');
 output.set('plugin-api.api.md', heading('插件 API 报告') +
   '清单与声明式贡献点见同目录 JSON Schema。公共错误码见类型声明。\n\n' +
@@ -157,7 +170,7 @@ const aiBuilderContext = [
   `- High-risk permissions requiring explicit review: \`harness:driver:register\`, \`process:spawn:*\`, \`secrets:read:*\`, \`fs:workspace:write\`, \`workspace:git:write\`, \`process:pty:workspace\`, \`handoff:redact\`.`,
   ``,
   `## 6. Five Mandatory Security Redlines`,
-  `1. **No Core Hijacking**: Never use \`core.*\`/\`broken.*\` plugin IDs, never register built-in driver IDs (\`codex\`, \`claude\`, \`agy\`, \`acp\`), and never override reserved security services (\`auth\`, \`permissions\`, \`remote\`, \`mcpHub\`, \`session-kernel\`, \`harness.*\`).`,
+  `1. **No Core Hijacking**: Never use \`core.*\`/\`broken.*\` plugin IDs, never register reserved Batch-4 \`agy\` native driver ID, and never override reserved security services (\`auth\`, \`permissions\`, \`remote\`, \`mcpHub\`, \`session-kernel\`). Peer \`codex\`/\`claude\`/\`acp\` drivers are open via \`harness:driver:register\` and \`harness.driver.<id>.v1\`.`,
   `2. **No Dangerous Runtime APIs**: Never import/call \`child_process\`, \`node:child_process\`, \`worker_threads\`, \`vm\`, \`eval(\`, \`new Function\`, \`process.binding\`, or unbounded \`fs.rmSync\`. Spawn CLIs exclusively via \`ctx.runtime.spawnCli\`.`,
   `3. **No Unauthorized Approval or System Prompt Injection**: Plugins may only attach risk annotations via \`ctx.approvals.onAnnotate\`; never auto-approve user requests or attempt to alter system prompts.`,
   `4. **Minimal Network & Permission Scope**: Every external URL referenced in code MUST match a declared \`net:<host>\` permission; avoid unused high-risk permissions.`,

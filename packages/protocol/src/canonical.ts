@@ -225,6 +225,8 @@ export type HarnessCapabilitiesV2 = z.infer<typeof HarnessCapabilitiesV2Schema>;
 export const HarnessInstanceConfigSchema = z.object({
   instanceId: z.string().trim().min(1).max(64).regex(/^[a-z0-9][a-z0-9_.:-]*$/i),
   driverId: HarnessDriverIdSchema,
+  providerPluginId: z.string().optional(),
+  providerInstanceId: z.string().optional(),
   displayName: z.string().trim().min(1).max(80),
   description: z.string().max(300).optional(),
   continuationKey: z.string().trim().min(1).max(200).optional(),
@@ -232,6 +234,9 @@ export const HarnessInstanceConfigSchema = z.object({
   homeDir: z.string().optional(),
   extraArgs: z.array(z.string()).optional(),
   envWhitelist: z.record(z.string()).optional(),
+  apiBaseUrl: z.string().optional(),
+  authToken: z.string().optional(),
+  defaultServiceTier: z.enum(['default', 'fast']).optional(),
   enabled: z.boolean().default(true),
 });
 export type HarnessInstanceConfig = z.infer<typeof HarnessInstanceConfigSchema>;
@@ -239,11 +244,25 @@ export type HarnessInstanceConfig = z.infer<typeof HarnessInstanceConfigSchema>;
 export const HarnessHealthSchema = z.enum(['ready', 'degraded', 'unavailable', 'unauthenticated']);
 export type HarnessHealth = z.infer<typeof HarnessHealthSchema>;
 
+export const DriverCommandCapabilitySchema = z.object({
+  command: z.string(),
+  description: z.string(),
+  argumentHint: z.string().optional(),
+  supported: z.boolean(),
+  reason: z.string().optional(),
+  source: z.enum(['builtin', 'driver', 'native_advertised']).optional(),
+});
+export type DriverCommandCapabilityInfo = z.infer<typeof DriverCommandCapabilitySchema>;
+
 export const HarnessInfoSchema = z.object({
   id: z.string(),
   kind: HarnessKindSchema,
   driverId: HarnessDriverIdSchema.optional(),
   instanceId: z.string().optional(),
+  providerPluginId: z.string().optional(),
+  providerInstanceId: z.string().optional(),
+  providerRunId: z.string().optional(),
+  driverCategoryContract: z.string().optional(),
   continuationKey: z.string().optional(),
   displayName: z.string(),
   description: z.string(),
@@ -256,6 +275,7 @@ export const HarnessInfoSchema = z.object({
   capabilitiesV2: HarnessCapabilitiesV2Schema.optional(),
   presentation: HarnessPresentationMetaSchema.optional(),
   optionDescriptors: z.array(ProviderOptionDescriptorSchema).optional(),
+  supportedCommands: z.array(DriverCommandCapabilitySchema).optional(),
   models: z.array(HarnessModelInfoSchema),
   defaultModelId: z.string().nullable().optional(),
   accountSummary: z.string().nullable().optional(),
@@ -389,6 +409,7 @@ export const SessionSchema = z.object({
   workspaceId: z.string(),
   harnessId: z.string(),
   harnessKind: HarnessKindSchema,
+  driverProviderInstanceId: z.string().nullable().optional(),
   nativeSessionId: z.string().nullable(),
   parentSessionId: z.string().nullable().optional(),
   forkedFromTurnSeq: z.number().int().nonnegative().nullable().optional(),
@@ -856,7 +877,7 @@ export const EffectOutboxRecordSchema = z.object({
 });
 export type EffectOutboxRecord = z.infer<typeof EffectOutboxRecordSchema>;
 
-export const HandoffDeliveryStatusSchema = z.enum(['pending', 'confirmed', 'failed']);
+export const HandoffDeliveryStatusSchema = z.enum(['pending', 'confirmed', 'failed', 'uncertain']);
 export type HandoffDeliveryStatus = z.infer<typeof HandoffDeliveryStatusSchema>;
 
 export const SessionHandoffRecordSchema = z.object({

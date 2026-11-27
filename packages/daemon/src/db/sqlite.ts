@@ -574,7 +574,7 @@ export class HarnessMateStore {
 
       CREATE TABLE IF NOT EXISTS session_handoffs (
         handoff_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
         turn_id TEXT,
         from_instance_id TEXT,
         to_instance_id TEXT NOT NULL,
@@ -614,8 +614,8 @@ export class HarnessMateStore {
       CREATE TABLE IF NOT EXISTS subagent_runs (
         subagent_id TEXT PRIMARY KEY,
         cohort_id TEXT NOT NULL,
-        parent_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        child_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        parent_session_id TEXT NOT NULL,
+        child_session_id TEXT NOT NULL,
         target_instance_id TEXT NOT NULL,
         target_driver_id TEXT,
         role_title TEXT NOT NULL,
@@ -861,6 +861,107 @@ export class HarnessMateStore {
     }
     if (!bindingCols.has('last_delivery_status')) {
       this.db.exec('ALTER TABLE session_harness_bindings ADD COLUMN last_delivery_status TEXT;');
+    }
+
+    const handoffTableSql = (
+      this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_handoffs'").get() as { sql?: string } | undefined
+    )?.sql;
+    if (handoffTableSql && /REFERENCES\s+sessions/i.test(handoffTableSql)) {
+      this.db.exec(`
+        CREATE TABLE session_handoffs_v2 (
+          handoff_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          turn_id TEXT,
+          from_instance_id TEXT,
+          to_instance_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          delivery_channel TEXT NOT NULL,
+          delivery_status TEXT NOT NULL,
+          covered_up_to_seq INTEGER NOT NULL DEFAULT 0,
+          estimated_chars INTEGER NOT NULL DEFAULT 0,
+          redacted_count INTEGER NOT NULL DEFAULT 0,
+          force_fresh_reason TEXT,
+          snapshot_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL,
+          confirmed_at INTEGER
+        );
+        INSERT INTO session_handoffs_v2 (
+          handoff_id, session_id, turn_id, from_instance_id, to_instance_id,
+          mode, delivery_channel, delivery_status, covered_up_to_seq,
+          estimated_chars, redacted_count, force_fresh_reason, snapshot_json,
+          created_at, confirmed_at
+        )
+        SELECT
+          handoff_id, session_id, turn_id, from_instance_id, to_instance_id,
+          mode, delivery_channel, delivery_status, covered_up_to_seq,
+          estimated_chars, redacted_count, force_fresh_reason, snapshot_json,
+          created_at, confirmed_at
+        FROM session_handoffs;
+        DROP TABLE session_handoffs;
+        ALTER TABLE session_handoffs_v2 RENAME TO session_handoffs;
+        CREATE INDEX IF NOT EXISTS idx_session_handoffs_session_target
+          ON session_handoffs(session_id, to_instance_id, created_at DESC);
+      `);
+    }
+
+    const subagentTableSql = (
+      this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'subagent_runs'").get() as { sql?: string } | undefined
+    )?.sql;
+    if (subagentTableSql && /REFERENCES\s+sessions/i.test(subagentTableSql)) {
+      this.db.exec(`
+        CREATE TABLE subagent_runs_v2 (
+          subagent_id TEXT PRIMARY KEY,
+          cohort_id TEXT NOT NULL,
+          parent_session_id TEXT NOT NULL,
+          child_session_id TEXT NOT NULL,
+          target_instance_id TEXT NOT NULL,
+          target_driver_id TEXT,
+          role_title TEXT NOT NULL,
+          prompt TEXT NOT NULL DEFAULT '',
+          isolation TEXT NOT NULL,
+          worktree_path TEXT,
+          branch_name TEXT,
+          base_branch TEXT,
+          effective_approval_policy TEXT NOT NULL,
+          requested_approval_policy TEXT,
+          depth INTEGER NOT NULL DEFAULT 1,
+          timeout_ms INTEGER NOT NULL DEFAULT 900000,
+          fail_fast INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL,
+          diff_stat_json TEXT,
+          summary TEXT,
+          error TEXT,
+          merged_at INTEGER,
+          merged_into_branch TEXT,
+          worktree_cleaned INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          finished_at INTEGER
+        );
+        INSERT INTO subagent_runs_v2 (
+          subagent_id, cohort_id, parent_session_id, child_session_id,
+          target_instance_id, target_driver_id, role_title, prompt,
+          isolation, worktree_path, branch_name, base_branch,
+          effective_approval_policy, requested_approval_policy, depth,
+          timeout_ms, fail_fast, status, diff_stat_json, summary, error,
+          merged_at, merged_into_branch, worktree_cleaned, created_at, finished_at
+        )
+        SELECT
+          subagent_id, cohort_id, parent_session_id, child_session_id,
+          target_instance_id, target_driver_id, role_title, prompt,
+          isolation, worktree_path, branch_name, base_branch,
+          effective_approval_policy, requested_approval_policy, depth,
+          timeout_ms, fail_fast, status, diff_stat_json, summary, error,
+          merged_at, merged_into_branch, worktree_cleaned, created_at, finished_at
+        FROM subagent_runs;
+        DROP TABLE subagent_runs;
+        ALTER TABLE subagent_runs_v2 RENAME TO subagent_runs;
+        CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent
+          ON subagent_runs(parent_session_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_subagent_runs_cohort
+          ON subagent_runs(cohort_id, created_at ASC);
+        CREATE INDEX IF NOT EXISTS idx_subagent_runs_child
+          ON subagent_runs(child_session_id);
+      `);
     }
 
     // Idempotent backfill for existing v0.1/v0.2 sessions -> unified multi-harness bindings + task ledger

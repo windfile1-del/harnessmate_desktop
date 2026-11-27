@@ -39,7 +39,12 @@ import type {
   RuntimeRequestPort,
 } from './runtime-ports.js';
 import type { TaskLedgerService } from './task-ledger-service.js';
-import { resolveGitCheckpointProvider } from './w1-service-helpers.js';
+import { resolveDriverForScope } from './driver-peer-router.js';
+import {
+  resolveOptionalSessionHandoffProvider,
+  resolveOptionalSessionOrchestrationProvider,
+} from './collaboration-peer-router.js';
+import { resolveGitCheckpointProvider, unwrapPeerServiceResult } from './w1-service-helpers.js';
 
 export interface HostRuntimePortDeps {
   store: HarnessMateStore;
@@ -71,23 +76,52 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
   };
 
   const driverPort: RuntimeDriverPort = {
-    getAdapter(harnessId) {
-      return deps.registry.get(harnessId);
+    getAdapter(harnessId, scope) {
+      try {
+        return resolveDriverForScope(deps.getPluginManager(), deps.registry, {
+          harnessId,
+          sessionId: scope?.sessionId,
+          workspaceId: scope?.workspaceId,
+          driverProviderInstanceId: scope?.driverProviderInstanceId,
+          store: deps.store,
+        }).adapter;
+      } catch (err) {
+        if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+          throw err;
+        }
+        return deps.registry.get(harnessId);
+      }
     },
-    assertDispatchTarget(instanceId, fallbackKind, provenance?: AgyDispatchProvenance) {
-      const adapter = deps.registry.get(instanceId);
+    assertDispatchTarget(instanceId, fallbackKind, provenance?: AgyDispatchProvenance, scope?) {
+      let adapter = deps.registry.get(instanceId);
+      try {
+        adapter = resolveDriverForScope(deps.getPluginManager(), deps.registry, {
+          harnessId: instanceId,
+          sessionId: scope?.sessionId,
+          workspaceId: scope?.workspaceId,
+          driverProviderInstanceId: scope?.driverProviderInstanceId,
+          store: deps.store,
+        }).adapter;
+      } catch (err) {
+        if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+          throw err;
+        }
+      }
       assertAgyConsumerProvenance({
         instanceId,
         driverId: adapter?.driverId ?? adapter?.kind ?? fallbackKind,
         profile: adapter instanceof AgyAdapter ? adapter.getProfile() : null,
       }, provenance);
     },
-    async openSession(harnessId, config: AdapterSessionConfig) {
-      const adapter = deps.registry.get(harnessId);
-      if (!adapter) {
-        throw new PluginApiError('E_SERVICE_UNAVAILABLE', `Harness 驱动实例 ${harnessId} 未注册`);
-      }
-      return adapter.createSession(config);
+    async openSession(harnessId, config: AdapterSessionConfig, scope) {
+      const resolved = resolveDriverForScope(deps.getPluginManager(), deps.registry, {
+        harnessId,
+        sessionId: scope?.sessionId,
+        workspaceId: scope?.workspaceId,
+        driverProviderInstanceId: scope?.driverProviderInstanceId,
+        store: deps.store,
+      });
+      return resolved.adapter.createSession(config);
     },
   };
 
@@ -291,7 +325,10 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
       };
     },
     isOrchestratorEnabled() {
-      return deps.getPluginManager().isPluginEnabled(ORCHESTRATOR_PLUGIN_ID);
+      const peer = resolveOptionalSessionOrchestrationProvider(deps.getPluginManager(), {
+        allowSingleCandidate: true,
+      });
+      return Boolean(peer);
     },
     prepareTurnText({ text, literalText, mode, cliCommand, nativeSkill, terminalContexts }) {
       const hasNative = Boolean(cliCommand || nativeSkill);
@@ -338,21 +375,100 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
     },
     async prepareTurnHandoff({ session, harnessId, harnessKind, binding, upToSeq, excludeTurnId, omitHandoff }) {
       if (omitHandoff) return null;
-      deps.onAttachCompressorHooks?.();
-      const compiler = deps.getPluginManager().host.get<ContextCompiler>('handoff');
-      if (!compiler?.options.autoAttach) return null;
-      return compiler.compile({
-        session,
-        targetHarnessId: harnessId,
-        targetHarnessKind: harnessKind,
-        binding,
-        upToSeq,
-        excludeTurnId,
+      const pm = deps.getPluginManager();
+      const handoffPeer = resolveOptionalSessionHandoffProvider(pm, {
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
       });
+      if (!handoffPeer) return null;
+      const compiler =
+        pm.host.getServiceByInstance<ContextCompiler>(handoffPeer.instanceId, 'handoff') ??
+        pm.host.get<ContextCompiler>('handoff');
+      if (compiler) {
+        if (!compiler.options.autoAttach) return null;
+        return compiler.compile({
+          session,
+          targetHarnessId: harnessId,
+          targetHarnessKind: harnessKind,
+          binding,
+          upToSeq,
+          excludeTurnId,
+        });
+      }
+      const info = unwrapPeerServiceResult(await handoffPeer.service.getProviderInfo());
+      if (!info.autoAttach) return null;
+      const { packet } = unwrapPeerServiceResult(
+        await handoffPeer.service.compile({
+          sessionId: session.id,
+          targetHarnessId: harnessId,
+          targetHarnessKind: harnessKind,
+          binding: binding
+            ? {
+                sessionId: binding.sessionId,
+                harnessId: binding.harnessId,
+                harnessKind: binding.harnessKind,
+                nativeSessionId: binding.nativeSessionId,
+                lastModel: binding.lastModel,
+                lastActualModel: binding.lastActualModel,
+                lastEffort: binding.lastEffort,
+                syncedUpToSeq: binding.syncedUpToSeq,
+                driverUsed: binding.driverUsed,
+                updatedAt: binding.updatedAt,
+              }
+            : null,
+          upToSeq,
+          excludeTurnId,
+        }),
+      );
+      return {
+        ...packet,
+        preview: packet.preview as unknown as import('@harnessmate/protocol').ContextPreview,
+        snapshot: packet.snapshot as unknown as import('./handoff-snapshot.js').HandoffSnapshot,
+        deliveryLifecycle: {
+          stagePending: ({ turnId, driver, fromInstanceId }) => {
+            void handoffPeer.service.stagePending({
+              sessionId: session.id,
+              targetHarnessId: harnessId,
+              turnId,
+              driver,
+              fromInstanceId,
+              coveredUpToSeq: packet.coveredUpToSeq,
+              estimatedChars: packet.deltaMarkdown.length,
+              redactedCount: packet.redaction?.redactedCount ?? 0,
+              isWarmBinding: packet.preview.isWarmBinding,
+              forceFreshNativeSession: packet.forceFreshNativeSession,
+              forceFreshReason: packet.forceFreshReason,
+              snapshot: packet.snapshot,
+            });
+            return `${session.id}:${harnessId}:${turnId ?? Date.now()}`;
+          },
+          confirmDelivery: (handoffId) => {
+            void handoffPeer.service.confirmDelivery({ handoffId });
+          },
+          failDelivery: (handoffId, resetBinding = false, uncertain = false) => {
+            void handoffPeer.service.failDelivery({
+              handoffId,
+              sessionId: session.id,
+              targetHarnessId: harnessId,
+              resetBinding,
+              uncertain,
+            });
+          },
+        },
+      };
     },
     async compileContext(params) {
-      deps.onAttachCompressorHooks?.();
-      const compiler = deps.getPluginManager().host.get<ContextCompiler>('handoff');
+      const pm = deps.getPluginManager();
+      const handoffPeer = resolveOptionalSessionHandoffProvider(pm, {
+        sessionId: params.session.id,
+        workspaceId: params.session.workspaceId,
+      });
+      if (!handoffPeer) {
+        throw new PluginApiError('E_PLUGIN_DISABLED', '交接插件已停用或不可用');
+      }
+      const compiler =
+        pm.host.getServiceByInstance<ContextCompiler>(handoffPeer.instanceId, 'handoff') ??
+        pm.host.get<ContextCompiler>('handoff');
       if (!compiler) {
         throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'handoff 服务不可用');
       }
@@ -399,22 +515,53 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
       deps.getPluginManager().host.get<TaskLedgerService>('ledger')?.syncSession(session);
     },
     notifyOrchestratorTurnCompleted(sessionId) {
+      const peer = resolveOptionalSessionOrchestrationProvider(deps.getPluginManager(), {
+        sessionId,
+        allowSingleCandidate: true,
+      });
+      if (peer?.service.notifyChildTurnCompleted) {
+        void peer.service.notifyChildTurnCompleted(sessionId).catch(() => {});
+        return;
+      }
       const orch = deps.getOrchestrator?.();
       if (orch) {
         void orch.handleChildTurnCompleted(sessionId).catch(() => {});
       }
     },
     notifyOrchestratorParentIdle(sessionId) {
-      const orch = deps.getOrchestrator?.();
-      orch?.onParentSessionIdle(sessionId);
+      const peer = resolveOptionalSessionOrchestrationProvider(deps.getPluginManager(), {
+        sessionId,
+        allowSingleCandidate: true,
+      });
+      if (peer?.service.notifyParentSessionIdle) {
+        peer.service.notifyParentSessionIdle(sessionId);
+        return;
+      }
+      deps.getOrchestrator?.()?.onParentSessionIdle(sessionId);
     },
     notifyOrchestratorTurnCancelled(sessionId) {
+      const peer = resolveOptionalSessionOrchestrationProvider(deps.getPluginManager(), {
+        sessionId,
+        allowSingleCandidate: true,
+      });
+      if (peer?.service.notifyChildTurnCancelled) {
+        void peer.service.notifyChildTurnCancelled(sessionId).catch(() => {});
+        return;
+      }
       const orch = deps.getOrchestrator?.();
       if (orch) {
         void orch.handleChildTurnCancelled(sessionId).catch(() => {});
       }
     },
     notifyOrchestratorChildApproval(sessionId, approvalId, toolName) {
+      const peer = resolveOptionalSessionOrchestrationProvider(deps.getPluginManager(), {
+        sessionId,
+        allowSingleCandidate: true,
+      });
+      if (peer?.service.notifyChildApproval) {
+        peer.service.notifyChildApproval(sessionId, approvalId, toolName);
+        return;
+      }
       deps.getOrchestrator?.()?.handleChildApprovalRequested(sessionId, approvalId, toolName);
     },
     recordFailoverFailure(sessionId, harnessId, failureClass, resetAt) {

@@ -76,9 +76,10 @@ import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js'
 import { ApprovalCenterService, SECRET_RECEIPT_LABEL, type ExternalApprovalAnnotator } from './approval-center-service.js';
 import {
   CONTEXT_COMPRESSION_PLUGIN_ID,
+  ContextCompressionError,
   ContextCompressionService,
 } from './context-compression-service.js';
-import { ORCHESTRATOR_PLUGIN_ID, OrchestratorService } from './orchestrator-service.js';
+import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError, OrchestratorService } from './orchestrator-service.js';
 import { CheckpointError, type CheckpointDiffResult, type CheckpointRevertHooks, type CheckpointService } from './checkpoint-service.js';
 import { CommandOutputHub } from './command-output-hub.js';
 import type { ContextCompiler } from './context-compiler.js';
@@ -111,6 +112,19 @@ import {
   SESSION_RUNTIME_DEFAULT_PLUGIN_ID,
   type SessionRuntimeDefaultController,
 } from '../plugins/session-runtime-default/index.js';
+import {
+  getRecordedDriverOwner,
+  recordDriverOwner,
+  resolveDriverForScope,
+} from './driver-peer-router.js';
+import {
+  resolveOptionalSessionHandoffProvider,
+  resolveOptionalSessionOrchestrationProvider,
+  resolveSessionCollaborationProvider,
+  resolveSessionCompressionProvider,
+  resolveSessionHandoffProvider,
+  resolveSessionOrchestrationProvider,
+} from './collaboration-peer-router.js';
 import {
   findSessionWithProvider,
   findWorkspaceWithProvider,
@@ -275,10 +289,7 @@ export class SessionManager {
   private readonly startingSessions = new Set<string>();
   private readonly importingSessions = new Map<string, Promise<Session>>();
   private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private fallbackExplorer?: SessionExplorerService;
   private fallbackApprovalCenter?: ApprovalCenterService;
-  private fallbackOrchestrator?: OrchestratorService;
-  private fallbackCompressor?: ContextCompressionService;
   private runtimeController: SessionRuntimeDefaultController | null = null;
   constructor(
     private readonly store: HarnessMateStore,
@@ -346,7 +357,7 @@ export class SessionManager {
   }
 
   attachCompressorForRuntime(): void {
-    this.attachActiveCompressorHooks();
+    // Compression lifecycle and hooks are self-owned by hm.plugin.context-compression on activation.
   }
 
   getOrchestratorIfEnabled(): OrchestratorService | undefined {
@@ -871,36 +882,17 @@ export class SessionManager {
     }
   }
 
-  getExplorerService(): SessionExplorerService {
-    const svc =
-      this.pluginManager.host.get<SessionExplorerService>('session-search') ??
-      (this.fallbackExplorer ??= new SessionExplorerService(this.store, this.registry));
-    svc.attachHooks({
-      emitCanonical: (sessionId, type, payload, turnId) =>
-        this.emitCanonical(sessionId, type, payload, turnId ?? null),
-      createSession: (req) => this.createSession(req),
-      addWorkspace: (rootPath, name) => this.addWorkspace(rootPath, name),
-      tryNativeFork: async (source, _fromTurnSeq) => {
-        const handle = this.runtimeController?.getLiveHandle(source.id, source.harnessId);
-        if (handle?.runNativeCommand) {
-          const out = await handle.runNativeCommand('fork', source.nativeSessionId ?? '');
-          const trimmed = out.trim();
-          if (trimmed && !/\s/.test(trimmed)) return trimmed;
-        }
-        return null;
-      },
-      getTaskLedger: () => this.pluginManager.host.get<TaskLedgerService>('ledger'),
-      onSessionImported: (importedSession, meta) => {
-        this.eventBus.publishAttention({
-          kind: 'session_updated',
-          sessionId: importedSession.id,
-          sessionTitle: importedSession.title,
-          harnessId: importedSession.harnessId,
-          summary: `Imported session (${String(meta.mode ?? 'attach')})`,
-          timestamp: Date.now(),
-        });
-      },
+  getExplorerService(sessionId?: string): SessionExplorerService {
+    const resolved = resolveSessionCollaborationProvider(this.pluginManager, {
+      sessionId,
+      allowSingleCandidate: true,
     });
+    const svc =
+      this.pluginManager.host.getServiceByInstance<SessionExplorerService>(resolved.instanceId, 'session-search') ??
+      this.pluginManager.host.get<SessionExplorerService>('session-search');
+    if (!svc) {
+      throw new PluginApiError('E_PLUGIN_DISABLED', '会话分叉与协作插件当前未启用或不可用');
+    }
     return svc;
   }
 
@@ -911,99 +903,62 @@ export class SessionManager {
     );
   }
 
-  getOrchestratorService(): OrchestratorService {
-    const svc =
-      this.pluginManager.host.get<OrchestratorService>('orchestrator') ??
-      (this.fallbackOrchestrator ??= new OrchestratorService(this.store, this.registry));
-    svc.attachHooks({
-      createChildSession: async ({
-        parentSession,
-        targetInstanceId,
-        roleTitle,
-        cwd,
-        worktreeBranch,
-        permissionMode,
-        model,
-      }) => {
-        const adapter = this.registry.get(targetInstanceId);
-        if (!adapter) {
-          throw new Error(`Target harness instance not registered: ${targetInstanceId}`);
-        }
-        const now = Date.now();
-        const child = this.store.createSession({
-          id: `sess_${crypto.randomBytes(6).toString('hex')}`,
-          workspaceId: parentSession.workspaceId,
-          harnessId: adapter.id,
-          harnessKind: adapter.kind,
-          nativeSessionId: null,
-          parentSessionId: parentSession.id,
-          participatingHarnesses: [adapter.id],
-          contextSyncMode: parentSession.contextSyncMode,
-          cwd,
-          worktreeBranch,
-          title: `[子任务] ${roleTitle}`.slice(0, 160),
-          status: 'idle',
-          model: model ?? null,
-          actualModel: null,
-          modelReroutedReason: null,
-          reasoningEffort: parentSession.reasoningEffort,
-          permissionMode,
-          lastSeq: 0,
-          usage: null,
-          pendingApprovalCount: 0,
-          createdAt: now,
-          updatedAt: now,
-        });
-        this.emitCanonical(child.id, 'session.status', { status: 'idle' });
-        await this.pluginManager.dispatchLifecycleEvent(
-          sessionPluginEvent('session.created', child),
-          child.workspaceId,
-        );
-        return this.store.getSession(child.id)!;
-      },
-      sendTurn: (sessionId, text, opts) => this.sendTurn(sessionId, text, undefined, opts),
-      interruptSession: (sessionId) => this.interruptSession(sessionId),
-      disposeSessionHandles: (sessionId) => this.disposeSessionHandles(sessionId),
-      emitCanonical: (sessionId, type, payload, turnId) =>
-        this.emitCanonical(sessionId, type, payload, turnId ?? null),
-      publishAttention: (item) => this.eventBus.publishAttention(item),
-      getGitService: () => {
-        const provider = resolveOptionalGitWorkspaceProvider(this.pluginManager, {
-          workspaceId: undefined,
-        });
-        return provider as unknown as GitService | undefined;
-      },
-      getTaskLedger: () => this.pluginManager.host.get<TaskLedgerService>('ledger'),
-      isOrchestratorEnabled: () => this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID),
-    });
-    return svc;
+  getOrchestratorService(parentSessionId?: string): OrchestratorService {
+    try {
+      const resolved = resolveSessionOrchestrationProvider(this.pluginManager, {
+        sessionId: parentSessionId,
+        allowSingleCandidate: true,
+      });
+      const svc =
+        this.pluginManager.host.getServiceByInstance<OrchestratorService>(resolved.instanceId, 'orchestrator') ??
+        this.pluginManager.host.get<OrchestratorService>('orchestrator');
+      if (svc) return svc;
+    } catch (err) {
+      if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+        throw new OrchestratorError('E_PLUGIN_DISABLED', err.message);
+      }
+      throw new OrchestratorError('E_PLUGIN_DISABLED', err instanceof Error ? err.message : String(err));
+    }
+    throw new OrchestratorError(
+      'E_PLUGIN_DISABLED',
+      'Multi-Harness Parallel Orchestrator 插件当前未启用，请先在插件管理中启用后再试。',
+    );
   }
 
   private getActiveOrchestrator(): OrchestratorService | null {
-    if (!this.pluginManager.isPluginEnabled(ORCHESTRATOR_PLUGIN_ID)) return null;
-    if (!this.pluginManager.host.get<OrchestratorService>('orchestrator')) return null;
-    return this.getOrchestratorService();
-  }
-
-  getContextCompressionService(): ContextCompressionService {
-    const active = this.pluginManager.host.get<ContextCompressionService>('compressor');
-    const svc = active ?? (this.fallbackCompressor ??= new ContextCompressionService(this.store, this.registry));
-    svc.attachHooks({
-      isEnabled: () => this.pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
-      emitEvent: (sessionId, type, payload) => this.emitCanonical(sessionId, type, payload, null),
-      getTaskState: (sessionId) => {
-        const session = this.store.getSession(sessionId);
-        if (!session) return undefined;
-        return this.getLocalLedger(session)?.getOrCreate(session) ?? this.store.getTaskState(sessionId) ?? undefined;
-      },
+    const resolved = resolveOptionalSessionOrchestrationProvider(this.pluginManager, {
+      allowSingleCandidate: true,
     });
-    return svc;
+    if (!resolved) return null;
+    return (
+      this.pluginManager.host.getServiceByInstance<OrchestratorService>(resolved.instanceId, 'orchestrator') ??
+      this.pluginManager.host.get<OrchestratorService>('orchestrator') ??
+      null
+    );
   }
 
-  private attachActiveCompressorHooks(): void {
-    if (!this.pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID)) return;
-    if (!this.pluginManager.host.get<ContextCompressionService>('compressor')) return;
-    this.getContextCompressionService();
+  getContextCompressionService(sessionId?: string): ContextCompressionService {
+    try {
+      const resolved = resolveSessionCompressionProvider(this.pluginManager, {
+        sessionId,
+        allowSingleCandidate: true,
+      });
+      const svc =
+        this.pluginManager.host.getServiceByInstance<ContextCompressionService>(resolved.instanceId, 'compressor') ??
+        this.pluginManager.host.get<ContextCompressionService>('compressor');
+      if (svc && svc.isEnabled()) {
+        return svc;
+      }
+    } catch (err) {
+      if (err instanceof PluginApiError && err.code === 'E_PLUGIN_DISABLED') {
+        throw new ContextCompressionError('E_PLUGIN_DISABLED', err.message);
+      }
+      throw new ContextCompressionError('E_PLUGIN_DISABLED', err instanceof Error ? err.message : String(err));
+    }
+    throw new ContextCompressionError(
+      'E_PLUGIN_DISABLED',
+      '上下文压缩与符号索引插件当前未启用，请先在插件管理中启用。',
+    );
   }
 
   searchSessions(opts: SessionExplorerQueryOptions): SessionSearchResponse {
@@ -1023,27 +978,27 @@ export class SessionManager {
   }
 
   async forkSession(sessionId: string, req: ForkSessionRequest): Promise<ForkSessionResult> {
-    return this.getExplorerService().forkSession(sessionId, req);
+    return this.getExplorerService(sessionId).forkSession(sessionId, req);
   }
 
   mergeBackSession(childSessionId: string, req: MergeBackRequest): MergeBackResult {
-    return this.getExplorerService().mergeBack(childSessionId, req);
+    return this.getExplorerService(childSessionId).mergeBack(childSessionId, req);
   }
 
   getSideChat(sessionId: string): SideChatMessage[] {
-    return this.getExplorerService().getSideChat(sessionId);
+    return this.getExplorerService(sessionId).getSideChat(sessionId);
   }
 
   clearSideChat(sessionId: string): void {
-    this.getExplorerService().clearSideChat(sessionId);
+    this.getExplorerService(sessionId).clearSideChat(sessionId);
   }
 
   async sendSideChat(sessionId: string, req: SideChatRequest) {
-    return this.getExplorerService().sendSideChat(sessionId, req);
+    return this.getExplorerService(sessionId).sendSideChat(sessionId, req);
   }
 
   async promoteSideChatToFork(sessionId: string, req?: SideChatPromoteRequest): Promise<ForkSessionResult> {
-    return this.getExplorerService().promoteSideChatToFork(sessionId, req);
+    return this.getExplorerService(sessionId).promoteSideChatToFork(sessionId, req);
   }
 
   exportSession(
@@ -1051,7 +1006,7 @@ export class SessionManager {
     format: 'markdown' | 'json_bundle',
     opts?: { redact?: boolean },
   ) {
-    return this.getExplorerService().exportSession(sessionId, format, opts);
+    return this.getExplorerService(sessionId).exportSession(sessionId, format, opts);
   }
 
   async importSessionBundle(req: ImportSessionBundleRequest): Promise<Session> {
@@ -1225,9 +1180,17 @@ export class SessionManager {
 
   // ── Sessions ─────────────────────────────────────────────────────────
 
+  private withDriverProvider(session: Session): Session {
+    const providerInstanceId =
+      session.driverProviderInstanceId
+      ?? getRecordedDriverOwner(this.store, session.id)
+      ?? this.registry.getEntry(session.harnessId)?.providerInstanceId;
+    return providerInstanceId ? { ...session, driverProviderInstanceId: providerInstanceId } : session;
+  }
+
   listSessions(filter?: { workspaceId?: string; harnessId?: string; includeArchived?: boolean }): Session[] {
     this.assertDefaultDataEnabledForSyncRead();
-    return this.store.listSessions(filter);
+    return this.store.listSessions(filter).map((s) => this.withDriverProvider(s));
   }
 
   async listSessionsAsync(filter?: {
@@ -1240,10 +1203,10 @@ export class SessionManager {
       const wsFound = await findWorkspaceWithProvider(this.pluginManager, filter.workspaceId);
       if (!wsFound) {
         if (this.pluginManager.hasLoadedRegistry()) return [];
-        return this.store.listSessions(filter);
+        return this.store.listSessions(filter).map((s) => this.withDriverProvider(s));
       }
       const res = unwrapPeerServiceResult(await wsFound.provider.service.listSessions(filter));
-      return res.sessions.map(sessionDtoToModel);
+      return res.sessions.map((s) => this.withDriverProvider(sessionDtoToModel(s)));
     }
     const providers = listActiveSessionDataProviders(this.pluginManager);
     if (providers.length === 0) {
@@ -1251,14 +1214,14 @@ export class SessionManager {
       if (this.pluginManager.hasLoadedRegistry()) {
         throw new PluginApiError('E_SERVICE_UNAVAILABLE', '当前没有可用的会话数据插件实例');
       }
-      return this.store.listSessions(filter);
+      return this.store.listSessions(filter).map((s) => this.withDriverProvider(s));
     }
     const seen = new Map<string, Session>();
     for (const provider of providers) {
       const res = await provider.service.listSessions(filter ?? {});
       if (!res.ok) continue;
       for (const s of res.value.sessions) {
-        if (!seen.has(s.id)) seen.set(s.id, sessionDtoToModel(s));
+        if (!seen.has(s.id)) seen.set(s.id, this.withDriverProvider(sessionDtoToModel(s)));
       }
     }
     return [...seen.values()].sort((a, b) => b.updatedAt - a.updatedAt);
@@ -1266,15 +1229,17 @@ export class SessionManager {
 
   getSession(id: string): Session | null {
     this.assertDefaultDataEnabledForSyncRead();
-    return this.store.getSession(id);
+    const s = this.store.getSession(id);
+    return s ? this.withDriverProvider(s) : null;
   }
 
   async getSessionAsync(id: string): Promise<Session | null> {
     await this.pluginManager.ensureBootstrapped();
     const found = await findSessionWithProvider(this.pluginManager, id);
-    if (found) return sessionDtoToModel(found.session);
+    if (found) return this.withDriverProvider(sessionDtoToModel(found.session));
     if (this.pluginManager.hasLoadedRegistry()) return null;
-    return this.store.getSession(id);
+    const fallback = this.store.getSession(id);
+    return fallback ? this.withDriverProvider(fallback) : null;
   }
 
   getSessionEvents(sessionId: string, afterSeq = 0): CanonicalEvent[] {
@@ -1335,6 +1300,7 @@ export class SessionManager {
       throw new Error(`Workspace not found: ${req.workspaceId}`);
     }
     const session = await this.buildSessionFromWorkspace(req, workspaceDtoToModel(wsFound.workspace));
+    const driverProviderInstanceId = session.driverProviderInstanceId;
     const createdRes = unwrapPeerServiceResult(
       await wsFound.provider.service.createSession({
         session: {
@@ -1369,8 +1335,14 @@ export class SessionManager {
         },
       }),
     );
-    const created = sessionDtoToModel(createdRes.session);
+    const created = {
+      ...sessionDtoToModel(createdRes.session),
+      ...(driverProviderInstanceId ? { driverProviderInstanceId } : {}),
+    };
     recordResourceOwner(this.store, 'session', created.id, wsFound.provider.instanceId, created.workspaceId);
+    if (driverProviderInstanceId) {
+      recordDriverOwner(this.store, created.id, driverProviderInstanceId, created.workspaceId);
+    }
 
     const statusEvRes = unwrapPeerServiceResult(
       await wsFound.provider.service.appendEvent({
@@ -1387,7 +1359,11 @@ export class SessionManager {
     await this.pluginManager.dispatchLifecycleEvent(sessionPluginEvent('session.created', created), created.workspaceId);
 
     const latestRes = unwrapPeerServiceResult(await wsFound.provider.service.getSession({ sessionId: created.id }));
-    return latestRes.session ? sessionDtoToModel(latestRes.session) : created;
+    const model = latestRes.session ? sessionDtoToModel(latestRes.session) : created;
+    return this.withDriverProvider({
+      ...model,
+      ...(driverProviderInstanceId ? { driverProviderInstanceId } : {}),
+    });
   }
 
   async importNativeSession(req: ImportNativeSessionRequest): Promise<Session> {
@@ -1479,13 +1455,30 @@ export class SessionManager {
   }
 
   private async buildSessionFromWorkspace(req: CreateSessionRequest, ws: Workspace): Promise<Session> {
-    let adapter = req.harnessId ? this.registry.get(req.harnessId) : undefined;
-    if (!adapter && !req.harnessId) {
-      // Pick first ready harness (fallback to first registered)
+    let resolvedHarnessId = req.harnessId?.trim();
+    let adapter: HarnessAdapter | undefined;
+    let driverProviderInstanceId: string | undefined;
+
+    if (resolvedHarnessId || req.driverProviderInstanceId) {
+      const targetKey = resolvedHarnessId || 'codex';
+      const resolved = resolveDriverForScope(this.pluginManager, this.registry, {
+        harnessId: targetKey,
+        driverProviderInstanceId: req.driverProviderInstanceId,
+        workspaceId: ws.id,
+        store: this.store,
+      });
+      adapter = resolved.adapter;
+      driverProviderInstanceId = resolved.providerInstanceId;
+      resolvedHarnessId = resolved.harnessId || resolvedHarnessId;
+    } else {
       const adapters = this.registry.listAdapters();
       adapter = adapters[0];
+      if (adapter) {
+        resolvedHarnessId = adapter.id;
+        driverProviderInstanceId = adapter.providerInstanceId;
+      }
     }
-    if (!adapter) {
+    if (!adapter || !resolvedHarnessId) {
       throw new Error(`Harness not registered: ${req.harnessId ?? '(none available)'}`);
     }
 
@@ -1504,10 +1497,11 @@ export class SessionManager {
     return {
       id: `sess_${crypto.randomBytes(6).toString('hex')}`,
       workspaceId: ws.id,
-      harnessId: adapter.id,
+      harnessId: resolvedHarnessId,
       harnessKind: adapter.kind,
+      ...(driverProviderInstanceId ? { driverProviderInstanceId } : {}),
       nativeSessionId: req.nativeSessionId ?? null,
-      participatingHarnesses: [adapter.id],
+      participatingHarnesses: [resolvedHarnessId],
       contextSyncMode: req.contextSyncMode ?? 'auto',
       cwd,
       worktreeBranch,
@@ -1643,30 +1637,61 @@ export class SessionManager {
     targetHarnessId?: string,
     syncMode?: ContextSyncMode,
   ): Promise<ContextPreview> {
-    const session = this.store.getSession(sessionId);
+    const session = await this.getSessionAsync(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
     const targetId = targetHarnessId || session.harnessId;
-    const adapter = this.registry.get(targetId);
-    if (!adapter) throw new Error(`Harness not registered: ${targetId}`);
-
-    const binding = this.store.getSessionBinding(sessionId, targetId);
-    this.attachActiveCompressorHooks();
-    const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
-    if (!compiler) return {
-      sessionId, targetHarnessId: targetId, targetHarnessKind: adapter.kind, currentLastSeq: session.lastSeq,
-      syncedUpToSeq: binding?.syncedUpToSeq ?? 0, unsyncedTurnCount: 0, estimatedTokens: 0, budgetTokens: 12_000,
-      driverPlanned: 'native_warm', isWarmBinding: Boolean(binding?.nativeSessionId), syncNeeded: false,
-      compiledMarkdown: '交接服务当前不可用', ledgerMarkdown: '', deltaTurnSummary: [],
-    };
-    const packet = await compiler.compile({
-      session,
-      targetHarnessId: adapter.id,
-      targetHarnessKind: adapter.kind,
-      binding,
-      syncMode,
+    const handoff = resolveSessionHandoffProvider(this.pluginManager, {
+      sessionId,
+      workspaceId: session.workspaceId,
     });
-    return compiler.options.autoAttach ? packet.preview : { ...packet.preview, syncNeeded: false };
+    const res = unwrapPeerServiceResult(
+      await handoff.service.preview({
+        sessionId,
+        targetHarnessId: targetId,
+        syncMode,
+      }),
+    );
+    return res.preview as unknown as ContextPreview;
+  }
+
+  private async getContextPreviewOptional(
+    session: Session,
+    targetHarnessId: string,
+    targetHarnessKind: HarnessKind,
+    syncMode: ContextSyncMode,
+    isWarmBinding: boolean,
+  ): Promise<ContextPreview> {
+    const handoff = resolveOptionalSessionHandoffProvider(this.pluginManager, {
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+    });
+    if (!handoff) {
+      return {
+        sessionId: session.id,
+        targetHarnessId,
+        targetHarnessKind,
+        currentLastSeq: session.lastSeq,
+        syncedUpToSeq: 0,
+        unsyncedTurnCount: 0,
+        estimatedTokens: 0,
+        budgetTokens: 12_000,
+        driverPlanned: 'native_warm',
+        isWarmBinding,
+        syncNeeded: false,
+        compiledMarkdown: '(交接插件已停用)',
+        ledgerMarkdown: '',
+        deltaTurnSummary: [],
+      };
+    }
+    const res = unwrapPeerServiceResult(
+      await handoff.service.preview({
+        sessionId: session.id,
+        targetHarnessId,
+        syncMode,
+      }),
+    );
+    return res.preview as unknown as ContextPreview;
   }
 
   /**
@@ -1691,12 +1716,20 @@ export class SessionManager {
       throw new Error('Cannot switch harness while a turn is active or awaiting approval.');
     }
 
-    const targetAdapter = this.registry.get(req.targetHarnessId);
-    if (!targetAdapter) {
-      throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
+    const targetResolved = resolveDriverForScope(this.pluginManager, this.registry, {
+      harnessId: req.targetHarnessId,
+      driverProviderInstanceId: req.driverProviderInstanceId,
+      sessionId,
+      workspaceId: current.workspaceId,
+      store: this.store,
+    });
+    const targetAdapter = targetResolved.adapter;
+    const targetHarnessId = targetResolved.harnessId || req.targetHarnessId;
+    if (targetResolved.providerInstanceId) {
+      recordDriverOwner(this.store, sessionId, targetResolved.providerInstanceId, current.workspaceId);
     }
 
-    const existingBinding = this.store.getSessionBinding(sessionId, targetAdapter.id);
+    const existingBinding = this.store.getSessionBinding(sessionId, targetHarnessId);
     const resolvedModel =
       req.targetModel !== undefined
         ? req.targetModel
@@ -1708,13 +1741,19 @@ export class SessionManager {
     const resolvedSyncMode = req.syncMode ?? current.contextSyncMode ?? 'auto';
 
     // If same harness and only updating model/effort/syncMode
-    if (current.harnessId === targetAdapter.id) {
+    if (current.harnessId === targetHarnessId && current.driverProviderInstanceId === targetResolved.providerInstanceId) {
       const updatedSame = await this.updateSession(sessionId, {
         model: resolvedModel,
         reasoningEffort: resolvedEffort,
         contextSyncMode: resolvedSyncMode,
       });
-      const preview = await this.getContextPreview(sessionId, targetAdapter.id, resolvedSyncMode);
+      const preview = await this.getContextPreviewOptional(
+        updatedSame,
+        targetHarnessId,
+        targetAdapter.kind,
+        resolvedSyncMode,
+        Boolean(existingBinding?.nativeSessionId),
+      );
       return { session: updatedSame, contextPreview: preview };
     }
 
@@ -1722,14 +1761,20 @@ export class SessionManager {
     const fromHarnessKind = current.harnessKind;
 
     // Preview exact delta that target harness will receive on next turn
-    const previewBefore = await this.getContextPreview(sessionId, targetAdapter.id, resolvedSyncMode);
+    const previewBefore = await this.getContextPreviewOptional(
+      current,
+      targetHarnessId,
+      targetAdapter.kind,
+      resolvedSyncMode,
+      Boolean(existingBinding?.nativeSessionId),
+    );
 
     const participating = Array.from(
-      new Set([...(current.participatingHarnesses ?? []), fromHarnessId, targetAdapter.id]),
+      new Set([...(current.participatingHarnesses ?? []), fromHarnessId, targetHarnessId]),
     );
 
     const updated = this.store.updateSession(sessionId, {
-      harnessId: targetAdapter.id,
+      harnessId: targetHarnessId,
       harnessKind: targetAdapter.kind,
       nativeSessionId: existingBinding?.nativeSessionId ?? null,
       participatingHarnesses: participating,
@@ -1745,7 +1790,7 @@ export class SessionManager {
     // Ensure binding row exists while preserving its prior syncedUpToSeq watermark!
     this.store.upsertSessionBinding({
       sessionId,
-      harnessId: targetAdapter.id,
+      harnessId: targetHarnessId,
       harnessKind: targetAdapter.kind,
       nativeSessionId: existingBinding?.nativeSessionId ?? null,
       lastModel: resolvedModel,
@@ -1778,7 +1823,7 @@ export class SessionManager {
     this.emitCanonical(sessionId, 'session.harness_switched', {
       fromHarnessId,
       fromHarnessKind,
-      toHarnessId: targetAdapter.id,
+      toHarnessId: targetHarnessId,
       toHarnessKind: targetAdapter.kind,
       toModel: resolvedModel,
       syncedUpToSeq: previewBefore.syncedUpToSeq,
@@ -1792,7 +1837,7 @@ export class SessionManager {
     });
 
     // If a warm handle for target harness exists with stale model config, apply config now
-    const warmHandle = this.runtimeController?.getLiveHandle(sessionId, targetAdapter.id);
+    const warmHandle = this.runtimeController?.getLiveHandle(sessionId, targetHarnessId);
     if (warmHandle && warmHandle.updateConfig) {
       try {
         await warmHandle.updateConfig({
@@ -1809,13 +1854,19 @@ export class SessionManager {
       kind: 'harness_switched',
       sessionId,
       sessionTitle: updated.title,
-      harnessId: targetAdapter.id,
-      summary: `已从 ${fromHarnessId} 切换至 ${targetAdapter.id}（待同步 ${previewBefore.unsyncedTurnCount} 轮增量上下文）`,
+      harnessId: targetHarnessId,
+      summary: `已从 ${fromHarnessId} 切换至 ${targetHarnessId}（待同步 ${previewBefore.unsyncedTurnCount} 轮增量上下文）`,
       timestamp: Date.now(),
     });
 
     const refreshed = this.store.getSession(sessionId)!;
-    return { session: refreshed, contextPreview: previewBefore };
+    return {
+      session: {
+        ...refreshed,
+        ...(targetResolved.providerInstanceId ? { driverProviderInstanceId: targetResolved.providerInstanceId } : {}),
+      },
+      contextPreview: previewBefore,
+    };
   }
 
   /**
@@ -1828,16 +1879,19 @@ export class SessionManager {
   ): Promise<{ session: Session; retriedTurnId: string | null }> {
     const current = await this.getSessionAsync(sessionId);
     if (!current) throw new Error(`Session not found: ${sessionId}`);
-    const targetAdapter = this.registry.get(req.targetHarnessId);
+    const targetAdapter = this.resolveAdapterForSession({
+      ...current,
+      harnessId: req.targetHarnessId,
+    });
     if (!targetAdapter) throw new Error(`Target harness not registered: ${req.targetHarnessId}`);
-    this.assertDispatchTarget(targetAdapter.id, targetAdapter.kind, provenance);
+    this.assertDispatchTarget(req.targetHarnessId, targetAdapter.kind, provenance, current.workspaceId, sessionId);
 
     const failover = selectedHarnessService<FailoverContract>(this.pluginManager, failoverContract, { sessionId });
     const retry = req.retryLastFailedTurn === false ? undefined : await failover?.retryInput(sessionId);
 
     if (current.status === 'error') await this.setSessionStatusAsync(sessionId, 'idle');
     const { session: switched } = await this.switchHarnessInternal(sessionId, {
-      targetHarnessId: targetAdapter.id,
+      targetHarnessId: req.targetHarnessId,
       targetModel: req.targetModel,
     });
 
@@ -1859,20 +1913,28 @@ export class SessionManager {
     targetHarnessId: string,
     targetModel?: string | null,
   ): Promise<{ session: Session; handoffPrompt: string }> {
-    const source = this.store.getSession(sourceSessionId);
+    const source = await this.getSessionAsync(sourceSessionId);
     if (!source) throw new Error(`Source session not found: ${sourceSessionId}`);
 
-    const targetAdapter = this.registry.get(targetHarnessId);
+    const targetAdapter = this.resolveAdapterForSession({
+      ...source,
+      harnessId: targetHarnessId,
+    });
     if (!targetAdapter) throw new Error(`Target harness not registered: ${targetHarnessId}`);
 
-    this.attachActiveCompressorHooks();
-    const packet = await this.service<ContextCompiler>('handoff').compile({
-      session: source,
-      targetHarnessId: targetAdapter.id,
-      targetHarnessKind: targetAdapter.kind,
-      binding: null,
-      syncMode: 'full_ledger',
-    });
+    const handoffSvc = resolveSessionHandoffProvider(this.pluginManager, {
+      sessionId: sourceSessionId,
+      workspaceId: source.workspaceId,
+    }).service;
+    const { packet } = unwrapPeerServiceResult(
+      await handoffSvc.compile({
+        sessionId: sourceSessionId,
+        targetHarnessId,
+        targetHarnessKind: targetAdapter.kind,
+        binding: null,
+        syncMode: 'full_ledger',
+      }),
+    );
 
     const newSession = await this.createSession({
       workspaceId: source.workspaceId,
@@ -1901,7 +1963,7 @@ export class SessionManager {
       '',
       '请基于以上任务状态与历史上下文继续推进任务。',
     ].join('\n');
-    return { session: this.store.getSession(newSession.id)!, handoffPrompt };
+    return { session: (await this.getSessionAsync(newSession.id))!, handoffPrompt };
   }
 
   exportSessionMarkdown(sessionId: string): { filename: string; markdown: string } {
@@ -1987,17 +2049,33 @@ export class SessionManager {
 
   // ── Turn Execution (Unified Multi-Harness + Context Bridge) ──────────
 
+  private resolveAdapterForSession(session: Session): HarnessAdapter | undefined {
+    try {
+      return resolveDriverForScope(this.pluginManager, this.registry, {
+        harnessId: session.harnessId,
+        driverProviderInstanceId: session.driverProviderInstanceId,
+        sessionId: session.id,
+        workspaceId: session.workspaceId,
+        store: this.store,
+      }).adapter;
+    } catch {
+      return this.registry.get(session.harnessId);
+    }
+  }
+
   getHarnessCommands(session: Session): HarnessCommandInfo[] {
     const service = this.pluginManager.host.get<NativeCommandsService>('native-commands');
     if (!service) return [];
     const source = session.nativeSessionId && this.store.getNativeHistory(session.id, session.nativeSessionId)?.source;
-    const base: HarnessCommandInfo[] = service
-      .list(session.harnessKind, source === 'agy_desktop')
-      .map((cmd) => ({
-        ...cmd,
-        source: 'builtin' as const,
-      }));
-    const adapter = this.registry.get(session.harnessId);
+    const adapter = this.resolveAdapterForSession(session);
+    const base: HarnessCommandInfo[] = (service.list as (kind: HarnessKind, agyDesktop: boolean, adapter?: HarnessAdapter) => HarnessCommandInfo[])(
+      session.harnessKind,
+      source === 'agy_desktop',
+      adapter,
+    ).map((cmd) => ({
+      ...cmd,
+      source: cmd.source ?? ('builtin' as const),
+    }));
     if (adapter instanceof AgyAdapter) {
       const seen = new Set(base.map((c) => c.command));
       for (const liveCmd of adapter.getAdvertisedCommands()) {
@@ -2007,6 +2085,7 @@ export class SessionManager {
           command: liveCmd.name,
           description: liveCmd.description ?? `AGY 原生命令 /${liveCmd.name}`,
           ...(liveCmd.argumentHint ? { argumentHint: liveCmd.argumentHint } : {}),
+          supported: true,
           source: 'native_advertised' as const,
         });
       }
@@ -2015,8 +2094,10 @@ export class SessionManager {
   }
 
   private nativeActionReason(session: Session, command: RunHarnessCommandRequest['command']): string | undefined {
-    if (!this.registry.get(session.harnessId)) return '当前 Harness 适配器不可用';
-    if (!this.getHarnessCommands(session).some((entry) => entry.command === command)) return '当前 Harness 或会话来源未开放此命令';
+    if (!this.resolveAdapterForSession(session)) return '当前 Harness 适配器不可用';
+    const cmdEntry = this.getHarnessCommands(session).find((entry) => entry.command === command);
+    if (!cmdEntry) return '当前 Harness 或会话来源未开放此命令';
+    if (cmdEntry.supported === false) return cmdEntry.reason ?? '当前驱动不支持此命令';
     if (command === 'compact' && !session.nativeSessionId && session.harnessKind !== 'claude') return '此会话尚无可压缩的原生上下文';
   }
 
@@ -2082,8 +2163,21 @@ export class SessionManager {
     return this.withSessionStartup(sessionId, () => this.executeHarnessCommand(sessionId, req, provenance));
   }
 
-  private assertDispatchTarget(instanceId: string, fallbackKind: string, provenance?: AgyDispatchProvenance): void {
-    const adapter = this.registry.get(instanceId);
+  private assertDispatchTarget(
+    instanceId: string,
+    fallbackKind: string,
+    provenance?: AgyDispatchProvenance,
+    workspaceId?: string,
+    sessionId?: string,
+  ): void {
+    const resolved = workspaceId || sessionId
+      ? resolveDriverForScope(this.pluginManager, this.registry, {
+          harnessId: instanceId,
+          workspaceId,
+          sessionId,
+        })
+      : null;
+    const adapter = resolved?.adapter ?? this.registry.get(instanceId);
     assertAgyConsumerProvenance({
       instanceId,
       driverId: adapter?.driverId ?? adapter?.kind ?? fallbackKind,
@@ -2097,8 +2191,20 @@ export class SessionManager {
     const session = await this.getSessionAsync(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     if (session.harnessId !== req.harnessId) throw new Error('当前引擎已切换，请重试');
-    if (!this.getHarnessCommands(session).some((entry) => entry.command === req.command)) {
+    const cmdEntry = this.getHarnessCommands(session).find((entry) => entry.command === req.command);
+    if (!cmdEntry) {
       throw new Error('当前 Harness 或会话来源未开放此命令');
+    }
+    if (cmdEntry.supported === false) {
+      return {
+        output: cmdEntry.reason ?? `当前驱动不支持 /${req.command}`,
+        session,
+        receipt: {
+          command: req.command,
+          status: 'unsupported',
+          reason: cmdEntry.reason ?? 'unsupported_by_driver',
+        },
+      };
     }
     const busy = session.status === 'running' || session.status === 'awaiting_approval';
     const goalControl = session.harnessKind === 'codex' && req.command === 'goal'
@@ -2106,20 +2212,31 @@ export class SessionManager {
     if ((busy && !goalControl) || session.status === 'archived') {
       throw new Error('请在会话空闲时运行原生命令');
     }
-    const adapter = this.registry.get(session.harnessId);
-    if (!adapter) throw new Error('当前 Harness 命令服务不可用');
+    const resolvedDriver = resolveDriverForScope(this.pluginManager, this.registry, {
+      harnessId: session.harnessId,
+      driverProviderInstanceId: session.driverProviderInstanceId,
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+      store: this.store,
+    });
+    const adapter = resolvedDriver.adapter;
     this.assertDispatchTarget(session.harnessId, session.harnessKind, provenance);
     const turnOpts = { dispatchProvenance: provenance };
     const tools = this.service<NativeCommandsService>('native-commands').tools;
 
-    const result = async (output: string, turnId?: string): Promise<HarnessCommandResult> => ({
+    const result = async (
+      output: string,
+      turnId?: string,
+      receipt?: HarnessCommandResult['receipt'],
+    ): Promise<HarnessCommandResult> => ({
       output,
       turnId,
       session: (await this.getSessionAsync(sessionId)) ?? session,
+      ...(receipt ? { receipt } : {}),
     });
     const rawCommand = async (text: string) => {
       const { turnId } = await this.sendTurn(sessionId, text, undefined, { ...turnOpts, cliCommand: text });
-      return result('', turnId);
+      return result('', turnId, { command: req.command, status: 'queued_turn' });
     };
     const getHandle = async () => {
       const existing = this.runtimeController?.getLiveHandle(sessionId, session.harnessId);
@@ -2131,24 +2248,72 @@ export class SessionManager {
       case 'model': {
         if (!args) {
           const catalog = selectedHarnessService<ModelCatalog>(this.pluginManager, modelCatalogContract, { sessionId: session.id });
-          const info = catalog
+          const info = catalog && !resolvedDriver.providerInstanceId
             ? await catalog.listModels({ sessionId: session.id, harnessInstanceId: session.harnessId })
-            : await this.registry.probeInstance(session.harnessId);
+            : await this.registry.probeInstance(
+                resolvedDriver.harnessId,
+                false,
+                resolvedDriver.providerInstanceId,
+              );
           const models = info?.models.map((model) => `${model.id} · ${model.displayName}`) ?? [];
-          return result([`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'));
+          return result(
+            [`当前模型 ${session.model || session.actualModel || info?.defaultModelId || 'CLI 默认'}`, ...models].join('\n'),
+            undefined,
+            { command: 'model', status: 'executed', confirmed: { model: session.model || session.actualModel || info?.defaultModelId || null } },
+          );
         }
         if (!/^[a-z0-9][a-z0-9_.:/\[\]-]*$/i.test(args)) throw new Error('请输入一个有效的模型 ID');
-        await this.updateSession(sessionId, { model: args === 'default' ? null : args, reasoningEffort: null });
-        return result(`已选择 ${args === 'default' ? 'CLI 默认模型' : args}`);
+        const nextModel = args === 'default' ? null : args;
+        const runtimeProvider = resolveSessionRuntimeProvider(this.pluginManager, {
+          sessionId,
+          workspaceId: session.workspaceId,
+        });
+        const cfgRes = unwrapPeerServiceResult(
+          await runtimeProvider.service.applyConfig({
+            sessionId,
+            patch: { model: nextModel, reasoningEffort: null },
+          }),
+        );
+        if (cfgRes.status === 'rejected' || cfgRes.status === 'unsupported') {
+          return result(
+            cfgRes.note ?? `驱动拒绝或不支持模型 ${args}`,
+            undefined,
+            {
+              command: 'model',
+              status: cfgRes.status,
+              confirmed: cfgRes.confirmed as Record<string, unknown>,
+              reason: cfgRes.note,
+            },
+          );
+        }
+        return result(
+          `已选择 ${args === 'default' ? 'CLI 默认模型' : args}`,
+          undefined,
+          { command: 'model', status: 'executed', confirmed: cfgRes.confirmed as Record<string, unknown> },
+        );
       }
       case 'plan': {
         if (args === 'off') {
           if (session.permissionMode === 'plan') await this.updateSession(sessionId, { permissionMode: 'manual' });
-          return result('已退出计划模式');
+          return result('已退出计划模式', undefined, { command: 'plan', status: 'executed', confirmed: { permissionMode: 'manual' } });
+        }
+        if (
+          adapter.capabilities.permissionModes.length > 0
+          && !adapter.capabilities.permissionModes.includes('plan')
+        ) {
+          return result(
+            `驱动 ${adapter.id} 不支持计划模式`,
+            undefined,
+            { command: 'plan', status: 'unsupported', reason: 'plan_mode_unsupported' },
+          );
         }
         await this.updateSession(sessionId, { permissionMode: 'plan' });
         const turn = args ? await this.sendTurn(sessionId, args, undefined, turnOpts) : undefined;
-        return result('已启用计划模式', turn?.turnId);
+        return result(
+          '已启用计划模式',
+          turn?.turnId,
+          { command: 'plan', status: turn?.turnId ? 'queued_turn' : 'executed', confirmed: { permissionMode: 'plan' } },
+        );
       }
       case 'compact': {
         if (args && session.harnessKind !== 'claude') throw new Error('请使用 /compact');
@@ -2157,15 +2322,48 @@ export class SessionManager {
       }
       case 'usage': {
         if (args) throw new Error('用法 /usage');
-        return session.harnessKind === 'claude' ? rawCommand('/usage')
-          : result(await tools.getUsage(session));
+        if (session.harnessKind === 'claude') {
+          return rawCommand('/usage');
+        }
+        if (adapter.readUsageLimits) {
+          const limits = await adapter.readUsageLimits();
+          const windows = limits.rateLimits.map((item) =>
+            `${item.label} · 剩余 ${(100 - item.usedPercent).toFixed(1)}%` +
+            (item.resetsAt ? ` · ${new Date(item.resetsAt).toLocaleString()} 重置` : ''));
+          const text = [
+            ...(limits.accountLabel ? [`账号 ${limits.accountLabel}`] : []),
+            ...windows,
+            ...(windows.length === 0 ? [`${adapter.displayName} 未返回订阅额度`] : []),
+            ...(limits.error ? [limits.error] : []),
+          ].join('\n');
+          return result(text, undefined, {
+            command: 'usage',
+            status: 'executed',
+            confirmed: { loggedIn: limits.loggedIn, accountLabel: limits.accountLabel },
+          });
+        }
+        return result(await tools.getUsage(session), undefined, { command: 'usage', status: 'executed' });
       }
       case 'goal': {
         if (session.harnessKind === 'codex') {
           const handle = await getHandle();
-          if (!handle.runNativeCommand) throw new Error('此 Codex 适配器未提供目标接口');
-          const output = await handle.runNativeCommand('goal', args);
-          return result(output);
+          if (!handle.runNativeCommand) {
+            return result('此 Codex 适配器未提供目标接口', undefined, {
+              command: 'goal',
+              status: 'unsupported',
+              reason: 'no_run_native_command',
+            });
+          }
+          const rawOut = await handle.runNativeCommand('goal', args);
+          if (typeof rawOut === 'string') {
+            return result(rawOut, undefined, { command: 'goal', status: 'executed' });
+          }
+          return result(rawOut.output, rawOut.turnId, {
+            command: rawOut.command,
+            status: rawOut.status,
+            confirmed: rawOut.confirmed,
+            reason: rawOut.reason,
+          });
         }
         if (session.harnessKind === 'agy' && !args) throw new Error('用法 /goal <目标>');
         return rawCommand(args ? `/goal ${args}` : '/goal');
@@ -2176,7 +2374,7 @@ export class SessionManager {
         if (args.startsWith('install ')) {
           await this.runtimeController?.disposeLiveHandle(sessionId, session.harnessId);
         }
-        return result(output);
+        return result(output, undefined, { command: 'plugin', status: 'executed' });
       }
       case 'skills':
       case 'skill': {
@@ -2185,8 +2383,12 @@ export class SessionManager {
         const availableSkills = skills.filter((skill) => skill.enabled !== false);
         if (command === 'skills') {
           if (args) throw new Error('用法 /skills');
-          return result(availableSkills.map((skill) =>
-            `${skill.name}${skill.description ? ` · ${skill.description}` : ''}`).join('\n') || '未发现可调用技能');
+          return result(
+            availableSkills.map((skill) =>
+              `${skill.name}${skill.description ? ` · ${skill.description}` : ''}`).join('\n') || '未发现可调用技能',
+            undefined,
+            { command: 'skills', status: 'executed', confirmed: { count: availableSkills.length } },
+          );
         }
         const [name = '', ...words] = args.split(/\s+/);
         if (!/^[a-z0-9][a-z0-9_.:-]*$/i.test(name)) throw new Error('用法 /skill <名称> [参数]');
@@ -2199,7 +2401,7 @@ export class SessionManager {
             ...turnOpts,
             nativeSkill: { name, path: skill.path },
           });
-          return result('', turnId);
+          return result('', turnId, { command: 'skill', status: 'queued_turn', confirmed: { skill: name } });
         }
         return rawCommand(`/${name}${skillArgs ? ` ${skillArgs}` : ''}`);
       }
@@ -2549,7 +2751,6 @@ export class SessionManager {
 
     try {
       // Compile incremental context delta if Context Bridge plugin is active
-      this.attachActiveCompressorHooks();
       const compiler = this.pluginManager.host.get<ContextCompiler>('handoff');
       const binding = this.store.getSessionBinding(sessionId, session.harnessId);
       if (!compiler?.options.autoAttach && (session.participatingHarnesses?.length ?? 0) > 1) {
@@ -3265,7 +3466,7 @@ export class SessionManager {
     }
   }
 
-  private async disposeSessionHandles(sessionId: string): Promise<void> {
+  async disposeSessionHandles(sessionId: string): Promise<void> {
     this.expireSessionApprovals(sessionId);
     const runtimeRes = this.pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, {
       sessionId,
@@ -3603,7 +3804,6 @@ export class SessionManager {
           void orchCompleted.handleChildTurnCompleted(sessionId).catch(() => {});
           orchCompleted.onParentSessionIdle(sessionId);
         }
-        this.attachActiveCompressorHooks();
 
         this.eventBus.publishAttention({
           kind: 'turn_completed',
@@ -4158,7 +4358,7 @@ export class SessionManager {
     });
   }
 
-  private emitCanonical(
+  emitCanonical(
     sessionId: string,
     type: CanonicalEvent['type'],
     payload: Record<string, unknown>,

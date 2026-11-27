@@ -128,6 +128,9 @@ interface LiveHandleEntry {
   sessionId: string;
   harnessId: string;
   harnessKind: HarnessKind;
+  providerPluginId?: string;
+  providerInstanceId?: string;
+  providerRunId?: string;
   adapter: HarnessAdapter;
   handle: AdapterSessionHandle;
   unsubscribe: () => void;
@@ -153,6 +156,8 @@ interface ActiveTurnMeta {
   turnId: string;
   harnessId: string;
   harnessKind: HarnessKind;
+  providerInstanceId?: string;
+  providerRunId?: string;
   model: string | null;
   actualModel: string | null;
   turnSeq?: number;
@@ -1395,13 +1400,18 @@ export function createDefaultSessionRuntimePlugin(
         refreshPluginTools = false,
       ): Promise<LiveHandleEntry> => {
         const key = handleKey(sessionDto.id, harnessId);
-        const adapter = deps.driverPort.getAdapter(harnessId);
+        const existing = liveHandles.get(key);
+        const scope = {
+          sessionId: sessionDto.id,
+          workspaceId: sessionDto.workspaceId,
+          driverProviderInstanceId: existing?.providerInstanceId,
+        };
+        const adapter = deps.driverPort.getAdapter(harnessId, scope);
         if (!adapter) {
           throw new PluginApiError('E_SERVICE_UNAVAILABLE', `Harness 驱动实例 ${harnessId} 未注册`);
         }
         const sessionModel = toSessionModel(sessionDto);
         const toolInfo = deps.collabPort.prepareModelTools(sessionModel, harnessId, adapter);
-        const existing = liveHandles.get(key);
         const toolChanged =
           refreshPluginTools &&
           Boolean(adapter.pluginMcpTransport) &&
@@ -1484,16 +1494,21 @@ export function createDefaultSessionRuntimePlugin(
 
         let lease = toolInfo.lease;
         let handle: AdapterSessionHandle;
+        const openScope = {
+          sessionId: sessionDto.id,
+          workspaceId: sessionDto.workspaceId,
+          driverProviderInstanceId: adapter.providerInstanceId,
+        };
         try {
           handle = await deps.driverPort.openSession(harnessId, {
             ...config,
             ...(lease ? { pluginMcp: lease.connection } : {}),
-          });
+          }, openScope);
         } catch (error) {
           if (!lease) throw error;
           lease.release();
           lease = undefined;
-          handle = await deps.driverPort.openSession(harnessId, config);
+          handle = await deps.driverPort.openSession(harnessId, config, openScope);
         }
 
         if (lease && (!handle.pluginMcpAvailable || !toolInfo.isLeaseActive(lease))) {
@@ -1506,8 +1521,11 @@ export function createDefaultSessionRuntimePlugin(
         const entry: LiveHandleEntry = {
           key,
           sessionId: sessionDto.id,
-          harnessId: adapter.id,
+          harnessId,
           harnessKind: adapter.kind,
+          providerPluginId: adapter.providerPluginId,
+          providerInstanceId: adapter.providerInstanceId,
+          providerRunId: adapter.providerRunId,
           adapter,
           handle,
           unsubscribe: () => {},
@@ -1538,7 +1556,7 @@ export function createDefaultSessionRuntimePlugin(
                 : {}),
               bindingUpsert: {
                 sessionId: sessionDto.id,
-                harnessId: adapter.id,
+                harnessId,
                 harnessKind: adapter.kind,
                 nativeSessionId: resolvedNativeId,
                 lastModel: sessionDto.model,
@@ -1716,14 +1734,17 @@ export function createDefaultSessionRuntimePlugin(
           const requestedModel = req.model !== undefined ? req.model : legacyOpts?.model;
           if ((requestedHarnessId && requestedHarnessId !== sessionDto.harnessId) || requestedModel !== undefined) {
             const targetHarness = requestedHarnessId ?? sessionDto.harnessId;
-            const targetAdapter = deps.driverPort.getAdapter(targetHarness);
+            const targetAdapter = deps.driverPort.getAdapter(targetHarness, {
+              sessionId: sessionDto.id,
+              workspaceId: sessionDto.workspaceId,
+            });
             if (!targetAdapter) {
               throw new PluginApiError('E_INVALID_INPUT', `Harness 驱动实例不存在: ${targetHarness}`);
             }
             const nextPatch: Parameters<SessionDataServiceV1['updateSession']>[0]['patch'] = {
-              harnessId: targetAdapter.id,
+              harnessId: targetHarness,
               harnessKind: targetAdapter.kind,
-              participatingHarnesses: Array.from(new Set([...(sessionDto.participatingHarnesses ?? []), targetAdapter.id])),
+              participatingHarnesses: Array.from(new Set([...(sessionDto.participatingHarnesses ?? []), targetHarness])),
               ...(requestedModel !== undefined
                 ? {
                     model: requestedModel,
@@ -1767,6 +1788,8 @@ export function createDefaultSessionRuntimePlugin(
             turnId,
             harnessId: sessionDto.harnessId,
             harnessKind: sessionDto.harnessKind,
+            providerInstanceId: liveHandles.get(handleKey(sessionDto.id, sessionDto.harnessId))?.providerInstanceId,
+            providerRunId: liveHandles.get(handleKey(sessionDto.id, sessionDto.harnessId))?.providerRunId,
             model: sessionDto.model,
             actualModel: sessionDto.actualModel ?? null,
             advanceWatermark: !cliCmd && !(req.omitHandoff ?? legacyOpts?.omitHandoff),
@@ -2284,19 +2307,43 @@ export function createDefaultSessionRuntimePlugin(
             status = 'applied';
             confirmed.actualModel = updated.actualModel ?? null;
           } else if (live && !live.disposed && current.status === 'idle') {
-            if (live.handle.updateConfig) {
+            if (
+              req.patch.permissionMode !== undefined
+              && live.adapter.capabilities.permissionModes.length > 0
+              && !live.adapter.capabilities.permissionModes.includes(req.patch.permissionMode as PermissionMode)
+            ) {
+              status = 'unsupported';
+              note = `驱动 ${live.harnessId} 不支持权限模式 ${req.patch.permissionMode}`;
+            } else if (live.handle.updateConfig) {
               live.lastConfirmedConfig = undefined;
               try {
-                await live.handle.updateConfig({
+                const driverReceipt = await live.handle.updateConfig({
                   model: updated.model,
                   reasoningEffort: (updated.reasoningEffort as ReasoningEffort | null) ?? null,
                   permissionMode: updated.permissionMode as PermissionMode,
                 });
                 const pendingCommit = sessionCommitQueues.get(req.sessionId);
                 if (pendingCommit) await pendingCommit.catch(() => {});
-                status = 'applied';
+                if (driverReceipt && typeof driverReceipt === 'object' && 'status' in driverReceipt) {
+                  status = driverReceipt.status;
+                  if (driverReceipt.note) note = driverReceipt.note;
+                  if (driverReceipt.confirmed) {
+                    confirmed = {
+                      model: (driverReceipt.confirmed.model as string | null | undefined) ?? updated.model,
+                      actualModel: (driverReceipt.confirmed.actualModel as string | null | undefined)
+                        ?? (driverReceipt.confirmed.model as string | null | undefined)
+                        ?? null,
+                      reasoningEffort: (driverReceipt.confirmed.reasoningEffort as ReasoningEffort | null | undefined)
+                        ?? updated.reasoningEffort,
+                      permissionMode: (driverReceipt.confirmed.permissionMode as PermissionMode | undefined)
+                        ?? updated.permissionMode,
+                    };
+                  }
+                } else {
+                  status = 'applied';
+                }
                 const confirmedCfg = (live as LiveHandleEntry).lastConfirmedConfig;
-                if (confirmedCfg) {
+                if (confirmedCfg && status === 'applied') {
                   confirmed = {
                     model: confirmedCfg.model ?? updated.model,
                     actualModel: confirmedCfg.actualModel ?? confirmedCfg.model ?? null,
@@ -2325,6 +2372,20 @@ export function createDefaultSessionRuntimePlugin(
               await disposeLiveHandleEntry(live);
               status = 'pending_next_session';
               note = '当前驱动不支持热切换配置，已释放旧句柄并在下次发送时应用';
+            }
+          } else {
+            const targetAdapter = deps.driverPort.getAdapter(updated.harnessId, {
+              sessionId: req.sessionId,
+              workspaceId: updated.workspaceId,
+            });
+            if (
+              req.patch.permissionMode !== undefined
+              && targetAdapter
+              && targetAdapter.capabilities.permissionModes.length > 0
+              && !targetAdapter.capabilities.permissionModes.includes(req.patch.permissionMode as PermissionMode)
+            ) {
+              status = 'unsupported';
+              note = `驱动 ${updated.harnessId} 不支持权限模式 ${req.patch.permissionMode}`;
             }
           }
 

@@ -78,10 +78,13 @@ export function capApprovalPolicy(
     : parentPolicy;
 }
 
+export type OrchestratorWorktreePolicy = 'required_for_write' | 'optional' | 'always';
+
 export interface OrchestratorConfig {
   maxDepth?: number;
   maxConcurrent?: number;
   defaultTimeoutMs?: number;
+  worktreePolicy?: OrchestratorWorktreePolicy;
 }
 
 export interface OrchestratorHooks {
@@ -111,6 +114,9 @@ export interface OrchestratorHooks {
   getGitService(): GitService | undefined;
   getTaskLedger(): TaskLedgerService | undefined;
   isOrchestratorEnabled(): boolean;
+  resolveTargetAdapter?(targetInstanceId: string, parentSession: Session): import('../harnesses/types.js').HarnessAdapter | undefined;
+  getSession?(sessionId: string): Promise<Session | null>;
+  getWorkspace?(workspaceId: string): Promise<{ id: string; rootPath: string; name: string } | null>;
 }
 
 interface PendingWakeupEntry {
@@ -128,6 +134,7 @@ export class OrchestratorService {
   private maxDepth: number;
   private maxConcurrent: number;
   private defaultTimeoutMs: number;
+  private worktreePolicy: OrchestratorWorktreePolicy;
   private readonly subagentTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly pendingWakeupsByParent = new Map<string, PendingWakeupEntry[]>();
   private readonly deliveredCohorts = new Set<string>();
@@ -140,9 +147,10 @@ export class OrchestratorService {
     private readonly registry: HarnessRegistry,
     config?: OrchestratorConfig,
   ) {
-    this.maxDepth = Math.min(HARD_MAX_DEPTH_CAP, Math.max(1, Math.floor(config?.maxDepth ?? DEFAULT_MAX_DEPTH)));
-    this.maxConcurrent = Math.min(16, Math.max(1, Math.floor(config?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT)));
+    this.maxDepth = Math.max(1, Math.floor(config?.maxDepth ?? DEFAULT_MAX_DEPTH));
+    this.maxConcurrent = Math.max(1, Math.floor(config?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT));
     this.defaultTimeoutMs = Math.max(200, Math.floor(config?.defaultTimeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS));
+    this.worktreePolicy = config?.worktreePolicy ?? 'required_for_write';
   }
 
   attachHooks(hooks: OrchestratorHooks): void {
@@ -151,21 +159,30 @@ export class OrchestratorService {
 
   configure(patch: OrchestratorConfig): void {
     if (patch.maxDepth !== undefined) {
-      this.maxDepth = Math.min(HARD_MAX_DEPTH_CAP, Math.max(1, Math.floor(patch.maxDepth)));
+      this.maxDepth = Math.max(1, Math.floor(patch.maxDepth));
     }
     if (patch.maxConcurrent !== undefined) {
-      this.maxConcurrent = Math.min(16, Math.max(1, Math.floor(patch.maxConcurrent)));
+      this.maxConcurrent = Math.max(1, Math.floor(patch.maxConcurrent));
     }
     if (patch.defaultTimeoutMs !== undefined) {
       this.defaultTimeoutMs = Math.max(200, Math.floor(patch.defaultTimeoutMs));
     }
+    if (patch.worktreePolicy !== undefined) {
+      this.worktreePolicy = patch.worktreePolicy;
+    }
   }
 
-  getLimits(): { maxDepth: number; maxConcurrent: number; defaultTimeoutMs: number } {
+  getLimits(): {
+    maxDepth: number;
+    maxConcurrent: number;
+    defaultTimeoutMs: number;
+    worktreePolicy: OrchestratorWorktreePolicy;
+  } {
     return {
       maxDepth: this.maxDepth,
       maxConcurrent: this.maxConcurrent,
       defaultTimeoutMs: this.defaultTimeoutMs,
+      worktreePolicy: this.worktreePolicy,
     };
   }
 
@@ -226,12 +243,12 @@ export class OrchestratorService {
     this.assertEnabled();
     const hooks = this.requireHooks();
 
-    const parent = this.store.getSession(parentSessionId);
+    const parent = (await hooks.getSession?.(parentSessionId)) ?? this.store.getSession(parentSessionId);
     if (!parent || parent.status === 'archived') {
       throw new OrchestratorError('E_SESSION_NOT_FOUND', `Parent session not found or archived: ${parentSessionId}`);
     }
 
-    // Guardrail 1A: Recursion depth cap (default maxDepth = 1, hard global cap <= 2)
+    // Plugin-configured recursion depth cap (default plugin setting: maxDepth = 1)
     const currentDepth = this.computeSessionDepth(parentSessionId);
     const nextDepth = currentDepth + 1;
     if (nextDepth > this.maxDepth) {
@@ -241,7 +258,7 @@ export class OrchestratorService {
       );
     }
 
-    // Guardrail 1B: Per-parent concurrency cap (default maxConcurrent = 4)
+    // Plugin-configured per-parent concurrency cap (default: maxConcurrent = 4)
     const activeRuns = this.store.listSubagentRuns({
       parentSessionId,
       statuses: ACTIVE_SUBAGENT_STATUSES,
@@ -253,8 +270,8 @@ export class OrchestratorService {
       );
     }
 
-    // Validate target harness instance
-    const adapter = this.registry.get(req.targetInstanceId);
+    // Validate target harness instance (prefer scoped driver lookup when provided)
+    const adapter = hooks.resolveTargetAdapter?.(req.targetInstanceId, parent) ?? this.registry.get(req.targetInstanceId);
     if (!adapter) {
       throw new OrchestratorError(
         'E_TARGET_INSTANCE_NOT_FOUND',
@@ -283,7 +300,7 @@ export class OrchestratorService {
     const normalizedRequested = normalizeApprovalPolicy(req.requestedApprovalPolicy);
     const effectiveApprovalPolicy = capApprovalPolicy(parent.permissionMode, req.requestedApprovalPolicy);
 
-    const workspace = this.store.getWorkspace(parent.workspaceId);
+    const workspace = (await hooks.getWorkspace?.(parent.workspaceId)) ?? this.store.getWorkspace(parent.workspaceId);
     if (!workspace) {
       throw new OrchestratorError('E_WORKSPACE_NOT_FOUND', `Workspace not found: ${parent.workspaceId}`);
     }
@@ -303,18 +320,21 @@ export class OrchestratorService {
     let branchName: string | null = null;
     let baseBranch: string | null = null;
 
-    if (req.isolation === 'worktree_write') {
-      // Non-Git workspace MUST reject worktree_write 100% with zero mutations
+    const wantsWorktree =
+      this.worktreePolicy === 'always' ||
+      req.isolation === 'worktree_write';
+    if (wantsWorktree) {
       const repoInfo = await git.inspect(workspace.rootPath);
-      if (!repoInfo.isGitRepo) {
+      if (repoInfo.isGitRepo) {
+        baseBranch = req.baseBranch?.trim() || repoInfo.branch || 'main';
+        const targetBranch = `hm/sub/${subagentId}`;
+        const wt = await git.createWorktree(workspace.rootPath, targetBranch, { baseBranch });
+        childCwd = wt.worktreePath;
+        worktreePath = wt.worktreePath;
+        branchName = wt.branch;
+      } else if (req.isolation === 'worktree_write' && this.worktreePolicy !== 'optional') {
         throw new OrchestratorError('E_GIT_REPO_REQUIRED', 'Write delegation requires a Git repository');
       }
-      baseBranch = req.baseBranch?.trim() || repoInfo.branch || 'main';
-      const targetBranch = `hm/sub/${subagentId}`;
-      const wt = await git.createWorktree(workspace.rootPath, targetBranch, { baseBranch });
-      childCwd = wt.worktreePath;
-      worktreePath = wt.worktreePath;
-      branchName = wt.branch;
     }
 
     // Create first-class Core child session linked via parentSessionId
@@ -904,21 +924,32 @@ export class OrchestratorService {
     this.subagentTimers.clear();
     this.pendingWakeupsByParent.clear();
 
+    const reason = 'Orchestrator plugin disabled; worktree preserved for manual review';
     const active = this.store.listSubagentRuns({ statuses: ACTIVE_SUBAGENT_STATUSES });
+    const now = Date.now();
+    for (const run of active) {
+      this.settlingChildren.add(run.childSessionId);
+      const updated = this.store.updateSubagentRun(run.subagentId, {
+        status: 'stopped',
+        error: reason,
+        finishedAt: now,
+      }) ?? { ...run, status: 'stopped' as const, error: reason, finishedAt: now };
+      this.hooks?.emitCanonical(run.parentSessionId, 'subagent.updated', {
+        subagent: updated,
+        reason,
+      });
+      this.syncTaskLedgerStep(run.parentSessionId, updated);
+    }
+
     for (const run of active) {
       if (this.hooks) {
-        await this.stopSubagent(
-          run.subagentId,
-          'Orchestrator plugin disabled; worktree preserved for manual review',
-          { suppressWakeup: true },
-        ).catch(() => {});
-      } else {
-        this.store.updateSubagentRun(run.subagentId, {
-          status: 'stopped',
-          error: 'Orchestrator plugin disabled; worktree preserved for manual review',
-          finishedAt: Date.now(),
-        });
+        await this.hooks.interruptSession(run.childSessionId).catch(() => {});
+        const diffStat = await this.snapshotWorktreeAndDiffStat(run, `chore(subagent): snapshot before disable (${run.roleTitle})`).catch(() => null);
+        if (diffStat) {
+          this.store.updateSubagentRun(run.subagentId, { diffStat });
+        }
       }
+      this.settlingChildren.delete(run.childSessionId);
     }
   }
 

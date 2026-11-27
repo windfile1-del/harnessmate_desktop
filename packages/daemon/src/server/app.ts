@@ -91,7 +91,8 @@ import {
 import { ORCHESTRATOR_PLUGIN_ID, OrchestratorError } from '../core/orchestrator-service.js';
 import { createBuiltinPlugins, type GitService } from '../plugin-host/builtin/services.js';
 import { GitOperationError } from '../core/git-service.js';
-import { FILE_PREVIEW_PERMISSION, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
+import { FILE_PREVIEW_PERMISSION, HARNESS_DRIVER_ACP_CONTRACT, PLUGIN_EVENT_VERSION, PluginApiError } from '@harnessmate/plugin-api';
+import type { AcpPluginFacade } from '../plugins/harness-acp-default/index.js';
 import { HarnessMateStore } from '../db/sqlite.js';
 import { HarnessRegistry } from '../harnesses/registry.js';
 import { AgyAuthService } from '../harnesses/agy/agy-auth-service.js';
@@ -291,6 +292,33 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
           pendingRuntimeController = ctrl;
           sessionManager?.attachRuntimeController?.(ctrl);
         },
+        emitCanonical: (sessionId, type, payload, turnId) =>
+          sessionManager.emitCanonical(sessionId, type, payload, turnId ?? null),
+        createSession: (req) => sessionManager.createSession(req),
+        addWorkspace: (rootPath, name) => sessionManager.addWorkspace(rootPath, name),
+        tryNativeFork: async (source) => {
+          const handle = sessionManager.getRuntimeController()?.getLiveHandle(source.id, source.harnessId);
+          if (handle?.runNativeCommand) {
+            const out = await handle.runNativeCommand('fork', source.nativeSessionId ?? '');
+            const text = typeof out === 'string' ? out : out.output;
+            const trimmed = text.trim();
+            if (trimmed && !/\s/.test(trimmed)) return trimmed;
+          }
+          return null;
+        },
+        onSessionImported: (importedSession, meta) => {
+          eventBus.publishAttention({
+            kind: 'session_updated',
+            sessionId: importedSession.id,
+            sessionTitle: importedSession.title,
+            harnessId: importedSession.harnessId,
+            summary: `Imported session (${String(meta.mode ?? 'attach')})`,
+            timestamp: Date.now(),
+          });
+        },
+        sendTurn: (sessionId, text, turnOpts) => sessionManager.sendTurn(sessionId, text, undefined, turnOpts),
+        interruptSession: (sessionId) => sessionManager.interruptSession(sessionId),
+        disposeSessionHandles: (sessionId) => sessionManager.disposeSessionHandles(sessionId),
       },
     ),
     { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
@@ -463,6 +491,12 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const mapped = httpStatusForPluginError(err);
       return reply.code(mapped.status).send({ error: mapped.message, code: mapped.code });
     }
+    if (err && typeof err === 'object' && 'code' in err && (err as { code?: unknown }).code === 'E_PLUGIN_DISABLED') {
+      return reply.code(409).send({
+        error: err instanceof Error ? err.message : String(err),
+        code: 'E_PLUGIN_DISABLED',
+      });
+    }
     return reply.code(fallbackStatus).send({ error: err instanceof Error ? err.message : String(err) });
   };
 
@@ -504,13 +538,31 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/harnesses', async (request) => {
-    const query = request.query as { refresh?: string };
+    const query = request.query as { refresh?: string; workspaceId?: string; sessionId?: string };
     const harnesses = await registry.probeAll(query.refresh === '1' || query.refresh === 'true');
+    if (query.workspaceId || query.sessionId) {
+      const selectedByCategory: Record<string, string | null> = {};
+      for (const category of ['codex', 'claude', 'acp', 'agy']) {
+        const res = pluginManager.resolveServiceSelection(`harness.driver.${category}.v1`, {
+          workspaceId: query.workspaceId,
+          sessionId: query.sessionId,
+          allowSingleCandidate: true,
+        });
+        selectedByCategory[category] = res.status === 'ready' ? (res.instanceId ?? null) : null;
+      }
+      return { harnesses, selectedByCategory };
+    }
     return { harnesses };
   });
 
   app.post('/api/v1/harnesses/custom', async (request, reply) => {
-    if (!pluginManager.host.get('harness.acp')) return reply.code(409).send({ error: '自定义 ACP 引擎插件已停用' });
+    const acpResolution = pluginManager.resolveServiceSelection(HARNESS_DRIVER_ACP_CONTRACT, {
+      allowSingleCandidate: true,
+    });
+    const acpFacade = pluginManager.host.get<AcpPluginFacade>('harness.acp');
+    if (acpResolution.status === 'disabled' || !acpFacade) {
+      return reply.code(409).send({ error: '自定义 ACP 引擎插件已停用', code: 'E_PLUGIN_DISABLED' });
+    }
     const parsed = CustomAcpHarnessConfigSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid harness config' });
@@ -525,12 +577,20 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       config.customAcpHarnesses.push(parsed.data);
     }
     saveConfig(paths.configPath, config);
-    registry.registerCustomAcp(parsed.data);
+    if (typeof acpFacade.registerCustomHarness === 'function') {
+      acpFacade.registerCustomHarness(parsed.data);
+    } else {
+      registry.registerCustomAcp(parsed.data);
+    }
     const harnesses = await registry.probeAll(true);
     return { harnesses };
   });
 
   app.delete('/api/v1/harnesses/custom/:id', async (request, reply) => {
+    const acpFacade = pluginManager.host.get<AcpPluginFacade>('harness.acp');
+    if (!acpFacade) {
+      return reply.code(409).send({ error: '自定义 ACP 引擎插件已停用', code: 'E_PLUGIN_DISABLED' });
+    }
     const { id } = request.params as { id: string };
     const before = config.customAcpHarnesses.length;
     config.customAcpHarnesses = config.customAcpHarnesses.filter((h) => h.id !== id);
@@ -538,7 +598,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(404).send({ error: 'Custom harness not found' });
     }
     saveConfig(paths.configPath, config);
-    if (!registry.isReserved(id) && registry.get(id)?.isCustom) registry.unregister(id);
+    if (typeof acpFacade.unregisterCustomHarness === 'function') {
+      acpFacade.unregisterCustomHarness(id);
+    } else if (!registry.isReserved(id) && registry.get(id)?.isCustom) {
+      registry.unregister(id);
+    }
     const harnesses = await registry.probeAll(false);
     return { harnesses };
   });
@@ -1258,6 +1322,14 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         'workspace.files.v1': pluginManager.resolveCapabilityBinding('workspace.files.v1', { workspaceId: id }),
         'session.attachments.v1': pluginManager.resolveCapabilityBinding('session.attachments.v1', { workspaceId: id }),
         'workspace.rules.v1': pluginManager.resolveCapabilityBinding('workspace.rules.v1', { workspaceId: id }),
+        'harness.driver.codex.v1': pluginManager.resolveServiceSelection('harness.driver.codex.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'harness.driver.claude.v1': pluginManager.resolveServiceSelection('harness.driver.claude.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'harness.driver.acp.v1': pluginManager.resolveServiceSelection('harness.driver.acp.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'harness.driver.agy.v1': pluginManager.resolveServiceSelection('harness.driver.agy.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'session.handoff.v1': pluginManager.resolveServiceSelection('session.handoff.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'session.compression.v1': pluginManager.resolveServiceSelection('session.compression.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'session.collaboration.v1': pluginManager.resolveServiceSelection('session.collaboration.v1', { workspaceId: id, allowSingleCandidate: true }),
+        'session.orchestration.v1': pluginManager.resolveServiceSelection('session.orchestration.v1', { workspaceId: id, allowSingleCandidate: true }),
       },
     };
   });
@@ -1758,7 +1830,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       return await sessionManager.switchHarness(id, parsed.data);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1769,7 +1841,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const preview = await sessionManager.getContextPreview(id, q.targetHarnessId, q.syncMode);
       return { preview };
     } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 404);
     }
   });
 
@@ -1898,7 +1970,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const res = await sessionManager.handoffSession(id, body.targetHarnessId, body.targetModel);
       return reply.code(201).send(res);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1910,7 +1982,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       return sessionManager.exportSession(id, format, { redact });
     } catch (err) {
-      return reply.code(404).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 404);
     }
   });
 
@@ -1924,7 +1996,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const result = await sessionManager.forkSession(id, parsed.data);
       return reply.code(201).send(result);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1938,7 +2010,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const result = sessionManager.mergeBackSession(id, parsed.data);
       return result;
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
@@ -1947,7 +2019,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.get('/api/v1/sessions/:id/subagents', async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
-    return sessionManager.getOrchestratorService().getBoard(id);
+    try {
+      return sessionManager.getOrchestratorService(id).getBoard(id);
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   app.post('/api/v1/sessions/:id/subagents', async (request, reply) => {
@@ -1957,7 +2033,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid delegation payload' });
     }
     try {
-      const subagent = await sessionManager.getOrchestratorService().delegateTask(id, parsed.data);
+      const subagent = await sessionManager.getOrchestratorService(id).delegateTask(id, parsed.data);
       return reply.code(201).send({ subagent });
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : 'E_DELEGATE_FAILED';
@@ -1972,7 +2048,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return sessionManager.getOrchestratorService().getSubagentResult(subagentId);
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : 'E_SUBAGENT_NOT_FOUND';
-      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
@@ -2002,7 +2079,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return { subagent };
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : 'E_SUBAGENT_STOP_FAILED';
-      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
@@ -2019,7 +2097,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return await sessionManager.getOrchestratorService().dryRunMergeSubagent(subagentId, parsed.data.baseBranch);
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_MERGE_PRECHECK_FAILED';
-      return reply.code(code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
@@ -2036,7 +2115,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return await sessionManager.getOrchestratorService().mergeBackSubagent(subagentId, parsed.data);
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_MERGE_FAILED';
-      const status = code === 'E_MERGE_CONFLICT' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      const status = code === 'E_PLUGIN_DISABLED' || code === 'E_MERGE_CONFLICT' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
       return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
@@ -2059,7 +2138,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       });
     } catch (err) {
       const code = err instanceof OrchestratorError ? err.code : err instanceof GitOperationError ? err.code : 'E_WORKTREE_REMOVE_FAILED';
-      const status = code === 'E_WORKTREE_BUSY' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
+      const status = code === 'E_PLUGIN_DISABLED' || code === 'E_WORKTREE_BUSY' || code === 'E_SUBAGENT_ACTIVE' ? 409 : code === 'E_SUBAGENT_NOT_FOUND' ? 404 : 400;
       return reply.code(status).send({ error: err instanceof Error ? err.message : String(err), code });
     }
   });
@@ -2070,10 +2149,11 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
     try {
-      return await sessionManager.getContextCompressionService().getSessionStatus(id);
+      return await sessionManager.getContextCompressionService(id).getSessionStatus(id);
     } catch (err) {
       const code = err instanceof ContextCompressionError ? err.code : 'E_COMPRESSION_STATUS_FAILED';
-      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SESSION_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
@@ -2095,7 +2175,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid compression payload' });
     }
     try {
-      const svc = sessionManager.getContextCompressionService();
+      const svc = sessionManager.getContextCompressionService(id);
       const fromSeq = parsed.data.fromSeq ?? 1;
       const toSeq = parsed.data.toSeq ?? session.lastSeq;
       const budgetChars = parsed.data.budgetChars ?? 6_000;
@@ -2106,7 +2186,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return { result, status };
     } catch (err) {
       const code = err instanceof ContextCompressionError ? err.code : 'E_COMPRESS_FAILED';
-      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SESSION_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
@@ -2117,25 +2198,30 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     const { id } = request.params as { id: string };
     if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
     try {
-      const svc = sessionManager.getContextCompressionService();
+      const svc = sessionManager.getContextCompressionService(id);
       const cleared = svc.clearSessionCache(id);
       const status = await svc.getSessionStatus(id);
       return { ...cleared, status };
     } catch (err) {
       const code = err instanceof ContextCompressionError ? err.code : 'E_CACHE_CLEAR_FAILED';
-      return reply.code(code === 'E_SESSION_NOT_FOUND' ? 404 : 400).send({
+      const status = code === 'E_PLUGIN_DISABLED' ? 409 : code === 'E_SESSION_NOT_FOUND' ? 404 : 400;
+      return reply.code(status).send({
         error: err instanceof Error ? err.message : String(err),
         code,
       });
     }
   });
 
-  app.get('/api/v1/compression/config', async () => {
-    const svc = sessionManager.getContextCompressionService();
-    return {
-      enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
-      config: svc.getConfig(),
-    };
+  app.get('/api/v1/compression/config', async (_request, reply) => {
+    try {
+      const svc = sessionManager.getContextCompressionService();
+      return {
+        enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
+        config: svc.getConfig(),
+      };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
+    }
   });
 
   app.put('/api/v1/compression/config', async (request, reply) => {
@@ -2143,18 +2229,26 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'Invalid compression config' });
     }
-    const svc = sessionManager.getContextCompressionService();
-    const config = svc.updateConfig(parsed.data);
-    return {
-      enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
-      config,
-    };
+    try {
+      const svc = sessionManager.getContextCompressionService();
+      const config = svc.updateConfig(parsed.data);
+      return {
+        enabled: pluginManager.isPluginEnabled(CONTEXT_COMPRESSION_PLUGIN_ID),
+        config,
+      };
+    } catch (err) {
+      return sendPluginError(reply, err, 409);
+    }
   });
 
   app.get('/api/v1/sessions/:id/side-chat', async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
-    return { messages: sessionManager.getSideChat(id) };
+    try {
+      return { messages: sessionManager.getSideChat(id) };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   app.post('/api/v1/sessions/:id/side-chat', async (request, reply) => {
@@ -2166,15 +2260,19 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       return await sessionManager.sendSideChat(id, parsed.data);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 
   app.delete('/api/v1/sessions/:id/side-chat', async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!sessionManager.getSession(id)) return reply.code(404).send({ error: 'Session not found' });
-    sessionManager.clearSideChat(id);
-    return { ok: true };
+    try {
+      sessionManager.clearSideChat(id);
+      return { ok: true };
+    } catch (err) {
+      return sendPluginError(reply, err, 400);
+    }
   });
 
   app.post('/api/v1/sessions/:id/side-chat/promote', async (request, reply) => {
@@ -2187,7 +2285,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const result = await sessionManager.promoteSideChatToFork(id, parsed.data);
       return reply.code(201).send(result);
     } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+      return sendPluginError(reply, err, 400);
     }
   });
 

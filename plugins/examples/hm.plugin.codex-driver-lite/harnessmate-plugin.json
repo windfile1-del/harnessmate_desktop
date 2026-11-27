@@ -1,0 +1,18 @@
+{
+  "id": "hm.plugin.codex-driver-lite",
+  "name": "外部 Codex 同类驱动样例 (Lite)",
+  "version": "1.0.0",
+  "description": "纯公开 SDK 实现的外部 Codex 同类驱动插件，支持多实例独立 CLI 路径/Home/账号配置、流式输出、中断、命令/配置确认回执与代次隔离。",
+  "author": "HarnessMate Examples",
+  "category": "harness",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "permissions": [
+    "harness:driver:register",
+    "storage:plugin"
+  ],
+  "contributes": {}
+}

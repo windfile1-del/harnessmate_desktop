@@ -34,6 +34,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '接入本机 Codex CLI (app-server JSON-RPC 2.0)，支持动态模型、账号限额与交互审批。',
     author: 'HarnessMate Core',
     category: 'harness',
+    provides: ['harness.driver.v1', 'harness.driver.codex.v1', 'harness.codex'],
     contributes: { uiSlots: ['modal'] },
   },
   {
@@ -43,6 +44,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '接入本机 agy CLI 原生 ACP 协议，支持动态模型、思考档位校验与权限确认。',
     author: 'HarnessMate Core',
     category: 'harness',
+    provides: ['harness.driver.v1', 'harness.driver.agy.v1', 'harness.agy'],
     contributes: { uiSlots: ['modal'] },
   },
   {
@@ -52,6 +54,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '接入本机 Claude Code (stream-json 双向控制流)，自动读取 settings.json 模型目录。',
     author: 'HarnessMate Core',
     category: 'harness',
+    provides: ['harness.driver.v1', 'harness.driver.claude.v1', 'harness.claude'],
     contributes: { uiSlots: ['modal'] },
   },
   {
@@ -60,6 +63,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     version: '1.0.0',
     description: '管理通过官方 ACP 协议接入的额外 CLI。',
     category: 'harness',
+    provides: ['harness.driver.v1', 'harness.driver.acp.v1', 'harness.acp'],
     contributes: {},
   },
   {
@@ -206,6 +210,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '基于水位线增量同步与协议原生注入（Codex inject_items / AGY embeddedContext / Claude sysfile），实现单会话内多引擎无缝切换。',
     author: 'HarnessMate Core',
     category: 'workflow',
+    provides: ['session.handoff.v1', 'handoff'],
     optional: ['compressor'],
     contributes: { uiSlots: ['composer_action', 'inspector_tab'], hooks: ['before_turn'] },
   },
@@ -260,9 +265,10 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     id: 'hm.plugin.session-explorer',
     name: '会话检索、导入与分叉中心',
     version: '1.0.0',
-    description: '提供跨工作区 SQLite FTS5 全文检索、GiB 级安全外部 CLI 流式导入（含 .jsonl.zst）、会话 Fork / merge_back、Side Chat 与脱敏 JSON Bundle v2 导入导出。',
+    description: '提供会话 Fork / merge_back、Side Chat 与脱敏 JSON Bundle v2 导入导出。',
     author: 'HarnessMate Core',
     category: 'workflow',
+    provides: ['session.collaboration.v1', 'session-search'],
     contributes: { uiSlots: ['sidebar_tool', 'inspector_tab', 'modal'] },
   },
   {
@@ -281,6 +287,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '承接场景 D 多引擎并行协作：支持 MCP 子任务委托、强制 Git Worktree 物理隔离、权限不提权天花板、批次聚合唤醒与无副作用冲突预检人工合回（官方可选插件）。',
     author: 'HarnessMate Core',
     category: 'workflow',
+    provides: ['session.orchestration.v1', 'orchestrator'],
     inject: ['git'],
     optional: ['ledger'],
     permissions: ['session:orchestrate', 'workspace:git:write', 'tools:model'],
@@ -293,7 +300,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '提供纯本地零费用多语言符号轮廓索引、分块增量摘要缓存（可选外置引擎，含 8s 超时与预算熔断）及防幻觉路径校验（官方可选插件）。',
     author: 'HarnessMate Core',
     category: 'workflow',
-    provides: ['compressor'],
+    provides: ['session.compression.v1', 'compressor'],
     permissions: ['session:read', 'fs:workspace:read', 'context:compressor'],
     contributes: { uiSlots: ['inspector_tab'] },
   },

@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {
+  HARNESS_DRIVER_CONTRACT,
   PluginApiError,
+  harnessDriverCategoryContract,
   isBuiltinPublicService,
   isReservedServiceName,
   isSafePluginUiPath,
@@ -11,9 +13,12 @@ import {
   type ApprovalAnnotation,
   type ApprovalPolicyDecision,
   type ApprovalPolicyRequest,
+  type DriverCommandReceipt,
+  type DriverConfigReceipt,
   type HandoffComposeEvent,
   type HandoffOfferDecision,
   type HandoffShouldOfferEvent,
+  type HarnessDriverProviderServiceV1,
   type PluginEventV4,
   type PluginHandshakeResponse,
   type PluginRouteRequest,
@@ -114,7 +119,17 @@ export interface ActiveIsolatedPlugin {
   slots: Map<string, PluginRuntimeSlotDescriptor>;
   sections: Map<string, { id: string; order?: number; text: string }>;
   declaredDrivers: Map<string, PublicHarnessDriverDescriptor>;
-  registeredDrivers: Map<string, HarnessAdapter>;
+  registeredDrivers: Map<string, {
+    adapter: HarnessAdapter;
+    harnessId: string;
+    driverId: string;
+    disposeServices: Array<() => void>;
+  }>;
+  provideDynamicService?: (
+    contract: string,
+    value: object,
+    opts?: { version?: string; metadata?: Record<string, unknown>; runId?: string },
+  ) => () => void;
   driverSessions: Map<string, ProxyDriverSessionEntry>;
   leasedHarnessSessions: Map<string, LeasedHarnessSessionEntry>;
   hasHandoffCompose: boolean;
@@ -250,14 +265,24 @@ export class IsolatedPluginManager {
         if (!entry || entry.runId !== runId || !entry.process.alive) {
           throw new PluginApiError('E_STALE_RUN', '插件实例已过期或未运行');
         }
-        const configWithWs = input.config as AdapterSessionConfig & { workspaceId?: unknown };
+        const configWithWs = input.config as AdapterSessionConfig & {
+          workspaceId?: unknown;
+          sessionId?: unknown;
+          driverProviderInstanceId?: unknown;
+        };
         const scope = typeof configWithWs.workspaceId === 'string' && configWithWs.workspaceId.trim()
           ? configWithWs.workspaceId.trim()
           : GLOBAL_WORKSPACE_SCOPE;
         this.opts.permissions.assertGranted(plugin, 'session:send', scope);
         const registry = this.getRegistry();
         if (!registry) throw new PluginApiError('E_SERVICE_UNAVAILABLE', 'Harness 注册表不可用');
-        const adapter = registry.get(input.harnessId);
+        const resolved = registry.resolveAdapter({
+          harnessId: input.harnessId,
+          providerInstanceId: typeof configWithWs.driverProviderInstanceId === 'string'
+            ? configWithWs.driverProviderInstanceId
+            : undefined,
+        });
+        const adapter = resolved?.adapter ?? registry.get(input.harnessId);
         if (!adapter) throw new PluginApiError('E_SERVICE_UNAVAILABLE', `Harness 实例 ${input.harnessId} 不存在`);
         const decision = evaluateAgyConsumerProvenance({
           instanceId: adapter.id,
@@ -324,10 +349,10 @@ export class IsolatedPluginManager {
           return { ok: true };
         }
         if (op === 'updateConfig') {
-          if (typeof lease.handle.updateConfig === 'function') {
-            await lease.handle.updateConfig((payload.patch ?? {}) as Partial<AdapterSessionConfig>);
-          }
-          return { ok: true };
+          const receipt = typeof lease.handle.updateConfig === 'function'
+            ? await lease.handle.updateConfig((payload.patch ?? {}) as Partial<AdapterSessionConfig>)
+            : undefined;
+          return receipt && typeof receipt === 'object' ? { ok: true, receipt } : { ok: true };
         }
         if (op === 'resolveApproval') {
           await lease.handle.resolveApproval(
@@ -565,6 +590,8 @@ export class IsolatedPluginManager {
           sections: new Map(),
           declaredDrivers: new Map(),
           registeredDrivers: new Map(),
+          provideDynamicService: (contract, value, svcOpts) =>
+            this.opts.host.registerDynamicService(instanceId, contract, value, svcOpts),
           driverSessions: new Map(),
           leasedHarnessSessions: new Map(),
           hasHandoffCompose: false,
@@ -982,13 +1009,151 @@ export class IsolatedPluginManager {
       throw new PluginApiError('E_INVALID_INPUT', `非法的 Harness 驱动 ID: ${String(driver?.driverId ?? '')}`);
     }
     const registry = this.getRegistry();
-    if (registry?.isReserved(driverId) || driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
-      throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置 Harness 驱动: ${driverId}`);
+    if (registry?.isReserved(driverId) || driverId === 'agy') {
+      throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖保留 AGY 原生驱动: ${driverId}`);
     }
-    const existing = entry.registeredDrivers.get(driverId);
-    if (registry && !existing && (registry.hasDriver(driverId) || registry.get(driverId))) {
-      throw new PluginApiError('E_CONFLICT', `Harness 驱动 ID 已被占用: ${driverId}`);
+    if (driver.harnessId?.trim()) {
+      const requestedHarnessId = driver.harnessId.trim();
+      const existingOwner = registry?.getEntry(requestedHarnessId);
+      if (existingOwner && existingOwner.providerInstanceId !== entry.instanceId) {
+        throw new PluginApiError('E_CONFLICT', `Harness 实例 ID 已被占用: ${requestedHarnessId}`);
+      }
     }
+  }
+
+  private resolveIsolatedHarnessId(
+    entry: ActiveIsolatedPlugin,
+    desc: PublicHarnessDriverDescriptor,
+    registry: HarnessRegistry,
+  ): string {
+    const requested = desc.harnessId?.trim();
+    if (requested) {
+      const owner = registry.getEntry(requested);
+      if (owner && owner.providerInstanceId !== entry.instanceId) {
+        throw new PluginApiError('E_CONFLICT', `Harness 实例 ID 已被占用: ${requested}`);
+      }
+      return requested;
+    }
+    const driverId = desc.driverId.trim();
+    // Built-in categories (codex/claude/acp) always receive deterministic provider-scoped harnessId
+    // so external implementations coexist with default plugins independent of load order.
+    if (driverId === 'codex' || driverId === 'claude' || driverId === 'acp') {
+      return `${entry.instanceId}:${driverId}`;
+    }
+    const existingEntry = registry.getEntry(driverId);
+    const existingAdapter = registry.get(driverId);
+    if (!existingEntry && !existingAdapter) {
+      return driverId;
+    }
+    if (existingEntry?.providerInstanceId === entry.instanceId) {
+      return driverId;
+    }
+    return `${entry.instanceId}:${driverId}`;
+  }
+
+  private createDriverProviderService(
+    entry: ActiveIsolatedPlugin,
+    filterDriverId?: string,
+  ): HarnessDriverProviderServiceV1 {
+    const getAdapters = () => [...entry.registeredDrivers.values()]
+      .filter((r) => !filterDriverId || r.driverId === filterDriverId);
+    return {
+      async getProviderInfo() {
+        const recs = getAdapters();
+        return {
+          ok: true,
+          value: {
+            pluginId: entry.pluginId,
+            instanceId: entry.instanceId,
+            runId: entry.runId,
+            driverIds: recs.map((r) => r.driverId),
+            harnessIds: recs.map((r) => r.harnessId),
+          },
+        };
+      },
+      async listHarnessInstances() {
+        const recs = getAdapters();
+        return {
+          ok: true,
+          value: {
+            instances: recs.map((r) => ({
+              key: `${entry.instanceId}::${r.driverId}::${r.harnessId}`,
+              pluginId: entry.pluginId,
+              instanceId: entry.instanceId,
+              driverId: r.driverId,
+              harnessId: r.harnessId,
+              runId: entry.runId,
+              displayName: r.adapter.displayName,
+              description: r.adapter.description,
+              protocolLabel: r.adapter.protocolLabel,
+              continuationKey: r.adapter.continuationKey,
+              isCustom: r.adapter.isCustom,
+              capabilities: r.adapter.capabilities,
+              capabilitiesV2: r.adapter.capabilitiesV2,
+              presentation: r.adapter.presentation,
+              supportedCommands: r.adapter.supportedCommands,
+            })),
+          },
+        };
+      },
+      async probe(req) {
+        const recs = getAdapters().filter((r) => !req?.harnessId || r.harnessId === req.harnessId);
+        const probes = await Promise.all(recs.map(async (r) => {
+          const info = await (!req?.forceRefresh && r.adapter.probePassive
+            ? r.adapter.probePassive()
+            : r.adapter.probe());
+          return {
+            harnessId: r.harnessId,
+            driverId: r.driverId,
+            providerPluginId: entry.pluginId,
+            providerInstanceId: entry.instanceId,
+            providerRunId: entry.runId,
+            binaryPath: info.binaryPath,
+            version: info.version,
+            health: info.health,
+            healthMessage: info.healthMessage,
+            models: info.models,
+            defaultModelId: info.defaultModelId,
+            accountSummary: info.accountSummary,
+            supportedCommands: r.adapter.supportedCommands,
+          };
+        }));
+        return { ok: true, value: { probes } };
+      },
+      async readUsageLimits(req) {
+        const rec = getAdapters().find((r) => !req?.harnessId || r.harnessId === req.harnessId);
+        if (!rec) {
+          return { ok: false, error: { code: 'not_found', message: '未找到匹配的驱动实例' } };
+        }
+        if (!rec.adapter.readUsageLimits) {
+          return { ok: false, error: { code: 'not_supported', message: '该驱动未提供额度读取能力' } };
+        }
+        const usage = await rec.adapter.readUsageLimits();
+        return {
+          ok: true,
+          value: {
+            harnessId: rec.harnessId,
+            driverId: rec.driverId,
+            providerInstanceId: entry.instanceId,
+            loggedIn: usage.loggedIn,
+            accountLabel: usage.accountLabel,
+            planType: usage.planType,
+            authMethod: usage.authMethod,
+            billingTier: usage.billingTier,
+            gatewayUrl: usage.gatewayUrl,
+            rateLimits: usage.rateLimits,
+            error: usage.error,
+          },
+        };
+      },
+      async listCommands(req) {
+        const rec = getAdapters().find((r) => !req?.harnessId || r.harnessId === req.harnessId);
+        if (!rec) {
+          return { ok: false, error: { code: 'not_found', message: '未找到匹配的驱动实例' } };
+        }
+        return { ok: true, value: { commands: rec.adapter.supportedCommands ?? [] } };
+      },
+    };
   }
 
   private syncPluginDrivers(entry: ActiveIsolatedPlugin): void {
@@ -1001,13 +1166,52 @@ export class IsolatedPluginManager {
     }
     for (const [driverId, desc] of entry.declaredDrivers) {
       if (entry.registeredDrivers.has(driverId)) continue;
-      if (registry.hasDriver(driverId) || registry.get(driverId)) {
-        throw new PluginApiError('E_CONFLICT', `Harness 驱动 ID 已被占用: ${driverId}`);
+      const harnessId = this.resolveIsolatedHarnessId(entry, desc, registry);
+      const adapter = this.createProxyHarnessAdapter(entry, desc, harnessId);
+      registry.registerProviderDriver({
+        pluginId: entry.pluginId,
+        providerInstanceId: entry.instanceId,
+        providerRunId: entry.runId,
+        driverId,
+        harnessId,
+        aliases: [],
+        isDefault: false,
+        adapter,
+        instanceConfig: {
+          displayName: desc.displayName,
+          description: desc.description,
+          continuationKey: `${driverId}:instance:${entry.instanceId}:${harnessId}`,
+          enabled: true,
+        },
+      });
+      const disposeServices: Array<() => void> = [];
+      if (entry.provideDynamicService) {
+        const svcMeta = {
+          version: entry.info.version,
+          metadata: { pluginId: entry.pluginId, driverId, harnessId },
+          runId: entry.runId,
+        };
+        if (!this.opts.host.getServiceRecordByInstance(entry.instanceId, HARNESS_DRIVER_CONTRACT)) {
+          disposeServices.push(
+            entry.provideDynamicService(
+              HARNESS_DRIVER_CONTRACT,
+              this.createDriverProviderService(entry),
+              svcMeta,
+            ),
+          );
+        }
+        const categoryContract = harnessDriverCategoryContract(driverId);
+        if (!this.opts.host.getServiceRecordByInstance(entry.instanceId, categoryContract)) {
+          disposeServices.push(
+            entry.provideDynamicService(
+              categoryContract,
+              this.createDriverProviderService(entry, driverId),
+              svcMeta,
+            ),
+          );
+        }
       }
-      const adapter = this.createProxyHarnessAdapter(entry, desc);
-      registry.registerDriver(driverId, () => adapter);
-      registry.register(adapter);
-      entry.registeredDrivers.set(driverId, adapter);
+      entry.registeredDrivers.set(driverId, { adapter, harnessId, driverId, disposeServices });
     }
   }
 
@@ -1036,19 +1240,16 @@ export class IsolatedPluginManager {
       }
       sess.listeners.clear();
     }
-    const adapter = entry.registeredDrivers.get(driverId);
+    const registered = entry.registeredDrivers.get(driverId);
     entry.registeredDrivers.delete(driverId);
-    const registry = this.getRegistry();
-    if (!registry) return;
-    for (const inst of registry.listInstances()) {
-      if (inst.driverId === driverId) {
-        registry.unregister(inst.instanceId);
+    if (registered) {
+      for (const disposeSvc of registered.disposeServices) {
+        try { disposeSvc(); } catch { /* ignore */ }
       }
     }
-    if (adapter && registry.get(driverId) === adapter) {
-      registry.unregister(driverId);
-    }
-    registry.unregisterDriver(driverId);
+    const registry = this.getRegistry();
+    if (!registry) return;
+    registry.unregisterProviderDriver(entry.instanceId, driverId, registered?.harnessId);
   }
 
   private cleanupPluginDrivers(entry: ActiveIsolatedPlugin, crashReason?: string): void {
@@ -1089,13 +1290,19 @@ export class IsolatedPluginManager {
   private createProxyHarnessAdapter(
     entry: ActiveIsolatedPlugin,
     desc: PublicHarnessDriverDescriptor,
+    harnessId: string,
   ): HarnessAdapter {
+    const continuationKey = `${desc.driverId}:instance:${entry.instanceId}:${harnessId}`;
     const mapProbe = (res: PublicHarnessProbeResult): HarnessInfo => ({
-      id: desc.driverId,
+      id: harnessId,
       kind: desc.driverId,
       driverId: desc.driverId,
-      instanceId: desc.driverId,
-      continuationKey: `${desc.driverId}:instance:${desc.driverId}`,
+      instanceId: harnessId,
+      providerPluginId: entry.pluginId,
+      providerInstanceId: entry.instanceId,
+      providerRunId: entry.runId,
+      driverCategoryContract: harnessDriverCategoryContract(desc.driverId),
+      continuationKey,
       displayName: desc.displayName,
       description: desc.description,
       protocolLabel: desc.protocolLabel,
@@ -1106,6 +1313,7 @@ export class IsolatedPluginManager {
       capabilities: desc.capabilities,
       capabilitiesV2: res?.capabilitiesV2 ?? desc.capabilitiesV2,
       presentation: res?.presentation ?? desc.presentation,
+      ...(desc.supportedCommands ? { supportedCommands: desc.supportedCommands } : {}),
       models: res?.models ?? [],
       defaultModelId: res?.defaultModelId ?? null,
       accountSummary: res?.accountSummary ?? null,
@@ -1114,16 +1322,20 @@ export class IsolatedPluginManager {
 
     const capturedRunId = entry.runId;
     return {
-      id: desc.driverId,
+      id: harnessId,
       kind: desc.driverId,
       driverId: desc.driverId,
-      continuationKey: `${desc.driverId}:instance:${desc.driverId}`,
+      providerPluginId: entry.pluginId,
+      providerInstanceId: entry.instanceId,
+      providerRunId: capturedRunId,
+      continuationKey,
       displayName: desc.displayName,
       description: desc.description,
       protocolLabel: desc.protocolLabel,
       capabilities: desc.capabilities,
       capabilitiesV2: desc.capabilitiesV2,
       presentation: desc.presentation,
+      supportedCommands: desc.supportedCommands,
       isCustom: true,
       pluginMcpTransport: desc.pluginMcpTransport,
       probePassive: async () => {
@@ -1232,12 +1444,24 @@ export class IsolatedPluginManager {
             ISOLATED_TIMEOUTS.command,
             capturedRunId,
           ),
-          runNativeCommand: async (command: string, args: string) => entry.process.call<string>(
+          runNativeCommand: async (command: string, args: string) => entry.process.call<string | DriverCommandReceipt>(
             'host.driver.runNativeCommand',
             { handleId, command, args },
             ISOLATED_TIMEOUTS.command,
             capturedRunId,
           ),
+          ...(desc.capabilitiesV2?.supportsActiveSteering
+            ? {
+                steerTurn: async (input: TurnInput) => {
+                  await entry.process.call(
+                    'host.driver.steerTurn',
+                    { handleId, input },
+                    ISOLATED_TIMEOUTS.command,
+                    capturedRunId,
+                  );
+                },
+              }
+            : {}),
           ...(created?.supportsInjectContext
             ? {
                 injectContext: async (payload: ContextSyncPayload) => {
@@ -1275,12 +1499,13 @@ export class IsolatedPluginManager {
             );
           },
           updateConfig: async (patch: Partial<AdapterSessionConfig>) => {
-            await entry.process.call(
+            const res = await entry.process.call<{ ok?: boolean; receipt?: DriverConfigReceipt } | undefined>(
               'host.driver.updateConfig',
               { handleId, patch },
               ISOLATED_TIMEOUTS.command,
               capturedRunId,
             );
+            return res?.receipt;
           },
           dispose: async () => {
             entry.driverSessions.delete(handleId);

@@ -129,6 +129,9 @@ function createServiceProxy(serviceName) {
 function toDriverDescriptor(driver) {
   return {
     driverId: driver.driverId,
+    ...(driver.harnessId ? { harnessId: driver.harnessId } : {}),
+    ...(driver.instanceId ? { instanceId: driver.instanceId } : {}),
+    ...(driver.pluginId ? { pluginId: driver.pluginId } : {}),
     displayName: driver.displayName,
     description: driver.description,
     protocolLabel: driver.protocolLabel,
@@ -136,6 +139,7 @@ function toDriverDescriptor(driver) {
     ...(driver.capabilitiesV2 ? { capabilitiesV2: driver.capabilitiesV2 } : {}),
     ...(driver.presentation ? { presentation: driver.presentation } : {}),
     ...(driver.pluginMcpTransport ? { pluginMcpTransport: driver.pluginMcpTransport } : {}),
+    ...(driver.supportedCommands ? { supportedCommands: driver.supportedCommands } : {}),
   };
 }
 
@@ -282,8 +286,8 @@ function buildContext(handshake) {
           if (!driverId) {
             throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
           }
-          if (driverId === 'codex' || driverId === 'claude' || driverId === 'agy' || driverId === 'acp') {
-            throw new PluginApiError('E_PERMISSION_DENIED', '禁止覆盖内置 Harness 驱动: ' + driverId);
+          if (driverId === 'agy') {
+            throw new PluginApiError('E_PERMISSION_DENIED', '禁止覆盖内置 AGY 原生驱动: ' + driverId);
           }
           if (driverHandlers.has(driverId)) {
             throw new PluginApiError('E_CONFLICT', '驱动 ' + driverId + ' 已注册');
@@ -1017,9 +1021,17 @@ async function handleMessage(message) {
     } else if (method === 'host.driver.updateConfig') {
       const sess = driverSessions.get(String(params.handleId || ''));
       if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
-      if (typeof sess.handle.updateConfig === 'function') {
-        await sess.handle.updateConfig(params.patch || {});
+      const receipt = typeof sess.handle.updateConfig === 'function'
+        ? await sess.handle.updateConfig(params.patch || {})
+        : undefined;
+      result = receipt && typeof receipt === 'object' ? { ok: true, receipt } : { ok: true };
+    } else if (method === 'host.driver.steerTurn') {
+      const sess = driverSessions.get(String(params.handleId || ''));
+      if (!sess) throw new PluginApiError('E_SERVICE_UNAVAILABLE', '驱动会话不存在');
+      if (typeof sess.handle.steerTurn !== 'function') {
+        throw new PluginApiError('E_NOT_SUPPORTED', '驱动不支持 steerTurn');
       }
+      await sess.handle.steerTurn(params.input || {});
       result = { ok: true };
     } else if (method === 'host.driver.listSkills') {
       const sess = driverSessions.get(String(params.handleId || ''));

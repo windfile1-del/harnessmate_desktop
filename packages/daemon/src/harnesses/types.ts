@@ -24,6 +24,11 @@ import type {
   TurnOptionsMap,
   UserQuestionSpec,
 } from '@harnessmate/protocol';
+import type {
+  DriverCommandCapability,
+  DriverCommandReceipt,
+  DriverConfigReceipt,
+} from '@harnessmate/plugin-api';
 import type { NativeRuntimeHooks } from './agy/native/wiring/types.js';
 
 export interface PortableHistoryMessage {
@@ -189,7 +194,7 @@ export interface AdapterSessionHandle {
   sendTurn(input: TurnInput): Promise<{ driverUsed?: ContextInjectionDriver } | void>;
   listSkills?(): Promise<NativeSkill[]>;
   /** Vendor-neutral native command execution (replaces vendor-specific handle methods such as runCodexGoal). */
-  runNativeCommand?(command: string, args: string): Promise<string>;
+  runNativeCommand?(command: string, args: string): Promise<string | DriverCommandReceipt>;
   injectContext?(payload: ContextSyncPayload): Promise<ContextInjectionDriver>;
   interrupt(): Promise<void>;
   requestNativeSessionCancel?(): boolean;
@@ -198,7 +203,7 @@ export interface AdapterSessionHandle {
   resolveSecret?(nativeRequestId: string, secretValue: string): Promise<void>;
   /** Optional structured answer delivery for user_question requests. */
   resolveQuestion?(nativeRequestId: string, answer: { selectedOptionIds?: string[]; freeText?: string }): Promise<void>;
-  updateConfig?(patch: Partial<AdapterSessionConfig>): Promise<void>;
+  updateConfig?(patch: Partial<AdapterSessionConfig>): Promise<DriverConfigReceipt | void>;
   /** Mid-turn non-cancelling steering input (supported on versions advertising supportsActiveSteering). */
   steerTurn?(input: TurnInput): Promise<void>;
   /** True when non-daemon background processes or scheduled timers keep the native session alive. */
@@ -233,6 +238,9 @@ export interface HarnessAdapter {
   readonly id: string;
   readonly kind: HarnessKind;
   readonly driverId?: HarnessDriverId;
+  providerPluginId?: string;
+  providerInstanceId?: string;
+  providerRunId?: string;
   readonly continuationKey?: string;
   readonly displayName: string;
   readonly description: string;
@@ -240,6 +248,7 @@ export interface HarnessAdapter {
   readonly capabilities: HarnessCapabilities;
   readonly capabilitiesV2?: HarnessCapabilitiesV2;
   readonly presentation?: HarnessPresentationMeta;
+  readonly supportedCommands?: DriverCommandCapability[];
   readonly isCustom?: boolean;
   readonly pluginMcpTransport?: 'http' | 'acp';
 

@@ -27,16 +27,24 @@ import type { CompiledContextPacket } from './context-compiler.js';
  * Narrow driver port separating concrete harness adapters/drivers (rewritten in W2)
  * from the generic session runtime (`hm.plugin.session-runtime-default`).
  */
+export interface DriverResolutionScope {
+  sessionId?: string;
+  workspaceId?: string;
+  driverProviderInstanceId?: string | null;
+}
+
 export interface RuntimeDriverPort {
-  getAdapter(harnessId: string): HarnessAdapter | undefined;
+  getAdapter(harnessId: string, scope?: DriverResolutionScope): HarnessAdapter | undefined;
   assertDispatchTarget(
     instanceId: string,
     fallbackKind: string,
     provenance?: AgyDispatchProvenance,
+    scope?: DriverResolutionScope,
   ): void;
   openSession(
     harnessId: string,
     config: AdapterSessionConfig,
+    scope?: DriverResolutionScope,
   ): Promise<AdapterSessionHandle>;
 }
 

@@ -88,8 +88,22 @@
                   "session.model-tools.v1",
                   "session.data.v1",
                   "session.runtime.v1",
-                  "hm.session-data.v1"
+                  "hm.session-data.v1",
+                  "harness.driver.v1",
+                  "harness.driver.codex.v1",
+                  "harness.driver.claude.v1",
+                  "harness.driver.acp.v1",
+                  "harness.driver.agy.v1",
+                  "session.handoff.v1",
+                  "session.compression.v1",
+                  "session.collaboration.v1",
+                  "session.orchestration.v1"
                 ]
+              },
+              {
+                "type": "string",
+                "maxLength": 100,
+                "pattern": "^harness\\.driver\\.[a-z0-9][a-z0-9._-]{0,47}\\.v1$"
               },
               {
                 "type": "string",

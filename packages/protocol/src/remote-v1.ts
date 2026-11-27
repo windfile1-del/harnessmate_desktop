@@ -98,13 +98,23 @@ export interface HarnessCommandInfo {
   command: string;
   description: string;
   argumentHint?: string;
-  source?: 'builtin' | 'native_advertised';
+  supported?: boolean;
+  reason?: string;
+  source?: 'builtin' | 'driver' | 'native_advertised';
+}
+
+export interface HarnessCommandReceipt {
+  command: string;
+  status: 'executed' | 'queued_turn' | 'unsupported' | 'rejected';
+  confirmed?: Record<string, unknown>;
+  reason?: string;
 }
 
 export interface HarnessCommandResult {
   session: Session;
   output: string;
   turnId?: string;
+  receipt?: HarnessCommandReceipt;
 }
 
 // ── REST Request Schemas ───────────────────────────────────────────────
@@ -119,6 +129,7 @@ export type CreateWorkspaceRequest = z.infer<typeof CreateWorkspaceRequestSchema
 export const CreateSessionRequestSchema = z.object({
   workspaceId: z.string().min(1),
   harnessId: z.string().min(1).optional(),
+  driverProviderInstanceId: z.string().min(1).max(160).optional(),
   title: z.string().max(160).optional(),
   model: z.string().nullable().optional(),
   reasoningEffort: ReasoningEffortSchema.nullable().optional(),
@@ -142,6 +153,7 @@ export type UpdateSessionRequest = z.infer<typeof UpdateSessionRequestSchema>;
 
 export const SwitchHarnessRequestSchema = z.object({
   targetHarnessId: z.string().min(1),
+  driverProviderInstanceId: z.string().min(1).max(160).optional(),
   targetModel: z.string().nullable().optional(),
   reasoningEffort: ReasoningEffortSchema.nullable().optional(),
   syncMode: ContextSyncModeSchema.optional(),

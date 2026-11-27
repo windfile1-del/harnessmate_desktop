@@ -757,12 +757,24 @@ export class IsolatedPluginRpcRouter {
       case 'sessions.capabilities': {
         const session = await this.getSessionOrThrow(params.sessionId);
         this.deps.permissions.assertGranted(plugin, 'session:read', session.workspaceId);
+        const registry = this.deps.host.getRegistryBridge();
+        const resolved = registry?.resolveAdapter({
+          harnessId: session.harnessId,
+          driverId: session.harnessKind,
+        });
+        const adapter = resolved?.adapter;
         const caps: PublicSessionCapabilities = {
           harnessId: session.harnessId,
           harnessKind: session.harnessKind,
-          supportsAttachments: true,
-          supportsNativeCommands: Boolean(this.deps.host.get('native-commands')),
-          supportsModelTools: session.harnessKind === 'codex' || session.harnessKind === 'claude' || session.harnessKind === 'agy' || session.harnessKind === 'acp',
+          supportsAttachments: adapter ? adapter.capabilities.imageInput : true,
+          supportsNativeCommands: Boolean(
+            this.deps.host.get('native-commands')
+            && (adapter?.supportedCommands?.some((c) => c.supported) ?? (adapter?.capabilitiesV2?.nativeCommands?.length ?? 0) > 0),
+          ),
+          supportsModelTools: Boolean(
+            adapter?.pluginMcpTransport
+            ?? (session.harnessKind === 'codex' || session.harnessKind === 'claude' || session.harnessKind === 'agy' || session.harnessKind === 'acp'),
+          ),
         };
         return caps;
       }
@@ -1286,19 +1298,41 @@ export class IsolatedPluginRpcRouter {
       case 'harnesses.listInstances': {
         const registry = this.deps.host.getRegistryBridge();
         if (!registry) return [];
-        const instances = registry.listInstances();
-        const result: PublicHarnessInstanceInfo[] = instances.map((inst) => {
+        const entries = registry.listEntries();
+        const result: PublicHarnessInstanceInfo[] = [];
+        const coveredAdapters = new Set<object>();
+        for (const entry of entries) {
+          coveredAdapters.add(entry.adapter);
+          result.push({
+            id: entry.harnessId,
+            driverId: entry.driverId,
+            pluginId: entry.pluginId,
+            providerInstanceId: entry.providerInstanceId,
+            runId: entry.providerRunId,
+            isDefault: entry.isDefault,
+            displayName: entry.instanceConfig.displayName ?? entry.adapter.displayName,
+            description: entry.instanceConfig.description ?? entry.adapter.description ?? '',
+            protocolLabel: entry.adapter.protocolLabel ?? entry.driverId,
+            enabled: entry.instanceConfig.enabled,
+            isCustom: entry.adapter.isCustom,
+            ...(entry.adapter.supportedCommands ? { supportedCommands: entry.adapter.supportedCommands } : {}),
+          });
+        }
+        for (const inst of registry.listInstances()) {
           const adapter = registry.get(inst.instanceId);
-          return {
+          if (adapter && coveredAdapters.has(adapter)) continue;
+          result.push({
             id: inst.instanceId,
             driverId: inst.driverId,
+            ...(inst.providerPluginId ? { pluginId: inst.providerPluginId } : {}),
+            ...(inst.providerInstanceId ? { providerInstanceId: inst.providerInstanceId } : {}),
             displayName: inst.displayName,
             description: inst.description ?? adapter?.description ?? '',
             protocolLabel: adapter?.protocolLabel ?? inst.driverId,
             enabled: inst.enabled,
             isCustom: adapter?.isCustom,
-          };
-        });
+          });
+        }
         return result;
       }
 

@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { z } from 'zod';
 import type { DaemonPersistedConfig } from '../../config.js';
 import { type Attachment, type GitStatusSummary, type SessionCheckpointRecord } from '@harnessmate/protocol';
 import {
+  HARNESS_DRIVER_AGY_CONTRACT,
+  HARNESS_DRIVER_CONTRACT,
+  HARNESS_DRIVER_CONTRACT_VERSION,
   PEER_CONTRACTS,
   type GitCheckpointServiceV1,
   type GitWorkspaceServiceV1,
@@ -28,16 +30,11 @@ import { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointError, CheckpointService } from '../../core/checkpoint-service.js';
 import { resolveGitRepoLockKey } from '../../core/git-repo-lock.js';
 import { toPublicGitStatusSummary } from '../../core/w1-service-helpers.js';
-import {
-  ContextCompressionService,
-  type ContextCompressorProvider,
-} from '../../core/context-compression-service.js';
-import { ContextCompiler } from '../../core/context-compiler.js';
 import type { FailoverCoordinator } from '../../core/failover-service.js';
 import { HistoryImportAdapter } from '../../core/history-import-adapter.js';
-import { OrchestratorService } from '../../core/orchestrator-service.js';
+import type { OrchestratorService } from '../../core/orchestrator-service.js';
 import { SessionChangeFeedService } from '../../core/session-change-feed.js';
-import { SessionExplorerService } from '../../core/session-explorer-service.js';
+import type { SessionExplorerHooks } from '../../core/session-explorer-service.js';
 import {
   SESSION_DATA_DEFAULT_PLUGIN_ID,
   createDefaultSessionDataPlugin,
@@ -47,6 +44,36 @@ import {
   createDefaultSessionRuntimePlugin,
   type SessionRuntimeDefaultController,
 } from '../../plugins/session-runtime-default/index.js';
+import {
+  HARNESS_CODEX_PLUGIN_ID,
+  createCodexDriverPlugin,
+} from '../../plugins/harness-codex-default/index.js';
+import {
+  HARNESS_CLAUDE_PLUGIN_ID,
+  createClaudeDriverPlugin,
+} from '../../plugins/harness-claude-default/index.js';
+import {
+  HARNESS_ACP_PLUGIN_ID,
+  createAcpDriverPlugin,
+} from '../../plugins/harness-acp-default/index.js';
+import {
+  SESSION_HANDOFF_DEFAULT_PLUGIN_ID,
+  createSessionHandoffPlugin,
+  handoffConfigSchema,
+  handoffRedactionMap,
+} from '../../plugins/session-handoff-default/index.js';
+import {
+  CONTEXT_COMPRESSION_PLUGIN_ID,
+  createContextCompressionPlugin,
+} from '../../plugins/context-compression-default/index.js';
+import {
+  SESSION_COLLABORATION_DEFAULT_PLUGIN_ID,
+  createSessionCollaborationPlugin,
+} from '../../plugins/session-collaboration-default/index.js';
+import {
+  ORCHESTRATOR_PLUGIN_ID,
+  createOrchestratorPlugin,
+} from '../../plugins/orchestrator-default/index.js';
 import { createHostRuntimePorts } from '../../core/host-runtime-ports.js';
 import type { AgyNativeRuntimeRegistry } from '../../harnesses/agy/native/wiring/registry.js';
 import { CommandOutputHub } from '../../core/command-output-hub.js';
@@ -77,7 +104,6 @@ import {
   workspaceTruthDigest,
 } from '../../core/git-service.js';
 import { HarnessCommandTools, listHarnessCommands } from '../../core/harness-commands.js';
-import { renderTaskLedgerMarkdown } from '../../core/task-ledger-service.js';
 import { registerSessionAssistance, type SessionAssistanceDependencies } from './session-assistance.js';
 import { TerminalWorkspaceService } from '../../core/terminal-workspace-service.js';
 import type { UsageService } from '../../core/usage-service.js';
@@ -86,14 +112,12 @@ import type { PluginManager } from '../../plugins/plugin-manager.js';
 import { createHarnessIntegrationPlugins, selectedHarnessService, usageContract } from './harness-integration.js';
 import type { HarnessMateStore } from '../../db/sqlite.js';
 import { createAgyDriverFactory } from '../../harnesses/agy/agy-driver.js';
-import { ClaudeStreamJsonAdapter } from '../../harnesses/claude-adapter.js';
-import { CodexAppServerAdapter } from '../../harnesses/codex-adapter.js';
 import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type { HarnessAdapter } from '../../harnesses/types.js';
 import type { HostPlugin } from '../runtime/lifecycle.js';
 import type { PluginEvents } from '../runtime/events.js';
 
-export const handoffRedactionMap = new WeakMap<object, { categories: string[]; redactedCount: number }>();
+export { handoffConfigSchema, handoffRedactionMap };
 
 export const gitService = {
   status: getGitStatusSummary,
@@ -422,10 +446,6 @@ export interface FailoverService {
   recordAutoSwitch?: FailoverCoordinator['recordAutoSwitch'];
   checkQuotaResets?: FailoverCoordinator['checkQuotaResets'];
 }
-export const handoffConfigSchema = z.object({
-  budgetTokens: z.number().int().min(2_000).max(48_000).default(12_000),
-  autoAttach: z.boolean().default(true),
-}).strict();
 
 export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessRegistry, config: DaemonPersistedConfig,
   assistance: Omit<SessionAssistanceDependencies, 'store'>,
@@ -448,31 +468,40 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
     onAttachCompressorHooks?: () => void;
     onRuntimeControllerReady?: (controller: SessionRuntimeDefaultController | null) => void;
+    emitCanonical?: (
+      sessionId: string,
+      type: import('@harnessmate/protocol').CanonicalEvent['type'],
+      payload: Record<string, unknown>,
+      turnId?: string | null,
+    ) => import('@harnessmate/protocol').CanonicalEvent;
+    createSession?: SessionExplorerHooks['createSession'];
+    addWorkspace?: SessionExplorerHooks['addWorkspace'];
+    tryNativeFork?: SessionExplorerHooks['tryNativeFork'];
+    onSessionImported?: SessionExplorerHooks['onSessionImported'];
+    sendTurn?: (
+      sessionId: string,
+      text: string,
+      opts?: { omitHandoff?: boolean; literalText?: boolean },
+    ) => Promise<{ turnId: string }>;
+    interruptSession?: (sessionId: string) => Promise<void>;
+    disposeSessionHandles?: (sessionId: string) => Promise<void>;
   }) {
   const resolvedAgyProfilesDir =
     agyProfilesDir ?? path.join(os.homedir(), '.harnessmate-desktop', 'agy-profiles');
   const plugins = new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>();
-  const adapterPlugin = (id: string, create: () => HarnessAdapter) => {
-    const service = `harness.${id}`;
-    plugins.set(`core.harness.${id}`, {
-      provides: [service],
-      apply(ctx) {
-        ctx.host?.setRegistryBridge(registry);
-        const adapter = overrides.find((candidate) => candidate.id === id) ?? create();
-        ctx.effect(() => {
-          registry.register(adapter);
-          return () => { if (registry.get(id) === adapter) registry.unregister(id); };
-        });
-        ctx.provide(service, adapter);
-      },
-    });
-  };
-  adapterPlugin('codex', () => new CodexAppServerAdapter(config.binaryOverrides.codex));
-  adapterPlugin('claude', () => new ClaudeStreamJsonAdapter(config.binaryOverrides.claude));
+  plugins.set(
+    HARNESS_CODEX_PLUGIN_ID,
+    createCodexDriverPlugin({ registry, config, overrides }),
+  );
+  plugins.set(
+    HARNESS_CLAUDE_PLUGIN_ID,
+    createClaudeDriverPlugin({ registry, config, overrides }),
+  );
   plugins.set('core.harness.agy', {
-    provides: ['harness.agy'],
+    provides: [HARNESS_DRIVER_CONTRACT, HARNESS_DRIVER_AGY_CONTRACT, 'harness.agy'],
     apply(ctx) {
       ctx.host?.setRegistryBridge(registry);
+      const providerInstanceId = ctx.instanceId ?? 'harness-agy';
       const profiles = config.agyProfiles ?? [];
       const driverFactory = createAgyDriverFactory({
         profilesRootDir: resolvedAgyProfilesDir,
@@ -486,6 +515,8 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       const primaryProfile = profiles.find((p) => p.instanceId === 'agy');
       let primaryAdapter: HarnessAdapter;
       if (overrideAgy) {
+        overrideAgy.providerPluginId ??= 'core.harness.agy';
+        overrideAgy.providerInstanceId ??= providerInstanceId;
         registry.register(overrideAgy);
         primaryAdapter = overrideAgy;
       } else {
@@ -499,8 +530,26 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
           homeDir: primaryProfile?.geminiDir,
           enabled: primaryProfile?.enabled ?? true,
         });
+        primaryAdapter.providerPluginId = 'core.harness.agy';
+        primaryAdapter.providerInstanceId = providerInstanceId;
       }
       registered.push({ id: 'agy', adapter: primaryAdapter });
+      registry.registerProviderDriver({
+        pluginId: 'core.harness.agy',
+        providerInstanceId,
+        providerRunId: 'agy-native',
+        driverId: 'agy',
+        harnessId: 'agy',
+        isDefault: true,
+        adapter: primaryAdapter,
+        instanceConfig: {
+          binaryPath: primaryProfile?.binaryPath ?? config.binaryOverrides.agy,
+          homeDir: primaryProfile?.geminiDir,
+          displayName: primaryAdapter.displayName,
+          description: primaryAdapter.description,
+          enabled: primaryProfile?.enabled ?? true,
+        },
+      });
 
       for (const profile of profiles) {
         if (profile.instanceId === 'agy' || !profile.enabled) continue;
@@ -513,6 +562,24 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
           homeDir: profile.geminiDir,
           enabled: profile.enabled,
         });
+        adapter.providerPluginId = 'core.harness.agy';
+        adapter.providerInstanceId = providerInstanceId;
+        registry.registerProviderDriver({
+          pluginId: 'core.harness.agy',
+          providerInstanceId,
+          providerRunId: 'agy-native',
+          driverId: 'agy',
+          harnessId: profile.instanceId,
+          isDefault: false,
+          adapter,
+          instanceConfig: {
+            binaryPath: profile.binaryPath ?? config.binaryOverrides.agy,
+            homeDir: profile.geminiDir,
+            displayName: profile.displayName,
+            description: profile.description,
+            enabled: profile.enabled,
+          },
+        });
         registered.push({ id: profile.instanceId, adapter });
       }
 
@@ -520,34 +587,62 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
         if (instance.driverId !== 'agy' || !instance.enabled) continue;
         if (registered.some((r) => r.id === instance.instanceId)) continue;
         const adapter = registry.registerInstance(instance);
+        adapter.providerPluginId = 'core.harness.agy';
+        adapter.providerInstanceId = providerInstanceId;
+        registry.registerProviderDriver({
+          pluginId: 'core.harness.agy',
+          providerInstanceId,
+          providerRunId: 'agy-native',
+          driverId: 'agy',
+          harnessId: instance.instanceId,
+          isDefault: false,
+          adapter,
+          instanceConfig: instance,
+        });
         registered.push({ id: instance.instanceId, adapter });
       }
 
       ctx.effect(() => () => {
+        registry.unregisterProviderDriver(providerInstanceId);
         for (const { id, adapter } of registered) {
           if (registry.get(id) === adapter) registry.unregister(id);
         }
         registry.unregisterDriver('agy');
       });
       ctx.provide('harness.agy', primaryAdapter);
+      const agyDriverMeta = {
+        getProviderInfo: async () => ({
+          ok: true as const,
+          value: { pluginId: 'core.harness.agy', instanceId: providerInstanceId, runId: 'agy-native' },
+        }),
+        listRegistrations: async () => ({
+          ok: true as const,
+          value: {
+            drivers: registered.map(({ id, adapter }) => ({
+              pluginId: 'core.harness.agy',
+              providerInstanceId: providerInstanceId,
+              providerRunId: 'agy-native',
+              driverId: 'agy',
+              harnessId: id,
+              isDefault: id === 'agy',
+              displayName: adapter.displayName,
+              description: adapter.description,
+              protocolLabel: adapter.protocolLabel,
+              capabilities: adapter.capabilities,
+              capabilitiesV2: adapter.capabilitiesV2,
+              supportedCommands: adapter.supportedCommands,
+            })),
+          },
+        }),
+      };
+      ctx.provide(HARNESS_DRIVER_CONTRACT, agyDriverMeta, { version: HARNESS_DRIVER_CONTRACT_VERSION });
+      ctx.provide(HARNESS_DRIVER_AGY_CONTRACT, agyDriverMeta, { version: HARNESS_DRIVER_CONTRACT_VERSION });
     },
   });
-  plugins.set('core.harness.acp', {
-    provides: ['harness.acp'],
-    apply(ctx) {
-      ctx.effect(() => {
-        for (const harness of config.customAcpHarnesses) {
-          if (!registry.isReserved(harness.id) && !registry.get(harness.id)) registry.registerCustomAcp(harness);
-        }
-        return () => {
-          for (const harness of config.customAcpHarnesses) {
-            if (!registry.isReserved(harness.id) && registry.get(harness.id)?.isCustom) registry.unregister(harness.id);
-          }
-        };
-      });
-      ctx.provide('harness.acp', {});
-    },
-  });
+  plugins.set(
+    HARNESS_ACP_PLUGIN_ID,
+    createAcpDriverPlugin({ registry, config }),
+  );
   plugins.set('core.git-inspector', {
     provides: [PEER_CONTRACTS.gitWorkspace, PEER_CONTRACTS.gitCheckpoint, 'git', 'checkpoints'],
     apply: (ctx) => {
@@ -587,101 +682,18 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     },
   });
   registerSessionAssistance(plugins, { ...assistance, store });
-  plugins.set('core.context-bridge', {
-    provides: ['handoff'],
-    apply(ctx, settings) {
-      ctx.host?.setRegistryBridge(registry);
-      const ledger = {
-        get: async (sessionId: string) => {
-          const session = store.getSession(sessionId);
-          return session ? assistance.readLedger(session) : null;
-        },
-        renderLedgerMarkdown: renderTaskLedgerMarkdown,
-      };
-      const options = handoffConfigSchema.parse(settings);
-      const compiler = new ContextCompiler(
-        store,
-        ledger,
-        options,
-        (cwd) => lookupOptionalGitStatusFromCtx(ctx, cwd) as ReturnType<typeof getGitStatusSummary>,
-        events(),
-        collectIsolatedSections,
-        undefined,
-        () => ctx.get<ContextCompressorProvider>('compressor'),
-      );
-      const baseCompile = compiler.compile.bind(compiler);
-      compiler.compile = async (compileOpts) => {
-        const packet = await baseCompile(compileOpts);
-        const redactor = ctx.host?.getHandoffRedactor();
-        if (!redactor || !packet.syncNeeded) {
-          return packet;
-        }
-        const targetDriverId = compileOpts.targetHarnessKind || compileOpts.targetHarnessId;
-        const deltaRes = await redactor({
-          text: packet.deltaMarkdown,
-          targetDriverId,
-          sessionId: compileOpts.session.id,
-          workspaceId: compileOpts.session.workspaceId,
-          targetInstanceId: compileOpts.targetHarnessId,
-        });
-        const allCategories = new Set<string>(deltaRes.categories);
-        let totalRedacted = deltaRes.redactedCount;
-        const redactText = async (inputText: string): Promise<string> => {
-          if (!inputText) return inputText;
-          const r = await redactor({
-            text: inputText,
-            targetDriverId,
-            sessionId: compileOpts.session.id,
-            workspaceId: compileOpts.session.workspaceId,
-            targetInstanceId: compileOpts.targetHarnessId,
-          });
-          for (const cat of r.categories) allCategories.add(cat);
-          totalRedacted = Math.max(totalRedacted, r.redactedCount);
-          return r.text;
-        };
-        const redactedPortableItems = await Promise.all(
-          packet.portableItems.map(async (item) => ({
-            ...item,
-            content: await Promise.all(
-              item.content.map(async (part) => ({
-                ...part,
-                text: await redactText(part.text),
-              })),
-            ),
-          })),
-        );
-        const redactedCompiledMarkdown = packet.preview.compiledMarkdown === packet.deltaMarkdown
-          ? deltaRes.text
-          : await redactText(packet.preview.compiledMarkdown);
-        const redactedLedgerMarkdown = packet.preview.ledgerMarkdown
-          ? await redactText(packet.preview.ledgerMarkdown)
-          : packet.preview.ledgerMarkdown;
-        const redactedObjective = packet.objective
-          ? await redactText(packet.objective)
-          : packet.objective;
-        const updated = {
-          ...packet,
-          deltaMarkdown: deltaRes.text,
-          objective: redactedObjective,
-          portableItems: redactedPortableItems,
-          preview: {
-            ...packet.preview,
-            compiledMarkdown: redactedCompiledMarkdown,
-            ledgerMarkdown: redactedLedgerMarkdown,
-            estimatedTokens: Math.max(1, Math.ceil(redactedCompiledMarkdown.length / 4)),
-          },
-        };
-        if (allCategories.size > 0 || totalRedacted > 0) {
-          handoffRedactionMap.set(updated, {
-            categories: [...allCategories],
-            redactedCount: totalRedacted,
-          });
-        }
-        return updated;
-      };
-      ctx.provide('handoff', compiler);
-    },
-  });
+  plugins.set(
+    SESSION_HANDOFF_DEFAULT_PLUGIN_ID,
+    createSessionHandoffPlugin({
+      store,
+      registry,
+      assistance,
+      events,
+      lookupGitStatus: (ctx, cwd) => lookupOptionalGitStatusFromCtx(ctx, cwd),
+      collectIsolatedSections,
+      getPluginManager,
+    }),
+  );
   for (const [id, plugin] of createHarnessIntegrationPlugins(store, registry, config.binaryOverrides, getCapabilities, getPluginManager)) {
     plugins.set(id, plugin);
   }
@@ -757,18 +769,21 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       }),
     );
   }
-  // Batch-1 temporary session adapter retained solely for Fork / MergeBack / SideChat / Export (and legacy unit tests).
-  // Search indexing and HTTP search/import routes are owned by hm.plugin.session-search-fts & hm.plugin.history-import.
-  plugins.set('hm.plugin.session-explorer', {
-    provides: ['session-search'],
-    apply(ctx) {
-      const explorer = new SessionExplorerService(store, registry);
-      ctx.provide('session-search', explorer);
-      ctx.effect(() => () => {
-        explorer.dispose();
-      });
-    },
-  });
+  plugins.set(
+    SESSION_COLLABORATION_DEFAULT_PLUGIN_ID,
+    createSessionCollaborationPlugin({
+      store,
+      registry,
+      getPluginManager,
+      bridge: {
+        emitCanonical: runtimeBridge?.emitCanonical,
+        createSession: runtimeBridge?.createSession,
+        addWorkspace: runtimeBridge?.addWorkspace,
+        tryNativeFork: runtimeBridge?.tryNativeFork,
+        onSessionImported: runtimeBridge?.onSessionImported,
+      },
+    }),
+  );
   plugins.set('hm.plugin.approval-center', {
     provides: ['approval-center'],
     apply(ctx) {
@@ -776,39 +791,32 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('approval-center', approvalCenter);
     },
   });
-  plugins.set('hm.plugin.multi-harness-orchestrator', {
-    inject: ['git'],
-    provides: ['orchestrator'],
-    apply(ctx, settings) {
-      const cfg = settings as { maxDepth?: number; maxConcurrent?: number; defaultTimeoutMs?: number };
-      const orchestrator = new OrchestratorService(store, registry, {
-        maxDepth: typeof cfg.maxDepth === 'number' ? cfg.maxDepth : undefined,
-        maxConcurrent: typeof cfg.maxConcurrent === 'number' ? cfg.maxConcurrent : undefined,
-        defaultTimeoutMs: typeof cfg.defaultTimeoutMs === 'number' ? cfg.defaultTimeoutMs : undefined,
-      });
-      orchestrator.recoverOrphanedRuns();
-      ctx.provide('orchestrator', orchestrator);
-      ctx.effect(() => () => {
-        void orchestrator.onPluginDisabled().catch(() => {});
-      });
-    },
-  });
-  plugins.set('hm.plugin.context-compression', {
-    provides: ['compressor'],
-    apply(ctx) {
-      const compressor = new ContextCompressionService(store, registry);
-      compressor.setPluginActive(true);
-      ctx.provide('compressor', compressor);
-      ctx.on('turn.completed', ({ sessionId, data }) => {
-        if (!data.maintenance && sessionId) {
-          compressor.scheduleIdleRollup(sessionId);
-        }
-      });
-      ctx.effect(() => () => {
-        compressor.onPluginDisabled();
-      });
-    },
-  });
+  plugins.set(
+    ORCHESTRATOR_PLUGIN_ID,
+    createOrchestratorPlugin({
+      store,
+      registry,
+      getPluginManager,
+      bridge: {
+        emitCanonical: runtimeBridge?.emitCanonical,
+        publishAttention: runtimeBridge?.eventBus
+          ? (item) => runtimeBridge.eventBus.publishAttention(item)
+          : undefined,
+        sendTurn: runtimeBridge?.sendTurn,
+        interruptSession: runtimeBridge?.interruptSession,
+        disposeSessionHandles: runtimeBridge?.disposeSessionHandles,
+      },
+    }),
+  );
+  plugins.set(
+    CONTEXT_COMPRESSION_PLUGIN_ID,
+    createContextCompressionPlugin({
+      store,
+      registry,
+      emitCanonical: runtimeBridge?.emitCanonical,
+      getPluginManager,
+    }),
+  );
   plugins.set('core.terminal-runner', {
     provides: [
       PEER_CONTRACTS.terminalRunner,

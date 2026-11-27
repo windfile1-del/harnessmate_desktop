@@ -38,7 +38,7 @@ export interface HandoffDeliveryLifecycle {
     fromInstanceId?: string | null;
   }): string;
   confirmDelivery(handoffId: string): void;
-  failDelivery(handoffId: string, resetBinding?: boolean): void;
+  failDelivery(handoffId: string, resetBinding?: boolean, uncertain?: boolean): void;
 }
 
 export interface CompiledContextPacket {
@@ -156,7 +156,9 @@ export class ContextCompiler {
     const targetSeq = opts.upToSeq ?? session.lastSeq;
 
     const latestHandoff = this.store.getLatestHandoffRecord(session.id, targetHarnessId);
-    const uncertainPreviousDelivery = latestHandoff?.deliveryStatus === 'pending';
+    const uncertainPreviousDelivery =
+      latestHandoff?.deliveryStatus === 'pending' ||
+      latestHandoff?.deliveryStatus === 'uncertain';
 
     let forceFreshNativeSession = uncertainPreviousDelivery;
     let forceFreshReason: HandoffForceFreshReason | null = uncertainPreviousDelivery
@@ -687,8 +689,8 @@ export class ContextCompiler {
       confirmDelivery: (handoffId) => {
         compilerStore.updateHandoffDeliveryStatus(handoffId, 'confirmed', Date.now());
       },
-      failDelivery: (handoffId, resetBinding = false) => {
-        compilerStore.updateHandoffDeliveryStatus(handoffId, 'failed');
+      failDelivery: (handoffId, resetBinding = false, uncertain = false) => {
+        compilerStore.updateHandoffDeliveryStatus(handoffId, uncertain ? 'uncertain' : 'failed');
         if (resetBinding) {
           compilerStore.setSessionBindingExact(session.id, targetHarnessId, {
             nativeSessionId: null,

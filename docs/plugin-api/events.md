@@ -5,7 +5,7 @@
 | 事件 | 分发 | 权限契约 | 生产方 | 内置消费方 |
 | --- | --- | --- | --- | --- |
 | `turn.started` | emit | `events:turn` | plugin-host/runtime/map-event.ts | — |
-| `turn.completed` | emit | `events:turn` | plugin-host/runtime/map-event.ts | plugin-host/builtin/services.ts |
+| `turn.completed` | emit | `events:turn` | plugin-host/runtime/map-event.ts | plugins/context-compression-default/index.ts |
 | `turn.failed` | emit | `events:turn` | plugin-host/runtime/map-event.ts | — |
 | `turn.cancelled` | emit | `events:turn` | plugin-host/runtime/map-event.ts | — |
 | `message.user` | emit | `events:message` | plugin-host/runtime/map-event.ts | — |
