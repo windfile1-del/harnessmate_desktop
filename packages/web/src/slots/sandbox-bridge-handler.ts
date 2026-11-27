@@ -204,6 +204,18 @@ export async function executeSandboxedBridgeMethod(
     return { workspaces };
   }
 
+  if (method === 'session.switchHarness') {
+    if (!currentSession || signal.aborted || isDisposed()) {
+      throw Object.assign(new Error('当前会话不可用'), { code: 'E_SERVICE_UNAVAILABLE' });
+    }
+    const targetHarnessId = typeof params?.targetHarnessId === 'string' ? params.targetHarnessId.trim() : '';
+    if (!store.harnesses.some((harness) => harness.id === targetHarnessId)) {
+      throw Object.assign(new Error('目标 Harness 不存在'), { code: 'E_INVALID_INPUT' });
+    }
+    await store.switchHarness(currentSession.id, { targetHarnessId });
+    return { ok: true };
+  }
+
   if (method === 'switchInstance') {
     const targetInstanceId = typeof params?.instanceId === 'string' ? params.instanceId.trim() : '';
     if (!targetInstanceId) {

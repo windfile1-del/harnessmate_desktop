@@ -268,10 +268,17 @@ export class WsGateway {
 
         case 'subscribe_terminal': {
           terminalOutputUnsubs.get(frame.terminalId)?.();
-          terminalOutputUnsubs.delete(frame.terminalId);
+          let stopped = false;
+          let cleanup: (() => void) | undefined;
+          const stop = () => {
+            stopped = true;
+            cleanup?.();
+          };
+          terminalOutputUnsubs.set(frame.terminalId, stop);
           const owner = this.deps.pluginManager
             ? await resolveTerminalProviderForTerminalIdAsync(this.deps.pluginManager, frame.terminalId)
             : null;
+          if (stopped || ws.readyState !== WebSocket.OPEN) break;
           const localSvc = owner?.legacy ?? (!this.deps.pluginManager ? this.deps.terminalWorkspace : undefined);
           if (localSvc && typeof localSvc.subscribeOutput === 'function') {
             const unsub = localSvc.subscribeOutput(frame.terminalId, (chunk) => {
@@ -285,55 +292,54 @@ export class WsGateway {
                 timestamp: chunk.timestamp,
               });
             });
-            terminalOutputUnsubs.set(frame.terminalId, unsub);
+            cleanup = unsub;
             break;
           }
           if (owner?.peer && typeof owner.peer.getOutputSnapshot === 'function') {
-            let lastLen = 0;
-            let stopped = false;
+            let previousSnapshot: string | undefined;
+            let polling = false;
             const emitSnap = async (initial: boolean) => {
-              if (stopped || ws.readyState !== WebSocket.OPEN) return;
+              if (stopped || polling || ws.readyState !== WebSocket.OPEN) return;
+              if (this.deps.pluginManager?.host.getServiceByInstance(owner.instanceId, PEER_CONTRACTS.terminalWorkspace) !== owner.peer) {
+                stop();
+                return;
+              }
+              polling = true;
               try {
                 const res = await owner.peer!.getOutputSnapshot({ terminalId: frame.terminalId });
-                if (stopped || !res.ok) return;
+                if (stopped) return;
+                if (!res.ok) {
+                  if (['not_found', 'E_NOT_FOUND', 'E_TERMINAL_NOT_FOUND'].includes(res.error.code)) stop();
+                  return;
+                }
                 const full = res.value.snapshot ?? '';
-                if (initial) {
-                  lastLen = full.length;
+                if (initial || full !== previousSnapshot) {
+                  // A bounded ring can roll over or shrink while producing output.
+                  // Only append when the old content is still an exact prefix.
+                  const append = previousSnapshot !== undefined && full.startsWith(previousSnapshot);
                   this.send(ws, {
                     op: 'terminal_output',
                     terminalId: frame.terminalId,
-                    chunk: full,
-                    snapshot: true,
+                    chunk: append ? full.slice(previousSnapshot!.length) : full,
+                    snapshot: !append,
                     truncated: res.value.truncated,
                     ringBufferBytes: Buffer.byteLength(full, 'utf8'),
                     timestamp: Date.now(),
                   });
-                } else if (full.length > lastLen) {
-                  const delta = full.slice(lastLen);
-                  lastLen = full.length;
-                  this.send(ws, {
-                    op: 'terminal_output',
-                    terminalId: frame.terminalId,
-                    chunk: delta,
-                    snapshot: false,
-                    truncated: res.value.truncated,
-                    ringBufferBytes: Buffer.byteLength(full, 'utf8'),
-                    timestamp: Date.now(),
-                  });
+                  previousSnapshot = full;
                 }
               } catch {
                 // ignore transient stop
+              } finally {
+                polling = false;
               }
             };
-            void emitSnap(true);
             const timer = setInterval(() => {
               void emitSnap(false);
             }, 150);
             timer.unref?.();
-            terminalOutputUnsubs.set(frame.terminalId, () => {
-              stopped = true;
-              clearInterval(timer);
-            });
+            cleanup = () => clearInterval(timer);
+            void emitSnap(true);
           }
           break;
         }

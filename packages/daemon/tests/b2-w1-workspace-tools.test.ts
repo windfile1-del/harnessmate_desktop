@@ -617,7 +617,26 @@ describe('Batch 2 W1 · Workspace Tools Backend Integration & Decoupling', () =>
           }
         }, 50);
       });
-      socket.close();
+      // Once the bounded snapshot rolls, the same subscription must receive replacement content.
+      const saturationMarker = 'after-saturation-中文-marker';
+      for (let index = 0; index < 9; index += 1) {
+        expect((await daemon.app.inject({
+          method: 'POST', url: `/api/v1/terminals/${liteTermId}/input`,
+          payload: { data: `${index}${'x'.repeat(10_000)}\n` },
+        })).statusCode).toBe(200);
+      }
+      expect((await daemon.app.inject({
+        method: 'POST', url: `/api/v1/terminals/${liteTermId}/input`,
+        payload: { data: `${saturationMarker}\n` },
+      })).statusCode).toBe(200);
+      await expect.poll(() => frames.some((frame) => frame.op === 'terminal_output'
+        && frame.terminalId === liteTermId && frame.snapshot === true
+        && String(frame.chunk).includes(saturationMarker)), { timeout: 10_000 }).toBe(true);
+      const frameCount = frames.length;
+      socket.send(JSON.stringify({ op: 'unsubscribe_terminal', terminalId: liteTermId }));
+      socket.send(JSON.stringify({ op: 'subscribe_terminal', terminalId: liteTermId }));
+      await expect.poll(() => frames.slice(frameCount).some((frame) => frame.op === 'terminal_output'
+        && frame.snapshot === true && String(frame.chunk).includes(saturationMarker)), { timeout: 5000 }).toBe(true);
 
       // Disabling user.terminal-lite tears down its active terminals and rejects input cleanly
       expect((await daemon.app.inject({
@@ -630,6 +649,7 @@ describe('Batch 2 W1 · Workspace Tools Backend Integration & Decoupling', () =>
         url: `/api/v1/terminals/${liteTermId}/input`,
         payload: { data: 'after-disable\n' },
       })).statusCode).toBe(409);
+      socket.close();
 
       // Switch to empty composition and restore builtin -> clean recovery
       const emptyRes = await daemon.app.inject({

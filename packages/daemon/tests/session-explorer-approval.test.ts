@@ -485,10 +485,12 @@ describe('Phase 2.3 · Session Explorer (FTS5, Streaming Import, Fork/MergeBack,
 
     // Advance child session with a fix turn & touched files in task ledger
     await daemon.sessionManager.sendTurn(portableFork.session.id, 'Fix memory leak in worker');
-    daemon.sessionManager.updateTaskState(portableFork.session.id, {
-      touchedFiles: ['src/worker.ts'],
-      decisions: ['Use WeakMap for transient buffers'],
+    const ledgerUpdate = await daemon.app.inject({
+      method: 'PUT',
+      url: `/api/v1/sessions/${portableFork.session.id}/task-state`,
+      payload: { touchedFiles: ['src/worker.ts'], decisions: ['Use WeakMap for transient buffers'] },
     });
+    expect(ledgerUpdate.statusCode).toBe(200);
 
     // 3. Execute merge_back -> parent receives fork_delta_summary
     const merged = daemon.sessionManager.mergeBackSession(portableFork.session.id, {});

@@ -1,0 +1,13 @@
+{
+  "id": "core.mcp-hub",
+  "name": "跨 CLI MCP 统一管理中心",
+  "description": "查看、添加、启停和移除各 CLI 的 MCP 配置。",
+  "version": "1.0.1",
+  "apiVersion": 4,
+  "category": "mcp",
+  "provides": ["harness.mcp-config.v1"],
+  "contributes": {
+    "uiSlots": ["sidebar_tool", "modal"],
+    "slots": [{ "slot": "workspace.pages", "id": "mcp-config", "title": "跨 CLI MCP 管理", "ui": "ui/panel.html", "height": 600 }]
+  }
+}

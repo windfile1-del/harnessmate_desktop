@@ -169,6 +169,22 @@ afterEach(() => {
 });
 
 describe('Batch 2 W1 · Frontend Navigation, Contract Gating & Custom Slot Overrides', () => {
+  it('keeps Harness tool entries available for external providers when default instances are disabled and workspace bindings have not loaded', () => {
+    useAppStore.setState({
+      selectedWorkspaceId: null,
+      plugins: [
+        makeW1Plugin('core.account-usage', ['harness.usage.v1'], { enabled: false }),
+        makeW1Plugin('core.mcp-hub', ['harness.mcp-config.v1'], { enabled: false }),
+        makeW1Plugin('user.harness-tools', ['harness.usage.v1', 'harness.mcp-config.v1']),
+      ],
+      workspaceBindingsByWorkspace: {},
+      compositionBindings: { 'harness.usage.v1': 'core.account-usage', 'harness.mcp-config.v1': 'core.mcp-hub' },
+    });
+    const html = renderToStaticMarkup(<SlotRegistryProvider registry={new SlotRegistry()}><Sidebar /></SlotRegistryProvider>);
+    expect(html).toContain('账号用量');
+    expect(html).toContain('MCP 中心');
+  });
+
   it('validates W1 peer contracts fixture and navigateToFile DTO while preserving active session', async () => {
     expect(Object.keys(w1Fixture.contracts)).toEqual([
       GIT_WORKSPACE_CONTRACT,

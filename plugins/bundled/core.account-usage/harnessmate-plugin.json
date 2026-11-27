@@ -1,0 +1,13 @@
+{
+  "id": "core.account-usage",
+  "name": "多账号与配额用量看板",
+  "description": "查看 CLI 账号配额、Token 趋势、成本与接力策略。",
+  "version": "1.0.1",
+  "apiVersion": 4,
+  "category": "telemetry",
+  "provides": ["usage", "harness.usage.v1", "harness.model-catalog.v1"],
+  "contributes": {
+    "uiSlots": ["sidebar_tool", "modal"],
+    "slots": [{ "slot": "workspace.pages", "id": "account-usage", "title": "多账号与配额用量", "ui": "ui/panel.html", "height": 600 }]
+  }
+}

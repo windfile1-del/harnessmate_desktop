@@ -661,7 +661,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       ctx.provide('handoff', compiler);
     },
   });
-  for (const [id, plugin] of createHarnessIntegrationPlugins(store, registry, config.binaryOverrides, getCapabilities)) {
+  for (const [id, plugin] of createHarnessIntegrationPlugins(store, registry, config.binaryOverrides, getCapabilities, getPluginManager)) {
     plugins.set(id, plugin);
   }
   plugins.set('core.harness-commands', {

@@ -86,6 +86,9 @@ export function Sidebar() {
 
   const activeSession = selectedSessionId ? sessions.find((s) => s.id === selectedSessionId) : undefined;
   const activeWorkspaceId = activeSession?.workspaceId ?? selectedWorkspaceId;
+  const hasHarnessProvider = (contract: string) => plugins.some(
+    (plugin) => plugin.enabled && pluginProvidesContract(plugin, contract),
+  );
   const gitWorkspaceEnabled = isContractAvailableClientSide({
     contract: GIT_WORKSPACE_CONTRACT,
     legacyPluginId: 'core.git-inspector',
@@ -513,7 +516,7 @@ export function Sidebar() {
           />
         )}
 
-        {isPluginEnabled('core.mcp-hub') && (
+        {hasHarnessProvider('harness.mcp-config.v1') && (
           <DockTile
             icon={<Plug size={13.5} style={{ color: 'var(--accent-emerald)' }} />}
             title="MCP 中心"
@@ -522,7 +525,7 @@ export function Sidebar() {
           />
         )}
 
-        {isPluginEnabled('core.account-usage') && (
+        {hasHarnessProvider('harness.usage.v1') && (
           <DockTile
             icon={<Activity size={13.5} style={{ color: 'var(--accent-clay)' }} />}
             title="账号用量"

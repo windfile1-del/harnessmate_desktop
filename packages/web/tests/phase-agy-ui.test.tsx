@@ -8,7 +8,7 @@ import {
 import { AgyComposerControls } from '../src/components/agy/AgyComposerControls';
 import { AgySettingsSlot } from '../src/components/agy/AgySettingsSlot';
 import { AgyStudioBlockCard } from '../src/components/agy/AgyStudioBlocks';
-import { UsageDashboardModal } from '../src/components/HarnessIntegrationViews';
+import { executeSandboxedBridgeMethod } from '../src/slots/sandbox-bridge-handler';
 import { useAppStore } from '../src/stores/app-store';
 
 vi.mock('../src/stores/app-store', async (importOriginal) => {
@@ -316,44 +316,22 @@ describe('Phase AGY-5 UI Components', () => {
     expect(ecoHtml).toContain('Plugins (双轨独立)');
   });
 
-  it('renders manual-only AGY multi-account guard notice and switch button inside UsageDashboardModal', () => {
+  it('lets the plugin page manually switch the current session to a registered AGY account', async () => {
+    const switchHarness = vi.fn().mockResolvedValue(undefined);
     useAppStore.setState({
       harnesses: [makeAgyHarness('agy', 'AGY Default'), makeAgyHarness('agy.work', 'AGY Work')],
-      selectedSessionId: baseAgySession.id,
-      accountUsage: [
-        {
-          harnessId: 'agy',
-          harnessKind: 'agy',
-          driverId: 'agy',
-          instanceId: 'agy',
-          displayName: 'AGY Default',
-          billingTier: 'subscription',
-          loggedIn: true,
-          accountLabel: 'default@example.com',
-          planType: 'Pro',
-          authMethod: 'oauth-personal',
-          rateLimits: [{ label: 'Daily Quota', usedPercent: 42 }],
-          dailyBuckets: [],
-          localSessionCount: 1,
-          localInputTokens: 1200,
-          localOutputTokens: 300,
-          localCachedTokens: 400,
-          localCostUsd: 0,
-          fetchedAt: 1000,
-          error: null,
-        },
-      ],
-      failoverPolicy: {
-        mode: 'manual_one_click',
-        priorityChain: ['agy', 'agy.work'],
-        maxAutoSwitchesPerSession: 2,
-        autoRetryInterruptedPrompt: true,
-        notifyOnQuotaReset: true,
-      },
+      switchHarness,
     });
-
-    const modalHtml = renderToStaticMarkup(<UsageDashboardModal onClose={() => {}} scope={{}} />);
-    expect(modalHtml).toContain('多 AGY Google 账号禁止自动额度轮换，仅支持手动一键切换。');
-    expect(modalHtml).toContain('手动切换至该账号');
+    const context = {
+      pluginId: 'core.account-usage', effectiveInstanceId: 'usage-second', slot: 'workspace.pages',
+      slotId: 'account-usage', runId: 'run-test', currentSession: baseAgySession,
+      signal: new AbortController().signal, isDisposed: () => false,
+    };
+    await executeSandboxedBridgeMethod(context, 'session.switchHarness', { targetHarnessId: 'agy.work' });
+    expect(switchHarness).toHaveBeenCalledWith(baseAgySession.id, { targetHarnessId: 'agy.work' });
+    switchHarness.mockClear();
+    await expect(executeSandboxedBridgeMethod({ ...context, isDisposed: () => true },
+      'session.switchHarness', { targetHarnessId: 'agy.work' })).rejects.toThrow('当前会话不可用');
+    expect(switchHarness).not.toHaveBeenCalled();
   });
 });

@@ -8,6 +8,7 @@ import type { HarnessRegistry } from '../../harnesses/registry.js';
 import type { PluginCapabilities, ToolDescriptor } from '../../plugins/plugin-capabilities.js';
 import type { PluginManager } from '../../plugins/plugin-manager.js';
 import type { HostPlugin } from '../runtime/lifecycle.js';
+import { registerMcpPage, registerUsagePage } from './harness-pages.js';
 
 export const usageContract = PEER_CONTRACTS.harnessUsage;
 export const modelCatalogContract = PEER_CONTRACTS.harnessModelCatalog;
@@ -59,12 +60,14 @@ export function createHarnessIntegrationPlugins(
   registry: HarnessRegistry,
   binaryOverrides: Record<string, string>,
   getCapabilities?: () => PluginCapabilities,
+  getPlugins?: () => PluginManager,
 ): Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>> {
   return new Map<string, Omit<HostPlugin, 'id' | 'enabled' | 'revision'>>([
     ['core.account-usage', {
       provides: ['usage', usageContract, modelCatalogContract],
       apply(ctx) {
         const usage = new UsageService(store, registry);
+        registerUsagePage(ctx, usage, getPlugins);
         ctx.provide('usage', usage);
         ctx.provide(usageContract, {
           listAccounts: usage.collectAccountUsage.bind(usage),
@@ -106,6 +109,7 @@ export function createHarnessIntegrationPlugins(
       provides: [mcpConfigContract],
       apply(ctx) {
         const config = new McpService(registry, binaryOverrides);
+        registerMcpPage(ctx, config, getPlugins);
         ctx.provide(mcpConfigContract, {
           list: config.listAllServers.bind(config),
           add: config.addServer.bind(config),

@@ -162,7 +162,7 @@ it('imports a desktop rollout with large metadata and reads every event page', a
     if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = oldCodexHome;
   }
-}, 20_000);
+});
 
 describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
   it('runs full Codex App-Server JSON-RPC flow with noisy preamble and cross-device atomic approval', async () => {
