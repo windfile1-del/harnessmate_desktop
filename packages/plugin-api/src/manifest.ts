@@ -25,6 +25,9 @@ export const PEER_CONTRACTS = {
   sessionFailover: 'session.failover.v1',
   harnessMcpConfig: 'harness.mcp-config.v1',
   sessionModelTools: 'session.model-tools.v1',
+  sessionData: 'session.data.v1',
+  sessionRuntime: 'session.runtime.v1',
+  hmSessionData: 'hm.session-data.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
   'browser.v1',
@@ -45,6 +48,9 @@ export const PEER_CONTRACT_NAMES = [
   'session.failover.v1',
   'harness.mcp-config.v1',
   'session.model-tools.v1',
+  'session.data.v1',
+  'session.runtime.v1',
+  'hm.session-data.v1',
 ] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 

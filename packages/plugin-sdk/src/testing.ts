@@ -43,6 +43,12 @@ import {
   type ServiceCallOptions,
   type ServiceImplementation,
   type ServiceResolutionV1,
+  type SessionCanonicalEventDto,
+  type SessionConfigApplyStatus,
+  type SessionHarnessBindingDto,
+  type SessionRecordDto,
+  type SessionRunRecordDto,
+  type SessionWorkspaceDto,
   type SpawnCliSpec,
 } from '@harnessmate/plugin-api';
 
@@ -1223,4 +1229,450 @@ export async function replayAdapterTranscript(
   }
 
   return summarizeReplay(events, capabilities, capabilitiesV2, probeResult);
+}
+
+// ── 5. Legacy Session Data & Deterministic Stream Driver Fixtures (B3-W1) ──
+
+export interface CreateLegacySessionDataFixtureOptions {
+  workspaceId?: string;
+  workspaceName?: string;
+  workspacePath?: string;
+  sessionId?: string;
+  title?: string;
+  harnessId?: string;
+  harnessKind?: string;
+  nativeSessionId?: string;
+  model?: string | null;
+  baseTimestamp?: number;
+}
+
+export interface LegacySessionDataFixture {
+  workspace: SessionWorkspaceDto;
+  session: SessionRecordDto;
+  events: SessionCanonicalEventDto[];
+  turnItems: PublicTurnBlock[];
+  runs: SessionRunRecordDto[];
+  bindings: SessionHarnessBindingDto[];
+  nativeImportMapping: {
+    sourceId: string;
+    legacySource: string;
+    nativeSessionId: string;
+    sessionId: string;
+    sourcePath: string;
+    harnessKind: string;
+    createdAt: number;
+  };
+}
+
+/**
+ * Produces deterministic B2-compatible workspace, session, events, turn blocks,
+ * run records, harness bindings, and native import mapping records for migration & compatibility tests.
+ */
+export function createLegacySessionDataFixture(
+  options: CreateLegacySessionDataFixtureOptions = {},
+): LegacySessionDataFixture {
+  const ts = options.baseTimestamp ?? 1_760_000_000_000;
+  const workspaceId = options.workspaceId ?? 'ws_legacy_fixture_1';
+  const sessionId = options.sessionId ?? 'sess_legacy_fixture_1';
+  const harnessId = options.harnessId ?? 'codex';
+  const harnessKind = options.harnessKind ?? 'codex';
+  const nativeSessionId = options.nativeSessionId ?? 'native_legacy_thread_001';
+  const workspacePath = options.workspacePath ?? 'D:/HarnessMate/b3-tmp/w1/legacy-ws';
+  const turnId = 'turn_legacy_1';
+
+  const workspace: SessionWorkspaceDto = {
+    id: workspaceId,
+    name: options.workspaceName ?? 'Legacy B2 Workspace',
+    rootPath: workspacePath,
+    isGitRepo: false,
+    gitBranch: null,
+    createdAt: ts,
+  };
+
+  const events: SessionCanonicalEventDto[] = [
+    {
+      sessionId,
+      seq: 1,
+      type: 'session.status',
+      turnId: null,
+      payload: { status: 'idle' },
+      createdAt: ts + 10,
+    },
+    {
+      sessionId,
+      seq: 2,
+      type: 'message.user',
+      turnId,
+      payload: { text: 'Explain legacy session state', harnessId, harnessKind, model: options.model ?? 'gpt-5' },
+      createdAt: ts + 20,
+    },
+    {
+      sessionId,
+      seq: 3,
+      type: 'message.assistant.completed',
+      turnId,
+      payload: { text: 'Legacy session state restored intact.', harnessId, actualModel: options.model ?? 'gpt-5' },
+      createdAt: ts + 30,
+    },
+    {
+      sessionId,
+      seq: 4,
+      type: 'turn.completed',
+      turnId,
+      payload: { stopReason: 'end_turn', harnessId, harnessKind, model: options.model ?? 'gpt-5' },
+      createdAt: ts + 40,
+    },
+  ];
+
+  const turnItems: PublicTurnBlock[] = [
+    {
+      itemId: `${turnId}:user`,
+      schemaVersion: 2,
+      sessionId,
+      turnId,
+      seq: 2,
+      instanceId: harnessId,
+      driverId: harnessKind,
+      blockType: 'user_message',
+      status: 'completed',
+      title: 'User',
+      textBody: 'Explain legacy session state',
+      payload: {},
+      outputOmitted: false,
+      omittedBytes: 0,
+      rawRef: null,
+      createdAt: ts + 20,
+      updatedAt: ts + 20,
+    },
+    {
+      itemId: `${turnId}:assistant:main`,
+      schemaVersion: 2,
+      sessionId,
+      turnId,
+      seq: 3,
+      instanceId: harnessId,
+      driverId: harnessKind,
+      blockType: 'assistant_text',
+      status: 'completed',
+      title: 'Assistant',
+      textBody: 'Legacy session state restored intact.',
+      payload: { actualModel: options.model ?? 'gpt-5' },
+      outputOmitted: false,
+      omittedBytes: 0,
+      rawRef: null,
+      createdAt: ts + 30,
+      updatedAt: ts + 30,
+    },
+  ];
+
+  const runs: SessionRunRecordDto[] = [
+    {
+      runId: 'run_legacy_1',
+      sessionId,
+      turnId,
+      instanceId: harnessId,
+      driverId: harnessKind,
+      model: options.model ?? 'gpt-5',
+      status: 'completed',
+      failureClass: null,
+      usage: { inputTokens: 120, outputTokens: 48 },
+      startedAt: ts + 20,
+      endedAt: ts + 40,
+    },
+  ];
+
+  const bindings: SessionHarnessBindingDto[] = [
+    {
+      sessionId,
+      harnessId,
+      harnessKind,
+      nativeSessionId,
+      lastModel: options.model ?? 'gpt-5',
+      lastActualModel: options.model ?? 'gpt-5',
+      lastEffort: 'medium',
+      syncedUpToSeq: 4,
+      driverUsed: 'native_warm',
+      updatedAt: ts + 40,
+    },
+  ];
+
+  const session: SessionRecordDto = {
+    id: sessionId,
+    workspaceId,
+    harnessId,
+    harnessKind,
+    nativeSessionId,
+    participatingHarnesses: [harnessId],
+    contextSyncMode: 'auto',
+    cwd: workspacePath,
+    worktreeBranch: null,
+    title: options.title ?? 'Legacy B2 Session',
+    status: 'idle',
+    model: options.model ?? 'gpt-5',
+    actualModel: options.model ?? 'gpt-5',
+    modelReroutedReason: null,
+    reasoningEffort: 'medium',
+    permissionMode: 'manual',
+    lastSeq: events.length,
+    usage: { inputTokens: 120, outputTokens: 48 },
+    pendingApprovalCount: 0,
+    createdAt: ts,
+    updatedAt: ts + 40,
+  };
+
+  return {
+    workspace,
+    session,
+    events,
+    turnItems,
+    runs,
+    bindings,
+    nativeImportMapping: {
+      sourceId: `${harnessKind}:default`,
+      legacySource: `${harnessKind}_cli`,
+      nativeSessionId,
+      sessionId,
+      sourcePath: `${workspacePath}/.mock-history/${nativeSessionId}.jsonl`,
+      harnessKind,
+      createdAt: ts,
+    },
+  };
+}
+
+export interface MockDriverTurnScript {
+  chunks?: string[];
+  thinkingChunks?: string[];
+  manualControl?: boolean;
+  failAfterDispatch?: boolean;
+  failMessage?: string;
+  failCode?: string;
+}
+
+export interface CreateDeterministicMockDriverFixtureOptions {
+  driverId?: string;
+  displayName?: string;
+  nativeSessionIdPrefix?: string;
+  configMode?: SessionConfigApplyStatus;
+  defaultScript?: MockDriverTurnScript;
+}
+
+export interface DeterministicMockDriverController {
+  readonly driver: PluginHarnessDriverRegistration;
+  readonly dispatchedTurns: PublicDriverTurnInput[];
+  readonly appliedConfigs: Array<Partial<PublicAdapterSessionConfig>>;
+  readonly interrupts: string[];
+  readonly disposedHandles: number;
+  setNextTurnScript(script: MockDriverTurnScript): void;
+  setConfigMode(mode: SessionConfigApplyStatus): void;
+  emitDelta(turnId: string, text: string): void;
+  emitThinking(turnId: string, text: string): void;
+  emitLateEvent(event: PublicNormalizedAdapterEvent): void;
+  completeTurn(turnId: string, finalText?: string): void;
+  cancelTurn(turnId: string): void;
+  failTurn(turnId: string, message: string, code?: string): void;
+}
+
+/**
+ * Controllable mock driver fixture supporting deterministic streaming, manual interrupt/completion,
+ * late stale-generation callbacks, config confirmation modes, and unknown-outcome send failures.
+ */
+export function createDeterministicMockDriverFixture(
+  options: CreateDeterministicMockDriverFixtureOptions = {},
+): DeterministicMockDriverController {
+  const driverId = options.driverId ?? 'mock-stream-driver';
+  const prefix = options.nativeSessionIdPrefix ?? 'native_mock';
+  let handleSeq = 0;
+  let configMode: SessionConfigApplyStatus = options.configMode ?? 'applied';
+  let nextScript: MockDriverTurnScript | null = null;
+  let disposedHandles = 0;
+
+  const dispatchedTurns: PublicDriverTurnInput[] = [];
+  const appliedConfigs: Array<Partial<PublicAdapterSessionConfig>> = [];
+  const interrupts: string[] = [];
+  const activeHandles = new Set<{
+    listeners: Set<(ev: PublicNormalizedAdapterEvent) => void>;
+    currentTurnId: string | null;
+    disposed: boolean;
+  }>();
+
+  const broadcast = (ev: PublicNormalizedAdapterEvent) => {
+    for (const h of activeHandles) {
+      if (h.disposed) continue;
+      for (const listener of [...h.listeners]) {
+        listener(ev);
+      }
+    }
+  };
+
+  const driver: PluginHarnessDriverRegistration = {
+    driverId,
+    displayName: options.displayName ?? 'Mock Stream Driver',
+    description: 'Deterministic streaming & lifecycle test driver',
+    protocolLabel: 'MockStream',
+    capabilities: {
+      streaming: true,
+      interactiveApproval: true,
+      reasoningEfforts: ['low', 'medium', 'high'],
+      permissionModes: ['manual', 'accept_edits', 'plan', 'auto'],
+      sessionResume: true,
+      sessionFork: false,
+      imageInput: false,
+      subagents: false,
+    },
+    capabilitiesV2: {
+      streaming: true,
+      interactiveApproval: true,
+      reasoningEfforts: ['low', 'medium', 'high'],
+      permissionModes: ['manual', 'accept_edits', 'plan', 'auto'],
+      sessionResume: true,
+      sessionFork: false,
+      imageInput: false,
+      subagents: false,
+      transport: 'custom',
+      historyInjectionMode: 'inline',
+      supportsNativeRollback: false,
+      supportsActiveSteering: false,
+      supportsUsageLimits: false,
+      supportsDynamicOptions: false,
+      nativeCommands: [],
+      optionDescriptors: [],
+    },
+    probe: async () => ({
+      binaryPath: null,
+      version: '1.0.0-mock',
+      health: 'ready',
+      models: [{ id: 'mock-model-1', displayName: 'Mock Model 1', isDefault: true }],
+      defaultModelId: 'mock-model-1',
+    }),
+    createSession: async (cfg) => {
+      handleSeq += 1;
+      const nativeSessionId = cfg.nativeSessionId ?? `${prefix}_${handleSeq}`;
+      const state = {
+        listeners: new Set<(ev: PublicNormalizedAdapterEvent) => void>(),
+        currentTurnId: null as string | null,
+        disposed: false,
+      };
+      activeHandles.add(state);
+
+      const emitLocal = (ev: PublicNormalizedAdapterEvent) => {
+        for (const listener of [...state.listeners]) {
+          listener(ev);
+        }
+      };
+
+      return {
+        nativeSessionId,
+        onEvent(listener) {
+          state.listeners.add(listener);
+          return () => state.listeners.delete(listener);
+        },
+        async sendTurn(input) {
+          dispatchedTurns.push(input);
+          state.currentTurnId = input.turnId;
+          const script = nextScript ?? options.defaultScript ?? { chunks: [`echo:${input.text}`] };
+          nextScript = null;
+
+          if (script.failAfterDispatch) {
+            const err = new Error(script.failMessage ?? 'Unknown dispatch outcome after transport write') as Error & {
+              code?: string;
+              outcomeUnknown?: boolean;
+            };
+            err.code = script.failCode ?? 'E_TIMEOUT';
+            err.outcomeUnknown = true;
+            throw err;
+          }
+
+          emitLocal({ type: 'native_session_ready', nativeSessionId });
+          emitLocal({ type: 'turn.started', turnId: input.turnId });
+          if (input.model) {
+            emitLocal({ type: 'model.confirmed', actualModel: input.model });
+          }
+          for (const tChunk of script.thinkingChunks ?? []) {
+            emitLocal({ type: 'thinking.delta', turnId: input.turnId, text: tChunk });
+          }
+          for (const chunk of script.chunks ?? []) {
+            emitLocal({ type: 'message.assistant.delta', turnId: input.turnId, text: chunk });
+          }
+          if (!script.manualControl) {
+            const fullText = (script.chunks ?? []).join('');
+            emitLocal({ type: 'message.assistant.completed', turnId: input.turnId, text: fullText });
+            emitLocal({ type: 'turn.completed', turnId: input.turnId, stopReason: 'end_turn' });
+            state.currentTurnId = null;
+          }
+        },
+        async interrupt() {
+          const tid = state.currentTurnId ?? 'unknown';
+          interrupts.push(tid);
+          emitLocal({ type: 'turn.cancelled', turnId: tid });
+          state.currentTurnId = null;
+        },
+        async resolveApproval() {},
+        async updateConfig(patch) {
+          appliedConfigs.push(patch);
+          if (configMode === 'unsupported') {
+            throw new PluginApiError('E_NOT_SUPPORTED', 'Mock driver config update unsupported');
+          }
+          if (configMode === 'rejected') {
+            throw new PluginApiError('E_INVALID_INPUT', 'Mock driver rejected config');
+          }
+          if (configMode === 'pending_next_session') {
+            const err = new Error('Config pending next session') as Error & { code?: string };
+            err.code = 'E_PENDING_NEXT_SESSION';
+            throw err;
+          }
+          if (patch.model) {
+            emitLocal({ type: 'model.confirmed', actualModel: patch.model });
+          }
+        },
+        async dispose() {
+          if (!state.disposed) {
+            state.disposed = true;
+            disposedHandles += 1;
+            activeHandles.delete(state);
+          }
+        },
+      };
+    },
+  };
+
+  return {
+    driver,
+    dispatchedTurns,
+    appliedConfigs,
+    interrupts,
+    get disposedHandles() {
+      return disposedHandles;
+    },
+    setNextTurnScript(script) {
+      nextScript = script;
+    },
+    setConfigMode(mode) {
+      configMode = mode;
+    },
+    emitDelta(turnId, text) {
+      broadcast({ type: 'message.assistant.delta', turnId, text });
+    },
+    emitThinking(turnId, text) {
+      broadcast({ type: 'thinking.delta', turnId, text });
+    },
+    emitLateEvent(event) {
+      for (const h of activeHandles) {
+        for (const listener of [...h.listeners]) {
+          listener(event);
+        }
+      }
+    },
+    completeTurn(turnId, finalText) {
+      if (finalText !== undefined) {
+        broadcast({ type: 'message.assistant.completed', turnId, text: finalText });
+      }
+      broadcast({ type: 'turn.completed', turnId, stopReason: 'end_turn' });
+    },
+    cancelTurn(turnId) {
+      broadcast({ type: 'turn.cancelled', turnId });
+    },
+    failTurn(turnId, message, code) {
+      broadcast({ type: 'turn.failed', turnId, message, ...(code ? { code } : {}) });
+    },
+  };
 }

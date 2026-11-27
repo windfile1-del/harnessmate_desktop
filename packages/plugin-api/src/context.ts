@@ -12,6 +12,11 @@ import type {
 import type { PLUGIN_API_VERSION } from './manifest.js';
 import type { PublicSlotRegistration } from './slots.js';
 import type { FilePreviewRenderer } from './file-preview.js';
+import {
+  LEGACY_SESSION_DATA_CONTRACT_VERSION,
+  SESSION_DATA_CONTRACT_VERSION,
+  SESSION_RUNTIME_CONTRACT_VERSION,
+} from './session-contracts.js';
 
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
@@ -415,6 +420,20 @@ export interface PublicDriverTurnInput {
 export type PublicNormalizedAdapterEvent =
   | { type: 'native_session_ready'; nativeSessionId: string }
   | { type: 'model.confirmed'; actualModel: string; reroutedFrom?: string; reason?: string }
+  | {
+      type: 'config.confirmed';
+      model?: string | null;
+      thoughtLevel?: string | null;
+      availableThoughtLevels?: string[];
+      modeId?: string | null;
+      permissionEnforcement?: 'native' | 'client_guard';
+      tierName?: string | null;
+    }
+  | {
+      type: 'commands.updated';
+      commands: Array<{ name: string; description?: string; argumentHint?: string }>;
+    }
+  | { type: 'session.title_updated'; title: string }
   | { type: 'turn.started'; turnId: string; continuation?: boolean }
   | { type: 'turn.completed'; turnId: string; stopReason?: string }
   | { type: 'turn.failed'; turnId: string; message: string; code?: string; failureClass?: string; resetAt?: number | null }
@@ -513,6 +532,7 @@ export interface PluginHarnessSessionHandle {
   readonly nativeSessionId?: string | null;
   readonly pluginMcpAvailable?: boolean;
   sendTurn(input: PublicDriverTurnInput): Promise<{ driverUsed?: PublicContextInjectionDriver } | void>;
+  steerTurn?(input: PublicDriverTurnInput): Promise<void>;
   listSkills?(): Promise<Array<{ name: string; path?: string; description?: string; enabled?: boolean }>>;
   runNativeCommand?(command: string, args: string): Promise<string>;
   injectContext?(payload: PublicDriverContextSyncPayload): Promise<PublicContextInjectionDriver>;
@@ -728,7 +748,19 @@ export const PEER_CONTRACT_VERSIONS = {
   'workspace.files.v1': WORKSPACE_FILES_CONTRACT_VERSION,
   'session.attachments.v1': SESSION_ATTACHMENTS_CONTRACT_VERSION,
   'workspace.rules.v1': WORKSPACE_RULES_CONTRACT_VERSION,
+  'session.data.v1': SESSION_DATA_CONTRACT_VERSION,
+  'session.runtime.v1': SESSION_RUNTIME_CONTRACT_VERSION,
+  'hm.session-data.v1': LEGACY_SESSION_DATA_CONTRACT_VERSION,
 } as const;
+
+export interface ServiceChannelEvent<T = Record<string, unknown>> {
+  contract: string;
+  instanceId: string;
+  runId?: string;
+  seq: number;
+  emittedAt: number;
+  payload: T;
+}
 
 export type PeerServiceErrorCode =
   | 'invalid_request'
@@ -1197,6 +1229,7 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
     list(contract?: string): Promise<ServiceProviderDescriptor[]>;
     resolve(contract: string, opts?: ResolveServiceSelectionOptions): Promise<ServiceResolutionV1>;
     call<T = unknown>(contract: string, method: string, args?: unknown[], opts?: ServiceCallOptions): Promise<T>;
+    publish?(contract: string, payload: Record<string, unknown>): void;
   };
   readonly routes: {
     register(
@@ -1207,6 +1240,7 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
   readonly harnesses: {
     registerDriver(driver: PluginHarnessDriverRegistration): Disposer;
     listInstances(): Promise<ReadonlyArray<PublicHarnessInstanceInfo>>;
+    openSession?(harnessId: string, config: PublicAdapterSessionConfig): Promise<PluginHarnessSessionHandle>;
   };
   readonly runtime: {
     /** Whether the user authorized direct system access for this development instance. */

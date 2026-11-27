@@ -85,7 +85,10 @@
                   "harness.model-catalog.v1",
                   "session.failover.v1",
                   "harness.mcp-config.v1",
-                  "session.model-tools.v1"
+                  "session.model-tools.v1",
+                  "session.data.v1",
+                  "session.runtime.v1",
+                  "hm.session-data.v1"
                 ]
               },
               {

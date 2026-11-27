@@ -268,6 +268,7 @@ export type TurnOptionsMap = z.infer<typeof TurnOptionsMapSchema>;
 
 export const SendTurnRequestSchema = z.object({
   text: z.string().min(1),
+  requestId: z.string().min(1).max(160).optional(),
   attachments: z.array(AttachmentSchema).optional(),
   terminalContexts: z.array(TerminalContextChipSchema).max(12).optional(),
   harnessId: z.string().min(1).optional(),
