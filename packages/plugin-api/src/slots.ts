@@ -122,6 +122,11 @@ const workspaceSlots = {
     scope: 'session',
     description: '接管或增强右侧项目规则与 Skills 视图',
   },
+  'session.stage.embedded': {
+    cardinality: 'single',
+    scope: 'session',
+    description: '会话主舞台内嵌工作台区域（支持分屏与全屏切换，默认与外部插件共享挂载路径）',
+  },
 } as const satisfies Record<string, PluginSlotContract>;
 
 export type AnyPluginSlotKey = PluginSlotKey | PluginSlotKeyV5 | keyof typeof workspaceSlots;
@@ -147,6 +152,7 @@ export const ALL_PLUGIN_SLOT_KEYS = [
   'workspace.start',
   'inspector.files',
   'inspector.rules',
+  'session.stage.embedded',
 ] as const satisfies readonly AnyPluginSlotKey[];
 
 const SLOT_ALIASES: Readonly<Record<string, AnyPluginSlotKey>> = {
@@ -197,6 +203,7 @@ export const PluginSlotKeyInputSchema = z.enum([
   'inspector.diff',
   'inspector.files',
   'inspector.rules',
+  'session.stage.embedded',
   'session.sidebar.badge',
 ]);
 

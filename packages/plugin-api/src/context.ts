@@ -29,6 +29,11 @@ import {
   SESSION_HANDOFF_CONTRACT_VERSION,
   SESSION_ORCHESTRATION_CONTRACT_VERSION,
 } from './collaboration-contracts.js';
+import {
+  AGY_ACCOUNTS_CONTRACT_VERSION,
+  AGY_RUNTIME_CONTRACT_VERSION,
+  AGY_WORKBENCH_CONTRACT_VERSION,
+} from './agy-contracts.js';
 
 export const pluginErrorCodes = [
   'E_PERMISSION_DENIED', 'E_SERVICE_UNAVAILABLE', 'E_NOT_SUPPORTED', 'E_TIMEOUT',
@@ -781,6 +786,9 @@ export const PEER_CONTRACT_VERSIONS = {
   'session.compression.v1': SESSION_COMPRESSION_CONTRACT_VERSION,
   'session.collaboration.v1': SESSION_COLLABORATION_CONTRACT_VERSION,
   'session.orchestration.v1': SESSION_ORCHESTRATION_CONTRACT_VERSION,
+  'agy.runtime.v1': AGY_RUNTIME_CONTRACT_VERSION,
+  'agy.accounts.v1': AGY_ACCOUNTS_CONTRACT_VERSION,
+  'agy.workbench.v1': AGY_WORKBENCH_CONTRACT_VERSION,
 } as const;
 
 export interface ServiceChannelEvent<T = Record<string, unknown>> {

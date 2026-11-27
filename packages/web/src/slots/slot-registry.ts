@@ -87,6 +87,11 @@ export interface SlotPropsMap {
   'inspector.rules': {
     session: Session;
   };
+  'session.stage.embedded': {
+    session: Session;
+    layout?: 'split' | 'full';
+    surface?: string;
+  };
   'session.sidebar.badge': {
     session: Session;
   };

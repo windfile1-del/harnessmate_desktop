@@ -50,6 +50,13 @@ import {
   type SessionRunRecordDto,
   type SessionWorkspaceDto,
   type SpawnCliSpec,
+  type AgyLegacyApprovalBridgeRequestDto,
+  type AgyLegacyApprovalBridgeResolveInputDto,
+  type AgyLegacyApprovalBridgeResolveResultDto,
+  type AgyProviderIdentity,
+  type AgyRuntimeBindingDto,
+  type AgyRuntimeStreamIdentity,
+  type AgyTurnSettlementDecisionDto,
 } from '@harnessmate/plugin-api';
 
 // ── 1. Mock Session Helper ──────────────────────────────────────────────
@@ -855,9 +862,6 @@ export function createMockPluginHost(options: CreateMockPluginHostOptions = {}):
           requirePermission('harness:driver:register');
           const driverId = typeof driver?.driverId === 'string' ? driver.driverId.trim() : '';
           if (!driverId) throw new PluginApiError('E_INVALID_INPUT', '驱动注册缺少 driverId');
-          if (driverId === 'agy') {
-            throw new PluginApiError('E_PERMISSION_DENIED', `禁止覆盖内置驱动 ID: ${driverId}`);
-          }
           if (drivers.has(driverId)) throw new PluginApiError('E_CONFLICT', `驱动 ${driverId} 已注册`);
           drivers.set(driverId, driver);
           return () => {
@@ -1673,6 +1677,330 @@ export function createDeterministicMockDriverFixture(
     },
     failTurn(turnId, message, code) {
       broadcast({ type: 'turn.failed', turnId, message, ...(code ? { code } : {}) });
+    },
+  };
+}
+
+// ── 7. Batch 4 W1 AGY Native Replay & Legacy Approval Bridge Fixtures ────
+
+export interface AgyWorkflowReplaySample {
+  readonly workflowKind: 'reactive' | 'subagents' | 'swarm' | 'boost' | 'teamwork' | 'dynamic' | 'tasks' | 'artifacts';
+  readonly eventType: string;
+  readonly entityId: string;
+  readonly summary: string;
+  readonly payload: Record<string, unknown>;
+}
+
+export interface AgyNativeReplayFixture {
+  readonly identity: AgyProviderIdentity;
+  readonly binding: AgyRuntimeBindingDto;
+  readonly stream: AgyRuntimeStreamIdentity;
+  readonly workflowSamples: readonly AgyWorkflowReplaySample[];
+  readonly settlementDecision: AgyTurnSettlementDecisionDto;
+  advanceGeneration(nextGeneration: string): {
+    binding: AgyRuntimeBindingDto;
+    stream: AgyRuntimeStreamIdentity;
+  };
+}
+
+export function createAgyNativeReplayFixture(opts?: {
+  pluginId?: string;
+  pluginInstanceId?: string;
+  runId?: string;
+  profileInstanceId?: string;
+  harnessId?: string;
+  sessionId?: string;
+  runtimeId?: string;
+  generation?: string;
+}): AgyNativeReplayFixture {
+  const pluginId = opts?.pluginId ?? 'hm.plugin.agy-driver-lite';
+  const pluginInstanceId = opts?.pluginInstanceId ?? 'agy-lite-ws-b';
+  const runId = opts?.runId ?? 'run-agy-lite-1';
+  const profileInstanceId = opts?.profileInstanceId ?? 'agy';
+  const harnessId = opts?.harnessId ?? `${pluginInstanceId}:agy`;
+  const sessionId = opts?.sessionId ?? 'sess_agy_replay_1';
+  const runtimeId = opts?.runtimeId ?? `rt_${pluginInstanceId}_1`;
+  const generation = opts?.generation ?? 'gen_1';
+
+  const identity: AgyProviderIdentity = {
+    pluginId,
+    pluginInstanceId,
+    driverProviderInstanceId: pluginInstanceId,
+    runId,
+    profileInstanceId,
+    harnessId,
+    nativeSessionId: `conv_${pluginInstanceId}_1`,
+    runtimeId,
+    generation,
+  };
+
+  const binding: AgyRuntimeBindingDto = {
+    runtimeId,
+    sessionId,
+    instanceId: harnessId,
+    generation,
+    driverProviderInstanceId: pluginInstanceId,
+    runtimeProviderInstanceId: pluginInstanceId,
+    runtimeRunId: runId,
+    bindingRevision: 1,
+  };
+
+  const stream: AgyRuntimeStreamIdentity = {
+    providerInstanceId: pluginInstanceId,
+    runId,
+    runtimeId,
+    generation,
+    sessionId,
+    harnessId,
+  };
+
+  const workflowSamples: AgyWorkflowReplaySample[] = [
+    {
+      workflowKind: 'reactive',
+      eventType: 'native.activity.changed',
+      entityId: 'act_root_1',
+      summary: 'Root reactive turn running with held settlement',
+      payload: { activityId: 'act_root_1', state: 'running', origin: 'user_turn' },
+    },
+    {
+      workflowKind: 'subagents',
+      eventType: 'native.agent.changed',
+      entityId: 'agent_child_1',
+      summary: 'Confirmed child subagent spawned under root lineage',
+      payload: { agentId: 'agent_child_1', role: 'researcher', state: 'running' },
+    },
+    {
+      workflowKind: 'swarm',
+      eventType: 'native.workflow.changed',
+      entityId: 'wf_swarm_1',
+      summary: 'Swarm shared board workflow with 2 workers',
+      payload: { workflowId: 'wf_swarm_1', kind: 'swarm', workerCount: 2, resource: 'board' },
+    },
+    {
+      workflowKind: 'boost',
+      eventType: 'native.workflow.changed',
+      entityId: 'wf_boost_1',
+      summary: 'Boost multi-stage reasoning pipeline phase 2/3',
+      payload: { workflowId: 'wf_boost_1', kind: 'boost', phaseIndex: 2, resource: 'phases' },
+    },
+    {
+      workflowKind: 'teamwork',
+      eventType: 'native.workflow.changed',
+      entityId: 'wf_teamwork_1',
+      summary: 'Teamwork multi-agent prompt artifact collaboration',
+      payload: { workflowId: 'wf_teamwork_1', kind: 'teamwork', resource: 'artifacts' },
+    },
+    {
+      workflowKind: 'dynamic',
+      eventType: 'native.workflow.changed',
+      entityId: 'wf_dynamic_1',
+      summary: 'Dynamic workflow DAG execution logs and script review',
+      payload: { workflowId: 'wf_dynamic_1', kind: 'dynamic', resource: 'logs' },
+    },
+    {
+      workflowKind: 'tasks',
+      eventType: 'native.workflow.changed',
+      entityId: 'wf_task_goal_1',
+      summary: 'Goal & scheduled recurring task progression',
+      payload: { workflowId: 'wf_task_goal_1', kind: 'goal', scheduleActive: true, resource: 'logs' },
+    },
+    {
+      workflowKind: 'artifacts',
+      eventType: 'native.artifact.changed',
+      entityId: 'art_plan_md',
+      summary: 'Plan & diff artifact ready for review',
+      payload: { name: 'implementation_plan.md', kind: 'plan', reviewable: true },
+    },
+  ];
+
+  const settlementDecision: AgyTurnSettlementDecisionDto = {
+    action: 'hold',
+    turnId: 'turn_replay_1',
+    binding,
+    reason: 'active_native_background_work',
+    settlementRef: `settle:${pluginInstanceId}:${runId}:turn_replay_1`,
+    providerInstanceId: pluginInstanceId,
+    providerRunId: runId,
+  };
+
+  return {
+    identity,
+    binding,
+    stream,
+    workflowSamples,
+    settlementDecision,
+    advanceGeneration(nextGeneration: string) {
+      const nextBinding: AgyRuntimeBindingDto = {
+        ...binding,
+        generation: nextGeneration,
+        bindingRevision: (binding.bindingRevision ?? 1) + 1,
+      };
+      const nextStream: AgyRuntimeStreamIdentity = {
+        ...stream,
+        generation: nextGeneration,
+      };
+      return { binding: nextBinding, stream: nextStream };
+    },
+  };
+}
+
+/**
+ * Runnable W1 -> W2 temporary narrow legacy approval adapter sample.
+ * Demonstrates request registration, native option binding, bindingRevision/generation CAS,
+ * deadline expiration, single-delivery reply, and settlement receipt handoff for W2 takeover.
+ */
+export function createAgyLegacyApprovalBridgeSample(opts?: {
+  now?: () => number;
+  defaultDeadlineMs?: number;
+}) {
+  const now = opts?.now ?? (() => Date.now());
+  const defaultDeadlineMs = opts?.defaultDeadlineMs ?? 120_000;
+  const requests = new Map<string, AgyLegacyApprovalBridgeRequestDto>();
+  const resolvedByIdempotency = new Map<string, AgyLegacyApprovalBridgeResolveResultDto>();
+  const settledRefs = new Set<string>();
+
+  return {
+    registerRequest(input: {
+      approvalId: string;
+      nativeRequestId: string;
+      binding: AgyRuntimeBindingDto;
+      kind?: AgyLegacyApprovalBridgeRequestDto['kind'];
+      toolName: string;
+      summary: string;
+      options: AgyLegacyApprovalBridgeRequestDto['options'];
+      deadlineMs?: number;
+    }): AgyLegacyApprovalBridgeRequestDto {
+      const createdAtMs = now();
+      const record: AgyLegacyApprovalBridgeRequestDto = {
+        approvalId: input.approvalId,
+        nativeRequestId: input.nativeRequestId,
+        sessionId: input.binding.sessionId,
+        harnessId: input.binding.instanceId,
+        driverProviderInstanceId: input.binding.driverProviderInstanceId ?? 'harness-agy',
+        runtimeProviderInstanceId: input.binding.runtimeProviderInstanceId ?? 'harness-agy',
+        runtimeRunId: input.binding.runtimeRunId ?? 'run-1',
+        binding: input.binding,
+        bindingRevision: input.binding.bindingRevision ?? 1,
+        kind: input.kind ?? 'command_approval',
+        toolName: input.toolName,
+        summary: input.summary,
+        options: [...input.options],
+        deadlineAtMs: createdAtMs + (input.deadlineMs ?? defaultDeadlineMs),
+        createdAtMs,
+        receiptState: 'pending',
+        settlementRef: `approval-settle:${input.binding.runtimeId}:${input.approvalId}`,
+      };
+      requests.set(record.approvalId, record);
+      return record;
+    },
+
+    getRequest(approvalId: string): AgyLegacyApprovalBridgeRequestDto | null {
+      return requests.get(approvalId) ?? null;
+    },
+
+    resolveRequest(input: AgyLegacyApprovalBridgeResolveInputDto): AgyLegacyApprovalBridgeResolveResultDto {
+      const cached = resolvedByIdempotency.get(`${input.approvalId}::${input.idempotencyKey}`);
+      if (cached) return cached;
+
+      const record = requests.get(input.approvalId);
+      if (!record) {
+        return {
+          approvalId: input.approvalId,
+          accepted: false,
+          receiptState: 'failed',
+          bindingRevision: input.expectedBindingRevision ?? 0,
+          generation: input.expectedGeneration ?? 'unknown',
+          note: 'Request not found',
+        };
+      }
+
+      if (input.expectedGeneration && input.expectedGeneration !== record.binding.generation) {
+        return {
+          approvalId: record.approvalId,
+          accepted: false,
+          staleGeneration: true,
+          receiptState: 'cancelled',
+          bindingRevision: record.bindingRevision,
+          generation: record.binding.generation,
+          note: 'Stale runtime generation rejected before wire reply',
+        };
+      }
+
+      if (
+        input.expectedBindingRevision !== undefined &&
+        input.expectedBindingRevision !== record.bindingRevision
+      ) {
+        return {
+          approvalId: record.approvalId,
+          accepted: false,
+          conflict: true,
+          receiptState: record.receiptState === 'pending' ? 'failed' : 'already_settled',
+          bindingRevision: record.bindingRevision,
+          generation: record.binding.generation,
+          note: 'Binding revision CAS mismatch',
+        };
+      }
+
+      if (record.receiptState !== 'pending') {
+        return {
+          approvalId: record.approvalId,
+          accepted: false,
+          conflict: true,
+          receiptState: 'already_settled',
+          bindingRevision: record.bindingRevision,
+          generation: record.binding.generation,
+          settlementRef: record.settlementRef,
+          note: `Already in terminal state: ${record.receiptState}`,
+        };
+      }
+
+      if (now() >= record.deadlineAtMs) {
+        record.receiptState = 'expired';
+        return {
+          approvalId: record.approvalId,
+          accepted: false,
+          receiptState: 'expired',
+          bindingRevision: record.bindingRevision,
+          generation: record.binding.generation,
+          settlementRef: record.settlementRef,
+          note: 'Request deadline elapsed before resolution',
+        };
+      }
+
+      if (
+        input.selectedOptionId &&
+        !record.options.some((opt) => opt.optionId === input.selectedOptionId)
+      ) {
+        return {
+          approvalId: record.approvalId,
+          accepted: false,
+          receiptState: 'failed',
+          bindingRevision: record.bindingRevision,
+          generation: record.binding.generation,
+          note: `Unknown native optionId: ${input.selectedOptionId}`,
+        };
+      }
+
+      record.receiptState = input.decision === 'cancel' ? 'cancelled' : 'delivered';
+      const result: AgyLegacyApprovalBridgeResolveResultDto = {
+        approvalId: record.approvalId,
+        accepted: true,
+        receiptState: record.receiptState,
+        bindingRevision: record.bindingRevision,
+        generation: record.binding.generation,
+        deliveredAtMs: now(),
+        settlementRef: record.settlementRef,
+      };
+      resolvedByIdempotency.set(`${input.approvalId}::${input.idempotencyKey}`, result);
+      return result;
+    },
+
+    acknowledgeSettlement(settlementRef: string): { acknowledged: boolean; duplicate: boolean } {
+      if (settledRefs.has(settlementRef)) {
+        return { acknowledged: false, duplicate: true };
+      }
+      settledRefs.add(settlementRef);
+      return { acknowledged: true, duplicate: false };
     },
   };
 }

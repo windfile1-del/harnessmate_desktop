@@ -89,7 +89,7 @@ const serviceNames = [...new Set([
 ])].sort();
 const handoffConfig = handoffPluginSource.match(/export const handoffConfigSchema = (z\.object\(\{[\s\S]+?\}\).*?);/);
 output.set('services.md', heading('宿主服务与配置') +
-  '第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 或 `harness:driver:register` 并获授权后提供公共契约、`harness.driver.<driverId>.v1` 同类驱动或自定义命名空间服务。`harness.agy` 原生驱动暂保留至第四批，公开契约见下表。\n\n' +
+  '第一方服务按名称注册。第三方 V4 隔离插件可在声明 `service:provide:<name>` 或 `harness:driver:register` 并获授权后提供公共契约、`harness.driver.<driverId>.v1` 同类驱动（含 `codex`/`claude`/`acp`/`agy`）、`agy.runtime.v1`、`agy.accounts.v1`、`agy.workbench.v1` 或自定义命名空间服务。公开契约见下表。\n\n' +
   serviceNames.map((name) => `- \`${name}\`\n`).join('') +
   '\n## 交接配置\n\n```ts\n' + (handoffConfig?.[1] ?? '') + '\n```\n');
 
@@ -99,7 +99,7 @@ output.set('slots.md', heading('公共 UI 插槽') +
   '第一方与内核级插件可直接注册 React 组件；第三方插件在 `contributes.slots` 或 `ctx.slots.register()` 中声明包内 HTML 入口，由宿主在 `sandbox="allow-scripts"` 沙箱 iframe 中渲染。包含全部 V4 与 V5 插槽契约。\n\n' +
   '| 插槽 | 基数 | 作用域 | 说明 |\n| --- | --- | --- | --- |\n' + slotRows.join('\n') + '\n');
 
-const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts', 'driver-contracts', 'collaboration-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
+const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts', 'driver-contracts', 'collaboration-contracts', 'chat-contracts', 'agy-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
   .split('\n').filter((line) => !line.startsWith('//# sourceMappingURL')).join('\n').trim()).join('\n\n');
 output.set('plugin-api.api.md', heading('插件 API 报告') +
   '清单与声明式贡献点见同目录 JSON Schema。公共错误码见类型声明。\n\n' +

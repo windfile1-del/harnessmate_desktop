@@ -98,7 +98,10 @@
                   "session.handoff.v1",
                   "session.compression.v1",
                   "session.collaboration.v1",
-                  "session.orchestration.v1"
+                  "session.orchestration.v1",
+                  "agy.runtime.v1",
+                  "agy.accounts.v1",
+                  "agy.workbench.v1"
                 ]
               },
               {
@@ -797,6 +800,7 @@
                       "inspector.diff",
                       "inspector.files",
                       "inspector.rules",
+                      "session.stage.embedded",
                       "session.sidebar.badge"
                     ]
                   },

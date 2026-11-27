@@ -24,3 +24,4 @@
 | `workspace.start` | `single` | `root` | 组合中提供的应用启动页与主工作区布局 |
 | `inspector.files` | `single` | `session` | 接管或增强右侧工作区文件浏览与行号预览视图 |
 | `inspector.rules` | `single` | `session` | 接管或增强右侧项目规则与 Skills 视图 |
+| `session.stage.embedded` | `single` | `session` | 会话主舞台内嵌工作台区域（支持分屏与全屏切换，默认与外部插件共享挂载路径） |

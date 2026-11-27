@@ -38,6 +38,9 @@ export const PEER_CONTRACTS = {
   sessionCompression: 'session.compression.v1',
   sessionCollaboration: 'session.collaboration.v1',
   sessionOrchestration: 'session.orchestration.v1',
+  agyRuntime: 'agy.runtime.v1',
+  agyAccounts: 'agy.accounts.v1',
+  agyWorkbench: 'agy.workbench.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
   'chat.view.v1',
@@ -71,6 +74,9 @@ export const PEER_CONTRACT_NAMES = [
   'session.compression.v1',
   'session.collaboration.v1',
   'session.orchestration.v1',
+  'agy.runtime.v1',
+  'agy.accounts.v1',
+  'agy.workbench.v1',
 ] as const;
 export type PeerContractName = typeof PEER_CONTRACT_NAMES[number];
 

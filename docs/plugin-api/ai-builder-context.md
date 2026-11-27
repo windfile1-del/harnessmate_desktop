@@ -32,7 +32,7 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 ```
 
 ## 3. Public Events & Host Services
-- Host services: `approval-center`, `approval.policy.v1`, `attachments`, `browser.v1`, `chat.view.v1`, `checkpoints`, `compressor`, `failover`, `filePreview.v1`, `files`, `git`, `git.checkpoint.v1`, `git.workspace.v1`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `harness.driver.acp.v1`, `harness.driver.agy.v1`, `harness.driver.claude.v1`, `harness.driver.codex.v1`, `harness.driver.v1`, `harness.mcp-config.v1`, `harness.model-catalog.v1`, `harness.usage.v1`, `history.import.v1`, `history.source.v1`, `hm.session-data.v1`, `ledger`, `native-commands`, `orchestrator`, `rules`, `session-search`, `session.attachments.v1`, `session.collaboration.v1`, `session.compression.v1`, `session.data.v1`, `session.failover.v1`, `session.handoff.v1`, `session.inbox.v1`, `session.ledger.v1`, `session.model-tools.v1`, `session.notifications.v1`, `session.orchestration.v1`, `session.runtime.v1`, `session.search.v1`, `session.snooze.v1`, `session.studio.v1`, `session.summary.v1`, `terminal`, `terminal-workspace`, `terminal.runner.v1`, `terminal.workspace.v1`, `triage-inbox`, `usage`, `workspace.files.v1`, `workspace.rules.v1`.
+- Host services: `agy.accounts.v1`, `agy.runtime.v1`, `agy.workbench.v1`, `approval-center`, `approval.policy.v1`, `attachments`, `browser.v1`, `chat.view.v1`, `checkpoints`, `compressor`, `failover`, `filePreview.v1`, `files`, `git`, `git.checkpoint.v1`, `git.workspace.v1`, `handoff`, `harness.acp`, `harness.agy`, `harness.claude`, `harness.codex`, `harness.driver.acp.v1`, `harness.driver.agy.v1`, `harness.driver.claude.v1`, `harness.driver.codex.v1`, `harness.driver.v1`, `harness.mcp-config.v1`, `harness.model-catalog.v1`, `harness.usage.v1`, `history.import.v1`, `history.source.v1`, `hm.session-data.v1`, `ledger`, `native-commands`, `orchestrator`, `rules`, `session-search`, `session.attachments.v1`, `session.collaboration.v1`, `session.compression.v1`, `session.data.v1`, `session.failover.v1`, `session.handoff.v1`, `session.inbox.v1`, `session.ledger.v1`, `session.model-tools.v1`, `session.notifications.v1`, `session.orchestration.v1`, `session.runtime.v1`, `session.search.v1`, `session.snooze.v1`, `session.studio.v1`, `session.summary.v1`, `terminal`, `terminal-workspace`, `terminal.runner.v1`, `terminal.workspace.v1`, `triage-inbox`, `usage`, `workspace.files.v1`, `workspace.rules.v1`.
 - Replaceable public services (with `service:provide:<name>`): `ledger`, `handoff`, `git`, `usage`, `notify`.
 
 | Event / Hook | Mode | Permission |
@@ -77,6 +77,7 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 | `workspace.start` | `single` | `root` | 组合中提供的应用启动页与主工作区布局 |
 | `inspector.files` | `single` | `session` | 接管或增强右侧工作区文件浏览与行号预览视图 |
 | `inspector.rules` | `single` | `session` | 接管或增强右侧项目规则与 Skills 视图 |
+| `session.stage.embedded` | `single` | `session` | 会话主舞台内嵌工作台区域（支持分屏与全屏切换，默认与外部插件共享挂载路径） |
 
 - Sandbox iframe CSP: `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'`.
 - Bridge API inside HTML: `window.harnessMate.{ session, props, onContext(cb), sendToPlugin(payload), setDraft(text), toast(title, body, level) }`.
