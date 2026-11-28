@@ -212,4 +212,4 @@ flowchart TD
 | 性能 | 使用相同事件回放、历史库和操作脚本记录首帧时间、流式刷新频率、搜索耗时和主线程阻塞。展示迁移前后差值，确认开关、订阅和索引任务按需运行。 |
 | 功能清单归零 | 核对 daemon 和 Electron 入口只引用内核与通用原语。Web 壳只装载组合页面及恢复界面。各功能包均能说明自己的接口、存储所有权和恢复方式。 |
 
-本文保留全量解耦设计与各批目标，实际进度见各批报告及[第四批规划交接核对](plugin-decoupling-batch-4/reports/coordinator-handoff.md)。第四批代码交付已完成，首段代理性能预算单列接续；下一步迁出第五批整体布局、管理/插件开发工具、远程与剩余 shell 功能，并完成业务初始化清理。
+本文保留全量解耦设计与各批目标，实际进度见各批报告及[第四批规划交接核对](plugin-decoupling-batch-4/reports/coordinator-handoff.md)。第四批代码交付已完成，首段代理性能预算单列接续；第五批详细范围、内核边界、三个任务和交付标准见[第五批实施方案](plugin-decoupling-batch-5-plan.md)，唯一一套启动提示词见[第五批三个任务提示词](plugin-decoupling-batch-5-prompts.md)；业务开发尚未开始。
