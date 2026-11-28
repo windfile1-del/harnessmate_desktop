@@ -53,6 +53,8 @@ import { isActivePlugin as isPluginActive, isTriageEnabled } from '../lib/triage
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry } from './hooks';
 import { SandboxedPluginFrame } from './SandboxedPluginFrame';
+import { shouldUseTrustedModuleMount } from './BoundSessionSurface';
+import { TrustedPluginModuleHost } from './TrustedPluginModuleHost';
 import type { SlotRegistry } from './slot-registry';
 
 const V1_EVENT_LABELS = {
@@ -237,6 +239,31 @@ export function registerPluginIframeSlots(
           render: (rawProps) => {
             const recordProps = rawProps as Record<string, unknown>;
             const session = (recordProps.session as Session | null | undefined) ?? null;
+            if (
+              slotDef.when?.harnessKinds?.length &&
+              (!session || !slotDef.when.harnessKinds.includes(session.harnessKind))
+            ) {
+              return null;
+            }
+            if (shouldUseTrustedModuleMount(plugin, slotDef)) {
+              return (
+                <TrustedPluginModuleHost
+                  key={`mod:${instanceId}:${slotDef.slot}:${slotDef.id}:${revision}`}
+                  pluginId={plugin.id}
+                  instanceId={instanceId}
+                  pluginName={plugin.name}
+                  revision={revision}
+                  slot={slotDef.slot}
+                  slotId={slotDef.id}
+                  title={slotDef.title}
+                  modulePath={slotDef.module!}
+                  session={session}
+                  props={recordProps}
+                  defaultHeight={slotDef.height}
+                  compact={isCompactSlot}
+                />
+              );
+            }
             return (
               <SandboxedPluginFrame
                 key={`${instanceId}:${slotDef.slot}:${slotDef.id}:${revision}`}
@@ -395,9 +422,13 @@ function collectPluginIframeSlots(
  */
 export function PluginSlotSync() {
   const plugins = useAppStore((state) => state.plugins);
-  const sessions = useAppStore((state) => state.sessions);
-  const selectedWorkspaceId = useAppStore((state) => state.selectedWorkspaceId);
   const selectedSessionId = useAppStore((state) => state.selectedSessionId);
+  const activeWorkspaceId = useAppStore((state) => {
+    const active = state.selectedSessionId
+      ? state.sessions.find((item) => item.id === state.selectedSessionId) ?? null
+      : null;
+    return active?.workspaceId ?? state.selectedWorkspaceId;
+  });
   const compositionEntries = useAppStore((state) => state.compositionEntries);
   const compositionBindings = useAppStore((state) => state.compositionBindings);
   const workspaceBindingsByWorkspace = useAppStore((state) => state.workspaceBindingsByWorkspace);
@@ -406,10 +437,6 @@ export function PluginSlotSync() {
 
   useEffect(() => {
     const disposers: Disposer[] = [];
-    const activeSession = selectedSessionId
-      ? sessions.find((item) => item.id === selectedSessionId) ?? null
-      : null;
-    const activeWorkspaceId = activeSession?.workspaceId ?? selectedWorkspaceId;
     const workspaceBindings = activeWorkspaceId
       ? workspaceBindingsByWorkspace[activeWorkspaceId]
       : undefined;
@@ -927,8 +954,7 @@ export function PluginSlotSync() {
     };
   }, [
     plugins,
-    sessions,
-    selectedWorkspaceId,
+    activeWorkspaceId,
     selectedSessionId,
     compositionEntries,
     compositionBindings,

@@ -15,6 +15,7 @@
         "id": "studio-work-group",
         "title": "工作组",
         "ui": "ui/panel.html",
+        "module": "ui/module.mjs",
         "key": "studio:work-group"
       },
       {
@@ -22,6 +23,7 @@
         "id": "studio-tool",
         "title": "工具条目",
         "ui": "ui/panel.html",
+        "module": "ui/module.mjs",
         "key": "studio:tool"
       },
       {
@@ -29,6 +31,7 @@
         "id": "studio-extension",
         "title": "扩展条目",
         "ui": "ui/panel.html",
+        "module": "ui/module.mjs",
         "key": "studio:extension"
       },
       {
@@ -36,6 +39,7 @@
         "id": "studio-timeline",
         "title": "时间线",
         "ui": "ui/panel.html",
+        "module": "ui/module.mjs",
         "key": "studio:timeline"
       }
     ]

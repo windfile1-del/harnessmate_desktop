@@ -41,6 +41,7 @@ import {
   resolveSessionDataProvider,
 } from '../../core/session-peer-router.js';
 import { TextDeltaCoalescer } from '../../core/text-delta-coalescer.js';
+import { perfDiagnostics } from '../../core/perf-diagnostics.js';
 import { classifyTerminalFailure, FAILOVER_TRIGGER_CLASSES } from '../../core/failover-service.js';
 import type { AdapterSessionConfig, AdapterSessionHandle, HarnessAdapter, NormalizedAdapterEvent } from '../../harnesses/types.js';
 import type { HostPlugin } from '../../plugin-host/runtime/lifecycle.js';
@@ -264,8 +265,23 @@ export function createDefaultSessionRuntimePlugin(
       };
 
       const enqueueSessionCommit = <T>(sessionId: string, fn: () => Promise<T>): Promise<T> => {
+        const enqueuedAt = Date.now();
+        perfDiagnostics.adjustQueueDepth('runtimeCommit', 1);
         const prev = sessionCommitQueues.get(sessionId) ?? Promise.resolve();
-        const next = prev.then(fn, fn);
+        const run = async () => {
+          const startedAt = Date.now();
+          try {
+            return await fn();
+          } finally {
+            const depthAfter = perfDiagnostics.adjustQueueDepth('runtimeCommit', -1);
+            perfDiagnostics.recordBatchFlush('runtimeCommit', {
+              batchSize: 1,
+              backlogMs: startedAt - enqueuedAt,
+              queueDepthAfter: depthAfter,
+            });
+          }
+        };
+        const next = prev.then(run, run);
         const settled = next.then(() => undefined, () => undefined);
         sessionCommitQueues.set(sessionId, settled);
         void settled.finally(() => {
@@ -332,7 +348,7 @@ export function createDefaultSessionRuntimePlugin(
       const pendingDeltaBatches = new Map<string, Promise<unknown>>();
 
       const deltaCoalescer = new TextDeltaCoalescer({
-        windowMs: 50,
+        windowMs: 20,
         onFlush: (batch) => {
           const meta = activeTurnMeta.get(batch.sessionId);
           const targetDataInstanceId = meta?.dataInstanceId;
@@ -353,6 +369,7 @@ export function createDefaultSessionRuntimePlugin(
               await commitToData(batch.sessionId, targetDataInstanceId, {
                 sessionId: batch.sessionId,
                 events: [{ type: evType, turnId: batch.turnId, payload }],
+                trace: { runtimeReceivedAt: batch.firstReceivedAt },
               });
             } catch {
               // Data plugin unavailable during delta flush: recorded via handle disconnect/data disable handler
@@ -429,6 +446,7 @@ export function createDefaultSessionRuntimePlugin(
       ): Promise<void> => {
         // Generation & handle-ownership fence: ignore callbacks from disposed or replaced handles
         if (!active || entry.disposed || liveHandles.get(entry.key) !== entry) return;
+        const runtimeReceivedAt = Date.now();
 
         const sessionId = entry.sessionId;
         const eventHarnessId = entry.harnessId;
@@ -489,6 +507,7 @@ export function createDefaultSessionRuntimePlugin(
             parentToolUseId: ev.parentToolUseId ?? null,
             harnessId: currentMeta?.harnessId ?? eventHarnessId,
             actualModel: currentMeta?.actualModel ?? null,
+            receivedAt: runtimeReceivedAt,
           });
           return;
         }
@@ -500,6 +519,7 @@ export function createDefaultSessionRuntimePlugin(
             channel: 'thinking',
             text: ev.text,
             harnessId: currentMeta?.harnessId ?? eventHarnessId,
+            receivedAt: runtimeReceivedAt,
           });
           return;
         }
@@ -781,6 +801,7 @@ export function createDefaultSessionRuntimePlugin(
               const now = Date.now();
               await commitToData(sessionId, entry.dataInstanceId, {
                 sessionId,
+                trace: { runtimeReceivedAt },
                 events: [
                   {
                     type: 'message.assistant.completed',
@@ -860,6 +881,7 @@ export function createDefaultSessionRuntimePlugin(
               const now = Date.now();
               await commitToData(sessionId, entry.dataInstanceId, {
                 sessionId,
+                trace: { runtimeReceivedAt },
                 events: [
                   {
                     type: 'tool.call.started',
@@ -924,6 +946,7 @@ export function createDefaultSessionRuntimePlugin(
               const now = Date.now();
               await commitToData(sessionId, entry.dataInstanceId, {
                 sessionId,
+                trace: { runtimeReceivedAt },
                 events: [
                   {
                     type: 'tool.call.completed',
@@ -1091,6 +1114,7 @@ export function createDefaultSessionRuntimePlugin(
                 },
               });
               entry.nativeToGlobalApprovalId.set(ev.nativeRequestId, approval.id);
+              deps.collabPort.notifyOrchestratorChildApproval(sessionModel.id, approval.id, approval.toolName);
               break;
             }
 
@@ -1127,6 +1151,7 @@ export function createDefaultSessionRuntimePlugin(
               const now = Date.now();
               const commitOut = await commitToData(sessionId, entry.dataInstanceId, {
                 sessionId,
+                trace: { runtimeReceivedAt },
                 sessionPatch: { status: 'idle' },
                 ...(meta
                   ? {

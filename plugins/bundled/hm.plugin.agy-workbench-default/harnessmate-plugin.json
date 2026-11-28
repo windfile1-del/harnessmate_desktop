@@ -29,6 +29,7 @@
         "id": "agy-composer",
         "title": "AGY 原生控制",
         "ui": "ui/index.html",
+        "when": { "harnessKinds": ["agy"] },
         "order": 60,
         "height": 56
       },
@@ -38,6 +39,7 @@
         "title": "Artifact 审阅",
         "key": "agy-artifacts",
         "ui": "ui/index.html",
+        "when": { "harnessKinds": ["agy"] },
         "order": 85
       },
       {
@@ -46,6 +48,7 @@
         "title": "AGY 生态边界",
         "key": "agy-ecosystem",
         "ui": "ui/index.html",
+        "when": { "harnessKinds": ["agy"] },
         "order": 88
       },
       {
@@ -54,6 +57,7 @@
         "title": "AGY Native Runtime",
         "key": "agy-native-runtime",
         "ui": "ui/index.html",
+        "when": { "harnessKinds": ["agy"] },
         "order": 80
       },
       {
@@ -69,6 +73,7 @@
         "id": "agy-native-badge",
         "title": "AGY 原生运行时状态徽标",
         "ui": "ui/index.html",
+        "when": { "harnessKinds": ["agy"] },
         "order": 40,
         "height": 48
       }

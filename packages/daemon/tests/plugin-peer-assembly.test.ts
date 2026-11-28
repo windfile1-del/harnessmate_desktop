@@ -495,7 +495,7 @@ it('supports trusted-local dev inheritance, approval.policy.v1 enforcement, cand
   };
 
   const ws = await daemon.sessionManager.addWorkspace(wsDir, 'Kernel WS');
-  const session = await daemon.sessionManager.createSession({ workspaceId: ws.id, harnessId: 'codex', permissionMode: 'manual' });
+  const session = await daemon.sessionManager.createSession({ workspaceId: ws.id, harnessId: 'codex', permissionMode: 'auto' });
 
   // 1. Trusted-local dev directory inheritance
   const devDir = writePluginPackage(

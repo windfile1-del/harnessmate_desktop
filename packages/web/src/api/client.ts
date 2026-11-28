@@ -123,6 +123,7 @@ import type {
   WsClientFrame,
   WsServerFrame,
 } from '@harnessmate/protocol';
+import { frontendPerfDiagnostics } from '../lib/perf-diagnostics';
 import {
   unwrapContractResult,
   type ContractResult,
@@ -1711,6 +1712,14 @@ export interface AgyEcosystemSnapshotDto {
 
 export type ServiceBatch = Extract<WsServerFrame, { op: 'service_batch' }>;
 export let sharedDaemonWs: DaemonWsClient | undefined;
+export function getSharedDaemonWs(): DaemonWsClient | undefined {
+  return (
+    sharedDaemonWs ??
+    (typeof window !== 'undefined'
+      ? (window as unknown as { __HM_SHARED_WS__?: DaemonWsClient }).__HM_SHARED_WS__
+      : undefined)
+  );
+}
 
 export class DaemonWsClient {
   private frameObservers = new Set<(frame: WsServerFrame) => void>();
@@ -1734,7 +1743,12 @@ export class DaemonWsClient {
       onConnected: (connected: boolean) => void;
       onFrame: (frame: WsServerFrame) => void;
     },
-  ) { sharedDaemonWs = this; }
+  ) {
+    sharedDaemonWs = this;
+    if (typeof window !== 'undefined') {
+      (window as unknown as { __HM_SHARED_WS__?: DaemonWsClient }).__HM_SHARED_WS__ = this;
+    }
+  }
 
   subscribeService(params: { contract: string; instanceId: string; runId?: string }, listener: (batch: ServiceBatch) => void): () => void {
     const subscriptionId = crypto.randomUUID();
@@ -1839,10 +1853,24 @@ export class DaemonWsClient {
 
       ws.onmessage = (ev) => {
         try {
+          const hostWsReceivedAt = Date.now();
           const frame = JSON.parse(String(ev.data)) as WsServerFrame;
           if (frame.op === 'plugins_changed') for (const sub of this.serviceSubscriptions.values()) this.send(sub.frame);
           for (const listener of this.frameObservers) listener(frame);
-          if (frame.op === 'service_batch') this.serviceSubscriptions.get(frame.subscriptionId)?.listener(frame);
+          if (frame.op === 'service_batch') {
+            const firstEv = frame.events[0]?.payload as { trace?: { runtimeReceivedAt?: number; committedAt?: number } } | undefined;
+            frontendPerfDiagnostics.recordHostWsBatch({
+              subscriptionId: frame.subscriptionId,
+              hostWsReceivedAt,
+              serverFlushedAt: frame.serverFlushedAt,
+              runtimeReceivedAt: firstEv?.trace?.runtimeReceivedAt,
+              postCommitAt: firstEv?.trace?.committedAt,
+              eventCount: frame.events.length,
+              serverQueueDepth: frame.queueDepth,
+              serverBacklogMs: frame.backlogMs,
+            });
+            this.serviceSubscriptions.get(frame.subscriptionId)?.listener(frame);
+          }
           this.handlers.onFrame(frame);
         } catch {
           // ignore malformed frames

@@ -821,6 +821,34 @@
                     "minLength": 1,
                     "maxLength": 240
                   },
+                  "module": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "mountMode": {
+                    "type": "string",
+                    "enum": [
+                      "iframe",
+                      "trusted-module"
+                    ]
+                  },
+                  "when": {
+                    "type": "object",
+                    "properties": {
+                      "harnessKinds": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 40
+                        },
+                        "minItems": 1,
+                        "maxItems": 16
+                      }
+                    },
+                    "additionalProperties": false
+                  },
                   "order": {
                     "type": "integer",
                     "minimum": -1000,

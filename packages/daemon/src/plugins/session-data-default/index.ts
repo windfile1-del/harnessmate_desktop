@@ -523,9 +523,46 @@ export function createDefaultSessionDataPlugin(
           const throughSeq = typeof req.throughSeq === 'number' && Number.isFinite(req.throughSeq)
             ? Math.max(0, Math.floor(req.throughSeq))
             : undefined;
+          const beforeSeq = typeof req.beforeSeq === 'number' && Number.isFinite(req.beforeSeq)
+            ? Math.max(0, Math.floor(req.beforeSeq))
+            : undefined;
           const limit = typeof req.limit === 'number' && Number.isFinite(req.limit)
             ? Math.min(4000, Math.max(1, Math.floor(req.limit)))
             : 500;
+
+          if (req.tail || beforeSeq !== undefined) {
+            const exclusiveUpper = beforeSeq !== undefined
+              ? (throughSeq !== undefined ? Math.min(beforeSeq, throughSeq + 1) : beforeSeq)
+              : (throughSeq !== undefined ? throughSeq + 1 : Number.MAX_SAFE_INTEGER);
+            const minTurnEvents = typeof req.minTurnEvents === 'number' && Number.isFinite(req.minTurnEvents)
+              ? Math.min(1000, Math.max(0, Math.floor(req.minTurnEvents)))
+              : 0;
+            const raw = deps.store.getEventsBefore(req.sessionId, exclusiveUpper, limit, afterSeq, minTurnEvents);
+            const sliced = req.turnId ? raw.filter((e) => e.turnId === req.turnId) : raw;
+            const lastSeq = sliced.length > 0 ? sliced[sliced.length - 1]!.seq : afterSeq;
+            const earliestSeq = sliced.length > 0 ? sliced[0]!.seq : null;
+            const hasEarlier = earliestSeq !== null
+              ? deps.store.hasEventsBefore(req.sessionId, earliestSeq, afterSeq)
+              : false;
+            return peerOk({
+              sessionId: req.sessionId,
+              stream: streamRef(),
+              events: sliced.map((ev) => ({
+                sessionId: ev.sessionId,
+                seq: ev.seq,
+                type: ev.type,
+                turnId: ev.turnId,
+                payload: ev.payload,
+                createdAt: ev.createdAt,
+              })),
+              lastSeq,
+              nextAfterSeq: null,
+              hasMore: false,
+              earliestSeq,
+              hasEarlier,
+            });
+          }
+
           const raw = throughSeq !== undefined
             ? deps.store.getEventsInRange(req.sessionId, afterSeq, throughSeq, limit + 1)
             : deps.store.getEventsAfter(req.sessionId, afterSeq, limit + 1);
@@ -533,6 +570,7 @@ export function createDefaultSessionDataPlugin(
           const hasMore = filtered.length > limit;
           const sliced = hasMore ? filtered.slice(0, limit) : filtered;
           const lastSeq = sliced.length > 0 ? sliced[sliced.length - 1]!.seq : afterSeq;
+          const earliestSeq = sliced.length > 0 ? sliced[0]!.seq : null;
           return peerOk({
             sessionId: req.sessionId,
             stream: streamRef(),
@@ -547,6 +585,8 @@ export function createDefaultSessionDataPlugin(
             lastSeq,
             nextAfterSeq: hasMore && sliced.length > 0 ? sliced[sliced.length - 1]!.seq : null,
             hasMore,
+            earliestSeq,
+            hasEarlier: afterSeq > 0,
           });
         },
 
@@ -833,12 +873,20 @@ export function createDefaultSessionDataPlugin(
             };
           });
 
+          // Captured strictly AFTER SQLite IMMEDIATE transaction returns (distinct from event createdAt).
+          const committedAt = Date.now();
+          const trace = {
+            ...(req.trace?.runtimeReceivedAt !== undefined ? { runtimeReceivedAt: req.trace.runtimeReceivedAt } : {}),
+            committedAt,
+          };
+
           const out: SessionDataCommitBatchResult = {
             stream: streamRef(),
             session: batchResult.session,
             committedEvents: batchResult.committedEvents,
             latestSeq: batchResult.latestSeq,
             changeSeq: batchResult.changeSeq,
+            trace,
           };
 
           publishChannel({
@@ -848,6 +896,7 @@ export function createDefaultSessionDataPlugin(
             sessionId: req.sessionId,
             workspaceId: batchResult.session.workspaceId,
             ...(batchResult.committedEvents.length > 0 ? { events: batchResult.committedEvents } : {}),
+            trace,
           });
 
           return peerOk(out);
@@ -1117,6 +1166,15 @@ export function createDefaultSessionDataPlugin(
             tx.prepare("UPDATE session_turn_receipts SET status = 'unknown', updated_at = ? WHERE status = 'running'")
               .run(now);
             for (const row of runningSess) {
+              const sess = deps.store.getSession(row.id);
+              const hasRunningRun = tx
+                .prepare("SELECT 1 AS hit FROM session_runs WHERE session_id = ? AND status = 'running' LIMIT 1")
+                .get(row.id) as { hit?: number } | undefined;
+              // Sessions left in awaiting_approval with no active run (e.g., legacy expired approvals)
+              // reconcile to idle via RequestBroker rather than being forced into error state.
+              if (sess?.status === 'awaiting_approval' && !hasRunningRun?.hit) {
+                continue;
+              }
               deps.store.updateSession(row.id, { status: 'error' });
             }
             if (runningSess.length > 0 || recoveredRuns > 0 || settledItems > 0) {

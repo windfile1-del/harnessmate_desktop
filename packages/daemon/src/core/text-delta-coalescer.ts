@@ -1,3 +1,5 @@
+import { perfDiagnostics } from './perf-diagnostics.js';
+
 export type CoalescedDeltaChannel = 'assistant' | 'thinking';
 
 export interface CoalescedDeltaBatch {
@@ -10,6 +12,8 @@ export interface CoalescedDeltaBatch {
   harnessId: string;
   actualModel: string | null;
   mergedCount: number;
+  firstReceivedAt: number;
+  lastReceivedAt: number;
 }
 
 interface PendingDeltaEntry {
@@ -23,6 +27,8 @@ interface PendingDeltaEntry {
   parentToolUseId: string | null;
   harnessId: string;
   actualModel: string | null;
+  firstReceivedAt: number;
+  lastReceivedAt: number;
   timer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -70,8 +76,10 @@ export class TextDeltaCoalescer {
     parentToolUseId?: string | null;
     harnessId: string;
     actualModel?: string | null;
+    receivedAt?: number;
   }): void {
     if (!input.text) return;
+    const now = input.receivedAt ?? Date.now();
     const key = this.entryKey(
       input.sessionId,
       input.turnId,
@@ -100,13 +108,17 @@ export class TextDeltaCoalescer {
         parentToolUseId: input.parentToolUseId ?? null,
         harnessId: input.harnessId,
         actualModel: input.actualModel ?? null,
+        firstReceivedAt: now,
+        lastReceivedAt: now,
         timer: null,
       };
       this.pending.set(key, entry);
+      perfDiagnostics.setQueueDepth('deltaCoalescer', this.pending.size);
     }
 
     entry.chunks.push(input.text);
     entry.bufferedChars += input.text.length;
+    entry.lastReceivedAt = now;
     if (input.actualModel !== undefined) entry.actualModel = input.actualModel;
 
     if (this.windowMs === 0 || entry.bufferedChars >= this.maxCharsBeforeFlush) {
@@ -115,6 +127,7 @@ export class TextDeltaCoalescer {
     }
 
     if (!entry.timer) {
+      perfDiagnostics.adjustTimer('deltaCoalescer', 1);
       entry.timer = setTimeout(() => {
         this.flushEntry(key);
       }, this.windowMs);
@@ -146,9 +159,13 @@ export class TextDeltaCoalescer {
 
   dispose(): void {
     for (const entry of this.pending.values()) {
-      if (entry.timer) clearTimeout(entry.timer);
+      if (entry.timer) {
+        clearTimeout(entry.timer);
+        perfDiagnostics.adjustTimer('deltaCoalescer', -1);
+      }
     }
     this.pending.clear();
+    perfDiagnostics.setQueueDepth('deltaCoalescer', 0);
   }
 
   private flushEntry(key: string): void {
@@ -157,9 +174,25 @@ export class TextDeltaCoalescer {
     if (entry.timer) {
       clearTimeout(entry.timer);
       entry.timer = null;
+      perfDiagnostics.adjustTimer('deltaCoalescer', -1);
     }
     this.pending.delete(key);
-    if (entry.chunks.length === 0) return;
+    if (entry.chunks.length === 0) {
+      perfDiagnostics.setQueueDepth('deltaCoalescer', this.pending.size);
+      return;
+    }
+    const flushedAt = Date.now();
+    perfDiagnostics.recordBatchFlush('deltaCoalescer', {
+      batchSize: entry.chunks.length,
+      backlogMs: flushedAt - entry.firstReceivedAt,
+      queueDepthAfter: this.pending.size,
+      trace: {
+        sessionId: entry.sessionId,
+        runtimeReceivedAt: entry.firstReceivedAt,
+        coalescerEnqueuedAt: entry.firstReceivedAt,
+        coalescerFlushedAt: flushedAt,
+      },
+    });
 
     this.onFlush({
       sessionId: entry.sessionId,
@@ -171,6 +204,8 @@ export class TextDeltaCoalescer {
       harnessId: entry.harnessId,
       actualModel: entry.actualModel,
       mergedCount: entry.chunks.length,
+      firstReceivedAt: entry.firstReceivedAt,
+      lastReceivedAt: entry.lastReceivedAt,
     });
   }
 }

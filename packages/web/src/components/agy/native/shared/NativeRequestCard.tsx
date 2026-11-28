@@ -22,7 +22,7 @@ export function NativeRequestCard({ approval, receipt, ownerAgent, onJumpToAgent
   const pending = approval?.status === 'pending' && (!receipt || receipt.receiptState === 'pending');
   const state = receipt?.receiptState;
   const label = state ? ({pending:'待处理',claimed:'发送中',response_written:'响应已写出',cancelled:'已取消',expired:'已过期',connection_lost:'连接丢失',delivery_unknown:'送达未知'}[state] ?? state) : approval?.status;
-  return <article data-testid="native-request-reference" className="rounded border p-2 text-[12px]">
+  return <article data-testid="native-request-reference" data-receipt-state={state ?? (pending ? 'pending' : undefined)} className="rounded border p-2 text-[12px]">
     <p>{approval?.summary ?? id} · {label}</p>
     {pending && <p>请在当前绑定的请求视图处理此请求。</p>}
     {state === 'connection_lost' && <p>原连接已断开，旧审批不会自动重放。</p>}

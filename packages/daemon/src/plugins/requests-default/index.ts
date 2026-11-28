@@ -59,6 +59,24 @@ export class RequestBroker {
     for (const fact of this.list(undefined, true)) {
       if (fact.status === 'pending') this.terminate(fact.requestId, fact.deadlineAtMs <= Date.now() ? 'expired' : 'cancelled', 'restart_connection_lost', false);
     }
+    // Replay missing approval.resolved events for legacy pre-expired approvals adopted on startup
+    const missingResolved = this.db.prepare(
+      `SELECT a.id FROM approvals a
+       WHERE a.status = 'expired'
+         AND NOT EXISTS (
+           SELECT 1 FROM session_events e
+           WHERE e.session_id = a.session_id
+             AND e.type = 'approval.resolved'
+             AND json_extract(e.payload_json, '$.approvalId') = a.id
+         )`,
+    ).all() as Array<{ id: string }>;
+    for (const row of missingResolved) {
+      const a = deps.store.getApproval(row.id);
+      if (a) {
+        this.event(a, 'approval.resolved');
+        this.committedEvents.splice(0);
+      }
+    }
     for (const session of deps.store.listSessions({ includeArchived: true })) this.project(session.id);
     const pm = deps.getPluginManager();
     this.unsubscribePolicy = pm.host?.onServicesChanged(() => {

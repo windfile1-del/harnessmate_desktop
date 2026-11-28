@@ -184,6 +184,23 @@ export function isSafePluginUiPath(value: string): boolean {
   return /\.(?:html|htm)$/i.test(normalized);
 }
 
+export function isSafePluginModulePath(value: string): boolean {
+  if (!value || value.includes('\0') || value.includes('\\')) return false;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith('/')) return false;
+  const normalized = value.replace(/^\.\//, '');
+  const segments = normalized.split('/');
+  if (segments.some((seg) => !seg || seg === '.' || seg === '..')) return false;
+  return /\.(?:mjs|js)$/i.test(normalized);
+}
+
+export const PluginSlotMountModeSchema = z.enum(['iframe', 'trusted-module']);
+export type PluginSlotMountMode = z.infer<typeof PluginSlotMountModeSchema>;
+
+export const PluginSlotWhenSchema = z.object({
+  harnessKinds: z.array(z.string().trim().min(1).max(40)).min(1).max(16).optional(),
+}).strict();
+export type PluginSlotWhen = z.infer<typeof PluginSlotWhenSchema>;
+
 export const PluginSlotKeyInputSchema = z.enum([
   'workspace.pages',
   'workspace.start',
@@ -212,6 +229,9 @@ export const PluginSlotContributionSchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/),
   title: z.string().trim().min(1).max(64),
   ui: z.string().trim().min(1).max(240).refine(isSafePluginUiPath, 'UI 入口必须为包内相对 .html/.htm 路径'),
+  module: z.string().trim().min(1).max(240).refine(isSafePluginModulePath, '可信模块入口必须为包内相对 .mjs/.js 路径').optional(),
+  mountMode: PluginSlotMountModeSchema.optional(),
+  when: PluginSlotWhenSchema.optional(),
   order: z.number().int().min(-1000).max(1000).optional(),
   key: z.string().trim().min(1).max(80).optional(),
   height: z.number().int().min(48).max(1200).optional(),
@@ -223,6 +243,9 @@ export interface PluginRuntimeSlotDescriptor {
   id: string;
   title: string;
   ui: string;
+  module?: string;
+  mountMode?: PluginSlotMountMode;
+  when?: PluginSlotWhen;
   order?: number;
   key?: string;
   height?: number;

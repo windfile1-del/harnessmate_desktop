@@ -109,9 +109,9 @@ import { isTriageEnabled, mergeTriageState, type TriageStateBySession } from '..
 
 
 import type { AppState, ToastNotice } from '../../stores/app-store';
-import { bridge, callPeer, startView } from './transport';
+import { callPeer, getActiveBridge, startView, triggerLoadEarlierHistory, type ChatPluginState, type PageBridge } from './transport';
 
-export const useAppStore = create<AppState>((set, get) => {
+export const useAppStore = create<ChatPluginState>((set, get) => {
  const actions: Partial<AppState> = {
 refreshOrchestratorBoard: async (sessionId) => {
   const board = await daemonApi.listSubagents(sessionId);
@@ -401,7 +401,7 @@ clearLastRevert: (sessionId) =>
       }))
  };
  const shellNames = ['setSidebarCollapsed','setInspectorOpen','setInspectorTab','openModal','openPluginPanel','selectSession','openSessionSearch','openSessionSearchPage','openHistoryImportPage','setNativeWorkbenchRoute','hydrateNativeRuntime','submitNativeCommand','dispatchNativeControl','loadNativeTimeline','loadNativeWorkflowResource','setNativeAgentMode','refreshAll','focusCheckpointDiff','openSubagentMergeReview'];
- const shell = Object.fromEntries(shellNames.map(name=>[name,(...args: unknown[])=>bridge.call('shell.invoke',{name,args})]));
+ const shell = Object.fromEntries(shellNames.map(name=>[name,(...args: unknown[])=>getActiveBridge().call('shell.invoke',{name,args})]));
  return {
 theme: 'dark',
 connected: false,
@@ -449,6 +449,7 @@ searchQuery: '',
 selectedSessionId: null,
 activePluginPage: null,
 eventsBySession: {},
+eventChunksBySession: {},
 turnItemsBySession: {},
 liveCommandOutputByKey: {},
 traitsByScope: {},
@@ -473,10 +474,12 @@ nativeRuntimeBySession: {},
 toasts: [],
 inspectorFile: null,
 inspectorFileError: null,
+historyMetaBySession: {},
+loadEarlierHistory: (sessionId: string) => triggerLoadEarlierHistory(sessionId),
  ...shell, ...actions,
- openInspectorFile: (sessionId: string,path: string,line?: number)=>{ void bridge.navigateToFile({sessionId,path,line}); return {opened:true}; },
- navigateToFile: (request: NavigateToFileRequest)=>{ void bridge.navigateToFile(request); return {opened:true}; },
- pushToast: (notice: Omit<ToastNotice,'id'>)=>{ void bridge.call('ui.toast',notice); },
+ openInspectorFile: (sessionId: string,path: string,line?: number)=>{ void getActiveBridge().navigateToFile({sessionId,path,line}); return {opened:true}; },
+ navigateToFile: (request: NavigateToFileRequest)=>{ void getActiveBridge().navigateToFile(request); return {opened:true}; },
+ pushToast: (notice: Omit<ToastNotice,'id'>)=>{ void getActiveBridge().call('ui.toast',notice); },
  sendTurn: async (sessionId,text,attachments,options)=>{
    const requestId=crypto.randomUUID();
    const receipt=await callPeer('session.runtime.v1','sendTurn',[{sessionId,text,attachments,requestId,...options}],{sessionId});
@@ -492,8 +495,8 @@ inspectorFileError: null,
    const {git}=await daemonApi.getSessionGit(sessionId);
    set(state=>({gitBySession:{...state.gitBySession,[sessionId]:git}}));
  },
- subscribeCommandOutput: (sessionId,toolCallId)=>{let released=false; void bridge.call('outputs.subscribe',{sessionId,toolCallId}).then(()=>{if(released)void bridge.call('outputs.unsubscribe',{sessionId,toolCallId});}).catch(()=>{}); return ()=>{released=true;void bridge.call('outputs.unsubscribe',{sessionId,toolCallId});};},
- } as AppState;
+ subscribeCommandOutput: (sessionId,toolCallId)=>{let released=false; void getActiveBridge().call('outputs.subscribe',{sessionId,toolCallId}).then(()=>{if(released)void getActiveBridge().call('outputs.unsubscribe',{sessionId,toolCallId});}).catch(()=>{}); return ()=>{released=true;void getActiveBridge().call('outputs.unsubscribe',{sessionId,toolCallId});};},
+ } as ChatPluginState;
 });
 
-export const startChatView = () => startView(useAppStore);
+export const startChatView = (bridgeOverride?: PageBridge) => startView(useAppStore, bridgeOverride);

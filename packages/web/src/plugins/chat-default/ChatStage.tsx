@@ -58,7 +58,7 @@ import {
 } from 'lucide-react';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { daemonApi, resolveAttachmentUrl } from '../../api/client';
-import { bridge } from './transport';
+import { getActiveBridge } from './transport';
 import { AttachmentImage } from './AttachmentImage';
 import { copyText } from '../../lib/clipboard';
 import {
@@ -76,7 +76,7 @@ import {
   resolveHarnessOptionDescriptors,
 } from '../../lib/harness-meta';
 import {
-  createSessionEventProjector,
+  createChunkedSessionEventProjector,
   mergeTurnBlockRecords,
   type ProjectedSwitchEvent,
   type ProjectedToolCall,
@@ -92,12 +92,10 @@ import {
 import { useAppStore } from './store';
 import type { FileLink } from '../../lib/file-links';
 import { Slot, SlotTurnProvider } from '../../slots';
-import {
-  DEFAULT_WORKBENCH_ROUTE,
-  EntityStatusBadge,
-  NativeActivityLink,
-  resolveAgyModeOptions,
-} from '../../components/agy/native/shared';
+import { DEFAULT_WORKBENCH_ROUTE } from '../../components/agy/native/shared/workbench-registry';
+import { EntityStatusBadge } from '../../components/agy/native/shared/EntityStatusBadge';
+import { NativeActivityLink } from '../../components/agy/native/shared/NativeActivityLink';
+import { resolveAgyModeOptions } from '../../components/agy/native/shared/AgyAgentModePicker';
 import type { WorkflowId } from '../../lib/native-client';
 import { HarnessBadge, StarLoomCrest } from '../../components/BrandMark';
 import { UndoRevertBanner } from '../../components/CheckpointControls';
@@ -128,7 +126,7 @@ const DRIVER_LABELS: Record<string, string> = {
 };
 const NO_ATTACHMENTS: Attachment[] = [];
 const NO_TERMINAL_CHIPS: TerminalContextChip[] = [];
-const NO_EVENTS: CanonicalEvent[] = [];
+const NO_EVENT_CHUNKS: readonly (readonly CanonicalEvent[])[] = [];
 const NO_TURN_ITEMS: TurnBlockRecord[] = [];
 const TIMELINE_PAGE_SIZE = 80;
 
@@ -176,8 +174,11 @@ export function ChatStage() {
     focusedTurn,
     focusTurn,
     selectedSessionId,
+    eventChunks,
     events,
     turnItems,
+    historyMeta,
+    loadEarlierHistory,
     accountUsage,
     failoverPolicy,
     traitsByScope,
@@ -234,8 +235,11 @@ export function ChatStage() {
     focusedTurn: state.focusedTurn,
     focusTurn: state.focusTurn,
     selectedSessionId: state.selectedSessionId,
-    events: state.selectedSessionId ? state.eventsBySession[state.selectedSessionId] : undefined,
-    turnItems: state.selectedSessionId ? state.turnItemsBySession[state.selectedSessionId] : undefined,
+    eventChunks: state.selectedSessionId ? state.eventChunksBySession?.[state.selectedSessionId] : undefined,
+    events: state.selectedSessionId ? state.eventsBySession?.[state.selectedSessionId] : undefined,
+    turnItems: state.selectedSessionId ? state.turnItemsBySession?.[state.selectedSessionId] : undefined,
+    historyMeta: state.selectedSessionId ? state.historyMetaBySession?.[state.selectedSessionId] : undefined,
+    loadEarlierHistory: state.loadEarlierHistory,
     accountUsage: state.accountUsage,
     failoverPolicy: state.failoverPolicy,
     traitsByScope: state.traitsByScope,
@@ -294,13 +298,19 @@ export function ChatStage() {
     [harnesses, session],
   );
 
-  const visibleEvents = events ?? NO_EVENTS;
+  const visibleEventChunks = useMemo(
+    () => eventChunks ?? (events ? [events] : NO_EVENT_CHUNKS),
+    [eventChunks, events],
+  );
   const visibleTurnItems = turnItems ?? NO_TURN_ITEMS;
   const taskState = selectedTaskState ?? null;
   const contextPreview = selectedContextPreview ?? null;
   const embeddedWorkbenchPlugin = useBoundSessionPlugin(AGY_WORKBENCH_CONTRACT, session);
   const embeddedWorkbenchSlot = embeddedWorkbenchPlugin?.contributes.slots?.find(
-    (s) => s.slot === 'session.stage.embedded' && Boolean(s.ui),
+    (s) =>
+      s.slot === 'session.stage.embedded' &&
+      Boolean(s.ui) &&
+      (!s.when?.harnessKinds?.length || (session !== null && s.when.harnessKinds.includes(session.harnessKind))),
   );
   const nativeWorkbenchActive = Boolean(
     session && embeddedWorkbenchPlugin && embeddedWorkbenchSlot,
@@ -345,9 +355,9 @@ export function ChatStage() {
       nativeProjection.activities.length > 0,
   );
 
-  const project = useMemo(() => createSessionEventProjector(), [selectedSessionId]);
+  const project = useMemo(() => createChunkedSessionEventProjector(), [selectedSessionId]);
   const baseTimeline = project(
-    visibleEvents,
+    visibleEventChunks,
     session ? { id: session.harnessId, kind: session.harnessKind } : undefined,
     { isolateNativePlaceholders: canIsolateNativePlaceholders },
   );
@@ -358,19 +368,42 @@ export function ChatStage() {
         : baseTimeline,
     [baseTimeline, visibleTurnItems],
   );
+  const lastPublishedDiagSigRef = useRef<string>('');
   useEffect(() => {
-    if (bridge) void bridge.call('presentation.publish', { diagnostics: timeline.diagnostics.slice(-200) }).catch(() => {});
-  }, [timeline.diagnostics]);
-  const minimapEntries = useMemo(
-    () =>
-      session
-        ? buildTimelineMinimapItems(timeline.items, {
-            id: session.harnessId,
-            kind: session.harnessKind,
-          })
-        : [],
-    [timeline.items, session],
-  );
+    const activeBridge = getActiveBridge();
+    if (!activeBridge) return;
+    const count = timeline.diagnostics.length;
+    const lastSeq = count > 0 ? timeline.diagnostics[count - 1]!.seq : 0;
+    const sig = `${selectedSessionId ?? ''}:${count}:${lastSeq}`;
+    if (sig === lastPublishedDiagSigRef.current) return;
+    lastPublishedDiagSigRef.current = sig;
+    if (count === 0 && !selectedSessionId) return;
+    void activeBridge.call('presentation.publish', { diagnostics: timeline.diagnostics.slice(-200) }).catch(() => {});
+  }, [timeline.diagnostics, selectedSessionId]);
+  const minimapCacheRef = useRef<{ sig: string; entries: ReturnType<typeof buildTimelineMinimapItems> }>({
+    sig: '',
+    entries: [],
+  });
+  const minimapEntries = useMemo(() => {
+    if (!session) return [];
+    const items = timeline.items;
+    const tailItems = items.length > 80 ? items.slice(-80) : items;
+    const firstItem = tailItems[0];
+    const lastItem = tailItems[tailItems.length - 1];
+    const lastStatus = lastItem?.kind === 'turn' ? lastItem.status : 'switch';
+    const lastId = lastItem ? (lastItem.kind === 'turn' ? lastItem.turnId : `sw_${lastItem.seq}`) : '';
+    const firstId = firstItem ? (firstItem.kind === 'turn' ? firstItem.turnId : `sw_${firstItem.seq}`) : '';
+    const sig = `${session.id}|${session.harnessId}|${items.length}|${firstId}|${lastId}|${lastStatus}`;
+    if (sig === minimapCacheRef.current.sig) {
+      return minimapCacheRef.current.entries;
+    }
+    const next = buildTimelineMinimapItems(tailItems, {
+      id: session.harnessId,
+      kind: session.harnessKind,
+    });
+    minimapCacheRef.current = { sig, entries: next };
+    return next;
+  }, [timeline.items, session]);
   const contextBridgeEnabled = isPluginEnabled('core.context-bridge');
   const taskLedgerEnabled = Boolean(useBoundSessionPlugin('session.ledger.v1', session ?? null));
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
@@ -459,6 +492,8 @@ export function ChatStage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const previousHistoryHeight = useRef<number | null>(null);
   const followBottom = useRef(true);
+  const programmaticScrollRef = useRef(false);
+  const scrollRafRef = useRef<number | null>(null);
   const previousSessionId = useRef<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -495,6 +530,7 @@ export function ChatStage() {
       const saved = selectedSessionId ? readTimelinePosition(selectedSessionId) : null;
       if (saved && el) {
         followBottom.current = saved.followBottom;
+        programmaticScrollRef.current = true;
         if (saved.followBottom) {
           el.scrollTop = el.scrollHeight;
         } else {
@@ -504,8 +540,24 @@ export function ChatStage() {
       }
       followBottom.current = true;
     }
-    if (el && followBottom.current) el.scrollTop = el.scrollHeight;
-  }, [visibleEvents.length, selectedSessionId]);
+    if (el && followBottom.current && scrollRafRef.current === null) {
+      scrollRafRef.current = requestAnimationFrame(() => {
+        scrollRafRef.current = null;
+        const target = scrollRef.current;
+        if (target && followBottom.current) {
+          programmaticScrollRef.current = true;
+          target.scrollTop = target.scrollHeight;
+        }
+      });
+    }
+  }, [visibleEventChunks, selectedSessionId]);
+
+  useEffect(() => () => {
+    if (scrollRafRef.current !== null) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+  }, []);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -513,7 +565,7 @@ export function ChatStage() {
       el.scrollTop += el.scrollHeight - previousHistoryHeight.current;
       previousHistoryHeight.current = null;
     }
-  }, [firstVisible]);
+  }, [firstVisible, historyMeta?.earliestSeq]);
 
   useEffect(() => {
     if (!focusedTurn || focusedTurn.sessionId !== selectedSessionId) return;
@@ -525,6 +577,9 @@ export function ChatStage() {
       const index = timeline.items.findIndex((item) => item.kind === 'turn' && item.turnId === focusedTurn.turnId);
       if (index >= 0 && index < firstVisible) {
         setVisibleHistory({ sessionId: selectedSessionId, count: timeline.items.length - index });
+      } else if (index < 0 && historyMeta?.hasEarlier && !historyMeta.loadingEarlier) {
+        previousHistoryHeight.current = scrollRef.current?.scrollHeight ?? null;
+        void loadEarlierHistory(selectedSessionId);
       }
       return;
     }
@@ -532,7 +587,7 @@ export function ChatStage() {
     target.scrollIntoView({ block: 'start' });
     target.focus({ preventScroll: true });
     focusTurn(null);
-  }, [focusedTurn, selectedSessionId, timeline, focusTurn, firstVisible]);
+  }, [focusedTurn, selectedSessionId, timeline, focusTurn, firstVisible, historyMeta, loadEarlierHistory]);
 
   useEffect(() => {
     if (!selectedSessionId) return;
@@ -890,7 +945,7 @@ export function ChatStage() {
   const handleExport = async () => {
     try {
       const { filename, markdown } = await daemonApi.exportSessionMarkdown(session.id);
-      await bridge.call('files.download', { filename, text: markdown, mime: 'text/markdown;charset=utf-8' });
+      await getActiveBridge().call('files.download', { filename, text: markdown, mime: 'text/markdown;charset=utf-8' });
       pushToast({ kind: 'success', title: `已导出 ${filename}` });
     } catch (err) {
       pushToast({
@@ -1263,6 +1318,10 @@ export function ChatStage() {
             ref={scrollRef}
             style={{ overflowAnchor: 'none' }}
             onScroll={(event) => {
+              if (programmaticScrollRef.current) {
+                programmaticScrollRef.current = false;
+                return;
+              }
               const el = event.currentTarget;
               const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 72;
               followBottom.current = atBottom;
@@ -1271,17 +1330,27 @@ export function ChatStage() {
             className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-6"
           >
             <div className="mx-auto max-w-[760px] space-y-7">
-              {firstVisible > 0 && (
+              {(firstVisible > 0 || historyMeta?.hasEarlier) && (
                 <button
                   type="button"
-                  className="mx-auto block cursor-pointer rounded-lg px-3 py-1.5 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)]"
+                  disabled={historyMeta?.loadingEarlier}
+                  className="mx-auto block cursor-pointer rounded-lg px-3 py-1.5 text-[12px] text-[var(--accent-indigo)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
                   onClick={() => {
                     previousHistoryHeight.current = scrollRef.current?.scrollHeight ?? null;
                     followBottom.current = false;
-                    setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
+                    if (firstVisible > 0) {
+                      setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
+                    } else if (historyMeta?.hasEarlier) {
+                      setVisibleHistory({ sessionId: session.id, count: visibleCount + TIMELINE_PAGE_SIZE });
+                      void loadEarlierHistory(session.id);
+                    }
                   }}
                 >
-                  加载更早的消息（{firstVisible}）
+                  {historyMeta?.loadingEarlier
+                    ? '正在加载更早的消息…'
+                    : firstVisible > 0
+                      ? `加载更早的消息（${firstVisible}${historyMeta?.hasEarlier ? '+' : ''}）`
+                      : '加载更早的历史消息'}
                 </button>
               )}
               {nativeWorkbenchActive && nativeContinuationActivities.length > 0 && (
@@ -2141,7 +2210,7 @@ const TurnBlock = memo(function TurnBlock({
                       name="chat.message.wrapper"
                       slotProps={{ session, turn, children: null }}
                     >
-                      {block.streaming || turn.status === 'running' ? (
+                      {block.streaming ? (
                         <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">
                           {block.text}
                         </div>

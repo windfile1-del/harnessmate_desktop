@@ -1,5 +1,5 @@
 import type { Session } from '@harnessmate/protocol';
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, memo, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { daemonApi } from '../api/client';
 import type { ExtensionTurnBlock, TimelineMinimapEntry, UnknownTurnBlock, WorkGroupProjection, WorkStepBlock } from '../lib/work-groups';
 import { useAppStore } from '../stores/app-store';
@@ -72,11 +72,15 @@ function WorkStep({ session, block, plugin }: { session: Session; block: WorkSte
   );
 }
 
-export function StudioWorkGroup({ session, group }: { session: Session; group: WorkGroupProjection }) {
+export const StudioWorkGroup = memo(function StudioWorkGroup({ session, group }: { session: Session; group: WorkGroupProjection }) {
   const plugin = useContext(StudioContext);
   const { element, visible } = useNearViewport<HTMLElement>();
   const [expanded, setExpanded] = useState<boolean | undefined>();
   const open = expanded ?? !group.collapsedByDefault;
+  const groupProps = useMemo(
+    () => ({ groupId: group.groupId, status: group.status, durationMs: group.durationMs, activeStep: group.activeStepTitle }),
+    [group.groupId, group.status, group.durationMs, group.activeStepTitle],
+  );
   return (
     <section ref={element} data-testid="work-group-row" className="rounded-xl border border-[var(--border-hairline)] p-2">
       {plugin ? (
@@ -87,7 +91,7 @@ export function StudioWorkGroup({ session, group }: { session: Session; group: W
             <div className="min-h-8">
               {visible && <BoundSessionSurface plugin={plugin} session={session} surface="studio-work-group"
                 defaultHeight={32}
-                props={{ groupId: group.groupId, status: group.status, durationMs: group.durationMs, activeStep: group.activeStepTitle }} />}
+                props={groupProps} />}
             </div>
             {group.blocks.map((block) => <WorkStep key={block.blockId} session={session} block={block} plugin={plugin} />)}
           </>}
@@ -95,7 +99,7 @@ export function StudioWorkGroup({ session, group }: { session: Session; group: W
       ) : <p className="text-xs text-[var(--text-muted)]">{group.summaryText} · 工作详情不可用</p>}
     </section>
   );
-}
+});
 
 export function StudioExtension({ session, block }: { session: Session; block: ExtensionTurnBlock | UnknownTurnBlock }) {
   const plugin = useContext(StudioContext);
@@ -111,19 +115,20 @@ export function StudioExtension({ session, block }: { session: Session; block: E
   );
 }
 
-export function StudioMinimap({ session, entries, activeTurnId }: {
+export const StudioMinimap = memo(function StudioMinimap({ session, entries, activeTurnId }: {
   session: Session; entries: readonly TimelineMinimapEntry[]; activeTurnId?: string | null;
 }) {
   const plugin = useContext(StudioContext);
+  const minimapProps = useMemo(() => ({ entries, activeTurnId }), [entries, activeTurnId]);
   if (!plugin || entries.length < 3) return null;
   return (
     <aside className="hidden w-9 shrink-0 overflow-y-auto xl:block" aria-label="对话轮次小地图">
       <BoundSessionSurface plugin={plugin} session={session} surface="studio-timeline"
-        props={{ entries, activeTurnId }} defaultHeight={160}
+        props={minimapProps} defaultHeight={160}
         onAction={(action, params) => {
           const turn = entries.find((item) => item.kind === 'turn' && item.id === params.turnId);
           if (action === 'jump' && turn) useAppStore.getState().focusTurn({ sessionId: session.id, turnId: turn.id });
         }} />
     </aside>
   );
-}
+});

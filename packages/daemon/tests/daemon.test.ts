@@ -406,12 +406,14 @@ describe('Real stdio Mock CLI Adapters + Daemon + HM-Remote v1', () => {
       }
     });
     try {
+      // Batch 4 W2 moved permission policy evaluation into approval.policy.v1 / runtime.requests.v1;
+      // raw AcpAdapter forwards session/set_mode and emits approval.requested without local driver auto-decisions.
       const scenarios = [
         ['manual', 'edit', true, 'default:opt_allow'],
-        ['accept_edits', 'edit', false, 'accept-edits:opt_allow'],
+        ['accept_edits', 'edit', true, 'accept-edits:opt_allow'],
         ['accept_edits', 'shell', true, 'accept-edits:opt_allow'],
-        ['auto', 'shell', false, 'auto:opt_allow'],
-        ['plan', 'edit', false, 'plan:opt_deny'],
+        ['auto', 'shell', true, 'auto:opt_allow'],
+        ['plan', 'edit', true, 'plan:opt_allow'],
         ['manual', 'edit', true, 'default:opt_allow'],
       ] as const;
       for (const [index, [permissionMode, text, manuallyReviewed, result]] of scenarios.entries()) {

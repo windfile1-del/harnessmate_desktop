@@ -63,7 +63,7 @@ try {
     try { const r = await cdp.call('Runtime.evaluate', { expression, contextId, returnByValue: true, awaitPromise: true });
       if (r.exceptionDetails) throw new Error(r.exceptionDetails.text); return r.result.value; } catch { return null; }
   };
-  const click = (label, contextId) => evaluate(`(() => { const el = [...document.querySelectorAll('button,[role=button],a')].find(e => e.innerText.includes(${JSON.stringify(label)}) || e.title?.includes(${JSON.stringify(label)})); if (!el) return false; el.click(); return true; })()`, contextId);
+  const click = (label, contextId, scoped = false) => evaluate(`(() => { const root = (${scoped} && document.querySelector('[data-testid="request-plugin-queue"]')) || document; const el = [...root.querySelectorAll('button,[role=button],a')].find(e => e.innerText.includes(${JSON.stringify(label)}) || e.title?.includes(${JSON.stringify(label)})); if (!el) return false; el.click(); return true; })()`, contextId);
   const frame = () => until(async () => { for (const [id] of cdp.contexts) if (await evaluate(`!!document.querySelector('[data-testid="request-plugin-queue"]')`, id)) return id; }, 'bound request view');
   const navigate = async () => {
     await cdp.call('Page.navigate', { url: `http://127.0.0.1:${address.port}` });
@@ -98,13 +98,13 @@ try {
   await until(() => evaluate(`!document.querySelector('[data-request-id="browser-expire"]')`, context), 'expired card leaves pending');
   assert.equal(daemon.store.getSession(session.id).pendingApprovalCount, 0);
   assert.equal(daemon.store.getSession(session.id).status, 'idle');
-  await click('历史', context);
+  await click('历史', context, true);
   await until(() => evaluate(`!!document.querySelector('[aria-label="关闭 browser-expire"]')`, context), 'history close');
   await evaluate(`document.querySelector('[aria-label="关闭 browser-expire"]').click()`, context);
   await until(() => daemon.sessionManager.getRequestBroker(session.id).get('browser-expire').closed, 'close persisted');
   fs.writeFileSync(path.join(run, 'closed.png'), Buffer.from((await cdp.call('Page.captureScreenshot', { format: 'png' })).data, 'base64'));
   await daemon.stop(); daemon = createDaemon(options); address = await daemon.start();
-  context = await navigate(); await click('历史', context);
+  context = await navigate(); await click('历史', context, true);
   assert.equal(await evaluate(`!!document.querySelector('[data-request-id="browser-expire"]')`, context), false);
   assert.equal(daemon.sessionManager.getRequestBroker(session.id).get('browser-expire').closed, true);
   evidence.steps.push({ expired: 'removed from pending', closed: 'persisted by stable ID', restart: 'not resurrected', pending: daemon.store.getSession(session.id).pendingApprovalCount });

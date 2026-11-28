@@ -15,6 +15,7 @@ import {
   createStaleReconcilingFixture,
   ensureDefaultWorkbenchViewsRegistered,
 } from '../src/components/agy/native/shared';
+import { NativeRequestQueuePanel } from '../src/plugins/requests-view-default/native/NativeRequestQueuePanel';
 import type { NativeRequestReceiptDto } from '../src/lib/native-client';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -96,11 +97,45 @@ describe('NP-17 Four UI Experience States (Actionable / Read-Only / No-Data / St
       />,
     );
 
-    for (const label of fourStateMatrix.states.actionable.expectButtons) {
-      expect(html).toContain(label);
-    }
-    expect(html).toContain(`data-testid="${fourStateMatrix.states.actionable.expectDataTestId}"`);
+    // Batch 4 W2: AGY Workbench shows read-only request reference with receipt state and NO fallback approve/deny buttons;
+    // interactive actionable controls belong to the bound requests-view-default plugin (NativeRequestDetailCard).
+    expect(html).toContain('data-testid="native-request-reference"');
     expect(html).toContain(`data-receipt-state="${fourStateMatrix.states.actionable.expectReceiptState}"`);
+    for (const label of fourStateMatrix.states.actionable.expectButtons) {
+      expect(html).not.toContain(label);
+    }
+
+    const requestViewHtml = renderToStaticMarkup(
+      <NativeRequestQueuePanel
+        title="Actionable Requests"
+        projection={{
+          ...fx.projection,
+          receipts: {
+            [pendingApproval.id]: {
+              ...pendingReceipt,
+              runtimeId: fx.projection.binding.runtimeId,
+              generation: fx.projection.binding.generation,
+              allowedOptionIds: ['allow_once', 'allow_session', 'reject_once'],
+            } as unknown as NativeRequestReceiptDto,
+          },
+        }}
+        approvals={[pendingApproval]}
+        metadataByApprovalId={{
+          [pendingApproval.id]: {
+            options: [
+              { optionId: 'allow_once', name: '允许本次', kind: 'allow_once' },
+              { optionId: 'allow_session', name: '本会话信任', kind: 'allow_always' },
+              { optionId: 'reject_once', name: '拒绝', kind: 'reject_once' },
+            ],
+          },
+        }}
+        onResolveNative={async () => ({})}
+      />,
+    );
+    for (const label of fourStateMatrix.states.actionable.expectButtons) {
+      expect(requestViewHtml).toContain(label);
+    }
+    expect(requestViewHtml).toContain(`data-receipt-state="${fourStateMatrix.states.actionable.expectReceiptState}"`);
   });
 
   it('2. Read-only state disables write actions across disconnected workbench, review gate-off, and settings boundaries', () => {

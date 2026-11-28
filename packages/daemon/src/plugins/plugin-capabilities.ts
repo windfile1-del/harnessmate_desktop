@@ -248,7 +248,8 @@ export class PluginCapabilities {
     return await new Promise<string>((resolve, reject) => {
       const id = `appr_model_${randomBytes(8).toString('hex')}`;
       broker.register({ workspaceId: session.workspaceId,
-        approval: { id, sessionId: session.id, nativeRequestId: id, kind: 'mcp_tool_approval', toolName: name,
+        approval: { id, sessionId: session.id, nativeRequestId: id, kind: 'mcp_tool_approval',
+          toolName: tool.kind === 'isolated' ? tool.toolName : name,
           toolKind: tool.readOnly ? 'file_read' : 'mcp', summary: name, input: args,
           riskLevel: tool.readOnly ? 'low' : 'medium', supportedDecisions: ['allow_once','deny'],
           status: 'pending', createdAt: Date.now(), resolvedAt: null, decision: null, resolvedBy: null, comment: null },

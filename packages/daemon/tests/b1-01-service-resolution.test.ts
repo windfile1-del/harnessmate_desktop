@@ -490,11 +490,16 @@ it('loads distribution defaults from harnessmate-core data, preserves legacy pro
   ]);
   comp.reload([]);
   expect(comp.layerBindings).toEqual({
+    'agy.accounts.v1': 'harness-agy',
+    'agy.runtime.v1': 'harness-agy',
+    'agy.workbench.v1': 'hm.plugin.agy-workbench-default',
     'chat.view.v1': 'hm.plugin.chat-default',
     'browser.v1': 'hm.plugin.browser-desktop',
     'filePreview.v1': 'hm.plugin.file-preview-text',
     'approval.policy.v1': 'hm.plugin.approval-policy-default',
     'history.import.v1': 'hm.plugin.history-import',
+    'runtime.requests.v1': 'hm.plugin.approval-center',
+    'runtime.requests.view.v1': 'hm.plugin.requests-view-default',
     'session.search.v1': 'hm.plugin.session-search-fts',
     'session.data.v1': 'hm.plugin.session-data-default',
     'session.runtime.v1': 'hm.plugin.session-runtime-default',

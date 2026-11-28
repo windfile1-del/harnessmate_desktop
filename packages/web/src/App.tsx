@@ -1,12 +1,10 @@
 import { useShallow } from 'zustand/react/shallow';
 import { X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import type { DiagnosticEntry } from './lib/projector';
 import { BoundSessionSurface, useBoundSessionPlugin } from './slots/BoundSessionSurface';
-import { InspectorDrawer } from './components/InspectorDrawer';
 import { KernelRecoveryView } from './components/KernelRecoveryView';
 import { PluginWorkspaceStage } from './slots/PluginWorkspace';
-import { ModalHost } from './components/Modals';
 import { Sidebar } from './components/Sidebar';
 import { TriageInboxLifecycle, openTriageSession } from './components/TriageInbox';
 import { isImeComposing, trackComposition } from './lib/ime';
@@ -19,7 +17,17 @@ import {
   SlotSessionProvider,
   useSlotItems,
 } from './slots';
+import { ensureSharedPluginRuntime } from './slots/shared-runtime';
 import { useAppStore } from './stores/app-store';
+
+ensureSharedPluginRuntime();
+
+const InspectorDrawer = lazy(() =>
+  import('./components/InspectorDrawer').then((m) => ({ default: m.InspectorDrawer })),
+);
+const ModalHost = lazy(() =>
+  import('./components/Modals').then((m) => ({ default: m.ModalHost })),
+);
 
 function StatusbarSlotStrip({ session }: { session: import('@harnessmate/protocol').Session | null }) {
   const items = useSlotItems('statusbar.items');
@@ -157,14 +165,26 @@ export function App() {
             {emptyComposition ? (
               <>
                 <KernelRecoveryView />
-                <ModalHost />
+                {activeModal && (
+                  <Suspense fallback={null}>
+                    <ModalHost />
+                  </Suspense>
+                )}
               </>
             ) : (
               <>
                 {!sidebarCollapsed && <Sidebar />}
                 <PluginWorkspaceStage><MainStageContent selectedSession={selectedSession} /></PluginWorkspaceStage>
-                {inspectorOpen && selectedSession && <InspectorDrawer session={selectedSession} diagnostics={presentation?.sessionId === selectedSession.id ? presentation.diagnostics : []} />}
-                <ModalHost />
+                {inspectorOpen && selectedSession && (
+                  <Suspense fallback={null}>
+                    <InspectorDrawer session={selectedSession} diagnostics={presentation?.sessionId === selectedSession.id ? presentation.diagnostics : []} />
+                  </Suspense>
+                )}
+                {activeModal && (
+                  <Suspense fallback={null}>
+                    <ModalHost />
+                  </Suspense>
+                )}
               </>
             )}
           </div>

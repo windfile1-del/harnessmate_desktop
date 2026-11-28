@@ -27,7 +27,7 @@ export function RequestQueue({ initialHistory = false }: { initialHistory?: bool
   const { session, requests, mode, error, refresh } = useRequestViewStore();
   const [history, setHistory] = useState(initialHistory);
   const [rules, setRules] = useState(false);
-  useEffect(startRequestView, []);
+  useEffect(() => startRequestView(), []);
   const visible = visibleRequests(requests, history);
   const resolve = async (id: string, input: ResolveApprovalRequest) => {
     try {

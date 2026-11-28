@@ -25,7 +25,7 @@ import {
   AgyWorkbenchRegistry,
 } from '../src/components/agy/native/shared';
 import { SubagentManagerView } from '../src/components/agy/native/child/SubagentManagerView';
-import { NativeRequestQueuePanel } from '../src/components/agy/native/requests/NativeRequestQueuePanel';
+import { NativeRequestQueuePanel } from '../src/plugins/requests-view-default/native/NativeRequestQueuePanel';
 import {
   NativeFeedController,
   applyNativeEventBatch,
@@ -402,13 +402,9 @@ describe('NP-16 T18 · Web Scale Virtualization, Focus, Overflow Observability &
       },
     });
 
-    const outcome = await useAppStore.getState().resolveRuntimeRequest('appr_race_1', {
-      decision: 'allow_once',
-      resolvedBy: 'desktop',
-    });
-    expect(outcome).toEqual({ conflict: true, resolvedBy: 'mobile' });
-    expect(resolveMock).toHaveBeenCalledOnce();
-    expect(useAppStore.getState().pendingApprovals).toHaveLength(0);
+    // Batch 4 W2: host app-store no longer owns approval resolution (moved to requests-view-default plugin)
+    expect('resolveRuntimeRequest' in useAppStore.getState()).toBe(false);
+    expect(resolveMock).not.toHaveBeenCalled();
 
     // Clear session / disable native gate resets scope state cleanly
     useAppStore.getState().clearNativeSessionState(sampleAgySession.id);

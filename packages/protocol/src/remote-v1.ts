@@ -525,6 +525,9 @@ export const WsServerFrameSchema = z.discriminatedUnion('op', [
     instanceId: z.string(),
     runId: z.string().optional(),
     reset: z.boolean().optional(),
+    serverFlushedAt: z.number().optional(),
+    queueDepth: z.number().int().nonnegative().optional(),
+    backlogMs: z.number().nonnegative().optional(),
     events: z.array(z.object({ seq: z.number(), emittedAt: z.number(), payload: z.record(z.unknown()) })),
   }),
   z.object({

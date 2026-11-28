@@ -15,6 +15,7 @@ import {
   type SessionDataStreamIdentity,
 } from '@harnessmate/plugin-api';
 import type { DaemonEventBus } from '../core/event-bus.js';
+import { perfDiagnostics } from '../core/perf-diagnostics.js';
 import type { SessionManager } from '../core/session-manager.js';
 import type { TerminalWorkspaceService } from '../core/terminal-workspace-service.js';
 import { resolveTerminalProviderForTerminalIdAsync } from '../core/w1-service-helpers.js';
@@ -193,30 +194,85 @@ export class WsGateway {
           serviceUnsubs.delete(frame.subscriptionId);
           const pm = this.deps.pluginManager;
           const provider = pm?.host.getServiceRecordByInstance(frame.instanceId, frame.contract);
-          const sendBatch = (events: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }>, reset = false) =>
-            this.send(ws, { op: 'service_batch', subscriptionId: frame.subscriptionId,
-              instanceId: frame.instanceId, runId: provider?.runId, events, ...(reset ? { reset: true } : {}) });
+          const sendBatch = (
+            events: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }>,
+            reset = false,
+            meta?: { serverFlushedAt?: number; queueDepth?: number; backlogMs?: number },
+          ) =>
+            this.send(ws, {
+              op: 'service_batch',
+              subscriptionId: frame.subscriptionId,
+              instanceId: frame.instanceId,
+              runId: provider?.runId,
+              events,
+              ...(reset ? { reset: true } : {}),
+              ...(meta?.serverFlushedAt !== undefined ? { serverFlushedAt: meta.serverFlushedAt } : {}),
+              ...(meta?.queueDepth !== undefined ? { queueDepth: meta.queueDepth } : {}),
+              ...(meta?.backlogMs !== undefined ? { backlogMs: meta.backlogMs } : {}),
+            });
           if (!pm || !provider || isReservedServiceName(frame.contract)
             || (frame.runId && provider.runId !== frame.runId) || !pm.isInstanceEnabled(frame.instanceId)) {
             sendBatch([], true);
             break;
           }
           let queue: Array<{ seq: number; emittedAt: number; payload: Record<string, unknown> }> = [];
+          let oldestEnqueuedAt = 0;
+          let lastFlushAt = 0;
           let timer: ReturnType<typeof setTimeout> | undefined;
           let released = false;
+          perfDiagnostics.adjustSubscription('wsService', 1);
+          const clearFlushTimer = () => {
+            if (timer) {
+              clearTimeout(timer);
+              timer = undefined;
+              perfDiagnostics.adjustTimer('wsServiceFlush', -1);
+            }
+          };
           const flush = () => {
-            timer = undefined;
+            if (timer) {
+              timer = undefined;
+              perfDiagnostics.adjustTimer('wsServiceFlush', -1);
+            }
             if (released || !queue.length) return;
             const batch = queue;
+            const batchSize = batch.length;
+            const enqueuedAt = oldestEnqueuedAt || Date.now();
             queue = [];
+            oldestEnqueuedAt = 0;
+            const flushedAt = Date.now();
+            lastFlushAt = flushedAt;
+            const backlogMs = Math.max(0, flushedAt - enqueuedAt);
+            const depthAfter = perfDiagnostics.adjustQueueDepth('wsService', -batchSize);
             if (ws.bufferedAmount > 2 * 1024 * 1024) { sendBatch([], true); release(); return; }
-            sendBatch(batch);
+            const firstPayload = batch[0]?.payload as { sessionId?: string; trace?: { runtimeReceivedAt?: number; committedAt?: number } } | undefined;
+            perfDiagnostics.recordBatchFlush('wsService', {
+              batchSize,
+              backlogMs,
+              queueDepthAfter: depthAfter,
+              trace: {
+                sessionId: firstPayload?.sessionId,
+                contract: frame.contract,
+                runtimeReceivedAt: firstPayload?.trace?.runtimeReceivedAt,
+                postCommitAt: firstPayload?.trace?.committedAt,
+                wsEnqueuedAt: enqueuedAt,
+                wsFlushedAt: flushedAt,
+              },
+            });
+            sendBatch(batch, false, { serverFlushedAt: flushedAt, queueDepth: depthAfter, backlogMs });
           };
           const unsub = pm.host.subscribeServiceChannel(frame.contract, (event) => {
             if (event.instanceId !== frame.instanceId || released) return;
+            const now = Date.now();
+            if (!queue.length) oldestEnqueuedAt = now;
             queue.push({ seq: event.seq, emittedAt: event.emittedAt, payload: event.payload });
-            if (queue.length >= 256) { if (timer) clearTimeout(timer); flush(); }
-            else timer ??= setTimeout(flush, 16);
+            perfDiagnostics.adjustQueueDepth('wsService', 1);
+            if (queue.length >= 256 || (!timer && now - lastFlushAt >= 12)) {
+              clearFlushTimer();
+              flush();
+            } else if (!timer) {
+              perfDiagnostics.adjustTimer('wsServiceFlush', 1);
+              timer = setTimeout(flush, 12);
+            }
           });
           const changed = pm.host.onServicesChanged(() => {
             const current = pm.host.getServiceRecordByInstance(frame.instanceId, frame.contract);
@@ -227,8 +283,12 @@ export class WsGateway {
           const release = () => {
             if (released) return;
             released = true; unsub(); changed();
-            if (timer) clearTimeout(timer);
-            queue = [];
+            clearFlushTimer();
+            if (queue.length) {
+              perfDiagnostics.adjustQueueDepth('wsService', -queue.length);
+              queue = [];
+            }
+            perfDiagnostics.adjustSubscription('wsService', -1);
             serviceUnsubs.delete(frame.subscriptionId);
           };
           serviceUnsubs.set(frame.subscriptionId, release);

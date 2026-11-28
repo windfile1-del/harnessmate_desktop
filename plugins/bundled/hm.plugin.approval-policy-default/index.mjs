@@ -3,7 +3,12 @@ export function apply(ctx, config = {}) {
   const deniedTools = new Set(config.deniedTools ?? []);
   const evaluate = req => {
     if (req.kind === 'user_question' || req.kind === 'secret_request') return { decision: 'ask' };
-    if (deniedTools.has(req.toolName)) return { decision: 'deny', reason: 'configured denied tool' };
+    const shortToolName = typeof req.toolName === 'string' && req.toolName.includes('__')
+      ? req.toolName.slice(req.toolName.lastIndexOf('__') + 2)
+      : req.toolName;
+    if (deniedTools.has(req.toolName) || deniedTools.has(shortToolName)) {
+      return { decision: 'deny', reason: `审批策略拒绝工具: ${shortToolName}` };
+    }
     // Preserve old model-tool callers that have no permission-mode context.
     if (!req.mode) return { decision: 'allow', scope: 'once' };
     if ((config.reviewHighRisk ?? true) && ['high','critical'].includes(req.riskLevel)) return { decision: 'ask', reason: 'default risk review' };

@@ -238,6 +238,13 @@ export interface SessionCommittedChangesResponseV1 {
   hasMore: boolean;
 }
 
+export interface SessionDataTraceTimestamps {
+  /** Wall-clock ms when runtime plugin received the originating driver event (first event for coalesced deltas). */
+  runtimeReceivedAt?: number;
+  /** Wall-clock ms captured strictly after the SQLite/data transaction committed (distinct from event createdAt). */
+  committedAt?: number;
+}
+
 export interface SessionEventsPageResponseV1 {
   sessionId: string;
   stream: SessionDataStreamIdentity;
@@ -245,6 +252,8 @@ export interface SessionEventsPageResponseV1 {
   lastSeq: number;
   nextAfterSeq: number | null;
   hasMore: boolean;
+  earliestSeq?: number | null;
+  hasEarlier?: boolean;
 }
 
 export interface SessionUpdatePatchDto {
@@ -290,6 +299,7 @@ export interface SessionDataCommitBatchRequest {
   bindingUpsert?: SessionHarnessBindingDto;
   settleRunningItemsStatus?: 'completed' | 'interrupted' | 'cancelled';
   turnReceipt?: SessionTurnReceiptDto;
+  trace?: SessionDataTraceTimestamps;
 }
 
 export interface SessionDataCommitBatchResult {
@@ -298,6 +308,7 @@ export interface SessionDataCommitBatchResult {
   committedEvents: SessionCanonicalEventDto[];
   latestSeq: number;
   changeSeq: number;
+  trace?: SessionDataTraceTimestamps;
 }
 
 export interface SessionDataChannelEvent {
@@ -307,6 +318,7 @@ export interface SessionDataChannelEvent {
   sessionId?: string;
   workspaceId?: string;
   events?: SessionCanonicalEventDto[];
+  trace?: SessionDataTraceTimestamps;
 }
 
 export interface SessionDataServiceV1 {
@@ -364,7 +376,10 @@ export interface SessionDataServiceV1 {
   listEvents(req: {
     sessionId: string;
     afterSeq?: number;
+    beforeSeq?: number;
     throughSeq?: number;
+    tail?: boolean;
+    minTurnEvents?: number;
     turnId?: string;
     limit?: number;
   }): Promise<ServiceMethodResult<SessionEventsPageResponseV1>>;

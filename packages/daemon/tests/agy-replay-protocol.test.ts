@@ -254,7 +254,7 @@ describe('Phase AGY-6: AGY 1.5.14 Offline Protocol Replay Suite', () => {
 
     await daemon.sessionManager.resolveRuntimeRequest(
       secApproval.id,
-      { decision: 'approve_once' },
+      { decision: 'allow_once' },
       'desktop',
     );
 

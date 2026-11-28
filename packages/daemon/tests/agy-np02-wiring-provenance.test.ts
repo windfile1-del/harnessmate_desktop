@@ -644,6 +644,7 @@ describe('AGY REST/WS contracts: R2 concurrent idempotency & control/approval lo
       },
     ];
 
+    const resolvedStubApprovals = new Set<string>();
     const permStub: NativePermissionPort = {
       onIncomingRequest: () => null,
       onConnectionClosed: () => {},
@@ -668,6 +669,28 @@ describe('AGY REST/WS contracts: R2 concurrent idempotency & control/approval lo
         return {
           approvalId,
           receiptId,
+          receiptState: 'response_written',
+          conflict: false,
+        };
+      },
+      validateResolutionInput: (_b, approvalId) =>
+        resolvedStubApprovals.has(approvalId)
+          ? { valid: false, errorCode: 'REQUEST_NOT_PENDING' }
+          : { valid: true },
+      resolveWithCas: async ({ approvalId }) => {
+        if (resolvedStubApprovals.has(approvalId)) {
+          return {
+            approvalId,
+            receiptId: `rcpt_${approvalId}`,
+            receiptState: 'response_written',
+            conflict: true,
+          };
+        }
+        resolvedStubApprovals.add(approvalId);
+        approvalExecutions += 1;
+        return {
+          approvalId,
+          receiptId: `rcpt_${approvalId}`,
           receiptState: 'response_written',
           conflict: false,
         };

@@ -16,7 +16,8 @@
         "slot": "workspace.pages",
         "id": "chat",
         "title": "聊天",
-        "ui": "ui/index.html"
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs"
       }
     ]
   },

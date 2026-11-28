@@ -1,14 +1,22 @@
-import { createRoot } from 'react-dom/client';
 import { useEffect } from 'react';
+import { createRoot } from 'react-dom/client';
+import { SlotRegistryProvider, SlotSessionProvider } from '../../slots/hooks';
+import '../../styles/theme.css';
+import { ChatSlotSync } from './ChatSlotSync';
 import { ChatStage } from './ChatStage';
 import { startChatView, useAppStore } from './store';
-import { SlotRegistryProvider, SlotSessionProvider } from '../../slots/hooks';
-import { PluginSlotSync } from '../../slots/PluginSlotSync';
-import '../../styles/theme.css';
 
 function Page() {
-  const session = useAppStore(state=>state.sessions.find(item=>item.id===state.selectedSessionId) ?? null);
-  useEffect(startChatView, []);
-  return <SlotRegistryProvider><SlotSessionProvider session={session}><PluginSlotSync/><ChatStage/></SlotSessionProvider></SlotRegistryProvider>;
+  const session = useAppStore((state) => state.sessions.find((item) => item.id === state.selectedSessionId) ?? null);
+  useEffect(() => startChatView(), []);
+  return (
+    <SlotRegistryProvider>
+      <SlotSessionProvider session={session}>
+        <ChatSlotSync />
+        <ChatStage />
+      </SlotSessionProvider>
+    </SlotRegistryProvider>
+  );
 }
-createRoot(document.getElementById('root')!).render(<Page/>);
+
+createRoot(document.getElementById('root')!).render(<Page />);

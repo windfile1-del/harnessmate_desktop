@@ -6,7 +6,7 @@ import type {
 } from '@harnessmate/protocol';
 import { Loader2, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { daemonApi, sharedDaemonWs } from '../api/client';
+import { daemonApi, getSharedDaemonWs } from '../api/client';
 import { isAbortError } from '../api/peer-workspace-client';
 import { useAppStore } from '../stores/app-store';
 import { useSlotRegistry, useSlotTheme } from './hooks';
@@ -179,7 +179,7 @@ export function SandboxedPluginFrame({
         .map((field) => [field, state[field]]));
       if (Object.keys(patch).length) iframeRef.current?.contentWindow?.postMessage({ type: 'hm:shell:state', runId: activeRunId, patch }, '*');
     });
-    const unsubscribeOutput = sharedDaemonWs?.observeFrames((frame) => {
+    const unsubscribeOutput = getSharedDaemonWs()?.observeFrames((frame) => {
       if (frame.op === 'command_output' && outputSubscriptions.has(`${frame.sessionId}::${frame.toolCallId}`)) {
         iframeRef.current?.contentWindow?.postMessage({ type: 'hm:output', runId: activeRunId, frame }, '*');
       }
@@ -222,7 +222,7 @@ export function SandboxedPluginFrame({
         return {};
       }
       if (method === 'services.subscribe') {
-        const connection = sharedDaemonWs;
+        const connection = getSharedDaemonWs();
         if (!connection) throw new Error('事件连接尚未就绪');
         const contract = String(params?.contract ?? '');
         const instanceId = String(params?.instanceId ?? '');

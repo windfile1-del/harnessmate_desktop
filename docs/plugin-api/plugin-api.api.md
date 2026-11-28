@@ -2010,12 +2010,32 @@ export declare function normalizePluginSlotKey(key: string): PluginSlotKey;
 export declare function normalizeAnyPluginSlotKey(key: string): AnyPluginSlotKey;
 export declare function isValidPluginSlotKey(key: string): key is AnyPluginSlotKey;
 export declare function isSafePluginUiPath(value: string): boolean;
+export declare function isSafePluginModulePath(value: string): boolean;
+export declare const PluginSlotMountModeSchema: z.ZodEnum<["iframe", "trusted-module"]>;
+export type PluginSlotMountMode = z.infer<typeof PluginSlotMountModeSchema>;
+export declare const PluginSlotWhenSchema: z.ZodObject<{
+    harnessKinds: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, "strict", z.ZodTypeAny, {
+    harnessKinds?: string[] | undefined;
+}, {
+    harnessKinds?: string[] | undefined;
+}>;
+export type PluginSlotWhen = z.infer<typeof PluginSlotWhenSchema>;
 export declare const PluginSlotKeyInputSchema: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "inspector.files", "inspector.rules", "session.stage.embedded", "session.sidebar.badge"]>;
 export declare const PluginSlotContributionSchema: z.ZodObject<{
     slot: z.ZodEnum<["workspace.pages", "workspace.start", "session.header.title", "sidebar.tools", "composer.actions", "inspector.tabs", "inspector.tab", "statusbar.items", "chat.node", "tool.result", "approval.detail", "chat.message.wrapper", "chat.block", "composer.traits", "harness.settings", "inspector.diff", "inspector.files", "inspector.rules", "session.stage.embedded", "session.sidebar.badge"]>;
     id: z.ZodString;
     title: z.ZodString;
     ui: z.ZodEffects<z.ZodString, string, string>;
+    module: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
+    mountMode: z.ZodOptional<z.ZodEnum<["iframe", "trusted-module"]>>;
+    when: z.ZodOptional<z.ZodObject<{
+        harnessKinds: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+    }, "strict", z.ZodTypeAny, {
+        harnessKinds?: string[] | undefined;
+    }, {
+        harnessKinds?: string[] | undefined;
+    }>>;
     order: z.ZodOptional<z.ZodNumber>;
     key: z.ZodOptional<z.ZodString>;
     height: z.ZodOptional<z.ZodNumber>;
@@ -2026,6 +2046,11 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
     ui: string;
     order?: number | undefined;
     key?: string | undefined;
+    module?: string | undefined;
+    mountMode?: "iframe" | "trusted-module" | undefined;
+    when?: {
+        harnessKinds?: string[] | undefined;
+    } | undefined;
     height?: number | undefined;
 }, {
     id: string;
@@ -2034,6 +2059,11 @@ export declare const PluginSlotContributionSchema: z.ZodObject<{
     ui: string;
     order?: number | undefined;
     key?: string | undefined;
+    module?: string | undefined;
+    mountMode?: "iframe" | "trusted-module" | undefined;
+    when?: {
+        harnessKinds?: string[] | undefined;
+    } | undefined;
     height?: number | undefined;
 }>;
 export type PluginSlotContribution = z.infer<typeof PluginSlotContributionSchema>;
@@ -2042,6 +2072,9 @@ export interface PluginRuntimeSlotDescriptor {
     id: string;
     title: string;
     ui: string;
+    module?: string;
+    mountMode?: PluginSlotMountMode;
+    when?: PluginSlotWhen;
     order?: number;
     key?: string;
     height?: number;
@@ -2496,6 +2529,12 @@ export interface SessionCommittedChangesResponseV1 {
     cursor: SessionDataCursor;
     hasMore: boolean;
 }
+export interface SessionDataTraceTimestamps {
+    /** Wall-clock ms when runtime plugin received the originating driver event (first event for coalesced deltas). */
+    runtimeReceivedAt?: number;
+    /** Wall-clock ms captured strictly after the SQLite/data transaction committed (distinct from event createdAt). */
+    committedAt?: number;
+}
 export interface SessionEventsPageResponseV1 {
     sessionId: string;
     stream: SessionDataStreamIdentity;
@@ -2503,6 +2542,8 @@ export interface SessionEventsPageResponseV1 {
     lastSeq: number;
     nextAfterSeq: number | null;
     hasMore: boolean;
+    earliestSeq?: number | null;
+    hasEarlier?: boolean;
 }
 export interface SessionUpdatePatchDto {
     title?: string;
@@ -2544,6 +2585,7 @@ export interface SessionDataCommitBatchRequest {
     bindingUpsert?: SessionHarnessBindingDto;
     settleRunningItemsStatus?: 'completed' | 'interrupted' | 'cancelled';
     turnReceipt?: SessionTurnReceiptDto;
+    trace?: SessionDataTraceTimestamps;
 }
 export interface SessionDataCommitBatchResult {
     stream: SessionDataStreamIdentity;
@@ -2551,6 +2593,7 @@ export interface SessionDataCommitBatchResult {
     committedEvents: SessionCanonicalEventDto[];
     latestSeq: number;
     changeSeq: number;
+    trace?: SessionDataTraceTimestamps;
 }
 export interface SessionDataChannelEvent {
     kind: 'events_committed' | 'session_changed' | 'session_deleted' | 'workspace_changed';
@@ -2559,6 +2602,7 @@ export interface SessionDataChannelEvent {
     sessionId?: string;
     workspaceId?: string;
     events?: SessionCanonicalEventDto[];
+    trace?: SessionDataTraceTimestamps;
 }
 export interface SessionDataServiceV1 {
     getStreamInfo(): Promise<ServiceMethodResult<{
@@ -2643,7 +2687,10 @@ export interface SessionDataServiceV1 {
     listEvents(req: {
         sessionId: string;
         afterSeq?: number;
+        beforeSeq?: number;
         throughSeq?: number;
+        tail?: boolean;
+        minTurnEvents?: number;
         turnId?: string;
         limit?: number;
     }): Promise<ServiceMethodResult<SessionEventsPageResponseV1>>;

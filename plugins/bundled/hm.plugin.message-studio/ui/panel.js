@@ -90,7 +90,51 @@ function renderTool(block) {
   }
 }
 
+let lastTimelineSig = '';
+
+function renderTimeline() {
+  const all = Array.isArray(props.entries) ? props.entries : [];
+  const entries = all.length > 80 ? all.slice(-80) : all;
+  const sig = `${entries.length}|${entries[0]?.id ?? ''}|${entries.at(-1)?.id ?? ''}|${entries.at(-1)?.failed ?? ''}|${props.activeTurnId ?? ''}`;
+  if (sig === lastTimelineSig) return;
+  lastTimelineSig = sig;
+  let nav = view.querySelector('nav');
+  if (!nav) {
+    view.replaceChildren();
+    nav = node('nav');
+  }
+  const existing = nav.children;
+  for (let i = 0; i < entries.length; i++) {
+    const item = entries[i];
+    const mark = item.failed ? '!' : item.kind === 'turn' ? '•' : '−';
+    let point = existing[i];
+    if (!point) {
+      point = document.createElement('button');
+      point.type = 'button';
+      nav.append(point);
+    }
+    if (point.textContent !== mark) point.textContent = mark;
+    if (point.title !== item.label) {
+      point.title = item.label;
+      point.setAttribute('aria-label', item.label);
+    }
+    const isCurrent = String(item.id === props.activeTurnId);
+    if (point.getAttribute('aria-current') !== isCurrent) {
+      point.setAttribute('aria-current', isCurrent);
+    }
+    point.disabled = item.kind !== 'turn';
+    point.onclick = () => action('jump', { turnId: item.id }).catch(showError);
+  }
+  while (nav.children.length > entries.length) {
+    nav.lastElementChild.remove();
+  }
+}
+
 function render() {
+  if (bridge.slotId === 'studio-timeline') {
+    renderTimeline();
+    return;
+  }
   const focus = document.activeElement?.matches('input') ? document.activeElement.selectionStart : null;
   view.replaceChildren();
   if (bridge.slotId === 'studio-tool' && props.block) renderTool(props.block);
@@ -104,17 +148,6 @@ function render() {
     const detail = node('details');
     node('summary', title ?? summary ?? originalType ?? type, detail);
     node('pre', textBody ?? JSON.stringify(payload ?? data ?? {}, null, 2), detail);
-  }
-  if (bridge.slotId === 'studio-timeline') {
-    const nav = node('nav');
-    for (const item of props.entries ?? []) {
-      const mark = item.failed ? '!' : item.kind === 'turn' ? '•' : '−';
-      const point = button(mark, () => action('jump', { turnId: item.id }).catch(showError), nav);
-      point.title = item.label;
-      point.setAttribute('aria-label', item.label);
-      point.setAttribute('aria-current', String(item.id === props.activeTurnId));
-      point.disabled = item.kind !== 'turn';
-    }
   }
   if (readError) node('p', readError).dataset.error = '';
   if (focus !== null) view.querySelector('input')?.focus();

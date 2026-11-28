@@ -429,8 +429,12 @@ export function startWorkbenchBridgeSync(): () => void {
   let releaseRuntimeSub: (() => void) | undefined;
   let releaseAccountsSub: (() => void) | undefined;
 
+  let lastContextKey = '';
   const syncContext = async (session: Session | null) => {
     if (disposed) return;
+    const contextKey = `${session?.id ?? ''}:${session?.harnessKind ?? ''}:${session?.harnessId ?? ''}`;
+    if (contextKey === lastContextKey) return;
+    lastContextKey = contextKey;
     try {
       const snap = (await workbenchBridge.call<Partial<WorkbenchState>>('shell.snapshot')) ?? {};
       if (disposed) return;
@@ -448,7 +452,7 @@ export function startWorkbenchBridgeSync(): () => void {
       // ignore initial snapshot failures
     }
 
-    if (session) {
+    if (session && session.harnessKind === 'agy') {
       try {
         const res = (await workbenchBridge.services.call(
           'agy.workbench.v1',
@@ -471,9 +475,7 @@ export function startWorkbenchBridgeSync(): () => void {
       } catch {
         // ignore
       }
-      if (session.harnessKind === 'agy') {
-        void useAppStore.getState().hydrateNativeRuntime(session.id);
-      }
+      void useAppStore.getState().hydrateNativeRuntime(session.id);
     }
   };
 

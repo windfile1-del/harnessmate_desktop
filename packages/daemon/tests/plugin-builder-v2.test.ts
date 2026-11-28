@@ -229,7 +229,8 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
     expect(issueCodes.has('AUDIT_FORBIDDEN_EVAL')).toBe(true);
     expect(issueCodes.has('AUDIT_FORBIDDEN_FUNCTION_CTOR')).toBe(true);
     expect(issueCodes.has('AUDIT_RESERVED_SERVICE')).toBe(true);
-    expect(issueCodes.has('AUDIT_BUILTIN_DRIVER_HIJACK')).toBe(true);
+    // Batch 4 W1 removed all reserved vendor driver categories (agy/codex/claude/acp are open to peer plugins)
+    expect(issueCodes.has('AUDIT_BUILTIN_DRIVER_HIJACK')).toBe(false);
     expect(issueCodes.has('AUDIT_UNDECLARED_NET_HOST')).toBe(true);
     expect(issueCodes.has('AUDIT_UNSAFE_HTML_EXTERNAL_SCRIPT')).toBe(true);
     expect(issueCodes.has('AUDIT_UNSAFE_HTML_INLINE_HANDLER')).toBe(true);

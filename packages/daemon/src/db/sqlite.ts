@@ -1994,6 +1994,74 @@ export class HarnessMateStore {
     }));
   }
 
+  getEventsBefore(
+    sessionId: string,
+    beforeSeq = Number.MAX_SAFE_INTEGER,
+    limit = 400,
+    afterSeq = 0,
+    minTurnEvents = 0,
+  ): CanonicalEvent[] {
+    let rows = this.db
+      .prepare(
+        `SELECT * FROM session_events
+         WHERE session_id = ? AND seq > ? AND seq < ?
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(sessionId, afterSeq, beforeSeq, limit) as unknown as EventRow[];
+
+    if (minTurnEvents > 0 && rows.length >= limit) {
+      let turnEventCount = 0;
+      for (const r of rows) {
+        if (r.turn_id !== null) turnEventCount += 1;
+      }
+      if (turnEventCount < minTurnEvents) {
+        const anchorRows = this.db
+          .prepare(
+            `SELECT seq FROM session_events
+             WHERE session_id = ? AND seq > ? AND seq < ? AND turn_id IS NOT NULL
+             ORDER BY seq DESC
+             LIMIT ?`,
+          )
+          .all(sessionId, afterSeq, beforeSeq, minTurnEvents) as unknown as Array<{ seq: number }>;
+        const anchorSeq = anchorRows.length > 0 ? anchorRows[anchorRows.length - 1]!.seq : undefined;
+        const currentOldest = rows[rows.length - 1]!.seq;
+        if (anchorSeq !== undefined && anchorSeq < currentOldest) {
+          const maxSpan = Math.max(limit, 4000);
+          rows = this.db
+            .prepare(
+              `SELECT * FROM session_events
+               WHERE session_id = ? AND seq >= ? AND seq < ?
+               ORDER BY seq DESC
+               LIMIT ?`,
+            )
+            .all(sessionId, anchorSeq, beforeSeq, maxSpan) as unknown as EventRow[];
+        }
+      }
+    }
+
+    rows.reverse();
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      seq: r.seq,
+      type: r.type as CanonicalEventType,
+      turnId: r.turn_id,
+      createdAt: r.created_at,
+      payload: safeJsonParse<Record<string, unknown>>(r.payload_json, {}),
+    }));
+  }
+
+  hasEventsBefore(sessionId: string, beforeSeq: number, afterSeq = 0): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit FROM session_events
+         WHERE session_id = ? AND seq > ? AND seq < ?
+         LIMIT 1`,
+      )
+      .get(sessionId, afterSeq, beforeSeq) as { hit?: number } | undefined;
+    return Boolean(row?.hit);
+  }
+
   *iterateEvents(sessionId: string, afterSeq = 0, upToSeq = Number.MAX_SAFE_INTEGER): Generator<CanonicalEvent> {
     const pageSize = 1000;
     while (afterSeq < upToSeq) {

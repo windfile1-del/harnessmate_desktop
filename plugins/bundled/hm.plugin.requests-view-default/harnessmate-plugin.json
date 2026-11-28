@@ -19,6 +19,7 @@
         "id": "requests-queue",
         "title": "请求与审批",
         "ui": "ui/index.html",
+        "module": "ui/module.mjs",
         "height": 180
       }
     ]

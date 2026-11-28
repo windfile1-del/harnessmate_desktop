@@ -132,6 +132,7 @@ import { registerHarnessIntegrationCompat } from './routes/harness-integration-c
 import { invalidateAccountUsage } from '../plugin-host/builtin/harness-integration.js';
 import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
 import { runPluginProgram } from '../plugins/plugin-program.js';
+import { perfDiagnostics } from '../core/perf-diagnostics.js';
 import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
 import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
 import type { CrashPolicy } from '../plugin-host/isolation/isolated-process.js';
@@ -529,6 +530,28 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       })();
     }, 80);
     return reply;
+  });
+
+  app.get('/api/v1/diagnostics/perf', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'Performance diagnostics only allowed from loopback' });
+    }
+    const query = request.query as { traces?: string };
+    const includeTraces = query.traces === '1' || query.traces === 'true' || perfDiagnostics.isEnabled();
+    return perfDiagnostics.snapshot(includeTraces);
+  });
+
+  app.post('/api/v1/diagnostics/perf', async (request, reply) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress)) {
+      return reply.code(403).send({ error: 'Performance diagnostics only allowed from loopback' });
+    }
+    const body = (request.body ?? {}) as { enabled?: boolean; reset?: boolean };
+    if (typeof body.enabled === 'boolean') {
+      perfDiagnostics.setEnabled(body.enabled, Boolean(body.reset));
+    } else if (body.reset) {
+      perfDiagnostics.reset();
+    }
+    return perfDiagnostics.snapshot(perfDiagnostics.isEnabled());
   });
 
   app.get('/api/v1/harnesses', async (request) => {
@@ -1133,7 +1156,9 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     try {
       const asset = resolvePluginUiAsset(pkg.packageRoot, wildcardPath);
       reply.header('Content-Type', asset.contentType);
-      reply.header('Content-Security-Policy', `${SANDBOX_IFRAME_CSP}; sandbox allow-scripts`);
+      if (!asset.contentType.includes('javascript')) {
+        reply.header('Content-Security-Policy', `${SANDBOX_IFRAME_CSP}; sandbox allow-scripts`);
+      }
       reply.header('X-Content-Type-Options', 'nosniff');
       reply.header('Cache-Control', 'no-store');
       return reply.send(asset.buffer);

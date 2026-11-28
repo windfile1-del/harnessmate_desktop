@@ -470,6 +470,82 @@ export function createSessionEventProjector() {
   };
 }
 
+export function createChunkedSessionEventProjector() {
+  let projection = createProjection();
+  let prevChunks: readonly (readonly CanonicalEvent[])[] = [];
+  let prevLastChunkLen = 0;
+  let prevFirstEvent: CanonicalEvent | undefined;
+  let harnessId: string | undefined;
+  let harnessKind: HarnessKind | undefined;
+  let isolateNativePlaceholders = false;
+
+  return (
+    chunks: readonly (readonly CanonicalEvent[])[],
+    fallbackHarness?: { id: string; kind: HarnessKind },
+    options?: SessionProjectorOptions,
+  ): ProjectedTimeline => {
+    const nextIsolate = Boolean(options?.isolateNativePlaceholders);
+    const firstEvent = chunks[0]?.[0];
+    const prevCount = prevChunks.length;
+    let appendOnly =
+      fallbackHarness?.id === harnessId &&
+      fallbackHarness?.kind === harnessKind &&
+      nextIsolate === isolateNativePlaceholders &&
+      chunks.length >= prevCount;
+
+    if (appendOnly && prevCount > 0) {
+      if (firstEvent !== prevFirstEvent) {
+        appendOnly = false;
+      } else {
+        // Every completed prefix chunk must keep exact identity
+        for (let c = 0; c < prevCount - 1; c++) {
+          if (chunks[c] !== prevChunks[c]) {
+            appendOnly = false;
+            break;
+          }
+        }
+        if (appendOnly) {
+          const prevLast = prevChunks[prevCount - 1]!;
+          const curAtPrevLast = chunks[prevCount - 1]!;
+          if (
+            curAtPrevLast.length < prevLastChunkLen ||
+            (prevLastChunkLen > 0 && curAtPrevLast[prevLastChunkLen - 1] !== prevLast[prevLastChunkLen - 1])
+          ) {
+            appendOnly = false;
+          }
+        }
+      }
+    }
+
+    if (!appendOnly) {
+      projection = createProjection(fallbackHarness, { isolateNativePlaceholders: nextIsolate });
+      prevChunks = [];
+      prevLastChunkLen = 0;
+      prevFirstEvent = undefined;
+      harnessId = fallbackHarness?.id;
+      harnessKind = fallbackHarness?.kind;
+      isolateNativePlaceholders = nextIsolate;
+      for (const chunk of chunks) {
+        projection.apply(chunk as CanonicalEvent[], 0);
+      }
+    } else if (chunks.length > 0) {
+      const startChunk = prevCount > 0 ? prevCount - 1 : 0;
+      for (let c = startChunk; c < chunks.length; c++) {
+        const offset = c === startChunk && prevCount > 0 ? prevLastChunkLen : 0;
+        const chunk = chunks[c]!;
+        if (offset < chunk.length) {
+          projection.apply(chunk as CanonicalEvent[], offset);
+        }
+      }
+    }
+
+    prevChunks = chunks;
+    prevLastChunkLen = chunks.length > 0 ? chunks[chunks.length - 1]!.length : 0;
+    prevFirstEvent = firstEvent;
+    return projection.snapshot();
+  };
+}
+
 function classifyFailureFromPayload(p: Record<string, unknown>, message: string): string {
   if (typeof p.failureClass === 'string' && p.failureClass) return p.failureClass;
   if (typeof p.code === 'string' && p.code) return p.code;
@@ -497,6 +573,12 @@ function createProjection(
   const approvalOwners = new Map<string, ProjectedTurn>();
   const pending = new Set<string>();
   const snapshots = new WeakMap<ProjectedTurn, ProjectedTurn>();
+  const blockSnapshots = new WeakMap<TurnBlock, TurnBlock>();
+  const toolSnapshots = new WeakMap<ProjectedToolCall, ProjectedToolCall>();
+  const approvalSnapshots = new WeakMap<ApprovalRequest, ApprovalRequest>();
+  const dirtyBlocks = new Set<TurnBlock>();
+  const dirtyTools = new Set<ProjectedToolCall>();
+  const dirtyApprovals = new Set<ApprovalRequest>();
   const dirty = new Set<ProjectedTurn>();
   let result: ProjectedTimeline = {
     items: [],
@@ -557,12 +639,14 @@ function createProjection(
     if (prevAssistant) {
       prevAssistant.streaming = false;
       (prevAssistant as { status: string }).status = 'completed';
+      dirtyBlocks.add(prevAssistant);
       activeAssistantBlockMap.delete(turnId);
     }
     const prevReasoning = activeReasoningBlockMap.get(turnId);
     if (prevReasoning) {
       prevReasoning.streaming = false;
       (prevReasoning as { status: string }).status = 'completed';
+      dirtyBlocks.add(prevReasoning);
       activeReasoningBlockMap.delete(turnId);
     }
   };
@@ -681,6 +765,7 @@ function createProjection(
         }
         rBlock.text += delta;
         (rBlock as { updatedAt: number }).updatedAt = ev.createdAt;
+        dirtyBlocks.add(rBlock);
         break;
       }
 
@@ -697,6 +782,7 @@ function createProjection(
           rBlock.streaming = false;
           (rBlock as { status: string }).status = 'completed';
           (rBlock as { updatedAt: number }).updatedAt = ev.createdAt;
+          dirtyBlocks.add(rBlock);
           activeReasoningBlockMap.delete(turn.turnId);
         } else if (finalThinking) {
           turn.blocks.push({
@@ -726,6 +812,7 @@ function createProjection(
         if (openReasoning) {
           openReasoning.streaming = false;
           (openReasoning as { status: string }).status = 'completed';
+          dirtyBlocks.add(openReasoning);
           activeReasoningBlockMap.delete(turn.turnId);
         }
         let aBlock = activeAssistantBlockMap.get(turn.turnId);
@@ -749,6 +836,7 @@ function createProjection(
         }
         aBlock.text += delta;
         (aBlock as { updatedAt: number }).updatedAt = ev.createdAt;
+        dirtyBlocks.add(aBlock);
         break;
       }
 
@@ -765,6 +853,7 @@ function createProjection(
           aBlock.streaming = false;
           (aBlock as { status: string }).status = 'completed';
           (aBlock as { updatedAt: number }).updatedAt = ev.createdAt;
+          dirtyBlocks.add(aBlock);
           activeAssistantBlockMap.delete(turn.turnId);
         } else if (finalText) {
           turn.blocks.push({
@@ -860,6 +949,7 @@ function createProjection(
         const tool = toolMap.get(toolCallId);
         if (tool) {
           dirty.add(toolOwners.get(toolCallId)!);
+          dirtyTools.add(tool);
           if (typeof p.outputDelta === 'string') tool.output += p.outputDelta;
           if (typeof p.diffDelta === 'string') tool.diff += p.diffDelta;
           const block = toolBlockMap.get(toolCallId);
@@ -867,6 +957,7 @@ function createProjection(
             if (typeof p.outputDelta === 'string') block.outputPreview = (block.outputPreview ?? '') + p.outputDelta;
             if (typeof p.diffDelta === 'string') block.diff = (block.diff ?? '') + p.diffDelta;
             (block as { updatedAt: number }).updatedAt = ev.createdAt;
+            dirtyBlocks.add(block);
           }
         }
         break;
@@ -877,6 +968,7 @@ function createProjection(
         const tool = toolMap.get(toolCallId);
         if (tool) {
           dirty.add(toolOwners.get(toolCallId)!);
+          dirtyTools.add(tool);
           const st = String(p.status ?? 'success');
           tool.status = st === 'error' ? 'error' : st === 'cancelled' ? 'cancelled' : 'success';
           if (typeof p.output === 'string' && p.output.length > 0) {
@@ -906,6 +998,7 @@ function createProjection(
               block.omittedBytes = typeof p.omittedBytes === 'number' ? p.omittedBytes : 0;
             }
             (block as { updatedAt: number }).updatedAt = ev.createdAt;
+            dirtyBlocks.add(block);
           }
         }
         break;
@@ -929,6 +1022,7 @@ function createProjection(
         const existing = approvalMap.get(approvalId);
         if (existing) {
           dirty.add(approvalOwners.get(approvalId)!);
+          dirtyApprovals.add(existing);
           pending.delete(approvalId);
           const decision = (p.decision as ApprovalDecision | undefined) ?? null;
           existing.decision = decision;
@@ -958,6 +1052,7 @@ function createProjection(
           const existing = approvalMap.get(reqObj.id);
           if (existing) {
             Object.assign(existing, reqObj);
+            dirtyApprovals.add(existing);
             const owner = approvalOwners.get(reqObj.id);
             if (owner) dirty.add(owner);
             if (reqObj.status !== 'pending') pending.delete(reqObj.id);
@@ -1028,13 +1123,46 @@ function createProjection(
       if (!timelineChanged && diagnostics.length === result.diagnostics.length && !detachedChanged) {
         return result;
       }
+      for (const block of dirtyBlocks) {
+        blockSnapshots.set(block, { ...block });
+      }
+      dirtyBlocks.clear();
+      for (const tool of dirtyTools) {
+        toolSnapshots.set(tool, { ...tool });
+      }
+      dirtyTools.clear();
+      for (const approval of dirtyApprovals) {
+        approvalSnapshots.set(approval, { ...approval });
+      }
+      dirtyApprovals.clear();
       for (const turn of dirty) {
         snapshots.set(turn, {
           ...turn,
-          tools: turn.tools.map((tool) => ({ ...tool })),
-          approvals: turn.approvals.map((approval) => ({ ...approval })),
+          tools: turn.tools.map((tool) => {
+            let snap = toolSnapshots.get(tool);
+            if (!snap) {
+              snap = { ...tool };
+              toolSnapshots.set(tool, snap);
+            }
+            return snap;
+          }),
+          approvals: turn.approvals.map((approval) => {
+            let snap = approvalSnapshots.get(approval);
+            if (!snap) {
+              snap = { ...approval };
+              approvalSnapshots.set(approval, snap);
+            }
+            return snap;
+          }),
           handoffSnapshots: turn.handoffSnapshots?.map((snapshot) => ({ ...snapshot })),
-          blocks: turn.blocks.map((block) => ({ ...block })),
+          blocks: turn.blocks.map((block) => {
+            let snap = blockSnapshots.get(block);
+            if (!snap) {
+              snap = { ...block };
+              blockSnapshots.set(block, snap);
+            }
+            return snap;
+          }),
         });
       }
       dirty.clear();
