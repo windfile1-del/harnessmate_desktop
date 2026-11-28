@@ -3,8 +3,6 @@ import { showSessionNotification } from '../lib/desktop-notifications';
 import type {
   AddMcpServerRequest,
   AgyAuthState,
-  ApprovalDecision,
-  ApprovalRequest,
   Attachment,
   AttentionItem,
   CanonicalEvent,
@@ -41,7 +39,6 @@ import type {
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
-  ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
@@ -200,7 +197,6 @@ export interface AppState {
   nativeRuntimeBySession: Record<string, NativeSessionRuntimeSlice>;
   workspaces: Workspace[];
   sessions: Session[];
-  pendingApprovals: ApprovalRequest[];
   triageBySession: TriageStateBySession;
   discoveredSessions: DiscoveredCliSession[];
   remoteStatus: RemoteAccessStatus | null;
@@ -393,12 +389,6 @@ export interface AppState {
     },
   ) => Promise<void>;
   interruptSession: (sessionId: string) => Promise<void>;
-  refreshPendingApprovals: () => Promise<void>;
-  resolveApproval: (approvalId: string, decision: ApprovalDecision, comment?: string) => Promise<void>;
-  resolveRuntimeRequest: (
-    approvalId: string,
-    req: ResolveApprovalRequest,
-  ) => Promise<{ conflict?: boolean; resolvedBy?: string | null }>;
   forkSession: (sessionId: string, req?: ForkSessionRequest) => Promise<ForkSessionResult | null>;
   mergeBackSession: (sessionId: string, req?: MergeBackRequest) => Promise<MergeBackResult | null>;
   importSessionBundle: (req: ImportSessionBundleRequest) => Promise<Session>;
@@ -620,18 +610,7 @@ export const useAppStore = create<AppState>((set, get) => {
   const snoozeToasts = new Set<string>();
 
   const handleAttention = (item: AttentionItem) => {
-    if (item.kind === 'approval_needed') {
-      void get().refreshPendingApprovals();
-      get().pushToast({
-        kind: 'warning',
-        title: `需要审批 · ${item.sessionTitle}`,
-        body: item.summary,
-      });
-      showSessionNotification(get(), get().sessions.find(({ id }) => id === item.sessionId), {
-        kind: 'approval', sessionId: item.sessionId, identity: item.approvalId ?? String(item.timestamp),
-        summary: item.summary.slice(0, 500),
-      });
-    } else if (item.kind === 'turn_failed') {
+    if (item.kind === 'turn_failed') {
       get().pushToast({
         kind: 'error',
         title: `执行出错 · ${item.sessionTitle}`,
@@ -673,7 +652,6 @@ export const useAppStore = create<AppState>((set, get) => {
     harnesses: [],
     workspaces: [],
     sessions: [],
-    pendingApprovals: [],
     triageBySession: {},
     discoveredSessions: [],
     remoteStatus: null,
@@ -1326,19 +1304,17 @@ export const useAppStore = create<AppState>((set, get) => {
     refreshAll: async () => {
       set({ loading: true });
       try {
-        const [hRes, wRes, sRes, rRes, aRes] = await Promise.all([
+        const [hRes, wRes, sRes, rRes] = await Promise.all([
           daemonApi.listHarnesses(false),
           daemonApi.listWorkspaces(),
           daemonApi.listSessions(),
           daemonApi.getRemoteStatus(),
-          daemonApi.listPendingApprovals().catch(() => ({ approvals: [] as ApprovalRequest[] })),
           get().refreshPlugins(),
         ]);
         set({
           harnesses: hRes.harnesses,
           workspaces: wRes.workspaces,
           sessions: sRes.sessions,
-          pendingApprovals: aRes.approvals,
           remoteStatus: rRes,
           loading: false,
         });
@@ -1972,51 +1948,6 @@ export const useAppStore = create<AppState>((set, get) => {
     interruptSession: async (sessionId) => {
       await daemonApi.interruptSession(sessionId);
       get().pushToast({ kind: 'info', title: '已发送中断信号' });
-    },
-
-    refreshPendingApprovals: async () => {
-      try {
-        const { approvals } = await daemonApi.listPendingApprovals();
-        set({ pendingApprovals: approvals });
-      } catch {
-        // ignore
-      }
-    },
-
-    resolveApproval: async (approvalId, decision, comment) => {
-      await get().resolveRuntimeRequest(approvalId, { decision, comment, resolvedBy: 'desktop' });
-    },
-
-    resolveRuntimeRequest: async (approvalId, req) => {
-      try {
-        await daemonApi.resolveRuntimeRequest(approvalId, req);
-        set((state) => ({
-          pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
-        }));
-        void get().refreshPendingApprovals();
-        return { conflict: false };
-      } catch (err) {
-        if (err instanceof ApiHttpError && err.status === 409) {
-          const resolvedBy =
-            typeof err.payload?.resolvedBy === 'string' ? err.payload.resolvedBy : null;
-          set((state) => ({
-            pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
-          }));
-          const actorLabel = resolvedBy === 'mobile' ? '移动端' : '其他客户端';
-          get().pushToast({
-            kind: 'info',
-            title: `该请求已由${actorLabel}处理`,
-            body: '已自动收起重复审批条。',
-          });
-          return { conflict: true, resolvedBy };
-        }
-        get().pushToast({
-          kind: 'error',
-          title: '审批提交失败',
-          body: err instanceof Error ? err.message : String(err),
-        });
-        return { conflict: false };
-      }
     },
 
     forkSession: async (sessionId, req) => {

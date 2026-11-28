@@ -12,3 +12,4 @@ export * from './driver-contracts.js';
 export * from './collaboration-contracts.js';
 export * from './chat-contracts.js';
 export * from './agy-contracts.js';
+export * from './request-contracts.js';

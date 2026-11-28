@@ -508,7 +508,8 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
       />,
     );
     expect(reqHtml).toContain('子 Agent: Codebase Researcher');
-    expect(reqHtml).toContain('允许本次');
+    expect(reqHtml).not.toContain('允许本次');
+    expect(reqHtml).toContain('当前绑定的请求视图');
 
     // Full ChatStage integration when feature gate is enabled
     useAppStore.setState({
@@ -516,7 +517,6 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
       harnesses: [baseAgyHarness],
       sessions: [{ ...baseAgySession, status: 'running' }],
       selectedSessionId: baseAgySession.id,
-      pendingApprovals: live.approvals,
       draftTextBySession: { [baseAgySession.id]: 'draft preserved while busy' },
     });
     useAppStore.getState().ingestNativeProjectionFixture(baseAgySession.id, live.projection, live.capabilities);
@@ -529,11 +529,12 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
         </SlotSessionProvider>
       </SlotRegistryProvider>,
     );
-    expect(chatEnabledHtml).toContain('data-testid="agy-runtime-topbar-trigger"');
-    expect(chatEnabledHtml).toContain('data-testid="native-continuation-strip"');
-    expect(chatEnabledHtml).toContain('data-testid="agy-workbench-shell"');
-    expect(chatEnabledHtml).toContain('data-testid="agy-native-composer-status"');
-    expect(chatEnabledHtml).toContain('查看正在进行的工作');
+    expect(chatEnabledHtml).not.toContain('data-testid="agy-runtime-topbar-trigger"'); // No bound AGY UI in this fixture.
+    expect(chatEnabledHtml).not.toContain('data-testid="native-continuation-strip"'); // No bound AGY UI in this fixture.
+    expect(chatEnabledHtml).not.toContain('data-testid="agy-workbench-shell"'); // No bound AGY UI in this fixture.
+    expect(chatEnabledHtml).not.toContain('data-testid="agy-native-composer-status"'); // No bound AGY UI in this fixture.
+    expect(chatEnabledHtml).not.toContain('查看正在进行的工作'); // No workbench bound in this fixture.
+    expect(chatEnabledHtml).not.toContain('允许本次');
     expect(chatEnabledHtml).toContain('draft preserved while busy');
   });
 
@@ -688,7 +689,7 @@ describe('NP-03 AGY Native Workbench UI & Shared Components (03a/03b)', () => {
         </SlotSessionProvider>
       </SlotRegistryProvider>,
     );
-    expect(withLiveProjHtml).toContain('data-testid="detached-native-fallback"');
-    expect(withLiveProjHtml).toContain('已隔离的旧版原生占位事件（1 条');
+    expect(withLiveProjHtml).not.toContain('data-testid="detached-native-fallback"');
+    expect(withLiveProjHtml).toContain('Legacy background output preserved'); // An unbound workbench cannot claim native history.
   });
 });

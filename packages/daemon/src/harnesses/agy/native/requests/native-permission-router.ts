@@ -72,13 +72,14 @@ function defaultClearTimer(handle: ReturnType<typeof setTimeout>): void {
  *   expiry, Stop, legacy+native dual-entry, and generation switch races.
  * - Rejects unknown methods (-32601), malformed wire/form schemas (-32602), and history_replay requests (-32601).
  * - Never implicitly maps free-text to options[0] and never replays stale authorizations after disconnect.
- * - Never auto-approves and never modifies general Approval Center risk rules or scores.
+ * - Delegates business decisions and deadlines to the bound request authority; owns only wire delivery.
  */
 export class NativePermissionRouter implements NativePermissionPort {
   private readonly recordsByApprovalId = new Map<string, InternalPendingNativeRequestRecord>();
   private readonly occurrenceCounters = new Map<string, number>();
   private readonly closedConnections = new Set<string>();
   private readonly targetResolver: NativeRequestTargetResolver;
+  private readonly authorities = new Map<string, import('./types.js').NativeRequestAuthority>();
   private readonly approvalCenterBridge?: NativeApprovalCenterBridge;
   private readonly onRequestSettled?: NativePermissionRouterOptions['onRequestSettled'];
   private readonly unknownChildPolicy: UnknownChildRequestPolicy;
@@ -92,7 +93,7 @@ export class NativePermissionRouter implements NativePermissionPort {
 
   constructor(
     private readonly registry: AgyNativeRuntimeRegistry,
-    options: NativePermissionRouterOptions = {},
+    private options: NativePermissionRouterOptions = {},
   ) {
     this.targetResolver = options.targetResolver ?? new StubNativeRequestTargetResolver();
     this.approvalCenterBridge = options.approvalCenterBridge;
@@ -316,7 +317,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     const deadline = nowMs + Math.max(1, deadlineMs);
 
     // Read-only Approval Center annotation evaluation (NEVER modifies general rules or risk scores!)
-    const sessionCtx = this.approvalCenterBridge?.getSessionContext?.(req.binding.sessionId) ?? null;
+    const sessionCtx = (this.options.getSessionContext ?? this.approvalCenterBridge?.getSessionContext)?.(req.binding.sessionId) ?? null;
     const annotations =
       this.approvalCenterBridge?.evaluateLocalAnnotations?.({
         approvalId,
@@ -395,18 +396,44 @@ export class NativePermissionRouter implements NativePermissionPort {
       respondError: req.respondError,
     };
 
-    record.timer = this.scheduleTimer(() => {
+    if (!this.options.requestAuthority) record.timer = this.scheduleTimer(() => {
       this.expireRequest(approvalId);
     }, Math.max(1, deadline - nowMs));
 
     this.recordsByApprovalId.set(approvalId, record);
 
-    // Optional mirror into legacy Approval Center (sanitized, same approvalId)
-    if (this.approvalCenterBridge?.mirrorPendingApproval) {
+    if (this.options.requestAuthority) {
+      const mirror = this.buildApprovalDto(record, sessionCtx?.parentSessionId ?? null);
+      const mapInput = (input: import('@harnessmate/plugin-api').RequestResolveDto) => input.native
+        ? ResolveNativeRequestInputSchema.parse(input.native)
+        : this.mapLegacyRequestToNativeInput(record, { decision: input.decision, comment: input.comment, questionAnswer: input.questionAnswer, resolvedBy: input.actor === 'mobile' ? 'mobile' : 'desktop' });
       try {
-        this.approvalCenterBridge.mirrorPendingApproval(this.buildLegacyApprovalMirror(record, sessionCtx?.parentSessionId ?? null));
+        const authority = this.options.requestAuthority(req.binding.sessionId);
+        this.authorities.set(approvalId, authority);
+        authority.register({ approval: mirror as unknown as Record<string, unknown>, presentation: this.toDetailDto(record, nowMs) as unknown as Record<string, unknown>, workspaceId: sessionCtx?.workspaceId ?? '',
+          origin: { providerInstanceId: this.options.providerInstanceId ?? req.binding.instanceId,
+            driverGeneration: String(req.binding.generation), runtimeId: String(req.binding.runtimeId), connectionId: req.connectionId,
+            nativeRequestId: req.wireRequestId, turnId: record.turnId }, deadlineAtMs: Date.now() + Math.max(0, record.deadline - this.now()),
+          idempotencyKey: `${req.binding.runtimeId}:${req.binding.generation}:${req.connectionId}:${typeof req.wireRequestId}:${req.wireRequestId}:${record.occurrence}` }, {
+          validate: input => {
+            const wire = mapInput(input);
+            const check = this.validateResolutionInput(record.binding, approvalId, wire);
+            if (!check.valid) throw new Error(check.message ?? 'Native validation failed');
+          },
+          deliver: async input => {
+            // Expiry/cancel comes from request authority; still send a cancellation on the original connection.
+            const wire = mapInput(input);
+            const outcome = input.decision === 'deny' && this.now() >= record.deadline
+              ? { receiptState: this.finalizeExpiryDelivery(record), conflict: false }
+              : await this.resolveWireWithCas({ binding: record.binding, approvalId, request: wire, resolvedBy: input.actor === 'mobile' ? 'mobile' : 'desktop' });
+            return outcome.receiptState === 'delivery_unknown' ? 'unknown'
+              : outcome.receiptState === 'connection_lost' || outcome.conflict ? 'unavailable' : 'acknowledged';
+          },
+          release: () => { this.clearRecordTimer(record); record.respond = null; record.respondError = null; },
+        });
       } catch {
-        // isolate legacy bridge mirror failures
+        this.finalizeExpiryInternal(record, true);
+        return { handled: true };
       }
     }
 
@@ -489,7 +516,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     }
   }
 
-  async resolveNativeRequest(input: {
+  private async resolveNativeRequest(input: {
     readonly binding: RuntimeBinding;
     readonly approvalId: string;
     readonly receiptId: string;
@@ -562,7 +589,7 @@ export class NativePermissionRouter implements NativePermissionPort {
       record.respond = null;
       record.respondError = null;
       this.publishRequestChanged(record, `req:${record.approvalId}:connection_lost`);
-      this.syncLegacyBridge(record, input.resolvedBy);
+      this.reconcileRequestFact(record, input.resolvedBy);
       return {
         approvalId: record.approvalId,
         receiptId: input.receiptId,
@@ -594,7 +621,7 @@ export class NativePermissionRouter implements NativePermissionPort {
       record.resolvedAt = record.updatedAt;
       record.terminalReason = 'wire_write_threw';
       this.publishRequestChanged(record, `req:${record.approvalId}:delivery_unknown`);
-      this.syncLegacyBridge(record, input.resolvedBy);
+      this.reconcileRequestFact(record, input.resolvedBy);
       return {
         approvalId: record.approvalId,
         receiptId: input.receiptId,
@@ -610,7 +637,7 @@ export class NativePermissionRouter implements NativePermissionPort {
       record.resolvedAt = nowMs;
       record.terminalReason = 'wire_write_returned_false';
       this.publishRequestChanged(record, `req:${record.approvalId}:connection_lost`);
-      this.syncLegacyBridge(record, input.resolvedBy);
+      this.reconcileRequestFact(record, input.resolvedBy);
       return {
         approvalId: record.approvalId,
         receiptId: input.receiptId,
@@ -632,7 +659,7 @@ export class NativePermissionRouter implements NativePermissionPort {
           : 'user_cancelled';
 
     this.publishRequestChanged(record, `req:${record.approvalId}:${finalState}`);
-    this.syncLegacyBridge(record, input.resolvedBy, parsedInput.data);
+    this.reconcileRequestFact(record, input.resolvedBy, parsedInput.data);
 
     return {
       approvalId: record.approvalId,
@@ -648,6 +675,25 @@ export class NativePermissionRouter implements NativePermissionPort {
    * `resolveNativeRequest`, and transitions DB receipt to final state.
    */
   async resolveWithCas(input: ResolveNativeRequestWithCasInput): Promise<NativeRequestResolutionOutcome> {
+    if (!this.options.requestAuthority) return this.resolveWireWithCas(input);
+    const record = this.recordsByApprovalId.get(input.approvalId);
+    if (!record) return { approvalId: input.approvalId, receiptId: '', receiptState: 'connection_lost', conflict: true };
+    const validation = this.validateResolutionInput(input.binding, input.approvalId, input.request);
+    if (!validation.valid) {
+      if (validation.errorCode && !['REQUEST_NOT_PENDING','REQUEST_EXPIRED','STALE_GENERATION'].includes(validation.errorCode)) {
+        throw new NativeRequestValidationError(validation.errorCode, validation.message ?? 'Invalid native response', validation.details);
+      }
+      return { approvalId: input.approvalId, receiptId: record.receiptId, receiptState: record.receiptState, conflict: true };
+    }
+    const chosen = input.request.outcome === 'selected' ? record.options.find(o => o.optionId === input.request.optionId) : undefined;
+    const decision = input.request.outcome === 'cancelled' || (chosen && isRejectOnlyOption(chosen)) ? 'deny'
+      : chosen?.kind === 'allow_always' && chosen.scope === 'session' ? 'allow_session' : 'allow_once';
+    const result = await this.authorities.get(record.approvalId)!.resolve({ requestId: input.approvalId, actor: input.resolvedBy,
+      decision, native: input.request as unknown as Record<string, unknown>, idempotencyKey: input.request.idempotencyKey });
+    return { approvalId: input.approvalId, receiptId: record.receiptId, receiptState: record.receiptState, conflict: result.conflict };
+  }
+
+  private async resolveWireWithCas(input: ResolveNativeRequestWithCasInput): Promise<NativeRequestResolutionOutcome> {
     const precheck = this.validateResolutionInput(input.binding, input.approvalId, input.request);
     if (!precheck.valid && precheck.errorCode && precheck.errorCode !== 'REQUEST_NOT_PENDING' && precheck.errorCode !== 'REQUEST_EXPIRED' && precheck.errorCode !== 'STALE_GENERATION') {
       throw new NativeRequestValidationError(
@@ -732,13 +778,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     }
 
     const mapped = this.mapLegacyRequestToNativeInput(record, input.request);
-    return this.resolveNativeRequest({
-      binding: input.binding,
-      approvalId: input.approvalId,
-      receiptId: input.receiptId,
-      request: mapped,
-      resolvedBy: input.resolvedBy,
-    });
+    return this.resolveWithCas({ binding: input.binding, approvalId: input.approvalId, request: mapped, resolvedBy: input.resolvedBy });
   }
 
   async resolveLegacyWithCas(input: Omit<LegacyApprovalBridgeInput, 'receiptId'>): Promise<NativeRequestResolutionOutcome> {
@@ -767,14 +807,14 @@ export class NativePermissionRouter implements NativePermissionPort {
         record.resolvedAt = nowMs;
         record.terminalReason = 'connection_closed';
         this.publishRequestChanged(record, `req:${record.approvalId}:conn_closed_lost`);
-        this.syncLegacyBridge(record, null);
+        this.reconcileRequestFact(record, null);
       } else if (record.receiptState === 'claimed') {
         record.receiptState = 'delivery_unknown';
         record.updatedAt = nowMs;
         record.resolvedAt = nowMs;
         record.terminalReason = 'connection_closed_in_flight';
         this.publishRequestChanged(record, `req:${record.approvalId}:conn_closed_unknown`);
-        this.syncLegacyBridge(record, null);
+        this.reconcileRequestFact(record, null);
       }
     }
   }
@@ -806,6 +846,11 @@ export class NativePermissionRouter implements NativePermissionPort {
           (target.type === 'activity' && record.activityId === target.id) ||
           (target.type === 'workflow' && record.workflowId === target.id);
         if (!matchesTarget) continue;
+      }
+
+      if (this.options.requestAuthority) {
+        if (this.authorities.get(record.approvalId)?.terminate(record.approvalId, 'cancelled', 'stop_requested')) cancelledApprovalIds.push(record.approvalId);
+        continue;
       }
 
       const cas = this.registry.persistence.claimApprovalReceiptCas({
@@ -847,7 +892,7 @@ export class NativePermissionRouter implements NativePermissionPort {
         { reason: 'stop_requested' },
       );
       this.publishRequestChanged(record, `req:${record.approvalId}:stop_${finalState}`);
-      this.syncLegacyBridge(record, null);
+      this.reconcileRequestFact(record, null);
       cancelledApprovalIds.push(record.approvalId);
     }
 
@@ -879,13 +924,13 @@ export class NativePermissionRouter implements NativePermissionPort {
         record.updatedAt = nowMs;
         record.resolvedAt = nowMs;
         record.terminalReason = 'generation_changed';
-        this.syncLegacyBridge(record, null);
+        this.reconcileRequestFact(record, null);
       } else if (record.receiptState === 'claimed') {
         record.receiptState = 'delivery_unknown';
         record.updatedAt = nowMs;
         record.resolvedAt = nowMs;
         record.terminalReason = 'generation_changed_in_flight';
-        this.syncLegacyBridge(record, null);
+        this.reconcileRequestFact(record, null);
       }
     }
   }
@@ -970,6 +1015,9 @@ export class NativePermissionRouter implements NativePermissionPort {
 
   dispose(): void {
     for (const record of this.recordsByApprovalId.values()) {
+      if (record.receiptState === 'pending' && this.options.requestAuthority) {
+        try { this.authorities.get(record.approvalId)?.terminate(record.approvalId, 'cancelled', 'driver_provider_stopped'); } catch {}
+      }
       this.clearRecordTimer(record);
       record.respond = null;
       record.respondError = null;
@@ -981,6 +1029,8 @@ export class NativePermissionRouter implements NativePermissionPort {
   private expireRequest(approvalId: string): boolean {
     const record = this.recordsByApprovalId.get(approvalId);
     if (!record || record.receiptState !== 'pending') return false;
+
+    if (this.options.requestAuthority) return this.authorities.get(record.approvalId)?.terminate(approvalId, 'expired', 'deadline_expired') ?? false;
 
     // Acquire shared DB CAS before writing expiry cancel on wire so double-click vs timeout never races
     let cas;
@@ -1011,6 +1061,15 @@ export class NativePermissionRouter implements NativePermissionPort {
     return true;
   }
 
+  private finalizeExpiryDelivery(record: InternalPendingNativeRequestRecord): NativeRequestReceiptState {
+    const cas = this.registry.persistence.claimApprovalReceiptCas({ approvalId: record.approvalId,
+      expectedGeneration: record.binding.generation, expectedSessionId: record.binding.sessionId });
+    if (!cas.claimed || !cas.receipt) return record.receiptState;
+    const state = this.finalizeExpiryInternal(record, true);
+    this.registry.persistence.transitionApprovalReceiptState(cas.receipt.receiptId, ['claimed'], state, { reason: 'deadline_expired' });
+    return state;
+  }
+
   private finalizeExpiryInternal(
     record: InternalPendingNativeRequestRecord,
     writeCancelToWire: boolean,
@@ -1037,7 +1096,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     record.resolvedAt = nowMs;
     record.terminalReason = 'deadline_expired';
     this.publishRequestChanged(record, `req:${record.approvalId}:${finalState}`);
-    this.syncLegacyBridge(record, null);
+    this.reconcileRequestFact(record, null);
     return finalState;
   }
 
@@ -1103,7 +1162,7 @@ export class NativePermissionRouter implements NativePermissionPort {
 
     if (legacyReq.decision === 'allow_session') {
       const allowAlways = record.options.find(
-        (o) => o.kind === 'allow_always' && record.allowedOptionIds.includes(o.optionId),
+        (o) => o.kind === 'allow_always' && o.scope === 'session' && record.allowedOptionIds.includes(o.optionId),
       );
       if (!allowAlways) {
         throw new NativeRequestValidationError(
@@ -1151,7 +1210,9 @@ export class NativePermissionRouter implements NativePermissionPort {
     record: InternalPendingNativeRequestRecord,
     nowMs: number,
   ): NativeRequestDetailDto {
+    const fact = this.authorities.get(record.approvalId)?.get(record.approvalId);
     return {
+      requestId: record.approvalId, requestVersion: fact?.version,
       approvalId: record.approvalId,
       runtimeId: record.binding.runtimeId,
       generation: record.binding.generation,
@@ -1185,15 +1246,15 @@ export class NativePermissionRouter implements NativePermissionPort {
       options: record.options.map((o) => ({ ...o })),
       ...(record.questionText ? { questionText: record.questionText } : {}),
       ...(record.formSpec ? { formSpec: record.formSpec } : {}),
-      canAnswer: record.canAnswer && record.receiptState === 'pending',
-      canCancel: record.canCancel && record.receiptState === 'pending',
+      canAnswer: record.canAnswer && record.receiptState === 'pending' && (!fact || fact.status === 'pending'),
+      canCancel: record.canCancel && record.receiptState === 'pending' && (!fact || fact.status === 'pending'),
       ...(record.unsupportedReason ? { unsupportedReason: record.unsupportedReason } : {}),
       ...(record.resolvedAt !== undefined ? { resolvedAt: record.resolvedAt } : {}),
       ...(record.terminalReason ? { terminalReason: record.terminalReason } : {}),
     };
   }
 
-  private buildLegacyApprovalMirror(
+  private buildApprovalDto(
     record: InternalPendingNativeRequestRecord,
     parentSessionId: string | null,
   ): ApprovalRequest {
@@ -1201,7 +1262,7 @@ export class NativePermissionRouter implements NativePermissionPort {
     if (record.options.some((o) => o.kind === 'allow_once' && record.allowedOptionIds.includes(o.optionId))) {
       supportedDecisions.push('allow_once');
     }
-    if (record.options.some((o) => o.kind === 'allow_always' && record.allowedOptionIds.includes(o.optionId))) {
+    if (record.options.some((o) => o.kind === 'allow_always' && o.scope === 'session' && record.allowedOptionIds.includes(o.optionId))) {
       supportedDecisions.push('allow_session');
     }
     supportedDecisions.push('deny');
@@ -1246,45 +1307,16 @@ export class NativePermissionRouter implements NativePermissionPort {
     };
   }
 
-  private syncLegacyBridge(
+  private reconcileRequestFact(
     record: InternalPendingNativeRequestRecord,
     resolvedBy: 'desktop' | 'mobile' | null,
     input?: ResolveNativeRequestInput,
   ): void {
-    if (!this.approvalCenterBridge?.syncResolvedApproval) return;
-    try {
-      const status: ApprovalRequest['status'] =
-        record.receiptState === 'expired'
-          ? 'expired'
-          : record.receiptState === 'cancelled' ||
-              record.receiptState === 'connection_lost' ||
-              record.receiptState === 'delivery_unknown'
-            ? 'cancelled'
-            : record.kind === 'question' || record.kind === 'elicitation'
-              ? 'resolved'
-              : 'approved';
-      const chosenOpt =
-        input?.outcome === 'selected'
-          ? record.options.find((o) => o.optionId === input.optionId)
-          : undefined;
-      const decision: ApprovalRequest['decision'] =
-        status === 'cancelled' || status === 'expired'
-          ? 'deny'
-          : chosenOpt?.kind === 'reject_once' || chosenOpt?.kind === 'reject_always' || chosenOpt?.kind === 'decline'
-            ? 'deny'
-            : chosenOpt?.kind === 'allow_always'
-              ? 'allow_session'
-              : 'allow_once';
-
-      this.approvalCenterBridge.syncResolvedApproval({
-        approvalId: record.approvalId,
-        status: decision === 'deny' && status === 'approved' ? 'denied' : status,
-        decision,
-        resolvedBy,
-        comment: input?.comment ?? record.terminalReason ?? null,
-      });
-    } catch {
-      // isolate legacy bridge sync failures
+    if (this.options.requestAuthority) {
+      if (record.receiptState !== 'pending' && record.receiptState !== 'claimed') {
+        this.authorities.get(record.approvalId)?.terminate(record.approvalId, record.receiptState === 'expired' ? 'expired' : 'cancelled', record.terminalReason ?? record.receiptState, false);
+      }
+      return;
     }
   }
 

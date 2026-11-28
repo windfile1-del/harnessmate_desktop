@@ -60,7 +60,8 @@ async function createAgyTestEnv(opts?: {
   unknownChildDeadlineMs?: number;
   now?: () => number;
   onRequestSettled?: NonNullable<ConstructorParameters<typeof NativePermissionRouter>[1]>['onRequestSettled'];
-  permissionMode?: 'manual' | 'accept_edits';
+  permissionMode?: 'manual' | 'accept_edits' | 'auto' | 'plan';
+  activatePolicy?: boolean;
 }) {
   const tmp = makeTempDir('hm-np07-');
   const daemon = createDaemon({
@@ -70,6 +71,7 @@ async function createAgyTestEnv(opts?: {
   });
   activeDaemons.push(daemon);
   await daemon.app.ready();
+  if (opts?.activatePolicy) await daemon.pluginManager.ensureBootstrapped();
 
   const ws = daemon.store.createWorkspace({
     id: 'ws_np07',
@@ -129,6 +131,8 @@ async function createAgyTestEnv(opts?: {
 
   const router = new NativePermissionRouter(daemon.nativeRegistry, {
     targetResolver: resolver,
+    requestAuthority: id => daemon.sessionManager.getRequestBroker(id),
+    getSessionContext: id => daemon.store.getSession(id),
     unknownChildPolicy: opts?.unknownChildPolicy,
     defaultDeadlineMs: opts?.defaultDeadlineMs,
     unknownChildDeadlineMs: opts?.unknownChildDeadlineMs,
@@ -140,22 +144,7 @@ async function createAgyTestEnv(opts?: {
         const s = daemon.store.getSession(sid);
         return s ? { workspaceId: s.workspaceId, cwd: s.cwd, parentSessionId: s.parentSessionId ?? null } : null;
       },
-      mirrorPendingApproval: (approval) => {
-        daemon.store.createApproval(approval);
-      },
-      syncResolvedApproval: ({ approvalId, status, decision, resolvedBy, comment }) => {
-        if (status === 'expired') {
-          daemon.store.expireApprovalIfPending(approvalId);
-        } else {
-          daemon.store.resolveApprovalIfPending(
-            approvalId,
-            decision ?? 'deny',
-            resolvedBy ?? 'auto',
-            comment ?? undefined,
-            { statusOverride: status },
-          );
-        }
-      },
+
     },
   });
   activeRouters.push(router);
@@ -548,7 +537,7 @@ describe('NP-07 T06/T07/T14 Routing, Child Attribution, CAS, Expiry, Stop & Reco
         optionId: 'reject_once',
       },
     });
-    expect(res1.statusCode).toBe(200);
+    expect(res1.statusCode, res1.body + JSON.stringify(daemon.store.listApprovals(session.id))).toBe(200);
     expect(res1.json().receiptState).toBe('response_written');
 
     // Duplicate double-click loses DB CAS -> 409 ALREADY_RESOLVED, zero second wire write!
@@ -655,7 +644,7 @@ describe('NP-07 T06/T07/T14 Routing, Child Attribution, CAS, Expiry, Stop & Reco
         optionId: 'allow_once',
       },
     });
-    expect(widenAttempt.statusCode).toBe(400);
+    expect(widenAttempt.statusCode, widenAttempt.body + JSON.stringify(daemon.store.listApprovals(session.id))).toBe(400);
     expect(wireWrites).toHaveLength(0);
 
     // Advance clock past bounded deadline -> auto-expires & writes cancelled safely on wire!
@@ -1333,6 +1322,7 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 
 const logPath = ${JSON.stringify(peerLogPath)};
+const toolResultPath = logPath + '.tool-result';
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 function send(msg) {
@@ -1472,6 +1462,7 @@ rl.on('line', (line) => {
   }
   // Record all client responses to server requests with exact typeof id!
   if (msg.id !== undefined && !msg.method) {
+    if (msg.id === 8101 && msg.result?.outcome?.optionId === 'allow_once') fs.writeFileSync(toolResultPath, 'approved-tool-executed', 'utf8');
     fs.appendFileSync(
       logPath,
       JSON.stringify({ id: msg.id, idType: typeof msg.id, result: msg.result, error: msg.error }) + '\\n',
@@ -1581,7 +1572,7 @@ rl.on('line', (line) => {
     expect(rootTimeline.body).not.toContain('child fixture');
     expect(childTimeline.statusCode).toBe(200);
     expect(childTimeline.body).toContain('child fixture');
-    expect(details.statusCode).toBe(200);
+    expect(details.statusCode, details.body).toBe(200);
     expect(details.json().requests.find((request: { approvalId: string }) => request.approvalId === qReq.approvalId))
       .toMatchObject({ scope: 'confirmed_child', generation: binding!.generation, canAnswer: true });
     expect(details.body).not.toMatch(/wireRequestId|actualNativeSessionId|child-e2e-sess/);
@@ -1632,6 +1623,7 @@ rl.on('line', (line) => {
     }
 
     expect(lines).toHaveLength(4);
+    expect(fs.readFileSync(peerLogPath + '.tool-result','utf8')).toBe('approved-tool-executed');
     const byId = new Map(lines.map((l) => [`${l.idType}:${String(l.id)}`, l]));
 
     expect(byId.get('number:8104')?.error?.code).toBe(JSON_RPC_METHOD_NOT_FOUND);
@@ -1661,4 +1653,48 @@ rl.on('line', (line) => {
     expect(disconnected.status).toBe('disconnected');
     expect(disconnected.agents.find((agent) => agent.id === qReq.agentId)?.foreground.kind).toBe('stale');
   }, 20_000);
+});
+
+describe('B4-W2 native per-request policy and real scope mapping', () => {
+  it('records a native persistent option without pretending its scope is once or session', async () => {
+    const {daemon,session,binding,router}=await createAgyTestEnv();
+    router.onIncomingRequest({binding,connectionId:'conn_1',ingressOrdinal:110,channel:'live',wireRequestId:110,method:'session/request_permission',
+      params:{sessionId:'nat_root_1',toolCall:{toolCallId:'persistent',kind:'read',title:'Persistent permission'},options:[{optionId:'persistent',kind:'allow_always',scope:'persistent',name:'Persistent'}]},
+      respond:()=>true,respondError:()=>true});
+    const request=router.listPendingRequests(binding)[0]!;
+    await router.resolveWithCas({binding,approvalId:request.approvalId,resolvedBy:'desktop',request:{generation:binding.generation,outcome:'selected',optionId:'persistent'}});
+    const fact=daemon.sessionManager.getRequestBroker(session.id).get(request.approvalId)!;
+    expect(fact.status).toBe('approved');expect(fact.approval.decision).toBeNull();
+    expect(fact.decisionReceipt).toMatchObject({optionId:'persistent',scope:'persistent',nativeOutcome:'selected'});
+  });
+  it('auto handles repeated native tool requests without an auto driver mode; never answers typed questions', async () => {
+    const { daemon, session, binding, router } = await createAgyTestEnv({ permissionMode:'auto', activatePolicy:true });
+    const writes: unknown[] = [];
+    for (let n = 0; n < 2; n++) router.onIncomingRequest({ binding, connectionId:'conn_1', ingressOrdinal:100+n, channel:'live', wireRequestId:n,
+      method:'session/request_permission', params:{ sessionId:'nat_root_1', toolCall:{toolCallId:`auto-${n}`,kind:'read',title:'Read source'},
+        options:[{optionId:'ok',kind:'allow_once',name:'Once'},{optionId:'no',kind:'reject_once',name:'Deny'}] },
+      respond: result => { writes.push(result); return true; }, respondError:()=>true });
+    await expect.poll(() => writes.length).toBe(2);
+    expect(daemon.sessionManager.getRequestBroker(session.id).list(session.id)).toHaveLength(0);
+    expect(daemon.store.listApprovals({sessionId:session.id}).every(a => a.resolvedBy === 'auto')).toBe(true);
+    router.onIncomingRequest({binding,connectionId:'conn_1',ingressOrdinal:102,channel:'live',wireRequestId:'q',method:'session/request_permission',
+      params:{sessionId:'nat_root_1',toolCall:{toolCallId:'interaction_q',title:'Which target?',rawInput:{question:'Which target?'}},options:[{optionId:'a',name:'A'},{optionId:'b',name:'B'}]},
+      respond: result => { writes.push(result); return true; },respondError:()=>true});
+    await new Promise(r=>setTimeout(r,30)); expect(writes).toHaveLength(2); expect(router.listPendingRequests(binding)).toHaveLength(1);
+  });
+  it('requires explicitly advertised session scope and fences the original connection after disconnect', async () => {
+    const { daemon, session, binding, router } = await createAgyTestEnv(); let writes=0;
+    router.onIncomingRequest({binding,connectionId:'conn_1',ingressOrdinal:103,channel:'live',wireRequestId:103,method:'session/request_permission',
+      params:{sessionId:'nat_root_1',toolCall:{toolCallId:'scope',kind:'read',title:'Read'},options:[{optionId:'session',kind:'allow_always',scope:'session',name:'Session'},{optionId:'once',kind:'allow_once',name:'Once'}]},
+      respond:()=>{writes++;return true;},respondError:()=>true});
+    const pending=router.listPendingRequests(binding)[0]!;
+    const resolved=await daemon.sessionManager.resolveRuntimeRequest(pending.approvalId,{decision:'allow_session'},'desktop');
+    expect(resolved.approval.decision).toBe('allow_session'); expect(writes).toBe(1);
+    router.onIncomingRequest({binding,connectionId:'conn_1',ingressOrdinal:104,channel:'live',wireRequestId:104,method:'session/request_permission',
+      params:{sessionId:'nat_root_1',toolCall:{toolCallId:'stale',kind:'read',title:'Read'},options:[{optionId:'once',kind:'allow_once',name:'Once'}]},
+      respond:()=>{writes++;return true;},respondError:()=>true});
+    const stale=router.listPendingRequests(binding)[0]!; router.onConnectionClosed(binding,'conn_1');
+    const result=await daemon.sessionManager.resolveRuntimeRequest(stale.approvalId,{decision:'allow_once'},'mobile');
+    expect(result.conflict).toBe(true); expect(writes).toBe(1); expect(daemon.store.getSession(session.id)?.pendingApprovalCount).toBe(0);
+  });
 });

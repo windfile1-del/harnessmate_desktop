@@ -494,7 +494,6 @@ export function ParallelExecutionBoardView({
 export function ParallelExecutionBoard({ session }: { session: Session }) {
   const {
     harnesses,
-    pendingApprovals,
     orchestratorBoardBySession,
     refreshOrchestratorBoard,
     delegateSubagent,
@@ -515,7 +514,7 @@ export function ParallelExecutionBoard({ session }: { session: Session }) {
       parentSession={session}
       board={board}
       harnesses={harnesses}
-      pendingApprovals={pendingApprovals}
+      pendingApprovals={[]}
       onRefresh={() => void refreshOrchestratorBoard(session.id)}
       onDelegate={async (req) => {
         await delegateSubagent(session.id, req);

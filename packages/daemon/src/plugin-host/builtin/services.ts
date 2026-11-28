@@ -26,7 +26,8 @@ import {
   searchWorkspaceFiles,
 } from '../../core/attachment-service.js';
 import { WorkspaceTerminalRunner } from '../../core/terminal-service.js';
-import { ApprovalCenterService } from '../../core/approval-center-service.js';
+import { createRequestsPlugin } from '../../plugins/requests-default/index.js';
+import type { ApprovalCenterService } from '../../core/approval-center-service.js';
 import { CheckpointError, CheckpointService } from '../../core/checkpoint-service.js';
 import { resolveGitRepoLockKey } from '../../core/git-repo-lock.js';
 import { toPublicGitStatusSummary } from '../../core/w1-service-helpers.js';
@@ -473,9 +474,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
     onAuthStateChanged?: (state: AgyAuthState) => void;
     onUsageCacheInvalidate?: (harnessId: string) => void;
     getPendingSettlementSink?: () => NativeTurnSettlementSink | undefined;
-    getApprovalCenter?: () => ApprovalCenterService;
     getOrchestrator?: () => OrchestratorService | undefined;
-    onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
     onAttachCompressorHooks?: () => void;
     onRuntimeControllerReady?: (controller: SessionRuntimeDefaultController | null) => void;
     emitCanonical?: (
@@ -611,9 +610,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       eventBus: runtimeBridge.eventBus,
       getPluginManager,
       getPluginCapabilities: getCapabilities,
-      getApprovalCenter: runtimeBridge.getApprovalCenter,
       getOrchestrator: runtimeBridge.getOrchestrator,
-      onAnnotatePendingApproval: runtimeBridge.onAnnotatePendingApproval,
       onAttachCompressorHooks: runtimeBridge.onAttachCompressorHooks,
     });
     const hub = runtimeBridge.commandOutputHub ?? new CommandOutputHub();
@@ -668,13 +665,7 @@ export function createBuiltinPlugins(store: HarnessMateStore, registry: HarnessR
       },
     }),
   );
-  plugins.set('hm.plugin.approval-center', {
-    provides: ['approval-center'],
-    apply(ctx) {
-      const approvalCenter = new ApprovalCenterService(store);
-      ctx.provide('approval-center', approvalCenter);
-    },
-  });
+  plugins.set('hm.plugin.approval-center', createRequestsPlugin({ store, eventBus: runtimeBridge?.eventBus ?? new DaemonEventBus(), getPluginManager: getPluginManager ?? (() => { throw new Error('Plugin manager unavailable'); }) }));
   plugins.set(
     ORCHESTRATOR_PLUGIN_ID,
     createOrchestratorPlugin({

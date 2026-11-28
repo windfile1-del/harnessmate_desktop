@@ -138,7 +138,6 @@ export function startView(store: StoreApi<AppState>): () => void {
         }
         if (ready.some(({ type }) => type === 'turn.completed' || type === 'turn.failed' || type === 'turn.cancelled')) {
           void store.getState().refreshTurnItems(id);
-          void store.getState().refreshPendingApprovals();
         }
       };
       const sync = (): Promise<void> => syncing ??= (async () => {
@@ -189,7 +188,6 @@ export function startView(store: StoreApi<AppState>): () => void {
       for (const batch of initial) consume(batch);
       if (overflowed) await sync();
       void store.getState().refreshTurnItems(id);
-      void store.getState().refreshPendingApprovals();
       void store.getState().refreshContextPreview(id);
     } catch (error) {
       if (current()) store.getState().pushToast({ kind: 'error', title: '加载聊天失败', body: String(error) });

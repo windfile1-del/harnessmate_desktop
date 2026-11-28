@@ -1,8 +1,6 @@
 import { Workflow } from 'lucide-react';
 import { useState } from 'react';
-import { defaultNativeTransport } from '../../../../lib/native-client';
-import { NativeRequestQueuePanel } from '../requests/NativeRequestQueuePanel';
-import { selectNativeRequestsForSession } from '../requests/selectors';
+import type { NativeRequestViewItem } from '../requests/types';
 import {
   CapabilityUnavailable,
   EntityStatusBadge,
@@ -101,12 +99,8 @@ export function DynamicWorkflowStudio({
   const detail = selectedWorkflow.detail.kind === 'dynamic' ? selectedWorkflow.detail : null;
   const bindingKey = `${projection.binding.runtimeId}:${projection.binding.generation}`;
 
-  const workflowRequests = selectNativeRequestsForSession({
-    projection,
-    approvals: pendingApprovals,
-    metadataByApprovalId: requestMetadataByApprovalId,
-    filterWorkflowId: selectedWorkflow.id,
-  });
+  const workflowRequests: NativeRequestViewItem[] = []; // Interactive requests live in the bound request view.
+
 
   const scriptPreview = scriptPreviewByWorkflowId?.[selectedWorkflow.id] ?? null;
   const scriptApprovalState = deriveScriptApprovalState(
@@ -122,11 +116,6 @@ export function DynamicWorkflowStudio({
     scriptApprovalState,
   });
   const bannerStyle = toneStyle(banner.tone);
-
-  const resolveHandler =
-    onResolveNativeRequest ??
-    ((approvalId, req) =>
-      defaultNativeTransport.resolveNativeRequest(session.id, approvalId, req));
 
   return (
     <div
@@ -195,23 +184,7 @@ export function DynamicWorkflowStudio({
         </p>
       </section>
 
-      {/* Workflow-scoped Pending Approvals & AGY 1.5.16 Forwarded Questions */}
-      {workflowRequests.length > 0 && (
-        <NativeRequestQueuePanel
-          title="工作流脚本批准与 1.5.16 问题转发"
-          projection={projection}
-          approvals={pendingApprovals}
-          metadataByApprovalId={requestMetadataByApprovalId}
-          filterWorkflowId={selectedWorkflow.id}
-          onResolveNative={resolveHandler}
-          onJumpToAgent={(agentId) =>
-            onNavigate({ surface: 'subagents', selectedAgentId: agentId })
-          }
-          onJumpToActivity={(activityId) =>
-            onNavigate({ surface: 'runtime', selectedActivityId: activityId })
-          }
-        />
-      )}
+      <p className="text-[12px]">工作流批准和问题由当前绑定的请求视图处理。</p>
 
       {/* Read-Only Script Review Panel */}
       <DynamicWorkflowScriptReview

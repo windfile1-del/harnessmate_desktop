@@ -214,7 +214,7 @@ export interface AgyLegacyApprovalBridgeResolveResultDto {
 }
 
 export interface AgyLegacyApprovalBridgeInfoDto {
-  mode: 'w1_temporary_narrow_adapter';
+  mode: 'w1_temporary_narrow_adapter' | 'unified_requests';
   owner: 'agy.runtime.v1';
   handoffTarget: 'runtime.requests.v1';
   supportsCasResolution: boolean;

@@ -1,6 +1,6 @@
 import type {
   AgyAuthState,
-  ResolveApprovalRequest,
+  ApprovalRequest,
   Session,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
@@ -183,7 +183,8 @@ const sourceId =
 /**
  * Plugin-owned AGY workbench store. Never shares or imports the host Zustand instance.
  */
-export const useAppStore = create<AppState>((set, get) => {
+type WorkbenchState = AppState & { pendingApprovals: ApprovalRequest[] };
+export const useAppStore = create<WorkbenchState>((set, get) => {
   const pushToast = (toast: Omit<ToastNotice, 'id'>) => {
     const id = `wb-toast-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     set((state) => ({ toasts: [...(state.toasts ?? []), { ...toast, id }].slice(-5) }));
@@ -204,7 +205,7 @@ export const useAppStore = create<AppState>((set, get) => {
     }
   };
 
-  const state: Partial<AppState> = {
+  const state: Partial<WorkbenchState> = {
     sessions: [],
     workspaces: [],
     harnesses: [],
@@ -397,23 +398,6 @@ export const useAppStore = create<AppState>((set, get) => {
         : activeTransport.getAgentTimeline(sessionId, scope.id as NativeAgentId, { pageToken }, signal),
     loadNativeWorkflowResource: (sessionId, workflowId, resource, pageToken, signal) =>
       activeTransport.getWorkflowResource(sessionId, workflowId, resource, { pageToken }, signal),
-    resolveRuntimeRequest: async (approvalId: string, req: ResolveApprovalRequest) => {
-      if (workbenchBridge) {
-        return workbenchBridge.call('api.fetch', {
-          path: `/api/v1/approvals/${encodeURIComponent(approvalId)}/resolve`,
-          method: 'POST',
-          body: req,
-        }) as Promise<{ conflict?: boolean; resolvedBy?: string | null }>;
-      }
-      const res = await fetch(`/api/v1/approvals/${encodeURIComponent(approvalId)}/resolve`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(req),
-      });
-      if (!res.ok) return { conflict: res.status === 409, resolvedBy: null };
-      const data = (await res.json()) as { conflict?: boolean; approval?: { resolvedBy?: string | null } };
-      return { conflict: data.conflict, resolvedBy: data.approval?.resolvedBy ?? null };
-    },
     switchHarness: async (sessionId, req) => {
       if (workbenchBridge) {
         await workbenchBridge.call('api.fetch', {
@@ -435,7 +419,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
   };
 
-  return state as AppState;
+  return state as WorkbenchState;
 });
 
 export function startWorkbenchBridgeSync(): () => void {
@@ -448,7 +432,7 @@ export function startWorkbenchBridgeSync(): () => void {
   const syncContext = async (session: Session | null) => {
     if (disposed) return;
     try {
-      const snap = (await workbenchBridge.call<Partial<AppState>>('shell.snapshot')) ?? {};
+      const snap = (await workbenchBridge.call<Partial<WorkbenchState>>('shell.snapshot')) ?? {};
       if (disposed) return;
       useAppStore.setState({
         sessions: snap.sessions ?? [],

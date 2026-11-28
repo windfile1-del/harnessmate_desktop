@@ -1499,18 +1499,17 @@ export class IsolatedPluginRpcRouter {
         if (!approval) throw new PluginApiError('E_INVALID_INPUT', '审批项不存在');
         const session = await this.getSessionOrThrow(approval.sessionId);
         this.deps.permissions.assertGranted(plugin, 'approvals:annotate', session.workspaceId);
-        const note = (params.note ?? {}) as PublicApprovalAnnotationInput;
-        if (typeof note.label !== 'string' || !note.label.trim()) {
-          throw new PluginApiError('E_INVALID_INPUT', '审批标注缺少 label');
+        const providers = this.deps.host.listServiceProviders('runtime.requests.internal');
+        for (const provider of providers) {
+          const requests = this.deps.host.getServiceByInstance<{
+            get(id: string): unknown;
+            addAnnotation(id: string, pluginId: string, note: PublicApprovalAnnotationInput): void;
+          }>(provider.instanceId, 'runtime.requests.internal');
+          if (!requests?.get(approvalId)) continue;
+          requests.addAnnotation(approvalId, meta.pluginId, (params.note ?? {}) as PublicApprovalAnnotationInput);
+          return { ok: true };
         }
-        const risk = note.risk === 'low' || note.risk === 'medium' || note.risk === 'high' ? note.risk : undefined;
-        this.deps.store.addApprovalAnnotation(approval.id, {
-          pluginId: meta.pluginId,
-          risk,
-          label: note.label.trim().slice(0, 120),
-          detail: typeof note.detail === 'string' ? note.detail.slice(0, 500) : undefined,
-        });
-        return { ok: true };
+        throw new PluginApiError('E_SERVICE_UNAVAILABLE', '原请求提供方不可用');
       }
 
       case 'storage.plugin.get':

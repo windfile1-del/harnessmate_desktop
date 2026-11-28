@@ -44,6 +44,7 @@ export function wireAgyNativeRuntime(
   sessions: SessionManager,
   adapters: HarnessRegistry,
   binaryOverrides: Record<string, string>,
+  providerInstanceId?: string,
 ): () => void {
   const lifecycle = new AgyReactiveRuntimeController({ publisher: registry });
   const child = new ChildSessionRouter();
@@ -307,12 +308,9 @@ export function wireAgyNativeRuntime(
         };
       },
     },
-    approvalCenterBridge: {
-      evaluateLocalAnnotations: (ctx) => sessions.getApprovalCenter().evaluateLocalRules(ctx),
-      getSessionContext: (id) => sessions.getSession(id),
-      mirrorPendingApproval: (approval) => sessions.mirrorNativeApproval(approval),
-      syncResolvedApproval: (resolution) => sessions.syncNativeApproval(resolution),
-    },
+    requestAuthority: sessionId => sessions.getRequestBroker(sessionId),
+    providerInstanceId,
+    getSessionContext: id => sessions.getSession(id),
   });
 
   async function applySessionConfig(input: NativeConfigApplyInput) {

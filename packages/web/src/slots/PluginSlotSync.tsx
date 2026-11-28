@@ -11,7 +11,6 @@ import {
 } from '@harnessmate/protocol';
 import { Puzzle, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo } from 'react';
-import { RuntimeRequestReceiptBlock } from '../components/ApprovalCenter';
 import { CheckpointTurnBadge } from '../components/CheckpointControls';
 import { ContextCompressionPanel } from '../components/ContextCompressionPanel';
 import { DiffInspectorPanel } from '../components/DiffInspectorPanel';
@@ -171,43 +170,6 @@ function V1PluginPanelAdapter({
         </div>
       )}
     </section>
-  );
-}
-
-function ApprovalAnnotationsDetail({ approval }: { approval: ApprovalRequest }) {
-  const annotations = approval.annotations ?? [];
-  if (annotations.length === 0) return null;
-  return (
-    <div className="mt-2 space-y-1">
-      {annotations.map((note, idx) => (
-        <div
-          key={`${note.pluginId}:${idx}`}
-          className="flex items-start gap-1.5 rounded-lg px-2 py-1 text-[11px]"
-          style={{
-            backgroundColor:
-              note.risk === 'high'
-                ? 'var(--accent-rose-soft)'
-                : note.risk === 'medium'
-                  ? 'var(--accent-star-soft)'
-                  : 'var(--bg-elevated)',
-            color:
-              note.risk === 'high'
-                ? 'var(--accent-rose)'
-                : note.risk === 'medium'
-                  ? 'var(--accent-star)'
-                  : 'var(--text-secondary)',
-            border: '1px solid var(--border-hairline)',
-          }}
-        >
-          <ShieldAlert size={11.5} className="mt-0.5 shrink-0" />
-          <div className="min-w-0">
-            <span className="font-medium">{note.label}</span>
-            <span className="ml-1.5 font-mono-code text-[10px] opacity-75">({note.pluginId})</span>
-            {note.detail && <div className="mt-0.5 text-[10.5px] opacity-90">{note.detail}</div>}
-          </div>
-        </div>
-      ))}
-    </div>
   );
 }
 
@@ -478,20 +440,6 @@ export function PluginSlotSync() {
     const triageBadge = registerTriageBadge(registry, plugins);
     if (triageBadge) disposers.push(triageBadge);
 
-    // Built-in chain adapter for approval risk annotations (P3 -> P4 UI integration)
-    disposers.push(
-      registry.register({
-        slot: 'approval.detail',
-        id: 'approval-annotations',
-        pluginId: 'core.ui-approvals',
-        pluginName: '审批风险标注',
-        order: 900,
-        sourceKind: 'builtin',
-        render: ({ approval }) =>
-          approval.annotations?.length ? <ApprovalAnnotationsDetail approval={approval} /> : null,
-      }),
-    );
-
     // Built-in V5 Chat: dynamic schema-driven TraitsPicker (composer.traits)
     disposers.push(
       registry.register({
@@ -732,35 +680,6 @@ export function PluginSlotSync() {
               );
             }
             return null;
-          },
-        }),
-      );
-    }
-
-    // Built-in V5 Approval Center: historical read-only receipt (`chat.block` key: `runtime_request`)
-    const approvalCenterPlugin = plugins.find((p) => p.id === 'hm.plugin.approval-center');
-    if (!approvalCenterPlugin || isPluginActive(approvalCenterPlugin)) {
-      disposers.push(
-        registry.register({
-          slot: 'chat.block',
-          id: 'approval-center-receipt',
-          pluginId: 'hm.plugin.approval-center',
-          pluginName: 'Approval Center',
-          title: '审批与凭据回执卡',
-          key: 'runtime_request',
-          order: 100,
-          sourceKind: 'builtin',
-          render: ({ block }) => {
-            if (block.type !== 'runtime_request') return null;
-            return (
-              <RuntimeRequestReceiptBlock
-                kind={block.kind}
-                title={block.title}
-                receiptText={block.receiptText}
-                requestStatus={block.requestStatus}
-                resolvedBy={block.resolvedBy}
-              />
-            );
           },
         }),
       );

@@ -1,3 +1,4 @@
+import { activeRequestBrokers, getRequestBroker } from './requests-default/index.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { PEER_CONTRACTS, PluginApiError } from '@harnessmate/plugin-api';
 import type { InstalledPluginInfo, PluginAction, PluginPermission, PluginProgram, Session, SetPluginPermissionRequest } from '@harnessmate/protocol';
@@ -177,7 +178,10 @@ export class PluginCapabilities {
     const token = randomBytes(32).toString('base64url');
     const lease: PluginToolLease = { sessionId: session.id, harnessId, tools, connection: { url: this.getMcpUrl(), token },
       ownerInstanceId: owner?.instanceId, generation: owner?.generation, isHarnessCurrent: owner?.isHarnessCurrent,
-      release: () => { this.leases.delete(token); } };
+      release: () => {
+        this.leases.delete(token);
+        if (owner) for (const broker of activeRequestBrokers(this.plugins)) broker.cancelSession(session.id, 'model_tool_lease_released', owner.generation);
+      } };
     this.leases.set(token, lease);
     return lease;
   }
@@ -239,49 +243,43 @@ export class PluginCapabilities {
     const tool = this.listLeaseTools(lease).find((entry) => entry.name === name);
     if (!tool) throw new Error('插件工具未授权或版本已变更');
 
-    // Enforce session-selected approval.policy.v1 plugin decision in kernel
-    const policyBinding = this.plugins.resolveCapabilityBinding(PEER_CONTRACTS.approvalPolicy, {
-      sessionId: session.id,
-      workspaceId: session.workspaceId,
-    });
-    if (policyBinding.instanceId && this.plugins.isolated) {
-      const policyActive = this.plugins.isolated.getActive(policyBinding.instanceId);
-      if (!policyActive?.process.alive) {
-        throw new PluginApiError('E_SERVICE_UNAVAILABLE', `审批策略实例 ${policyBinding.instanceId} 暂不可用`);
-      }
-      const decision = await this.plugins.isolated.invokeApprovalPolicy(policyBinding.instanceId, {
-        sessionId: session.id,
-        workspaceId: session.workspaceId,
-        pluginId: tool.permission.pluginId,
-        instanceId: tool.kind === 'isolated' ? tool.instanceId : tool.permission.pluginId,
-        toolName: tool.kind === 'isolated' ? tool.toolName : tool.name,
-        readOnly: tool.readOnly,
-        args,
+    const broker = getRequestBroker(this.plugins, session.id);
+    // Every tool request, including policy allow/deny, has the same persisted CAS fact.
+    return await new Promise<string>((resolve, reject) => {
+      const id = `appr_model_${randomBytes(8).toString('hex')}`;
+      broker.register({ workspaceId: session.workspaceId,
+        approval: { id, sessionId: session.id, nativeRequestId: id, kind: 'mcp_tool_approval', toolName: name,
+          toolKind: tool.readOnly ? 'file_read' : 'mcp', summary: name, input: args,
+          riskLevel: tool.readOnly ? 'low' : 'medium', supportedDecisions: ['allow_once','deny'],
+          status: 'pending', createdAt: Date.now(), resolvedAt: null, decision: null, resolvedBy: null, comment: null },
+        origin: { providerInstanceId: lease.ownerInstanceId ?? session.harnessId, driverGeneration: lease.generation ?? 'local',
+          nativeRequestId: id, turnId: null, connectionId: 'model_tool' },
+        deadlineAtMs: Date.now() + 120000, idempotencyKey: id }, {
+        deliver: async input => {
+          if (input.decision === 'deny') {
+            reject(new PluginApiError('E_PERMISSION_DENIED', input.comment ?? '策略或用户拒绝工具请求'));
+            return 'acknowledged';
+          }
+          if (!this.isLeaseActive(lease) || !this.listLeaseTools(lease).includes(tool)) {
+            reject(new PluginApiError('E_STALE_RUN', '会话工具授权已变更')); return 'unavailable';
+          }
+          try {
+            let result: string;
+            if (tool.kind === 'program') {
+              const text = typeof args.text === 'string' && args.text.length <= pluginTextLimit ? args.text : null;
+              if (text === null) throw new Error('Invalid tool arguments');
+              result = await runPluginProgram(tool.program, text);
+            } else {
+              if (!this.plugins.isolated) throw new Error('隔离插件运行时不可用');
+              result = await this.plugins.isolated.invokeTool(tool.pluginId, tool.runId, tool.toolName, args,
+                { sessionId: session.id, workspaceId: session.workspaceId }, tool.instanceId);
+            }
+            broker.recordExecution(id, 'succeeded'); resolve(result);
+          } catch (error) { broker.recordExecution(id, 'failed'); reject(error); }
+          return 'acknowledged'; // Authorization delivery and tool outcome are separate facts.
+        },
+        release: () => reject(new PluginApiError('E_STALE_RUN', '工具请求资源已释放')),
       });
-      if (decision.decision !== 'allow') {
-        throw new PluginApiError(
-          'E_PERMISSION_DENIED',
-          decision.reason || `审批策略 (${policyBinding.instanceId}) 拒绝执行工具 ${name}`,
-        );
-      }
-    }
-
-    if (!this.isLeaseActive(lease) || !this.listLeaseTools(lease).includes(tool)) {
-      throw new PluginApiError('E_STALE_RUN', '会话工具授权已变更');
-    }
-    if (tool.kind === 'program') {
-      const text = typeof args.text === 'string' && args.text.length <= pluginTextLimit ? args.text : null;
-      if (text === null) throw new Error('Invalid tool arguments');
-      return runPluginProgram(tool.program, text);
-    }
-    if (!this.plugins.isolated) throw new Error('隔离插件运行时不可用');
-    return await this.plugins.isolated.invokeTool(
-      tool.pluginId,
-      tool.runId,
-      tool.toolName,
-      args,
-      { sessionId: session.id, workspaceId: session.workspaceId },
-      tool.instanceId,
-    );
+    });
   }
 }

@@ -319,27 +319,6 @@ export class AntigravityAcpFlavorPolicy implements AcpFlavorPolicy {
       }
       return { outcome: { outcome: 'cancelled' } };
     }
-    const toolCall = (params.toolCall ?? {}) as Record<string, unknown>;
-    const kind = String(toolCall.kind ?? '').toLowerCase();
-    const readOnly = kind === 'read' || kind === 'search';
-    const edit = ['edit', 'write', 'create'].includes(kind);
-    const allow =
-      permissionMode === 'auto' ||
-      (permissionMode === 'accept_edits' && (readOnly || edit)) ||
-      (permissionMode === 'plan' && readOnly);
-    const reject =
-      permissionMode === 'plan' &&
-      (edit || ['delete', 'move', 'execute', 'shell', 'terminal'].includes(kind));
-    if (allow || reject) {
-      const chosen = pickAcpOption(options, reject ? 'deny' : 'allow_once', true);
-      if (chosen || reject) {
-        return {
-          outcome: chosen
-            ? { outcome: 'selected', optionId: chosen.optionId }
-            : { outcome: 'cancelled' },
-        };
-      }
-    }
     return null;
   }
 }

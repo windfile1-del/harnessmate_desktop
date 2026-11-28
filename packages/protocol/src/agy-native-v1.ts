@@ -743,6 +743,8 @@ const NativeElicitationFieldDtoSchema = z.object({
 }).strict();
 
 const NativeRequestDetailDtoSchema = NativeRequestSummaryDtoSchema.extend({
+  requestId: z.string().optional(),
+  requestVersion: z.number().int().positive().optional(),
   scope: z.enum(['root', 'confirmed_child', 'confirmed_workflow', 'unknown_child']),
   agentLabel: z.string().optional(),
   workflowId: WorkflowIdSchema.optional(),
@@ -766,6 +768,7 @@ const NativeRequestDetailDtoSchema = NativeRequestSummaryDtoSchema.extend({
     description: z.string().optional(),
     securityWarning: z.string().optional(),
     scopeWidening: z.boolean(),
+    scope: z.enum(['once','session','persistent','unknown']).optional(),
   }).strict()),
   questionText: z.string().optional(),
   formSpec: z.object({

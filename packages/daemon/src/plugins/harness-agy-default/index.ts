@@ -211,7 +211,7 @@ function createLazySessionManagerProxy(
       const real = getSessionManager?.();
       if (!real) {
         if (prop === 'getSession') return () => null;
-        if (prop === 'getApprovalCenter') return () => ({ evaluateLocalRules: () => [] });
+        if (prop === 'getRequestBroker') return () => { throw new Error('Request provider unavailable'); };
         return undefined;
       }
       const value = (real as unknown as Record<PropertyKey, unknown>)[prop];
@@ -329,6 +329,7 @@ export function createAgyDriverPlugin(
           ...params.config.binaryOverrides,
           ...(cfg.binaryPath ? { agy: cfg.binaryPath } : {}),
         },
+        providerInstanceId,
       );
 
       // Re-attach host settlement sink if SessionManager already registered one
@@ -781,7 +782,7 @@ export function createAgyDriverPlugin(
             },
             provenancePolicy,
             legacyApprovalBridge: {
-              mode: 'w1_temporary_narrow_adapter',
+              mode: 'unified_requests',
               owner: 'agy.runtime.v1',
               handoffTarget: 'runtime.requests.v1',
               supportsCasResolution: true,
@@ -1452,103 +1453,10 @@ export function createAgyDriverPlugin(
               },
             });
           }
-          try {
-            nativeRegistry.persistence.createPendingApprovalReceipt({
-              binding,
-              approvalId,
-            });
-          } catch (err) {
-            if (err instanceof NativePersistenceError && err.code === 'STALE_BINDING') {
-              return peerOk({
-                __nativeError: {
-                  statusCode: 409,
-                  code: 'STALE_BINDING',
-                  message: err.message,
-                  retryable: false,
-                },
-              });
-            }
-            throw err;
-          }
-          const cas = nativeRegistry.persistence.claimApprovalReceiptCas({
-            approvalId,
-            expectedGeneration: binding.generation,
-            expectedSessionId: resolved.session.id,
-            idempotencyKey: parsed.data.idempotencyKey,
-          });
-          if (!cas.claimed || !cas.receipt) {
-            return peerOk({
-              __nativeError: {
-                statusCode: 409,
-                code: cas.staleGeneration ? 'STALE_BINDING' : 'ALREADY_RESOLVED',
-                message: cas.staleGeneration
-                  ? 'Approval generation is no longer active'
-                  : `Native request "${approvalId}" was already claimed or resolved`,
-                retryable: false,
-                details: {
-                  receiptId: cas.receipt?.receiptId ?? null,
-                  receiptState: cas.receipt?.state ?? null,
-                },
-              },
-            });
-          }
-          try {
-            const outcome = await permissionPort.resolveNativeRequest({
-              binding,
-              approvalId,
-              receiptId: cas.receipt.receiptId,
-              request: parsed.data,
-              resolvedBy: 'desktop',
-            });
-            const finalState = outcome.receiptState;
-            const transition = nativeRegistry.persistence.transitionApprovalReceiptState(
-              cas.receipt.receiptId,
-              ['claimed'],
-              finalState,
-              { outcome: parsed.data.outcome },
-            );
-            if (!transition.transitioned) {
-              return peerOk({
-                __nativeError: {
-                  statusCode: 409,
-                  code: 'DELIVERY_UNKNOWN',
-                  message: 'Runtime changed before its approval receipt could be completed',
-                  retryable: false,
-                  details: {
-                    receiptId: cas.receipt.receiptId,
-                    receiptState: transition.receipt?.state ?? 'delivery_unknown',
-                  },
-                },
-              });
-            }
-            const resBody = ResolveNativeRequestResponseSchema.parse({
-              schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-              approvalId: outcome.approvalId,
-              receiptId: cas.receipt.receiptId,
-              receiptState: finalState,
-              conflict: outcome.conflict,
-            });
-            return peerOk({
-              statusCode: outcome.conflict ? 409 : 200,
-              body: resBody,
-            });
-          } catch {
-            nativeRegistry.persistence.transitionApprovalReceiptState(
-              cas.receipt.receiptId,
-              ['claimed'],
-              'delivery_unknown',
-              { error: 'permission_wire_write_uncertain' },
-            );
-            return peerOk({
-              __nativeError: {
-                statusCode: 500,
-                code: 'DELIVERY_UNKNOWN',
-                message: 'Permission response write failed or timed out; delivery state is unknown and will not be replayed',
-                retryable: false,
-                details: { receiptId: cas.receipt.receiptId, receiptState: 'delivery_unknown' },
-              },
-            });
-          }
+          if (!permissionPort.resolveWithCas) return peerErr('UNSUPPORTED_ACTION', 'Unified request routing unavailable');
+          const outcome = await permissionPort.resolveWithCas({ binding, approvalId, request: parsed.data, resolvedBy: 'desktop' });
+          return peerOk({ statusCode: outcome.conflict ? 409 : 200, body: ResolveNativeRequestResponseSchema.parse({
+            schemaVersion: AGY_NATIVE_CONTRACT_VERSION, ...outcome }) });
         },
 
         async listSubagents({ sessionId }) {

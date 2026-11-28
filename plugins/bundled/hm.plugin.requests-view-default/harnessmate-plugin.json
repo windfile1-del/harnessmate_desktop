@@ -1,0 +1,27 @@
+{
+  "id": "hm.plugin.requests-view-default",
+  "name": "请求、审批与凭据",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "category": "ui",
+  "main": "index.mjs",
+  "permissions": [],
+  "provides": [
+    "runtime.requests.view.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "session.stage.embedded",
+        "id": "requests-queue",
+        "title": "请求与审批",
+        "ui": "ui/index.html",
+        "height": 180
+      }
+    ]
+  },
+  "description": "可替换的统一请求视图：审批、问题、凭据、模式回执与持久关闭。"
+}

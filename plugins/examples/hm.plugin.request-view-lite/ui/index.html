@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><body><main id="queue">连接请求服务…</main><script type="module">
+const bridge = window.harnessMate;
+const call = async (method, input) => { const response = await bridge.services.call('runtime.requests.v1', method, [input]); if (!response.value.ok) throw new Error(response.value.error.message); return response.value.value; };
+async function refresh() {
+  const { requests } = await call('snapshot', { sessionId: bridge.session?.id, includeHistory: true });
+  const root = document.getElementById('queue'); root.replaceChildren();
+  for (const request of requests.filter(r => !r.closed)) {
+    const row = document.createElement('p'); row.textContent = `${request.approval.summary} · ${request.status} · ${request.delivery}`;
+    const action = async input => { await call('resolve', { requestId: request.requestId, expectedVersion: request.version, actor: 'desktop', ...input }); await refresh(); };
+    if (request.status === 'pending') {
+      // Typed question/credential/native forms belong to a full view; never invent a value.
+      for (const decision of request.approval.supportedDecisions ?? ['deny']) {
+        if (request.approval.kind === 'secret_request' && decision !== 'deny') continue;
+        if (request.approval.kind === 'user_question' && decision !== 'deny') continue;
+        const button = document.createElement('button'); button.textContent = decision; button.onclick = () => action({ decision }); row.append(button);
+      }
+    } else {
+      const close = document.createElement('button'); close.textContent = '关闭'; close.onclick = async () => { await call('close', { requestId: request.requestId }); await refresh(); }; row.append(close);
+    }
+    root.append(row);
+  }
+}
+const dispose = await bridge.services.subscribe({ contract: 'runtime.requests.v1' }, refresh);
+bridge.onContext(refresh); window.addEventListener('pagehide', dispose); refresh();
+</script></body></html>

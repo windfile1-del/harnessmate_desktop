@@ -255,6 +255,10 @@ export interface NativePermissionDecisionWireResult {
 }
 
 export interface NativePermissionPort {
+    resolveWithCas?(input: {
+      binding: RuntimeBinding; approvalId: string; request: ResolveNativeRequestInput; resolvedBy: 'desktop' | 'mobile';
+    }): Promise<{ approvalId: string; receiptId: string; receiptState: NativeRequestReceiptState; conflict: boolean }>;
+
   resolveLegacyWithCas?(input: {
     readonly binding: RuntimeBinding;
     readonly approvalId: string;
@@ -282,18 +286,6 @@ export interface NativePermissionPort {
     },
   ): NativePermissionDecisionWireResult | null;
 
-  resolveNativeRequest(input: {
-    readonly binding: RuntimeBinding;
-    readonly approvalId: string;
-    readonly receiptId: string;
-    readonly request: ResolveNativeRequestInput;
-    readonly resolvedBy: 'desktop' | 'mobile';
-  }): Promise<{
-    readonly approvalId: string;
-    readonly receiptId: string;
-    readonly receiptState: NativeRequestReceiptState;
-    readonly conflict: boolean;
-  }>;
 
   onConnectionClosed(binding: RuntimeBinding, connectionId: string): void;
   listPendingRequests(binding: RuntimeBinding): readonly PendingNativeRequest[];

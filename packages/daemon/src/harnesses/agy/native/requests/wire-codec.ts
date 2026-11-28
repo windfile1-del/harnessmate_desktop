@@ -248,6 +248,7 @@ function parsePermissionRequest(params: Record<string, unknown>): ParseWireReque
       kind,
       ...(description ? { description } : {}),
       ...(warning ? { securityWarning: warning } : {}),
+      scope: rawOpt.scope === 'session' ? 'session' : rawOpt.scope === 'persistent' ? 'persistent' : kind === 'allow_once' ? 'once' : 'unknown',
       scopeWidening: isScopeWideningOption(kind, optionId, name),
     });
   }

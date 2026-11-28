@@ -214,9 +214,9 @@ describe('NP-11 Dynamic Workflow Studio Frontend & View Model', () => {
         scriptPreviewByWorkflowId={forwarded.scriptPreviewByWorkflowId}
       />,
     );
-    expect(forwardedHtml).toContain('工作流脚本批准与 1.5.16 问题转发');
-    expect(forwardedHtml).toContain('仅检查 docs/');
-    expect(forwardedHtml).toContain('经父会话转发');
+    expect(forwardedHtml).toContain('当前绑定的请求视图');
+    expect(forwardedHtml).not.toContain('role="radiogroup"');
+    expect(forwardedHtml).not.toContain('允许本次');
     expect(forwardedHtml).not.toContain('<textarea');
   });
 

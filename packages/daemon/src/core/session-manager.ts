@@ -73,7 +73,8 @@ import {
   type FailoverContract, type ModelCatalog, type ModelToolRouter,
 } from '../plugin-host/builtin/harness-integration.js';
 import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
-import { ApprovalCenterService, SECRET_RECEIPT_LABEL, type ExternalApprovalAnnotator } from './approval-center-service.js';
+import type { ApprovalCenterService, ExternalApprovalAnnotator } from './approval-center-service.js';
+import { activeRequestBrokers, getRequestBroker } from '../plugins/requests-default/index.js';
 import {
   CONTEXT_COMPRESSION_PLUGIN_ID,
   ContextCompressionError,
@@ -294,8 +295,6 @@ export class SessionManager {
   private readonly activeTurnMeta = new Map<string, ActiveTurnMeta>();
   private readonly startingSessions = new Set<string>();
   private readonly importingSessions = new Map<string, Promise<Session>>();
-  private readonly approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private fallbackApprovalCenter?: ApprovalCenterService;
   private runtimeController: SessionRuntimeDefaultController | null = null;
   constructor(
     private readonly store: HarnessMateStore,
@@ -332,17 +331,6 @@ export class SessionManager {
     // Stale running/turn crash recovery is owned by session.runtime.v1 & session.data.v1 plugins.
     // AGY native binding recovery is owned by core.harness.agy on plugin activation.
     this.explicitNativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
-    if (!this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)) {
-      for (const approval of this.store.listUnpublishedExpiredApprovals()) {
-        this.publishExpiredApproval(approval);
-        if (
-          this.store.getSession(approval.sessionId)?.status === 'awaiting_approval' &&
-          this.store.listPendingApprovals(approval.sessionId).length === 0
-        ) {
-          this.setSessionStatus(approval.sessionId, 'idle');
-        }
-      }
-    }
     this.bindSettlementSinkToActiveAgy();
   }
 
@@ -427,20 +415,6 @@ export class SessionManager {
       resolved.instanceId,
       AGY_RUNTIME_INTERNAL_SERVICE,
     )?.nativeRegistry;
-  }
-
-  private recoverStaleSessions(): void {
-    this.store.recoverCrashStateOnStartup();
-    this.nativeRegistry?.persistence.markAttachedBindingsReconcilingOnStartup();
-    for (const approval of this.store.listUnpublishedExpiredApprovals()) {
-      this.publishExpiredApproval(approval);
-    }
-    const sessions = this.store.listSessions({ includeArchived: true });
-    for (const s of sessions) {
-      if (s.status === 'running' || s.status === 'awaiting_approval') {
-        this.setSessionStatus(s.id, 'idle');
-      }
-    }
   }
 
   getSessionTurnItems(
@@ -931,12 +905,8 @@ export class SessionManager {
     return svc;
   }
 
-  getApprovalCenter(): ApprovalCenterService {
-    return (
-      this.pluginManager.host.get<ApprovalCenterService>('approval-center') ??
-      (this.fallbackApprovalCenter ??= new ApprovalCenterService(this.store))
-    );
-  }
+  getRequestBroker(sessionId?: string, requestId?: string) { return getRequestBroker(this.pluginManager, sessionId, requestId); }
+  getApprovalCenter(): ApprovalCenterService { return this.getRequestBroker().rules; }
 
   getOrchestratorService(parentSessionId?: string): OrchestratorService {
     try {
@@ -1325,7 +1295,7 @@ export class SessionManager {
   }
 
   listPendingApprovals(sessionId?: string): ApprovalRequest[] {
-    return this.store.listPendingApprovals(sessionId);
+    return activeRequestBrokers(this.pluginManager).flatMap(broker => broker.list(sessionId)).map(f => f.approval as unknown as ApprovalRequest);
   }
 
   async createSession(req: CreateSessionRequest): Promise<Session> {
@@ -1613,7 +1583,7 @@ export class SessionManager {
         await this.getActiveOrchestrator()?.cascadeStopChildren(id, 'Parent session archived');
       }
       await this.disposeSessionHandles(id);
-    } else if (!configAlreadyApplied && configChanged && current.status === 'idle') {
+    } else if (configChanged) {
       const runtimeRes = this.pluginManager.resolveServiceSelection(PEER_CONTRACTS.sessionRuntime, {
         sessionId: id,
         workspaceId: updated.workspaceId,
@@ -1627,6 +1597,7 @@ export class SessionManager {
           unwrapPeerServiceResult(
             await runtimeSvc.applyConfig({
               sessionId: id,
+              configAlreadyApplied,
               patch: {
                 model: updated.model,
                 reasoningEffort: updated.reasoningEffort,
@@ -2910,364 +2881,19 @@ export class SessionManager {
     );
   }
 
-  // ── Atomic Approval, Question & Secret Broker ────────────────────────
-
-  async resolveRuntimeRequest(
-    approvalId: string,
-    req: ResolveApprovalRequest,
-    resolvedBy: 'desktop' | 'mobile',
-  ): Promise<{ updated: boolean; conflict: boolean; approval: ApprovalRequest }> {
-    const existing = this.store.getApproval(approvalId);
-    if (!existing) {
-      throw new Error(`Approval not found: ${approvalId}`);
-    }
-
-    // Unified CAS check when native permission routing owns a receipt for this approval
-    let nativeClaimedReceiptId: string | null = null;
-    if (
-      this.nativeRegistry?.getFeatureFlags().enabled &&
-      this.nativeRegistry?.getFeatureFlags().nativePermissions &&
-      this.nativeRegistry.getSchemaStatus().compatible
-    ) {
-      const existingNativeReceipt =
-        this.nativeRegistry.persistence.getApprovalReceiptByApprovalId(approvalId);
-      if (existingNativeReceipt && existingNativeReceipt.sessionId === existing.sessionId) {
-        const activeBinding = this.nativeRegistry.getActiveBinding(existing.sessionId);
-        if (!activeBinding) {
-          return { updated: false, conflict: true, approval: existing };
-        }
-        const permissionPort = this.nativeRegistry.getPermissionPort();
-        if (permissionPort?.resolveLegacyWithCas) {
-          const outcome = await permissionPort.resolveLegacyWithCas({
-            binding: activeBinding,
-            approvalId,
-            request: req,
-            resolvedBy,
-          });
-          const approval = this.store.getApproval(approvalId) ?? existing;
-          return { updated: !outcome.conflict && approval.status !== 'pending', conflict: outcome.conflict, approval };
-        }
-        const cas = this.nativeRegistry.persistence.claimApprovalReceiptCas({
-          approvalId,
-          expectedGeneration: activeBinding.generation,
-          expectedSessionId: existing.sessionId,
-        });
-        if (!cas.claimed || !cas.receipt) {
-          return { updated: false, conflict: true, approval: existing };
-        }
-        nativeClaimedReceiptId = cas.receipt.receiptId;
-      }
-    }
-
-    const finalizeNativeReceipt = (written: boolean) => {
-      if (!nativeClaimedReceiptId || !this.nativeRegistry) return;
-      try {
-        this.nativeRegistry.persistence.transitionApprovalReceiptState(
-          nativeClaimedReceiptId,
-          ['claimed'],
-          written ? 'response_written' : 'connection_lost',
-          { resolvedBy },
-        );
-      } catch {
-        // ignore secondary receipt transition errors
-      }
-    };
-
-    const kind: RuntimeRequestKind = existing.kind ?? 'command_approval';
-
-    // Handle secret_request: STRICT ZERO-DISK / ZERO-LOG / ZERO-ECHO PIPELINE
-    if (kind === 'secret_request') {
-      const denied = req.decision === 'deny';
-      const secretPayload = !denied ? req.secretValue : undefined;
-      if (!denied && (!secretPayload || !secretPayload.length)) {
-        throw new Error('请提供凭据内容或选择拒绝');
-      }
-      const { updated, approval } = this.store.resolveApprovalIfPending(
-        approvalId,
-        denied ? 'deny' : 'allow_once',
-        resolvedBy,
-        undefined, // NEVER persist secret or comment containing secret to SQLite
-        {
-          statusOverride: denied ? 'denied' : 'resolved',
-          secretProvided: !denied,
-        },
-      );
-      if (!approval) throw new Error(`Approval not found: ${approvalId}`);
-      if (!updated) {
-        return { updated: false, conflict: true, approval };
-      }
-      this.clearApprovalTimer(approval.id);
-
-      // Deliver secret directly to live adapter memory/stdin; NEVER emit or log plaintext
-      await this.runtimeController?.resolveApprovalOnLiveHandle(
-        approval.sessionId,
-        approval.nativeRequestId,
-        denied ? 'deny' : 'allow_once',
-        denied ? '用户拒绝提供凭据' : req.comment,
-        secretPayload,
-      );
-
-      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
-        approvalId: approval.id,
-        kind: 'secret_request',
-        decision: approval.decision ?? (denied ? 'deny' : 'allow_once'),
-        status: approval.status,
-        resolvedBy,
-        secretProvided: !denied,
-        receiptText: denied ? '已拒绝提供凭据' : SECRET_RECEIPT_LABEL,
-      });
-      this.emitCanonical(approval.sessionId, 'runtime_request.updated', {
-        request: approval,
-        receiptText: denied ? '已拒绝提供凭据' : SECRET_RECEIPT_LABEL,
-      });
-      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
-      this.resumeSessionAfterApprovalIfClear(approval.sessionId);
-      return { updated: true, conflict: false, approval };
-    }
-
-    // Handle user_question
-    if (kind === 'user_question') {
-      const denied = req.decision === 'deny';
-      const answer = req.questionAnswer ?? (req.comment ? { freeText: req.comment } : undefined);
-      const { updated, approval } = this.store.resolveApprovalIfPending(
-        approvalId,
-        denied ? 'deny' : 'allow_once',
-        resolvedBy,
-        req.comment,
-        {
-          statusOverride: denied ? 'denied' : 'resolved',
-          questionAnswer: answer ?? null,
-        },
-      );
-      if (!approval) throw new Error(`Approval not found: ${approvalId}`);
-      if (!updated) {
-        return { updated: false, conflict: true, approval };
-      }
-      this.clearApprovalTimer(approval.id);
-
-      const formattedAnswer = answer
-        ? [
-            answer.selectedOptionIds?.length ? `selected: ${answer.selectedOptionIds.join(', ')}` : '',
-            answer.freeText?.trim() ? answer.freeText.trim() : '',
-          ]
-            .filter(Boolean)
-            .join(' | ')
-        : req.comment;
-
-      const written = (await this.runtimeController?.resolveApprovalOnLiveHandle(
-        approval.sessionId,
-        approval.nativeRequestId,
-        denied ? 'deny' : 'allow_once',
-        formattedAnswer,
-        undefined,
-        !denied ? answer : undefined,
-      )) ?? false;
-      finalizeNativeReceipt(written);
-
-      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
-        approvalId: approval.id,
-        kind: 'user_question',
-        decision: approval.decision ?? (denied ? 'deny' : 'allow_once'),
-        status: approval.status,
-        resolvedBy,
-        questionAnswer: answer ?? null,
-        comment: req.comment ?? null,
-      });
-      this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
-      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
-      this.resumeSessionAfterApprovalIfClear(approval.sessionId);
-      return { updated: true, conflict: false, approval };
-    }
-
-    // Standard approval: command_approval / file_change_approval / mcp_tool_approval
-    const decision = req.decision;
-    if (!decision) {
-      throw new Error('缺少审批决策 decision');
-    }
-    const { updated, approval } = this.store.resolveApprovalIfPending(
-      approvalId,
-      decision,
-      resolvedBy,
-      req.comment,
-    );
-    if (!approval) {
-      throw new Error(`Approval not found: ${approvalId}`);
-    }
-    if (!updated) {
-      return { updated: false, conflict: true, approval };
-    }
-    this.clearApprovalTimer(approval.id);
-
-    const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
-      approvalId: approval.id,
-      kind,
-      decision,
-      status: approval.status,
-      resolvedBy,
-      comment: req.comment ?? null,
-    });
-    this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
-    this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
-
-    // Deliver approval to whichever warm handle in this session owns nativeRequestId
-    const deliveredToLiveHandle = (await this.runtimeController?.resolveApprovalOnLiveHandle(
-      approval.sessionId,
-      approval.nativeRequestId,
-      decision,
-      req.comment,
-    )) ?? false;
-    finalizeNativeReceipt(deliveredToLiveHandle);
-
-    this.resumeSessionAfterApprovalIfClear(approval.sessionId);
-    return { updated: true, conflict: false, approval };
+  // Compatibility facade; the selected request plugin owns all lifecycle writes.
+  async resolveRuntimeRequest(approvalId: string, req: ResolveApprovalRequest, resolvedBy: 'desktop' | 'mobile') {
+    await this.pluginManager.ensureBootstrapped();
+    const result = await getRequestBroker(this.pluginManager, this.store.getApproval(approvalId)?.sessionId, approvalId).resolve({ requestId: approvalId, ...req, actor: resolvedBy });
+    return { updated: result.accepted, conflict: result.conflict, approval: result.request.approval as unknown as ApprovalRequest };
   }
-
-  async resolveApproval(
-    approvalId: string,
-    decision: ApprovalDecision,
-    resolvedBy: 'desktop' | 'mobile' | 'auto',
-    comment?: string,
-  ): Promise<ApprovalRequest> {
-    // Enforce human-origin channel: map legacy 'auto' only if directly invoked internally, never from plugins
-    const actor: 'desktop' | 'mobile' = resolvedBy === 'mobile' ? 'mobile' : 'desktop';
-    const { approval } = await this.resolveRuntimeRequest(
-      approvalId,
-      { decision, comment, resolvedBy: actor },
-      actor,
-    );
-    return approval;
+  async resolveApproval(approvalId: string, decision: ApprovalDecision, resolvedBy: 'desktop' | 'mobile' | 'auto', comment?: string): Promise<ApprovalRequest> {
+    const result = await getRequestBroker(this.pluginManager, this.store.getApproval(approvalId)?.sessionId, approvalId).resolve({ requestId: approvalId, decision, actor: resolvedBy, comment });
+    return result.request.approval as unknown as ApprovalRequest;
   }
+  private cancelSessionApprovals(sessionId: string, reason = 'session_interrupted'): void { for (const broker of activeRequestBrokers(this.pluginManager)) broker.cancelSession(sessionId, reason); }
+  private expireSessionApprovals(sessionId?: string): void { for (const broker of activeRequestBrokers(this.pluginManager)) broker.cancelSession(sessionId, 'turn_ended'); }
 
-  private recordRuntimeRequestReceipt(approval: ApprovalRequest, seq: number, createdAt: number): void {
-    const session = this.store.getSession(approval.sessionId);
-    if (!session) return;
-    const receipt = this.getApprovalCenter().buildReceiptSummary(approval);
-    this.store.upsertTurnItem({
-      itemId: `rtreq:${approval.id}`,
-      schemaVersion: 2,
-      sessionId: approval.sessionId,
-      turnId: this.runtimeController?.getActiveTurnId(approval.sessionId) ?? `rtreq_${seq}`,
-      seq,
-      instanceId: approval.instanceId ?? session.harnessId,
-      driverId: session.harnessKind,
-      blockType: 'runtime_request',
-      status: approval.status === 'cancelled' || approval.status === 'expired' ? 'cancelled' : 'completed',
-      title: receipt.title,
-      textBody: receipt.textBody,
-      payload: receipt.payload,
-      outputOmitted: false,
-      omittedBytes: 0,
-      createdAt: approval.createdAt,
-      updatedAt: createdAt,
-    });
-  }
-
-  mirrorNativeApproval(approval: ApprovalRequest): void {
-    this.store.createApproval(approval);
-    const session = this.store.getSession(approval.sessionId);
-    if (!session) return;
-    const turnId = this.runtimeController?.getActiveTurnId(session.id);
-    this.runtimeController?.flushSessionDeltas(session.id);
-    this.setSessionStatus(session.id, 'awaiting_approval');
-    this.emitCanonical(session.id, 'approval.requested', { approval }, turnId);
-    this.emitCanonical(session.id, 'runtime_request.updated', { request: approval }, turnId);
-    this.getActiveOrchestrator()?.handleChildApprovalRequested(session.id, approval.id, approval.toolName);
-    this.eventBus.publishAttention({
-      kind: 'approval_needed',
-      sessionId: session.id,
-      sessionTitle: session.title,
-      harnessId: approval.instanceId ?? session.harnessId,
-      summary: approval.summary,
-      approvalId: approval.id,
-      timestamp: Date.now(),
-    });
-  }
-
-  syncNativeApproval({
-    approvalId, status, decision, resolvedBy, comment,
-  }: Parameters<NonNullable<import('../harnesses/agy/native/requests/types.js').NativeApprovalCenterBridge['syncResolvedApproval']>>[0]): void {
-    const updated = status === 'expired'
-      ? this.store.expireApprovalIfPending(approvalId)
-      : this.store.resolveApprovalIfPending(
-          approvalId, decision ?? 'deny', resolvedBy ?? 'auto', comment ?? undefined, { statusOverride: status },
-        ).updated;
-    const approval = updated ? this.store.getApproval(approvalId) : null;
-    if (!approval) return;
-    const event = this.emitCanonical(approval.sessionId, 'approval.resolved', {
-      approvalId, status: approval.status, decision: approval.decision, resolvedBy: approval.resolvedBy,
-    });
-    this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
-    this.recordRuntimeRequestReceipt(approval, event.seq, event.createdAt);
-    this.resumeSessionAfterApprovalIfClear(approval.sessionId);
-  }
-
-  private resumeSessionAfterApprovalIfClear(sessionId: string): void {
-    const remaining = this.store.listPendingApprovals(sessionId);
-    if (remaining.length === 0) {
-      const sess = this.store.getSession(sessionId);
-      if (sess && sess.status === 'awaiting_approval') {
-        this.setSessionStatus(sessionId, this.runtimeController?.hasActiveTurn(sessionId) ? 'running' : 'idle');
-      }
-      this.getActiveOrchestrator()?.handleChildApprovalResolved(sessionId);
-    }
-  }
-
-  private cancelSessionApprovals(sessionId: string, reason = '会话中断'): void {
-    const cancelled = this.store.cancelPendingApprovals(sessionId);
-    for (const approval of cancelled) {
-      this.clearApprovalTimer(approval.id);
-      const ev = this.emitCanonical(approval.sessionId, 'approval.resolved', {
-        approvalId: approval.id,
-        kind: approval.kind ?? 'command_approval',
-        status: 'cancelled',
-        resolvedAt: approval.resolvedAt,
-        comment: reason,
-      });
-      this.emitCanonical(approval.sessionId, 'runtime_request.updated', { request: approval });
-      this.recordRuntimeRequestReceipt(approval, ev.seq, ev.createdAt);
-      void this.runtimeController?.resolveApprovalOnLiveHandle(
-        approval.sessionId,
-        approval.nativeRequestId,
-        'deny',
-        reason,
-      ).catch(() => {});
-    }
-    this.resumeSessionAfterApprovalIfClear(sessionId);
-  }
-
-  private clearApprovalTimer(id: string): void {
-    clearTimeout(this.approvalTimers.get(id));
-    this.approvalTimers.delete(id);
-  }
-
-  private publishExpiredApproval(approval: ApprovalRequest): void {
-    this.emitCanonical(approval.sessionId, 'approval.resolved', {
-      approvalId: approval.id, status: 'expired', resolvedAt: approval.resolvedAt,
-    });
-  }
-
-  private expireApproval(approval: ApprovalRequest): void {
-    this.clearApprovalTimer(approval.id);
-    if (!this.store.expireApprovalIfPending(approval.id)) return;
-    this.publishExpiredApproval({ ...approval, resolvedAt: Date.now() });
-    void this.runtimeController?.resolveApprovalOnLiveHandle(
-      approval.sessionId,
-      approval.nativeRequestId,
-      'deny',
-      '审批已过期',
-    ).catch(() => {});
-    if (this.store.getSession(approval.sessionId)?.status === 'awaiting_approval' &&
-        this.store.listPendingApprovals(approval.sessionId).length === 0) {
-      this.setSessionStatus(
-        approval.sessionId,
-        this.runtimeController?.hasActiveTurn(approval.sessionId) ? 'running' : 'idle',
-      );
-    }
-  }
-
-  private expireSessionApprovals(sessionId?: string): void {
-    for (const approval of this.store.listPendingApprovals(sessionId)) this.expireApproval(approval);
-  }
 
   async shutdown(): Promise<void> {
     await this.terminalWorkspace?.disposeAll();
@@ -3283,7 +2909,6 @@ export class SessionManager {
     }
     if (!this.pluginManager.isInstanceKnownDisabled(SESSION_DATA_DEFAULT_PLUGIN_ID)) {
       this.store.settleRunningTurnItems(undefined, 'interrupted');
-      this.expireSessionApprovals();
     }
   }
 
@@ -4179,87 +3804,7 @@ export class SessionManager {
       }
 
       case 'approval.requested': {
-        this.deltaCoalescer.flushSession(sessionId);
-        const approvalId = `appr_${crypto.randomBytes(6).toString('hex')}`;
-        nativeToGlobalApprovalId.set(ev.nativeRequestId, approvalId);
-        const inferredKind: RuntimeRequestKind =
-          ev.kind ??
-          (ev.toolKind === 'file_edit'
-            ? 'file_change_approval'
-            : ev.toolKind === 'mcp'
-              ? 'mcp_tool_approval'
-              : 'command_approval');
-        const adapter = this.registry.get(eventHarnessId);
-        const supportedDecisions =
-          ev.supportedDecisions ??
-          adapter?.capabilitiesV2?.supportedApprovalDecisions ??
-          ['allow_once', 'allow_session', 'deny'];
-
-        const approvalCenter = this.getApprovalCenter();
-        const localAnnotations = approvalCenter.evaluateLocalRules({
-          approvalId,
-          sessionId,
-          workspaceId: session.workspaceId,
-          cwd: session.cwd,
-          kind: inferredKind,
-          toolName: ev.toolName,
-          toolKind: ev.toolKind,
-          summary: ev.summary,
-          input: ev.input,
-          diffPreview: ev.diffPreview ?? null,
-          riskLevel: ev.riskLevel,
-        });
-        const riskRank: Record<ApprovalRequest['riskLevel'], number> = { low: 0, medium: 1, high: 2, critical: 3 };
-        let effectiveRisk: ApprovalRequest['riskLevel'] = ev.riskLevel;
-        for (const note of localAnnotations) {
-          if (note.risk && riskRank[note.risk] > riskRank[effectiveRisk]) {
-            effectiveRisk = note.risk;
-          }
-        }
-
-        const approval: ApprovalRequest = {
-          id: approvalId,
-          sessionId,
-          parentSessionId: session.parentSessionId ?? null,
-          instanceId: eventHarnessId,
-          nativeRequestId: ev.nativeRequestId,
-          kind: inferredKind,
-          toolName: ev.toolName,
-          toolKind: ev.toolKind,
-          summary: ev.summary,
-          input: inferredKind === 'secret_request' ? {} : ev.input,
-          diffPreview: ev.diffPreview ?? null,
-          riskLevel: effectiveRisk,
-          supportedDecisions,
-          questionSpec: ev.questionSpec ?? null,
-          secretSpec: ev.secretSpec ?? null,
-          annotations: localAnnotations.length > 0 ? localAnnotations : undefined,
-          status: 'pending',
-          resolvedBy: null,
-          decision: null,
-          comment: null,
-          createdAt: Date.now(),
-          resolvedAt: null,
-        };
-        this.store.createApproval(approval);
-        const expiry = setTimeout(() => this.expireApproval(approval), 120_000);
-        expiry.unref();
-        this.approvalTimers.set(approvalId, expiry);
-        this.setSessionStatus(sessionId, 'awaiting_approval');
-        this.emitCanonical(sessionId, 'approval.requested', { approval }, ev.turnId);
-        this.emitCanonical(sessionId, 'runtime_request.updated', { request: approval }, ev.turnId);
-        this.getActiveOrchestrator()?.handleChildApprovalRequested(sessionId, approvalId, ev.toolName);
-        void this.annotatePendingApproval(session, approval);
-        this.eventBus.publishAttention({
-          kind: 'approval_needed',
-          sessionId,
-          sessionTitle: session.title,
-          harnessId: eventHarnessId,
-          summary: ev.summary,
-          approvalId,
-          timestamp: Date.now(),
-        });
-        break;
+        throw new Error('Approval ingress requires session.runtime.v1 and runtime.requests.v1');
       }
 
       case 'usage.updated': {
@@ -4329,55 +3874,8 @@ export class SessionManager {
     this.pluginManager?.notifyEvent(modelEv, found.session.workspaceId);
   }
 
-  async annotatePendingApproval(
-    session: Session,
-    approval: ApprovalRequest,
-    extraAnnotators?: readonly ExternalApprovalAnnotator[],
-  ) {
-    const isolatedNotes =
-      (await this.pluginManager.isolated?.annotateApproval({
-        approvalId: approval.id,
-        sessionId: session.id,
-        workspaceId: session.workspaceId,
-        toolName: approval.toolName,
-        toolKind: approval.toolKind,
-        summary: approval.summary,
-        riskLevel: approval.riskLevel === 'critical' ? 'high' : approval.riskLevel,
-      })) ?? [];
-
-    for (const note of isolatedNotes) {
-      this.store.addApprovalAnnotation(approval.id, note);
-    }
-
-    if (extraAnnotators && extraAnnotators.length > 0) {
-      const evaluation = await this.getApprovalCenter().evaluateWithPlugins(
-        {
-          approvalId: approval.id,
-          sessionId: session.id,
-          workspaceId: session.workspaceId,
-          cwd: session.cwd,
-          kind: approval.kind ?? 'command_approval',
-          toolName: approval.toolName,
-          toolKind: approval.toolKind,
-          summary: approval.summary,
-          input: approval.input,
-          diffPreview: approval.diffPreview ?? null,
-          riskLevel: approval.riskLevel,
-        },
-        extraAnnotators,
-      );
-      for (const note of evaluation.annotations) {
-        if (note.pluginId !== 'hm.plugin.approval-center') {
-          this.store.addApprovalAnnotation(approval.id, note);
-        }
-      }
-    }
-
-    const updated = this.store.getApproval(approval.id);
-    if (updated && (isolatedNotes.length > 0 || (extraAnnotators?.length ?? 0) > 0)) {
-      this.emitCanonical(session.id, 'runtime_request.updated', { request: updated });
-    }
-    return updated;
+  async annotatePendingApproval(session: Session, approval: ApprovalRequest, extraAnnotators?: readonly ExternalApprovalAnnotator[]) {
+    return this.getRequestBroker(session.id).annotate(session, approval, extraAnnotators);
   }
 
   async evaluateHandoffOffer(session: Session, harnessId: string, message?: string | null) {

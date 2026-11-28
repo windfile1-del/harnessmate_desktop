@@ -15,7 +15,7 @@ export default defineConfig({
           if (
             output.type === 'chunk' &&
             Object.keys(output.modules).some((id) =>
-              id.replaceAll('\\', '/').endsWith('/stores/app-store.ts'),
+              id.replaceAll('\\', '/').endsWith('/stores/app-store.ts') || (id.replaceAll('\\', '/').includes('/plugins/requests-view-default/') && !id.endsWith('.d.ts')),
             )
           ) {
             throw new Error('AGY workbench plugin must never bundle the host app-store');

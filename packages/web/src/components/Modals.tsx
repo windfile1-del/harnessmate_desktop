@@ -20,7 +20,6 @@ import { useShallow } from 'zustand/react/shallow';
 import { formatRelativeTime, PERMISSION_MODE_LABELS } from '../lib/harness-meta';
 import { Slot } from '../slots';
 import { useAppStore } from '../stores/app-store';
-import { RiskRulesModal } from './ApprovalCenter';
 import { HarnessBadge } from './BrandMark';
 import { CommandPaletteModal, KeyboardShortcuts } from './CommandPalette';
 import { HarnessIntegrationModal } from './HarnessIntegrationModal';
@@ -87,7 +86,6 @@ export function ModalHost() {
         {activeModal === 'keyboard_shortcuts' && <KeyboardShortcuts onClose={() => openModal(null)} />}
         {activeModal === 'worktrees' && <WorktreeManagerModal onClose={() => openModal(null)} />}
         {activeModal === 'session_explorer' && <SessionExplorerModal onClose={() => openModal(null)} />}
-        {activeModal === 'risk_rules' && <RiskRulesModal onClose={() => openModal(null)} />}
         {activeModal === 'subagent_merge_back' && (
           <MergeBackReviewModal onClose={() => openModal(null)} />
         )}

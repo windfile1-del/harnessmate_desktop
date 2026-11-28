@@ -299,11 +299,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         onAuthStateChanged: (state) => wsGateway?.notifyAgyAuthState(state),
         onUsageCacheInvalidate: (instanceId) => invalidateAccountUsage(pluginManager, instanceId),
         getPendingSettlementSink: () => sessionManager?.createSettlementSink(),
-        getApprovalCenter: () => sessionManager.getApprovalCenter(),
         getOrchestrator: () => sessionManager.getOrchestratorIfEnabled(),
-        onAnnotatePendingApproval: async (session, approval) => {
-          await sessionManager.annotatePendingApproval(session, approval);
-        },
         onAttachCompressorHooks: () => sessionManager.attachCompressorForRuntime(),
         onRuntimeControllerReady: (ctrl) => {
           pendingRuntimeController = ctrl;
@@ -2354,7 +2350,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   app.get('/api/v1/approvals', async (request) => {
     const q = request.query as { sessionId?: string; includeHistory?: string };
     if (q.includeHistory === '1' || q.includeHistory === 'true') {
-      return { approvals: store.listApprovals({ sessionId: q.sessionId, limit: 100 }) };
+      return { approvals: sessionManager.getRequestBroker(q.sessionId).list(q.sessionId, true).map(f => f.approval) };
     }
     return { approvals: sessionManager.listPendingApprovals(q.sessionId) };
   });
@@ -2383,6 +2379,17 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       const status = msg.includes('not found') ? 404 : 400;
       return reply.code(status).send({ error: msg });
     }
+  });
+
+  app.post('/api/v1/approvals/:id/close', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const sessionId = store.getApproval(id)?.sessionId;
+    const closed = sessionManager.getRequestBroker(sessionId, id).close(id);
+    return reply.code(closed ? 200 : 409).send({ closed });
+  });
+  app.get('/api/v1/sessions/:id/request-mode', async request => {
+    const { id } = request.params as { id: string };
+    return sessionManager.getRequestBroker(id).service.getMode({ sessionId: id });
   });
 
   app.get('/api/v1/approval-center/rules', async () => {

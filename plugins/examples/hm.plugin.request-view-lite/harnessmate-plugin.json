@@ -1,0 +1,7 @@
+{
+  "id": "hm.plugin.request-view-lite", "name": "Request View Lite", "version": "1.0.0",
+  "description": "公开请求服务与实际贡献挂载的最小替换视图。",
+  "category": "ui", "apiVersion": 4, "engines": { "pluginApi": "^4.0" }, "main": "index.mjs",
+  "provides": ["runtime.requests.view.v1"],
+  "contributes": { "slots": [{ "slot": "session.stage.embedded", "id": "requests-queue", "title": "Lite requests", "ui": "ui/index.html" }] }
+}

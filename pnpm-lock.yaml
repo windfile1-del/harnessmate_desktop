@@ -133,6 +133,9 @@ importers:
 
   packages/web:
     dependencies:
+      '@harnessmate/plugin-api':
+        specifier: workspace:*
+        version: link:../plugin-api
       '@harnessmate/protocol':
         specifier: workspace:*
         version: link:../protocol

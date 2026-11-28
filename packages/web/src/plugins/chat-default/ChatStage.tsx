@@ -1,7 +1,6 @@
 import { BoundSessionSurface, useBoundSessionPlugin } from '../../slots/BoundSessionSurface';
 import { useShallow } from 'zustand/react/shallow';
 import type {
-  ApprovalRequest,
   Attachment,
   CanonicalEvent,
   FailoverPolicy,
@@ -100,11 +99,6 @@ import {
   resolveAgyModeOptions,
 } from '../../components/agy/native/shared';
 import type { WorkflowId } from '../../lib/native-client';
-import {
-  ComposerPendingRequestBar,
-  GlobalAttentionStrip,
-  RuntimeRequestReceiptBlock,
-} from '../../components/ApprovalCenter';
 import { HarnessBadge, StarLoomCrest } from '../../components/BrandMark';
 import { UndoRevertBanner } from '../../components/CheckpointControls';
 import { HarnessSwitcher } from '../../components/HarnessSwitcher';
@@ -174,7 +168,6 @@ function SessionUndoRevertBar({ sessionId }: { sessionId: string }) {
 export function ChatStage() {
   const {
     sessions,
-    pendingApprovals,
     harnesses,
     workspaces,
     slashCommands,
@@ -209,8 +202,6 @@ export function ChatStage() {
     failoverSession,
     interruptSession,
     updateSession,
-    resolveApproval,
-    resolveRuntimeRequest,
     forkSession,
     mergeBackSession,
     setDraftText,
@@ -235,7 +226,6 @@ export function ChatStage() {
     loadNativeWorkflowResource,
   } = useAppStore(useShallow((state) => ({
     sessions: state.sessions,
-    pendingApprovals: state.pendingApprovals,
     harnesses: state.harnesses,
     workspaces: state.workspaces,
     slashCommands: state.slashCommands,
@@ -270,8 +260,6 @@ export function ChatStage() {
     failoverSession: state.failoverSession,
     interruptSession: state.interruptSession,
     updateSession: state.updateSession,
-    resolveApproval: state.resolveApproval,
-    resolveRuntimeRequest: state.resolveRuntimeRequest,
     forkSession: state.forkSession,
     mergeBackSession: state.mergeBackSession,
     setDraftText: state.setDraftText,
@@ -304,17 +292,6 @@ export function ChatStage() {
   const harness = useMemo(
     () => (session ? harnesses.find((h) => h.id === session.harnessId) ?? null : null),
     [harnesses, session],
-  );
-
-  // Background sessions awaiting approval (Global Attention Strip)
-  const otherAwaitingSessions = useMemo(
-    () =>
-      sessions.filter(
-        (s) =>
-          s.id !== selectedSessionId &&
-          (s.status === 'awaiting_approval' || s.pendingApprovalCount > 0),
-      ),
-    [sessions, selectedSessionId],
   );
 
   const visibleEvents = events ?? NO_EVENTS;
@@ -398,28 +375,9 @@ export function ChatStage() {
   const taskLedgerEnabled = Boolean(useBoundSessionPlugin('session.ledger.v1', session ?? null));
   const nativeCommandsEnabled = isPluginEnabled('core.harness-commands');
   const explorerEnabled = isPluginEnabled('hm.plugin.session-explorer');
-  const approvalCenterEnabled = isPluginEnabled('hm.plugin.approval-center');
-  const sessionPendingRequests = useMemo(() => {
-    if (!session) return [];
-    const byId = new Map<string, ApprovalRequest>();
-    for (const item of timeline.pendingApprovals) byId.set(item.id, item);
-    for (const item of pendingApprovals) {
-      if (item.sessionId === session.id && item.status === 'pending') {
-        byId.set(item.id, item);
-      }
-    }
-    return [...byId.values()];
-  }, [session, timeline.pendingApprovals, pendingApprovals]);
-  const allGlobalPendingRequests = useMemo(() => {
-    const byId = new Map<string, ApprovalRequest>();
-    for (const item of pendingApprovals) {
-      if (item.status === 'pending') byId.set(item.id, item);
-    }
-    for (const item of timeline.pendingApprovals) {
-      if (item.status === 'pending') byId.set(item.id, item);
-    }
-    return [...byId.values()];
-  }, [pendingApprovals, timeline.pendingApprovals]);
+  const requestViewPlugin = useBoundSessionPlugin('runtime.requests.view.v1', session ?? null);
+  // Request facts are rendered by the bound request view; history is never a pending source.
+
   const commandCatalogKey = session ? `${session.id}:${session.harnessId}` : '';
 
   const traitScopeKey = session ? `${session.id}:${session.harnessId}` : '';
@@ -976,30 +934,6 @@ export function ChatStage() {
     (isNarrowViewport || nativeRoute.layout === 'split');
   const isNarrowSheetOpen = showSplitOrSheetWorkbench && isNarrowViewport;
 
-  const sharedWorkbenchProps = {
-    session,
-    projection: nativeProjection,
-    syncState: nativeSyncState,
-    capabilities: nativeCapabilities,
-    pendingApprovals: sessionPendingRequests,
-    route: nativeRoute,
-    returnFocusToRef: workbenchTriggerRef,
-    onNavigate: (patch: Parameters<typeof setNativeWorkbenchRoute>[1]) =>
-      setNativeWorkbenchRoute(session.id, patch),
-    onBackToChat: () => {
-      pendingWorkbenchFocusRestoreRef.current = true;
-      setNativeWorkbenchRoute(session.id, { surface: 'chat' });
-    },
-    onRefresh: () => void hydrateNativeRuntime(session.id),
-    onResolveRequest: resolveRuntimeRequest,
-    onSubmitCommand: async (req: Parameters<typeof submitNativeCommand>[1]) => {
-      await submitNativeCommand(session.id, req);
-    },
-    onDispatchControl: (req: Parameters<typeof dispatchNativeControl>[1]) =>
-      dispatchNativeControl(session.id, req),
-    loadTimeline: stableLoadNativeTimeline,
-    loadWorkflowResource: stableLoadNativeWorkflowResource,
-  };
 
   return (
     <div className="flex h-full min-w-0 flex-1 overflow-hidden">
@@ -1169,9 +1103,9 @@ export function ChatStage() {
                     {activeNativeWorkCount} 运行
                   </span>
                 )}
-                {sessionPendingRequests.length > 0 && (
+                {session.pendingApprovalCount > 0 && (
                   <span className="rounded-full bg-[var(--accent-star-soft)] px-1.5 py-0.2 font-mono-code text-[10px] font-semibold text-[var(--accent-star)]">
-                    {sessionPendingRequests.length}
+                    {session.pendingApprovalCount}
                   </span>
                 )}
               </button>
@@ -1317,56 +1251,7 @@ export function ChatStage() {
           </div>
         </header>
 
-        {/* Global Attention Strip (current + background + child sessions pending approvals/questions/secrets) */}
-        {approvalCenterEnabled ? (
-          <GlobalAttentionStrip
-            pendingRequests={allGlobalPendingRequests}
-            sessions={sessions}
-            selectedSessionId={selectedSessionId}
-            onJumpToSession={(targetId) => void selectSession(targetId)}
-            onOpenRiskRules={() => openModal('risk_rules')}
-          />
-        ) : (
-          otherAwaitingSessions.length > 0 && (
-            <div
-              className="flex shrink-0 items-center justify-between gap-2 px-4 py-1.5 text-[11.5px]"
-              style={{
-                backgroundColor: 'var(--accent-star-soft)',
-                borderBottom: '1px solid color-mix(in srgb, var(--accent-star) 35%, transparent)',
-                color: 'var(--accent-star)',
-              }}
-            >
-              <span className="inline-flex items-center gap-1.5 truncate">
-                <ShieldAlert size={13} />
-                其他后台会话正在等待权限确认：{otherAwaitingSessions.map((s) => s.title).join('、')}
-              </span>
-              <button
-                type="button"
-                onClick={() => void selectSession(otherAwaitingSessions[0]!.id)}
-                className="shrink-0 cursor-pointer rounded-md px-2 py-0.5 font-medium underline"
-              >
-                立即前往
-              </button>
-            </div>
-          )
-        )}
-
-        {/* Fallback simple approval alert bar ONLY when approval-center plugin is explicitly disabled */}
-        {!approvalCenterEnabled && timeline.pendingApprovals.length > 0 && (
-          <div className="shrink-0 px-4 pt-3">
-            <div className="mx-auto max-w-[760px] space-y-2">
-              {timeline.pendingApprovals.map((appr) => (
-                <ApprovalCard
-                  key={appr.id}
-                  session={session}
-                  approval={appr}
-                  pinned
-                  onResolve={(decision) => void resolveApproval(appr.id, decision)}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+        <BoundSessionSurface plugin={requestViewPlugin} surface="requests-queue" session={session} defaultHeight={180} />
 
         {/* Prominent Undo Revert Banner after a checkpoint revert */}
         <SessionUndoRevertBar sessionId={session.id} />
@@ -1405,8 +1290,8 @@ export function ChatStage() {
                     const relatedWork = act.workId
                       ? nativeProjection?.work.find((w) => w.id === act.workId) ?? null
                       : null;
-                    const actPending = sessionPendingRequests.filter(
-                      (req) => nativeProjection?.receipts?.[req.id]?.activityId === act.id,
+                    const actPending = Object.values(nativeProjection?.receipts ?? {}).filter(
+                      (receipt) => receipt.activityId === act.id && receipt.receiptState === 'pending',
                     ).length;
                     return (
                       <NativeActivityLink
@@ -1476,7 +1361,6 @@ export function ChatStage() {
                       allowFailover={!isRunning && item.status === 'failed'}
                       onFailover={onFailover}
                       onPreviewImage={setLightboxImg}
-                      onResolveApproval={resolveApproval}
                       onOpenFile={openFile}
                     />
                   ),
@@ -1508,14 +1392,6 @@ export function ChatStage() {
 
         {/* Floating Glass Composer Dock (Drag-Drop + Paste Image + @file + /slash + ModelPicker) */}
         <div className="shrink-0 px-4 pb-4 pt-1">
-          {approvalCenterEnabled && (
-            <ComposerPendingRequestBar
-              session={session}
-              pendingRequests={sessionPendingRequests}
-              onResolve={resolveRuntimeRequest}
-              onOpenRiskRules={() => openModal('risk_rules')}
-            />
-          )}
           {pluginMode && (
             <div className="mx-auto mb-2 flex max-w-[760px] items-center justify-between gap-2 px-1 text-[12px] text-[var(--text-secondary)]">
               <span>描述你想定制的功能，当前模型会收到 SDK、安装和热重载说明。</span>
@@ -2126,7 +2002,6 @@ const TurnBlock = memo(function TurnBlock({
   allowFailover,
   onFailover,
   onPreviewImage,
-  onResolveApproval,
   onOpenFile,
 }: {
   session: Session;
@@ -2139,7 +2014,6 @@ const TurnBlock = memo(function TurnBlock({
   allowFailover: boolean;
   onFailover: (targetHarnessId: string) => void;
   onPreviewImage: (src: string) => void;
-  onResolveApproval: (id: string, decision: 'allow_once' | 'allow_session' | 'deny') => void;
   onOpenFile: (file: FileLink) => void;
 }) {
   const effectiveKind = turn.harnessKind ?? fallbackHarnessKind;
@@ -2304,15 +2178,7 @@ const TurnBlock = memo(function TurnBlock({
                     name="chat.block"
                     matchKey="runtime_request"
                     slotProps={{ session, turn, block, onOpenFile, onFailover }}
-                    fallback={
-                      <RuntimeRequestReceiptBlock
-                        kind={block.kind}
-                        title={block.title}
-                        receiptText={block.receiptText}
-                        requestStatus={block.requestStatus}
-                        resolvedBy={block.resolvedBy}
-                      />
-                    }
+
                   />
                 );
               }
@@ -2416,17 +2282,6 @@ const TurnBlock = memo(function TurnBlock({
             )}
           </>
         )}
-
-        {turn.approvals
-          .filter((a) => a.status === 'approved' || a.status === 'denied')
-          .map((appr) => (
-            <ApprovalCard
-              key={appr.id}
-              session={session}
-              approval={appr}
-              onResolve={(decision) => onResolveApproval(appr.id, decision)}
-            />
-          ))}
 
         <Slot
           name="chat.node"
@@ -2572,135 +2427,6 @@ function ToolCallCard({ session, tool }: { session: Session; tool: ProjectedTool
               </>
             }
           />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ApprovalCard({
-  session,
-  approval,
-  pinned = false,
-  onResolve,
-}: {
-  session: Session;
-  approval: ApprovalRequest;
-  pinned?: boolean;
-  onResolve: (decision: 'allow_once' | 'allow_session' | 'deny') => void;
-}) {
-  const [showRaw, setShowRaw] = useState(false);
-  const isPending = approval.status === 'pending';
-
-  return (
-    <div
-      className="animate-fade-up overflow-hidden rounded-2xl p-3.5"
-      style={{
-        backgroundColor: isPending ? 'var(--bg-glass)' : 'var(--bg-surface)',
-        backdropFilter: pinned ? 'blur(16px)' : undefined,
-        border: `1px solid ${
-          isPending
-            ? 'color-mix(in srgb, var(--accent-star) 55%, transparent)'
-            : 'var(--border-hairline)'
-        }`,
-        boxShadow: pinned ? 'var(--shadow-float)' : 'none',
-      }}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-2.5">
-          {isPending ? (
-            <ShieldAlert size={17} className="mt-0.5 shrink-0 text-[var(--accent-star)]" />
-          ) : (
-            <ShieldCheck
-              size={16}
-              className="mt-0.5 shrink-0"
-              style={{
-                color:
-                  approval.status === 'approved' ? 'var(--accent-emerald)' : 'var(--accent-rose)',
-              }}
-            />
-          )}
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[12.5px] font-semibold text-[var(--text-primary)]">
-                {isPending ? '需要权限确认' : approval.status === 'approved' ? '已批准操作' : '已拒绝操作'}
-              </span>
-              <span
-                className="rounded-md px-1.5 py-0.5 font-mono-code text-[10.5px]"
-                style={{
-                  backgroundColor: 'var(--bg-elevated)',
-                  color: 'var(--text-secondary)',
-                }}
-              >
-                {approval.toolName}
-              </span>
-              {approval.resolvedBy && (
-                <span className="text-[11px] text-[var(--text-muted)]">
-                  · 由{approval.resolvedBy === 'mobile' ? '手机端' : '桌面端'}裁决
-                </span>
-              )}
-            </div>
-            <p className="mt-1 font-mono-code text-[12px] break-all text-[var(--text-secondary)]">
-              {approval.summary}
-            </p>
-            <Slot name="approval.detail" slotProps={{ session, approval }} />
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setShowRaw(!showRaw)}
-          className="shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
-        >
-          {showRaw ? '收起参数' : '查看详情'}
-        </button>
-      </div>
-
-      {showRaw && (
-        <pre
-          className="mt-2.5 max-h-[180px] overflow-auto rounded-xl p-2.5 font-mono-code text-[11px] text-[var(--text-secondary)]"
-          style={{
-            backgroundColor: 'var(--code-bg)',
-            border: '1px solid var(--border-hairline)',
-          }}
-        >
-          {approval.diffPreview || JSON.stringify(approval.input, null, 2)}
-        </pre>
-      )}
-
-      {isPending && (
-        <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => onResolve('deny')}
-            className="cursor-pointer rounded-xl px-3 py-1.5 text-[12px] font-medium transition-colors hover:bg-[var(--accent-rose-soft)]"
-            style={{
-              color: 'var(--accent-rose)',
-              border: '1px solid color-mix(in srgb, var(--accent-rose) 35%, transparent)',
-            }}
-          >
-            拒绝
-          </button>
-          <button
-            type="button"
-            onClick={() => onResolve('allow_session')}
-            className="cursor-pointer rounded-xl px-3 py-1.5 text-[12px] font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
-            style={{
-              backgroundColor: 'var(--bg-elevated)',
-              border: '1px solid var(--border-strong)',
-            }}
-          >
-            本会话信任
-          </button>
-          <button
-            type="button"
-            onClick={() => onResolve('allow_once')}
-            className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12px] font-medium text-white transition-all hover:opacity-90"
-            style={{ backgroundColor: 'var(--accent-emerald)' }}
-          >
-            <Check size={13} />
-            <span>允许本次</span>
-          </button>
         </div>
       )}
     </div>

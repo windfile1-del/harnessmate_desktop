@@ -1,3 +1,4 @@
+import type { RequestCreateDto, RequestResolveDto, RuntimeRequestDto } from '@harnessmate/plugin-api';
 import type {
   ActivityId,
   AgentLineage,
@@ -38,6 +39,7 @@ export interface NativeRequestOption {
   readonly description?: string;
   readonly securityWarning?: string;
   /** True for persistent/session-wide permissions such as allow_always / allow_session. */
+  readonly scope?: 'once' | 'session' | 'persistent' | 'unknown';
   readonly scopeWidening: boolean;
 }
 
@@ -151,6 +153,8 @@ export interface NativeRequestValidationResult {
  * Explicitly omits `connectionId`, `wireRequestId`, `actualNativeSessionId`, and raw host paths.
  */
 export interface NativeRequestDetailDto extends NativeRequestSummaryDto {
+  readonly requestId?: string;
+  readonly requestVersion?: number;
   readonly scope: NativeRequestTargetScope;
   readonly agentLabel?: string;
   readonly workflowId?: WorkflowId;
@@ -189,17 +193,24 @@ export interface NativeApprovalCenterBridge {
     readonly cwd?: string;
     readonly parentSessionId?: string | null;
   } | null;
-  mirrorPendingApproval?(approval: ApprovalRequest): void;
-  syncResolvedApproval?(params: {
-    readonly approvalId: string;
-    readonly status: ApprovalRequest['status'];
-    readonly decision?: ApprovalRequest['decision'];
-    readonly resolvedBy?: 'desktop' | 'mobile' | 'auto' | null;
-    readonly comment?: string | null;
-  }): void;
+
 }
 
+export interface NativeRequestAuthority {
+  get(id: string): RuntimeRequestDto | null;
+  register(input: RequestCreateDto, resource: {
+    deliver: (input: RequestResolveDto) => Promise<RuntimeRequestDto['delivery']>;
+    validate?: (input: RequestResolveDto) => void;
+    release?: () => void;
+  }): RuntimeRequestDto;
+  resolve(input: RequestResolveDto): Promise<{ accepted: boolean; conflict: boolean; request: RuntimeRequestDto }>;
+  terminate(id: string, status: 'expired' | 'cancelled', reason: string, send?: boolean): boolean;
+}
 export interface NativePermissionRouterOptions {
+  readonly getSessionContext?: NativeApprovalCenterBridge['getSessionContext'];
+  readonly requestAuthority?: (sessionId?: string) => NativeRequestAuthority;
+  readonly providerInstanceId?: string;
+
   readonly onRequestSettled?: (
     binding: RuntimeBinding,
     wireRequestId: InternalPendingNativeRequestRecord['wireRequestId'],

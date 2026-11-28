@@ -23,7 +23,6 @@ function AgyWorkbenchPluginRoot() {
   const nativeRuntimeBySession = useAppStore((s) => s.nativeRuntimeBySession);
   const setRoute = useAppStore((s) => s.setNativeWorkbenchRoute);
   const hydrate = useAppStore((s) => s.hydrateNativeRuntime);
-  const resolveRuntimeRequest = useAppStore((s) => s.resolveRuntimeRequest);
   const submitNativeCommand = useAppStore((s) => s.submitNativeCommand);
   const dispatchNativeControl = useAppStore((s) => s.dispatchNativeControl);
   const loadNativeTimeline = useAppStore((s) => s.loadNativeTimeline);
@@ -138,7 +137,7 @@ function AgyWorkbenchPluginRoot() {
         onNavigate={(patch) => setRoute(session.id, patch)}
         onBackToChat={() => setRoute(session.id, { surface: 'chat' })}
         onRefresh={() => void hydrate(session.id)}
-        onResolveRequest={resolveRuntimeRequest}
+        onResolveRequest={async () => { throw new Error('请在绑定的请求视图处理'); }}
         onSubmitCommand={async (req) => {
           await submitNativeCommand(session.id, req);
         }}

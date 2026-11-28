@@ -142,6 +142,7 @@ interface LiveHandleEntry {
   dataInstanceId: string;
   generation: number;
   disposed: boolean;
+  requestedPermissionMode: PermissionMode;
   lastConfirmedConfig?: {
     model?: string | null;
     thoughtLevel?: string | null;
@@ -386,6 +387,7 @@ export function createDefaultSessionRuntimePlugin(
 
       const disposeLiveHandleEntry = async (entry: LiveHandleEntry): Promise<void> => {
         if (entry.disposed) return;
+        try { deps.requestPort.cancelSessionApprovals(entry.sessionId, 'driver_connection_stopped', undefined, `${entry.providerRunId ?? 'local'}:${entry.generation}`); } catch {}
         entry.disposed = true;
         if (liveHandles.get(entry.key) === entry) {
           liveHandles.delete(entry.key);
@@ -530,6 +532,16 @@ export function createDefaultSessionRuntimePlugin(
             modeId: ev.modeId ?? null,
             permissionEnforcement: ev.permissionEnforcement ?? 'native',
           };
+          const current = (await findSessionWithProvider(deps.getPluginManager(), sessionId))?.session;
+          if (current) {
+            const policy = deps.getPluginManager().resolveCapabilityBinding('approval.policy.v1', { sessionId, workspaceId: current.workspaceId });
+            await deps.requestPort.recordMode({ sessionId, requested: entry.requestedPermissionMode,
+              policyInstanceId: policy.instanceId ?? null, policyRevision: null,
+              status: ev.permissionEnforcement === 'client_guard' ? 'policy_handled' : 'applied',
+              execution: ev.permissionEnforcement === 'client_guard' ? 'per_request_policy' : 'driver',
+              driverRequested: { permissionMode: entry.requestedPermissionMode }, driverAccepted: { modeId: ev.modeId ?? null, permissionEnforcement: ev.permissionEnforcement ?? 'native' } });
+          }
+
         }
 
         // Flush any buffered deltas before non-delta boundary events
@@ -1048,7 +1060,7 @@ export function createDefaultSessionRuntimePlugin(
               const supportedDecisions =
                 (ev.supportedDecisions ??
                   entry.adapter.capabilitiesV2?.supportedApprovalDecisions ??
-                  ['allow_once', 'allow_session', 'deny']) as ApprovalDecision[];
+                  ['allow_once', 'deny']) as ApprovalDecision[];
               const approval = deps.requestPort.createAndEmitApproval({
                 session: sessionModel,
                 harnessId: eventHarnessId,
@@ -1064,40 +1076,21 @@ export function createDefaultSessionRuntimePlugin(
                 supportedDecisions,
                 questionSpec: ev.questionSpec ?? null,
                 secretSpec: ev.secretSpec ?? null,
-                onTimeoutDeny: (expired) => {
-                  entry.nativeToGlobalApprovalId.delete(expired.nativeRequestId);
-                  void entry.handle.resolveApproval(expired.nativeRequestId, 'deny', '审批已过期').catch(() => {});
-                  if (activeTurnMeta.has(sessionId)) {
-                    void enqueueSessionCommit(sessionId, async () => {
-                      await commitToData(sessionId, entry.dataInstanceId, {
-                        sessionId,
-                        sessionPatch: { status: 'running' },
-                        events: [{ type: 'session.status', payload: { status: 'running' } }],
-                      }).catch(() => {});
-                    });
-                  }
+                driverGeneration: `${entry.providerRunId ?? 'local'}:${entry.generation}`,
+                providerInstanceId: entry.providerInstanceId,
+                deliver: async input => {
+                  if (entry.disposed || liveHandles.get(entry.key) !== entry || !entry.nativeToGlobalApprovalId.has(ev.nativeRequestId)) return 'unavailable';
+                  entry.nativeToGlobalApprovalId.delete(ev.nativeRequestId);
+                  if (input.secretValue !== undefined && input.decision !== 'deny') {
+                    if (!entry.handle.resolveSecret) return 'unavailable';
+                    await entry.handle.resolveSecret(ev.nativeRequestId, input.secretValue);
+                  } else if (input.questionAnswer && input.decision !== 'deny' && entry.handle.resolveQuestion) {
+                    await entry.handle.resolveQuestion(ev.nativeRequestId, input.questionAnswer);
+                  } else await entry.handle.resolveApproval(ev.nativeRequestId, input.decision ?? 'deny', input.comment);
+                  return 'acknowledged';
                 },
               });
               entry.nativeToGlobalApprovalId.set(ev.nativeRequestId, approval.id);
-              await commitToData(sessionId, entry.dataInstanceId, {
-                sessionId,
-                sessionPatch: { status: 'awaiting_approval' },
-                events: [
-                  { type: 'session.status', payload: { status: 'awaiting_approval' } },
-                  { type: 'approval.requested', turnId: ev.turnId ?? null, payload: { approval } },
-                  { type: 'runtime_request.updated', turnId: ev.turnId ?? null, payload: { request: approval } },
-                ],
-              });
-              deps.collabPort.notifyOrchestratorChildApproval(sessionId, approval.id, ev.toolName);
-              deps.collabPort.notifyAttention({
-                kind: 'approval_needed',
-                sessionId,
-                sessionTitle: sessionDto.title,
-                harnessId: eventHarnessId,
-                summary: ev.summary,
-                approvalId: approval.id,
-                timestamp: Date.now(),
-              });
               break;
             }
 
@@ -1504,6 +1497,10 @@ export function createDefaultSessionRuntimePlugin(
           ...(nativeRuntimeHooks ? { nativeRuntimeHooks } : {}),
         };
 
+        const selectedPolicy = deps.getPluginManager().resolveCapabilityBinding('approval.policy.v1', { sessionId: sessionDto.id, workspaceId: sessionDto.workspaceId });
+        await deps.requestPort.recordMode({ sessionId: sessionDto.id, requested: config.permissionMode,
+          policyInstanceId: selectedPolicy.instanceId ?? null, policyRevision: null, status: 'pending_next_session', execution: 'none',
+          driverRequested: { permissionMode: config.permissionMode, providerInstanceId: adapter.providerInstanceId, harnessId }, note: '等待驱动配置接受回执' });
         let lease = toolInfo.lease;
         let handle: AdapterSessionHandle;
         const openScope = {
@@ -1549,6 +1546,7 @@ export function createDefaultSessionRuntimePlugin(
           dataInstanceId,
           generation: generationCounter,
           disposed: false,
+          requestedPermissionMode: config.permissionMode,
         };
         // Register live handle BEFORE handle.onEvent() so synchronously replayed earlyBuffer events
         // pass the liveHandles ownership fence instead of being dropped.
@@ -2332,6 +2330,8 @@ export function createDefaultSessionRuntimePlugin(
               note = `驱动 ${live.harnessId} 不支持权限模式 ${req.patch.permissionMode}`;
             } else if (live.handle.updateConfig) {
               live.lastConfirmedConfig = undefined;
+              const previousPermissionMode = live.requestedPermissionMode;
+              live.requestedPermissionMode = updated.permissionMode as PermissionMode;
               try {
                 const driverReceipt = await live.handle.updateConfig({
                   model: updated.model,
@@ -2356,9 +2356,11 @@ export function createDefaultSessionRuntimePlugin(
                     };
                   }
                 } else {
-                  status = 'applied';
+                  status = 'pending_next_session';
+                  note = '驱动未返回配置接受回执';
                 }
                 const confirmedCfg = (live as LiveHandleEntry).lastConfirmedConfig;
+                if (!driverReceipt && confirmedCfg && (req.patch.permissionMode === undefined || confirmedCfg.permissionEnforcement !== undefined)) status = 'applied'; // explicit driver event is an acceptance receipt
                 if (confirmedCfg && status === 'applied') {
                   confirmed = {
                     model: confirmedCfg.model ?? updated.model,
@@ -2370,6 +2372,7 @@ export function createDefaultSessionRuntimePlugin(
                   };
                 }
               } catch (err) {
+                live.requestedPermissionMode = previousPermissionMode;
                 const errCode =
                   err && typeof err === 'object' && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
                     ? (err as { code: string }).code
@@ -2405,6 +2408,14 @@ export function createDefaultSessionRuntimePlugin(
             }
           }
 
+          if (req.patch.permissionMode !== undefined) {
+            const policy = deps.getPluginManager().resolveCapabilityBinding('approval.policy.v1', { sessionId: req.sessionId, workspaceId: updated.workspaceId });
+            await deps.requestPort.recordMode({ sessionId: req.sessionId, requested: req.patch.permissionMode as PermissionMode,
+              policyInstanceId: policy.instanceId ?? null, policyRevision: null,
+              status: status === 'applied' && confirmed.permissionEnforcement === 'client_guard' ? 'policy_handled' : status,
+              driverRequested: { permissionMode: req.patch.permissionMode }, driverAccepted: status === 'applied' ? { ...confirmed, modeId: live?.lastConfirmedConfig?.modeId ?? null } : undefined,
+              execution: status === 'applied' ? confirmed.permissionEnforcement === 'client_guard' ? 'per_request_policy' : 'driver' : 'none', note });
+          }
           return peerOk({
             sessionId: req.sessionId,
             harnessId: updated.harnessId,

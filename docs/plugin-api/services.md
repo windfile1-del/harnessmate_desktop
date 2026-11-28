@@ -41,6 +41,10 @@
 - `native-commands`
 - `orchestrator`
 - `rules`
+- `runtime.request-delivery.v1`
+- `runtime.requests.internal`
+- `runtime.requests.v1`
+- `runtime.requests.view.v1`
 - `session-search`
 - `session.attachments.v1`
 - `session.collaboration.v1`

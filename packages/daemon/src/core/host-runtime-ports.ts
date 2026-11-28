@@ -1,3 +1,4 @@
+import { activeRequestBrokers, getRequestBroker } from '../plugins/requests-default/index.js';
 import crypto from 'node:crypto';
 import type {
   ApprovalDecision,
@@ -65,9 +66,7 @@ export interface HostRuntimePortDeps {
   eventBus: DaemonEventBus;
   getPluginManager: () => PluginManager;
   getPluginCapabilities?: () => PluginCapabilities | undefined;
-  getApprovalCenter?: () => ApprovalCenterService;
   getOrchestrator?: () => OrchestratorService | undefined;
-  onAnnotatePendingApproval?: (session: Session, approval: ApprovalRequest) => Promise<void>;
   onAttachCompressorHooks?: () => void;
 }
 
@@ -77,7 +76,6 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
   requestPort: RuntimeRequestPort;
   collabPort: CollaborationBridgePort;
 } {
-  const approvalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let pendingSettlementSink: NativeTurnSettlementSink | null = null;
 
   const resolveActiveAgyInternal = (scope?: {
@@ -102,14 +100,6 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
       handle.bindTurnSettlementSink(pendingSettlementSink);
     }
     return handle;
-  };
-
-  const clearApprovalTimer = (id: string) => {
-    const t = approvalTimers.get(id);
-    if (t) {
-      clearTimeout(t);
-      approvalTimers.delete(id);
-    }
   };
 
   const driverPort: RuntimeDriverPort = {
@@ -290,121 +280,11 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
   };
 
   const requestPort: RuntimeRequestPort = {
-    createAndEmitApproval({
-      session,
-      harnessId,
-      nativeRequestId,
-      kind,
-      toolName,
-      toolKind,
-      summary,
-      input,
-      diffPreview,
-      riskLevel,
-      supportedDecisions,
-      questionSpec,
-      secretSpec,
-      onTimeoutDeny,
-    }) {
-      const approvalId = `appr_${crypto.randomBytes(6).toString('hex')}`;
-      const localAnnotations = deps.getApprovalCenter?.().evaluateLocalRules({
-        approvalId,
-        sessionId: session.id,
-        workspaceId: session.workspaceId,
-        cwd: session.cwd,
-        kind,
-        toolName,
-        toolKind,
-        summary,
-        input: input ?? null,
-        diffPreview: diffPreview ?? null,
-        riskLevel,
-      }) ?? [];
-      const riskRank: Record<ApprovalRequest['riskLevel'], number> = { low: 0, medium: 1, high: 2, critical: 3 };
-      let effectiveRisk: ApprovalRequest['riskLevel'] = riskLevel;
-      for (const note of localAnnotations) {
-        if (note.risk && riskRank[note.risk] > riskRank[effectiveRisk]) {
-          effectiveRisk = note.risk;
-        }
-      }
-      const approval: ApprovalRequest = {
-        id: approvalId,
-        sessionId: session.id,
-        parentSessionId: session.parentSessionId ?? null,
-        instanceId: harnessId,
-        nativeRequestId,
-        kind,
-        toolName,
-        toolKind,
-        summary,
-        input: kind === 'secret_request' ? {} : (input ?? {}),
-        diffPreview: diffPreview ?? null,
-        riskLevel: effectiveRisk,
-        supportedDecisions,
-        questionSpec: questionSpec ?? null,
-        secretSpec: secretSpec ?? null,
-        ...(localAnnotations.length > 0 ? { annotations: localAnnotations } : {}),
-        status: 'pending',
-        resolvedBy: null,
-        decision: null,
-        comment: null,
-        createdAt: Date.now(),
-        resolvedAt: null,
-      };
-      deps.store.createApproval(approval);
-      const timer = setTimeout(() => {
-        clearApprovalTimer(approval.id);
-        if (!deps.store.expireApprovalIfPending(approval.id)) return;
-        const expired = deps.store.getApproval(approval.id) ?? { ...approval, resolvedAt: Date.now() };
-        const ev = deps.store.appendEvent(approval.sessionId, 'approval.resolved', {
-          approvalId: approval.id,
-          status: 'expired',
-          resolvedAt: expired.resolvedAt,
-        });
-        deps.eventBus.publishEvent(ev);
-        onTimeoutDeny(expired);
-      }, 120_000);
-      timer.unref();
-      approvalTimers.set(approval.id, timer);
-      void deps.onAnnotatePendingApproval?.(session, approval).catch(() => {});
-      return approval;
-    },
-    expireSessionApprovals(sessionId, onDenied) {
-      for (const approval of deps.store.listPendingApprovals(sessionId)) {
-        clearApprovalTimer(approval.id);
-        if (!deps.store.expireApprovalIfPending(approval.id)) continue;
-        const expired = deps.store.getApproval(approval.id) ?? { ...approval, resolvedAt: Date.now() };
-        const ev = deps.store.appendEvent(approval.sessionId, 'approval.resolved', {
-          approvalId: approval.id,
-          status: 'expired',
-          resolvedAt: expired.resolvedAt,
-        });
-        deps.eventBus.publishEvent(ev);
-        onDenied?.(expired);
-      }
-    },
-    cancelSessionApprovals(sessionId, reason, onDenied) {
-      const cancelled = deps.store.cancelPendingApprovals(sessionId);
-      for (const approval of cancelled) {
-        clearApprovalTimer(approval.id);
-        const ev = deps.store.appendEvent(approval.sessionId, 'approval.resolved', {
-          approvalId: approval.id,
-          kind: approval.kind ?? 'command_approval',
-          status: 'cancelled',
-          resolvedAt: approval.resolvedAt,
-          comment: reason,
-        });
-        deps.eventBus.publishEvent(ev);
-        const runtimeUpdated = deps.store.appendEvent(approval.sessionId, 'runtime_request.updated', {
-          request: approval,
-        });
-        deps.eventBus.publishEvent(runtimeUpdated);
-        onDenied?.(approval);
-      }
-    },
-    countPendingApprovals(sessionId) {
-      return deps.store.listPendingApprovals(sessionId).length;
-    },
+    createAndEmitApproval(params) { return getRequestBroker(deps.getPluginManager(), params.session.id).createCli(params); },
+    expireSessionApprovals(sessionId) { for (const broker of activeRequestBrokers(deps.getPluginManager())) broker.cancelSession(sessionId, 'turn_ended'); },
+    cancelSessionApprovals(sessionId, reason, _onDenied, generation) { for (const broker of activeRequestBrokers(deps.getPluginManager())) broker.cancelSession(sessionId, reason, generation); },
+    countPendingApprovals(sessionId) { return activeRequestBrokers(deps.getPluginManager()).reduce((count, broker) => count + broker.list(sessionId).length, 0); },
+    recordMode(receipt) { return getRequestBroker(deps.getPluginManager(), receipt.sessionId).service.recordMode(receipt); },
   };
 
   const collabPort: CollaborationBridgePort = {

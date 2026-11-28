@@ -1,5 +1,6 @@
 import type {
   AgyRuntimeBindingDto,
+  RequestResolveDto, RequestDelivery, RequestModeReceiptDto, ServiceMethodResult,
   AgyTurnSettlementDecisionDto,
 } from '@harnessmate/plugin-api';
 import type {
@@ -119,11 +120,15 @@ export interface RuntimeRequestPort {
     supportedDecisions?: ApprovalDecision[];
     questionSpec?: ApprovalRequest['questionSpec'];
     secretSpec?: ApprovalRequest['secretSpec'];
-    onTimeoutDeny: (approval: ApprovalRequest) => void;
+    driverGeneration: string;
+    providerInstanceId?: string;
+    deliver: (input: RequestResolveDto) => Promise<RequestDelivery>;
+    onTimeoutDeny?: (approval: ApprovalRequest) => void;
   }): ApprovalRequest;
   expireSessionApprovals(sessionId?: string, onDenied?: (approval: ApprovalRequest) => void): void;
-  cancelSessionApprovals(sessionId: string, reason: string, onDenied?: (approval: ApprovalRequest) => void): void;
+  cancelSessionApprovals(sessionId: string, reason: string, onDenied?: (approval: ApprovalRequest) => void, generation?: string): void;
   countPendingApprovals(sessionId: string): number;
+  recordMode(receipt: RequestModeReceiptDto): Promise<ServiceMethodResult<RequestModeReceiptDto>>;
 }
 
 /**

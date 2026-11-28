@@ -3,8 +3,6 @@ import { showSessionNotification } from '../../lib/desktop-notifications';
 import type {
   AddMcpServerRequest,
   AgyAuthState,
-  ApprovalDecision,
-  ApprovalRequest,
   Attachment,
   AttentionItem,
   CanonicalEvent,
@@ -41,7 +39,6 @@ import type {
   PluginMcpPreset,
   PluginSlashCommand,
   RemoteAccessStatus,
-  ResolveApprovalRequest,
   RevertCheckpointRequest,
   RunHarnessCommandRequest,
   RunPluginActionRequest,
@@ -308,48 +305,6 @@ interruptSession: async (sessionId) => {
       await daemonApi.interruptSession(sessionId);
       get().pushToast({ kind: 'info', title: '已发送中断信号' });
     },
-refreshPendingApprovals: async () => {
-      try {
-        const { approvals } = await daemonApi.listPendingApprovals();
-        set({ pendingApprovals: approvals });
-      } catch {
-        // ignore
-      }
-    },
-resolveApproval: async (approvalId, decision, comment) => {
-      await get().resolveRuntimeRequest(approvalId, { decision, comment, resolvedBy: 'desktop' });
-    },
-resolveRuntimeRequest: async (approvalId, req) => {
-      try {
-        await daemonApi.resolveRuntimeRequest(approvalId, req);
-        set((state) => ({
-          pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
-        }));
-        void get().refreshPendingApprovals();
-        return { conflict: false };
-      } catch (err) {
-        if (err instanceof ApiHttpError && err.status === 409) {
-          const resolvedBy =
-            typeof err.payload?.resolvedBy === 'string' ? err.payload.resolvedBy : null;
-          set((state) => ({
-            pendingApprovals: state.pendingApprovals.filter((a) => a.id !== approvalId),
-          }));
-          const actorLabel = resolvedBy === 'mobile' ? '移动端' : '其他客户端';
-          get().pushToast({
-            kind: 'info',
-            title: `该请求已由${actorLabel}处理`,
-            body: '已自动收起重复审批条。',
-          });
-          return { conflict: true, resolvedBy };
-        }
-        get().pushToast({
-          kind: 'error',
-          title: '审批提交失败',
-          body: err instanceof Error ? err.message : String(err),
-        });
-        return { conflict: false };
-      }
-    },
 forkSession: async (sessionId, req) => {
       try {
         const res = await daemonApi.forkSession(sessionId, req ?? {});
@@ -461,7 +416,6 @@ newSessionPresetHarnessId: null,
 harnesses: [],
 workspaces: [],
 sessions: [],
-pendingApprovals: [],
 triageBySession: {},
 discoveredSessions: [],
 remoteStatus: null,

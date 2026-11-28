@@ -1269,97 +1269,10 @@ export function registerAgyNativeRoutes(app: FastifyInstance, deps: NativeRoutes
         return sendNativeError(reply, 400, 'INVALID_REQUEST', 'Invalid option or form for the pending native request');
       }
 
-      // Ensure durable receipt exists and acquire authoritative DB CAS BEFORE calling permissionPort!
-      try {
-        ctx.nativeRegistry.persistence.createPendingApprovalReceipt({
-          binding,
-          approvalId,
-        });
-      } catch (err) {
-        if (err instanceof NativePersistenceError && err.code === 'STALE_BINDING') {
-          return sendNativeError(reply, 409, 'STALE_BINDING', err.message, { retryable: false });
-        }
-        throw err;
-      }
+      if (!permissionPort.resolveWithCas) return sendNativeError(reply, 422, 'UNSUPPORTED_ACTION', 'Unified request router unavailable');
+      const outcome = await permissionPort.resolveWithCas({ binding, approvalId, request: parsed.data, resolvedBy: 'desktop' });
+      return reply.code(outcome.conflict ? 409 : 200).send(ResolveNativeRequestResponseSchema.parse({ schemaVersion: AGY_NATIVE_CONTRACT_VERSION, ...outcome }));
 
-      const cas = ctx.nativeRegistry.persistence.claimApprovalReceiptCas({
-        approvalId,
-        expectedGeneration: binding.generation,
-        expectedSessionId: ctx.session.id,
-        idempotencyKey: parsed.data.idempotencyKey,
-      });
-
-      if (!cas.claimed || !cas.receipt) {
-        return sendNativeError(
-          reply,
-          409,
-          cas.staleGeneration ? 'STALE_BINDING' : 'ALREADY_RESOLVED',
-          cas.staleGeneration
-            ? 'Approval generation is no longer active'
-            : `Native request "${approvalId}" was already claimed or resolved`,
-          {
-            retryable: false,
-            details: {
-              receiptId: cas.receipt?.receiptId ?? null,
-              receiptState: cas.receipt?.state ?? null,
-            },
-          },
-        );
-      }
-
-      try {
-        const outcome = await permissionPort.resolveNativeRequest({
-          binding,
-          approvalId,
-          receiptId: cas.receipt.receiptId,
-          request: parsed.data,
-          resolvedBy: 'desktop',
-        });
-
-        const finalState = outcome.receiptState;
-        const transition = ctx.nativeRegistry.persistence.transitionApprovalReceiptState(
-          cas.receipt.receiptId,
-          ['claimed'],
-          finalState,
-          { outcome: parsed.data.outcome },
-        );
-        if (!transition.transitioned) {
-          return sendNativeError(reply, 409, 'DELIVERY_UNKNOWN', 'Runtime changed before its approval receipt could be completed', {
-            retryable: false,
-            details: { receiptId: cas.receipt.receiptId, receiptState: transition.receipt?.state ?? 'delivery_unknown' },
-          });
-        }
-
-        const body = ResolveNativeRequestResponseSchema.parse({
-          schemaVersion: AGY_NATIVE_CONTRACT_VERSION,
-          approvalId: outcome.approvalId,
-          receiptId: cas.receipt.receiptId,
-          receiptState: finalState,
-          conflict: outcome.conflict,
-        });
-
-        if (outcome.conflict) {
-          return reply.code(409).send(body);
-        }
-        return reply.code(200).send(body);
-      } catch {
-        ctx.nativeRegistry.persistence.transitionApprovalReceiptState(
-          cas.receipt.receiptId,
-          ['claimed'],
-          'delivery_unknown',
-          { error: 'permission_wire_write_uncertain' },
-        );
-        return sendNativeError(
-          reply,
-          500,
-          'DELIVERY_UNKNOWN',
-          'Permission response write failed or timed out; delivery state is unknown and will not be replayed',
-          {
-            retryable: false,
-            details: { receiptId: cas.receipt.receiptId, receiptState: 'delivery_unknown' },
-          },
-        );
-      }
     },
   );
 }

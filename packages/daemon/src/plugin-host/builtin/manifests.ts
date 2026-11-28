@@ -6,6 +6,7 @@ import { SESSION_RUNTIME_DEFAULT_MANIFEST } from '../../plugins/session-runtime-
 export const BUNDLED_PLUGIN_IDS = [
   'hm.plugin.chat-default',
   'hm.plugin.agy-workbench-default',
+  'hm.plugin.requests-view-default',
   'hm.plugin.message-studio',
   'hm.plugin.browser-desktop',
   'hm.plugin.browser-headless',
@@ -285,8 +286,9 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     version: '1.0.0',
     description: '聚合全局跨会话待审批请求、输入框锚定确认条、高危命令静态风险规则引擎、结构化提问卡与零落盘 secret_request 私密凭据通道。',
     author: 'HarnessMate Core',
-    category: 'ui',
-    contributes: { uiSlots: ['composer_action', 'modal'] },
+    category: 'workflow',
+    provides: ['runtime.requests.v1', 'runtime.requests.internal', 'approval-center'],
+    contributes: {},
   },
   {
     id: 'hm.plugin.multi-harness-orchestrator',

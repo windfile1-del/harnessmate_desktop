@@ -523,6 +523,7 @@ it('enforces V4 permissions, handoff/approval/tool hooks, coverFuture upgrades, 
         commands: [
           { command: 'read-ws', description: 'Read workspace file' },
           { command: 'kv-roundtrip', description: 'Test plugin storage' },
+          { command: 'annotate-request', description: 'Attach a request annotation' },
         ],
       },
     };
@@ -535,6 +536,10 @@ it('enforces V4 permissions, handoff/approval/tool hooks, coverFuture upgrades, 
         await ctx.storage.plugin.set('greeting', args);
         const value = await ctx.storage.plugin.get('greeting');
         return { kind: 'message', text: String(value) };
+      });
+      ctx.commands.register('annotate-request', async ({ args }) => {
+        await ctx.approvals.annotate(args, { label: 'Explicit RPC note', risk: 'high' });
+        return { kind: 'message', text: 'annotated' };
       });
       ctx.handoff.onCompose((event) => ({
         id: 'notes',
@@ -600,27 +605,44 @@ it('enforces V4 permissions, handoff/approval/tool hooks, coverFuture upgrades, 
     expect(preview.compiledMarkdown).toContain('Workspace Truth Anchor');
 
     // 4. Approval annotate adds note without resolving approval + handoff.shouldOffer bail
-    const approval = daemon.store.createApproval({
-      id: 'appr_p3_test',
-      sessionId: session.id,
-      nativeRequestId: 'nat_1',
-      toolName: 'bash',
-      toolKind: 'command',
-      summary: 'rm -rf build',
-      input: { cmd: 'rm -rf build' },
-      riskLevel: 'high',
-      status: 'pending',
-      resolvedBy: null,
-      decision: null,
-      comment: null,
-      createdAt: Date.now(),
-      resolvedAt: null,
+    const requests = daemon.sessionManager.getRequestBroker(session.id);
+    requests.register({
+      workspaceId: workspace.id,
+      origin: { providerInstanceId: 'codex', driverGeneration: 'p3-test', nativeRequestId: 'nat_1', turnId: null },
+      deadlineAtMs: Date.now() + 120_000,
+      idempotencyKey: 'appr_p3_test',
+      approval: {
+        id: 'appr_p3_test',
+        sessionId: session.id,
+        nativeRequestId: 'nat_1',
+        toolName: 'bash',
+        toolKind: 'shell',
+        summary: 'rm -rf build',
+        input: { cmd: 'rm -rf build' },
+        riskLevel: 'high',
+        status: 'pending',
+        resolvedBy: null,
+        decision: null,
+        comment: null,
+        createdAt: Date.now(),
+        resolvedAt: null,
+      },
     });
-    const annotated = await daemon.sessionManager.annotatePendingApproval(session, approval);
+    await waitFor(() => (requests.get('appr_p3_test')?.approval.annotations as { pluginId: string }[])?.some(note => note.pluginId === 'user.full-v4'));
+    const annotated = daemon.store.getApproval('appr_p3_test');
     expect(annotated?.status).toBe('pending');
-    expect(annotated?.annotations).toEqual([
+    expect(annotated?.annotations).toEqual(expect.arrayContaining([
       expect.objectContaining({ pluginId: 'user.full-v4', risk: 'high', label: '审查提醒', detail: 'Observed tool bash' }),
-    ]);
+    ]));
+    const versionBeforeNote = requests.get('appr_p3_test')!.version;
+    await daemon.pluginManager.isolated!.runCommand(session, 'annotate-request', 'appr_p3_test');
+    expect(requests.get('appr_p3_test')!.version).toBeGreaterThan(versionBeforeNote);
+    expect(daemon.store.getApproval('appr_p3_test')?.annotations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pluginId: 'user.full-v4', label: 'Explicit RPC note' }),
+    ]));
+    expect(daemon.store.getSession(session.id)?.pendingApprovalCount).toBe(1);
+    await requests.resolve({ requestId: 'appr_p3_test', actor: 'desktop', decision: 'deny' });
+    expect(daemon.store.getSession(session.id)?.pendingApprovalCount).toBe(0);
 
     const offer = await daemon.sessionManager.evaluateHandoffOffer(session, 'codex', '429 rate_limit exceeded');
     expect(offer).toEqual({ offer: true, targetHarnessId: 'claude', reason: 'quota exhausted' });
@@ -639,12 +661,16 @@ it('enforces V4 permissions, handoff/approval/tool hooks, coverFuture upgrades, 
     expect(tools).toHaveLength(1);
     expect(tools[0].inputSchema.required).toEqual(['a', 'b']);
 
-    const callRes = await daemon.app.inject({
+    const callPending = daemon.app.inject({
       method: 'POST',
       url: '/api/v1/plugin-tools',
       headers: { authorization: `Bearer ${mcpConn!.token}` },
       payload: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: tools[0].name, arguments: { a: 19, b: 23 } } },
-    });
+    }).then(response => response);
+    await waitFor(() => requests.list(session.id).some(fact => fact.approval.toolName === tools[0].name));
+    const toolRequest = requests.list(session.id).find(fact => fact.approval.toolName === tools[0].name)!;
+    await requests.resolve({ requestId: toolRequest.requestId, actor: 'desktop', decision: 'allow_once' });
+    const callRes = await callPending;
     expect(callRes.json().result.content).toEqual([{ type: 'text', text: '42' }]);
     sessions[0]?.emit?.({ type: 'turn.cancelled', turnId: turn.turnId });
 

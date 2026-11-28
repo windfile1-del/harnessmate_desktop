@@ -46,7 +46,7 @@ const producers = {
   'plugin.state': 'plugin-host/runtime/lifecycle.ts',
   'handoff.compose': 'core/context-compiler.ts',
   'handoff.shouldOffer': 'core/session-manager.ts',
-  'approval.annotate': 'core/session-manager.ts',
+  'approval.annotate': 'plugins/requests-default/index.ts',
 };
 const mapper = read(`${daemon}/plugin-host/runtime/map-event.ts`);
 const builtin = read(`${daemon}/plugin-host/builtin/services.ts`);
@@ -99,7 +99,7 @@ output.set('slots.md', heading('公共 UI 插槽') +
   '第一方与内核级插件可直接注册 React 组件；第三方插件在 `contributes.slots` 或 `ctx.slots.register()` 中声明包内 HTML 入口，由宿主在 `sandbox="allow-scripts"` 沙箱 iframe 中渲染。包含全部 V4 与 V5 插槽契约。\n\n' +
   '| 插槽 | 基数 | 作用域 | 说明 |\n| --- | --- | --- | --- |\n' + slotRows.join('\n') + '\n');
 
-const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts', 'driver-contracts', 'collaboration-contracts', 'chat-contracts', 'agy-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
+const surface = ['context', 'events', 'rpc', 'slots', 'browser-preview', 'desktop-view', 'file-preview', 'session-contracts', 'driver-contracts', 'collaboration-contracts', 'chat-contracts', 'agy-contracts', 'request-contracts'].map((name) => read(`packages/plugin-api/dist/${name}.d.ts`)
   .split('\n').filter((line) => !line.startsWith('//# sourceMappingURL')).join('\n').trim()).join('\n\n');
 output.set('plugin-api.api.md', heading('插件 API 报告') +
   '清单与声明式贡献点见同目录 JSON Schema。公共错误码见类型声明。\n\n' +
@@ -170,9 +170,9 @@ const aiBuilderContext = [
   `- High-risk permissions requiring explicit review: \`harness:driver:register\`, \`process:spawn:*\`, \`secrets:read:*\`, \`fs:workspace:write\`, \`workspace:git:write\`, \`process:pty:workspace\`, \`handoff:redact\`.`,
   ``,
   `## 6. Five Mandatory Security Redlines`,
-  `1. **No Core Hijacking**: Never use \`core.*\`/\`broken.*\` plugin IDs, never register reserved Batch-4 \`agy\` native driver ID, and never override reserved security services (\`auth\`, \`permissions\`, \`remote\`, \`mcpHub\`, \`session-kernel\`). Peer \`codex\`/\`claude\`/\`acp\` drivers are open via \`harness:driver:register\` and \`harness.driver.<id>.v1\`.`,
+  `1. **No Core Hijacking**: Never use \`core.*\`/\`broken.*\` plugin IDs, and never override reserved security services (\`auth\`, \`permissions\`, \`remote\`, \`mcpHub\`, \`session-kernel\`). Peer \`codex\`/\`claude\`/\`acp\` drivers are open via \`harness:driver:register\` and \`harness.driver.<id>.v1\`.`,
   `2. **No Dangerous Runtime APIs**: Never import/call \`child_process\`, \`node:child_process\`, \`worker_threads\`, \`vm\`, \`eval(\`, \`new Function\`, \`process.binding\`, or unbounded \`fs.rmSync\`. Spawn CLIs exclusively via \`ctx.runtime.spawnCli\`.`,
-  `3. **No Unauthorized Approval or System Prompt Injection**: Plugins may only attach risk annotations via \`ctx.approvals.onAnnotate\`; never auto-approve user requests or attempt to alter system prompts.`,
+  `3. **No Unauthorized Approval or System Prompt Injection**: Plugins may only attach risk annotations via \`ctx.approvals.onAnnotate\`; selected approval.policy.v1 instances may decide tool requests through runtime.requests.v1; question and secret inputs remain user supplied.`,
   `4. **Minimal Network & Permission Scope**: Every external URL referenced in code MUST match a declared \`net:<host>\` permission; avoid unused high-risk permissions.`,
   `5. **Strict HTML Sandbox Hygiene**: No external \`<script src="http...">\` or \`<link href="http...">\`, no \`javascript:\` URLs, no inline event handlers (\`onclick=\`, \`onload=\`, etc.), and no \`../\` path traversal.`,
   ``,

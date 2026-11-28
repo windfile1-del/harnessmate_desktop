@@ -1246,6 +1246,13 @@ export interface PluginRouteResponse {
 }
 
 export interface ApprovalPolicyRequest {
+  mode?: import('./request-contracts.js').RequestMode;
+  kind?: string;
+  source?: string;
+  toolKind?: string;
+  riskLevel?: string;
+  supportedDecisions?: string[];
+  requestId?: string;
   sessionId: string;
   workspaceId: string;
   pluginId: string;
@@ -1256,6 +1263,7 @@ export interface ApprovalPolicyRequest {
 }
 
 export interface ApprovalPolicyDecision {
+  scope?: 'once' | 'session';
   decision: 'allow' | 'deny' | 'ask';
   reason?: string;
 }

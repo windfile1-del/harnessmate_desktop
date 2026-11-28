@@ -1,0 +1,6 @@
+{
+  "id": "hm.plugin.request-policy-lite", "name": "Request Policy Lite", "version": "1.0.0",
+  "description": "公开 approval.policy.v1 双工作区实例示例，无 daemon 内部导入。",
+  "category": "workflow", "apiVersion": 4, "engines": { "pluginApi": "^4.0" },
+  "main": "index.mjs", "provides": ["approval.policy.v1"]
+}
