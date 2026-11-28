@@ -25,6 +25,8 @@ import {
   SlotSessionProvider,
 } from '../src/slots';
 import { executeSandboxedBridgeMethod } from '../src/slots/sandbox-bridge-handler';
+import { navigationBus } from '../src/kernel/navigation-bus';
+import { createDefaultShellNavigationHandler } from '../src/plugins/shell-default/navigation';
 import { useAppStore } from '../src/stores/app-store';
 
 vi.mock('../src/stores/app-store', async (importOriginal) => {
@@ -199,6 +201,10 @@ describe('Batch 2 W1 · Frontend Navigation, Contract Gating & Custom Slot Overr
 
     // Windows drive path + Chinese + file:///#L syntax via sandbox bridge preserves selectedSessionId and closes activePluginPage
     useAppStore.setState({ activePluginPage: 'user.search:page' });
+    const disposeNav = navigationBus.registerHandler(
+      { instanceId: 'hm.plugin.shell-default', runId: 'test-b2-w1' },
+      createDefaultShellNavigationHandler(),
+    );
     const ac = new AbortController();
     const bridgeResult = (await executeSandboxedBridgeMethod(
       {
@@ -215,7 +221,7 @@ describe('Batch 2 W1 · Frontend Navigation, Contract Gating & Custom Slot Overr
       {
         path: 'file:///D:/Repo/%E7%A4%BA%E4%BE%8B%20%E7%9B%AE%E5%BD%95/src/main.ts#L42',
       },
-    )) as { opened: boolean; line?: number; sessionId: string | null };
+    ).finally(() => disposeNav())) as { opened: boolean; line?: number; sessionId: string | null };
     expect(bridgeResult.opened).toBe(true);
     expect(bridgeResult.line).toBe(42);
     expect(bridgeResult.sessionId).toBe(sessionOne.id);

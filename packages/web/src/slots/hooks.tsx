@@ -1,7 +1,7 @@
 import type { AnyPluginSlotKey, PluginSlotRenderFailure, Session } from '@harnessmate/protocol';
 import { createContext, useContext, useSyncExternalStore, type ReactNode } from 'react';
 import type { ProjectedTurn } from '../lib/projector';
-import { useAppStore } from '../stores/app-store';
+import { useKernelStore } from '../stores/kernel-store';
 import { slotRegistry, type RegisteredSlotItem, type SlotRegistry } from './slot-registry';
 
 const SlotRegistryContext = createContext<SlotRegistry>(slotRegistry);
@@ -65,7 +65,7 @@ export function useTurn(): ProjectedTurn | null {
 }
 
 export function useSlotTheme(): 'dark' | 'light' {
-  return useAppStore((state) => state.theme);
+  return useKernelStore((state) => state.theme);
 }
 
 export function useSlotItems<K extends AnyPluginSlotKey>(

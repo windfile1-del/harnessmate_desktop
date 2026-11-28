@@ -77,3 +77,10 @@
 - Electron 桌面实测覆盖浏览器模板、首次授权、真实网页画面、点击、中文文本输入、撤销后关闭及保存源码刷新面板。通过模拟 ACP 检查插件开发说明进入用户消息，并从回复中的文件链接打开右侧指定行。
 - 模拟 AGY stdio 验证同一会话内切换 Manual、Accept Edits、Auto 和 Plan，以及审批选择与旧审批记录补齐。本机 AGY 能启动 ACP，隔离环境未创建原生会话，登录后的权限行为待实机确认。
 - 同一台机器的合成投影负载包含 1,500 个历史轮次和 300 次输出更新。旧投影耗时 467 ms，增量投影耗时 90 ms，两者输出相同。这组数据覆盖前端事件投影。
+
+## 第五批 W1：应用布局、导航、贡献与独立恢复
+
+- **应用入口契约（`application.view.v1` / `application.shell`）**：`@harnessmate/plugin-api` 新增 `application-contracts.ts`，定义 `APPLICATION_VIEW_CONTRACT`、`APPLICATION_SHELL_SLOT`、`ApplicationViewServiceV1`、`ApplicationSwitchResult`、`NavigationRequestV1` / `NavigationResultV1` 与 `UiContributionInput` / `UiContributionRecord` / `DesktopMenuContributionDto`，由 `pnpm contracts:generate` 同步至 `docs/plugin-api/*`。
+- **默认与外部布局平级加载**：`plugins/bundled/hm.plugin.shell-default` 与外部示例 `plugins/examples/hm.plugin.shell-lite` 走同一 `ApplicationEntryHost`（`TrustedPluginModuleHost` / `SandboxedPluginFrame`）与共享 React/Zustand 运行时；`App.tsx` 不保留默认布局组件特判或宿主 UI fallback，并由 `packages/web/vite.config.ts` 的 `kernel-root-ownership-check` 构建门禁校验。
+- **前端状态与表面挂载拆分**：内核状态收敛至 `packages/web/src/stores/kernel-store.ts`，跨插件导航收敛至 `kernel/navigation-bus.ts`，页面/区域/命令/快捷键/菜单/托盘/设置贡献收敛至 `kernel/contribution-registry.ts`（含 IME 与输入焦点保护、Electron 托盘菜单同步及按 `instanceId + runId` 自动撤销），子插件表面通过公开 `bridge.surfaces`（`mountBoundSurface` / `mountSlotItem` / `listSlots`）挂载。
+- **独立最小恢复视图**：`KernelRecoveryView` 仅依赖 `kernel/recovery-client.ts`，不导入 `app-store`、`ModalHost`、`Sidebar` 或聊天模块，在空组合、入口未绑定、布局自停用与坏修订加载/渲染异常时均可独立恢复与重启。详见 [B5-W1 交付报告](plugin-decoupling-batch-5/reports/W1.md)。

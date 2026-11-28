@@ -67,7 +67,9 @@ describe('Peer Plugin Web UI', () => {
     expect(html).toContain('内核恢复模式（空业务组合）');
     expect(html).toContain('重新启用预装组合');
     expect(html).toContain('恢复上一套配置');
-    expect(html).toContain('打开插件恢复中心');
+    expect(html).toContain('可用应用布局入口 (application.view.v1)');
+    expect(html).toContain('恢复模式不依赖完整插件管理中心');
+    expect(html).not.toContain('打开插件恢复中心');
 
     await useAppStore.getState().restorePluginComposition('empty');
     await useAppStore.getState().restorePluginComposition('builtin');

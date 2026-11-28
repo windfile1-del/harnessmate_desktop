@@ -207,7 +207,7 @@ describe('projectSessionEvents', () => {
 });
 
 it('recognizes native and workspace file links without intercepting protocol URLs', () => {
-  expect(parseFileLink('/D:/Project/src/main.ts:25:3')).toEqual({ path: 'D:/Project/src/main.ts', line: 25 });
+  expect(parseFileLink('/D:/Project/src/main.ts:25:3')).toEqual({ path: 'D:/Project/src/main.ts', line: 25, column: 3 });
   expect(parseFileLink('file:///D:/My%20Project/readme.md#L17-L21')).toEqual({ path: 'D:/My Project/readme.md', line: 17 });
   expect(parseFileLink('src/index.ts#L3')).toEqual({ path: 'src/index.ts', line: 3 });
   expect(parseFileLink('https://example.com/path.ts#L3')).toBeNull();

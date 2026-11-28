@@ -1,5 +1,6 @@
 {
   "bindings": {
+    "application.view.v1": "hm.plugin.shell-default",
     "runtime.requests.v1": "hm.plugin.approval-center",
     "runtime.requests.view.v1": "hm.plugin.requests-view-default",
     "chat.view.v1": "hm.plugin.chat-default",

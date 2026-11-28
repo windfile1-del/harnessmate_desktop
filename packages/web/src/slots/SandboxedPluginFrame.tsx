@@ -8,10 +8,10 @@ import { Loader2, ShieldAlert } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { daemonApi, getSharedDaemonWs } from '../api/client';
 import { isAbortError } from '../api/peer-workspace-client';
-import { useAppStore } from '../stores/app-store';
+import { useKernelStore } from '../stores/kernel-store';
 import { useSlotRegistry, useSlotTheme } from './hooks';
 import { executeSandboxedBridgeMethod } from './sandbox-bridge-handler';
-import { shellFields } from './shell-bridge';
+import { subscribeShellState } from './shell-bridge';
 import {
   buildIframeSrcDoc,
   collectThemeCssVars,
@@ -32,6 +32,7 @@ export interface SandboxedPluginFrameProps {
   defaultHeight?: number;
   compact?: boolean;
   onAction?: (action: string, params: Record<string, unknown>, signal: AbortSignal) => unknown;
+  onLoadError?: (message: string) => void;
 }
 
 function serializeSafeProps(input: Record<string, unknown> | undefined): Record<string, unknown> {
@@ -62,6 +63,7 @@ export function SandboxedPluginFrame({
   defaultHeight,
   compact = false,
   onAction,
+  onLoadError,
 }: SandboxedPluginFrameProps) {
   const effectiveInstanceId = instanceId ?? pluginId;
   const registry = useSlotRegistry();
@@ -74,6 +76,8 @@ export function SandboxedPluginFrame({
   sessionRef.current = session;
   const actionRef = useRef(onAction);
   actionRef.current = onAction;
+  const loadErrorRef = useRef(onLoadError);
+  loadErrorRef.current = onLoadError;
 
   const sessionDto = useMemo(() => toPublicSessionDto(session), [session]);
   const safeProps = useMemo(() => {
@@ -115,6 +119,7 @@ export function SandboxedPluginFrame({
           slotItemId: slotId,
           message: `UI 加载失败: ${message}`,
         });
+        loadErrorRef.current?.(message);
       });
     return () => controller.abort();
   }, [pluginId, effectiveInstanceId, pluginName, revision, slot, slotId, ui, registry]);
@@ -174,10 +179,10 @@ export function SandboxedPluginFrame({
     let unsubscribeBrowser: (() => void) | undefined;
     const serviceSubscriptions = new Map<string, () => void>();
     const outputSubscriptions = new Map<string, () => void>();
-    const unsubscribeShell = useAppStore.subscribe((state, previous) => {
-      const patch = Object.fromEntries(shellFields.filter((field) => state[field] !== previous[field])
-        .map((field) => [field, state[field]]));
-      if (Object.keys(patch).length) iframeRef.current?.contentWindow?.postMessage({ type: 'hm:shell:state', runId: activeRunId, patch }, '*');
+    const unsubscribeShell = subscribeShellState((patch) => {
+      if (Object.keys(patch).length) {
+        iframeRef.current?.contentWindow?.postMessage({ type: 'hm:shell:state', runId: activeRunId, patch }, '*');
+      }
     });
     const unsubscribeOutput = getSharedDaemonWs()?.observeFrames((frame) => {
       if (frame.op === 'command_output' && outputSubscriptions.has(`${frame.sessionId}::${frame.toolCallId}`)) {
@@ -212,7 +217,7 @@ export function SandboxedPluginFrame({
         const id = `${sessionId}::${toolCallId}`;
         outputSubscriptions.get(id)?.();
         outputSubscriptions.delete(id);
-        if (method === 'outputs.subscribe') outputSubscriptions.set(id, useAppStore.getState().subscribeCommandOutput(sessionId, toolCallId));
+        if (method === 'outputs.subscribe') outputSubscriptions.set(id, useKernelStore.getState().subscribeCommandOutput(sessionId, toolCallId));
         return id;
       }
       if (method === 'services.unsubscribe') {
@@ -310,7 +315,7 @@ export function SandboxedPluginFrame({
         iframeWindow.postMessage(
           {
             type: 'hm:theme',
-            theme: useAppStore.getState().theme,
+            theme: useKernelStore.getState().theme,
             cssVars: collectThemeCssVars(),
           } satisfies PluginSlotBridgeHostMessage,
           '*',
@@ -430,10 +435,10 @@ export function SandboxedPluginFrame({
           type: 'hm:context', session: sessionDtoRef.current, props: safePropsRef.current,
         } satisfies PluginSlotBridgeHostMessage, '*');
       }}
-      className={slot === 'workspace.pages' || slot === 'session.stage.embedded'
+      className={slot === 'application.shell' || slot === 'workspace.pages' || slot === 'session.stage.embedded'
         ? 'block size-full border-0 bg-transparent'
         : 'w-full rounded-xl border border-[var(--border-hairline)] bg-transparent'}
-      style={slot === 'workspace.pages' || slot === 'session.stage.embedded' ? undefined : { height: `${height}px` }}
+      style={slot === 'application.shell' || slot === 'workspace.pages' || slot === 'session.stage.embedded' ? undefined : { height: `${height}px` }}
     />
   );
 }

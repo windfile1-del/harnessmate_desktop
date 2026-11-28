@@ -1,20 +1,74 @@
 import type {
   AnyPluginSlotKey,
+  ApplicationSwitchResult,
+  Disposer,
+  NavigationRequestV1,
+  NavigationResultV1,
   PublicSession,
   Session,
+  UiContributionInput,
+  UiContributionInvocation,
+  UiContributionRecord,
   WsServerFrame,
 } from '@harnessmate/protocol';
 import { Loader2, ShieldAlert } from 'lucide-react';
 import { Component, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react';
 import { getDaemonBaseUrl, getSharedDaemonWs, type ServiceBatch } from '../api/client';
 import { isAbortError } from '../api/peer-workspace-client';
+import { contributionRegistry, type UiContributionQuery } from '../kernel/contribution-registry';
+import {
+  layoutBridge,
+  type LayoutLegacyActionDelegate,
+  type LayoutToastHandler,
+  type PublishedLayoutState,
+} from '../kernel/layout-bridge';
+import { navigationBus, type NavigationHandler } from '../kernel/navigation-bus';
+import { kernelRecoveryClient, type KernelRestartResult } from '../kernel/recovery-client';
 import { frontendPerfDiagnostics } from '../lib/perf-diagnostics';
-import { useAppStore } from '../stores/app-store';
+import { useKernelStore, type KernelStoreState } from '../stores/kernel-store';
 import { useSlotRegistry, useSlotTheme } from './hooks';
 import { executeSandboxedBridgeMethod } from './sandbox-bridge-handler';
 import { collectThemeCssVars, toPublicSessionDto } from './sandbox-iframe-utils';
 import { ensureSharedPluginRuntime, type HarnessMateSharedFrontendRuntime } from './shared-runtime';
-import { shellFields } from './shell-bridge';
+import { subscribeShellState } from './shell-bridge';
+import { createPublicSurfacesApi, type PublicSurfacesApi } from './surface-mounter';
+
+export interface TrustedModuleKernelApi {
+  getSnapshot(): Pick<
+    KernelStoreState,
+    | 'theme'
+    | 'connected'
+    | 'loading'
+    | 'plugins'
+    | 'emptyComposition'
+    | 'compositionBindings'
+    | 'compositionEntries'
+    | 'workspaceBindingsByWorkspace'
+    | 'sessionBindingsBySession'
+    | 'pluginPermissionRevision'
+    | 'restartStatus'
+  >;
+  subscribe(listener: () => void): Disposer;
+  setTheme(theme: 'dark' | 'light'): void;
+  toggleTheme(): void;
+  refreshPlugins(): Promise<void>;
+  refreshComposition(workspaceId?: string): Promise<void>;
+  refreshWorkspaceBindings(workspaceId: string): Promise<void>;
+  setWorkspaceBinding(workspaceId: string, contract: string, instanceId: string | null): Promise<void>;
+  refreshSessionBindings(sessionId: string): Promise<void>;
+  setSessionBinding(sessionId: string, contract: string, instanceId: string | null): Promise<void>;
+  setCompositionBinding(contract: string, instanceId: string | null): Promise<void>;
+  switchApplicationEntry(
+    instanceId: string | null,
+    options?: { requiresRestart?: boolean; restartReason?: string },
+  ): Promise<ApplicationSwitchResult>;
+  togglePlugin(id: string, enabled: boolean): Promise<void>;
+  rollbackPlugin(id: string): Promise<void>;
+  restoreComposition(source: 'builtin' | 'previous' | 'empty'): Promise<void>;
+  reloadPlugins(): Promise<void>;
+  invalidatePluginPermissions(): void;
+  requestRestart(options?: { safeMode?: boolean }): Promise<KernelRestartResult>;
+}
 
 export interface TrustedModulePageBridge {
   readonly pluginId: string;
@@ -29,14 +83,44 @@ export interface TrustedModulePageBridge {
   readonly session: PublicSession | null;
   readonly props: Record<string, unknown>;
   readonly mountMode: 'trusted-module';
-  call<T = unknown>(method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<T>;
+  call<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<T>;
   services: {
-    call<T = { value: unknown }>(contract: string, method: string, args?: unknown[], options?: Record<string, unknown>): Promise<T>;
+    call<T = { value: unknown }>(
+      contract: string,
+      method: string,
+      args?: unknown[],
+      options?: Record<string, unknown>,
+    ): Promise<T>;
     subscribe(
       options: { contract: string; instanceId?: string; runId?: string; signal?: AbortSignal },
       listener: (batch: ServiceBatch) => void,
     ): Promise<() => void>;
   };
+  navigate(request: NavigationRequestV1): Promise<NavigationResultV1>;
+  navigation: {
+    navigate(request: NavigationRequestV1): Promise<NavigationResultV1>;
+    registerHandler(handler: NavigationHandler): Disposer;
+  };
+  contributions: {
+    register(input: UiContributionInput): Disposer;
+    query(filter?: UiContributionQuery): readonly UiContributionRecord[];
+    execute(
+      keyOrId: string,
+      invocation?: Partial<UiContributionInvocation>,
+    ): Promise<{ ok: boolean; value?: unknown; code?: string; message?: string }>;
+    subscribe(listener: () => void): Disposer;
+  };
+  application: {
+    publishState(patch: PublishedLayoutState): boolean;
+    registerToastHandler(handler: LayoutToastHandler): Disposer;
+    registerLegacyActionDelegate(delegate: LayoutLegacyActionDelegate): Disposer;
+  };
+  kernel: TrustedModuleKernelApi;
+  surfaces: PublicSurfacesApi;
   requestPluginRoute(options?: Record<string, unknown>): Promise<unknown>;
   resolveService(options?: Record<string, unknown>): Promise<unknown>;
   listPlugins(): Promise<unknown>;
@@ -80,6 +164,7 @@ export interface TrustedPluginModuleHostProps {
   defaultHeight?: number;
   compact?: boolean;
   onAction?: (action: string, params: Record<string, unknown>, signal: AbortSignal) => unknown;
+  onLoadError?: (message: string) => void;
 }
 
 class ModuleErrorBoundary extends Component<
@@ -119,7 +204,7 @@ class ModuleErrorBoundary extends Component<
   }
 }
 
-function resolveModuleUrl(instanceId: string, modulePath: string, revision: string): string {
+export function resolvePluginModuleUrl(instanceId: string, modulePath: string, revision: string): string {
   const cleaned = modulePath.replace(/^\.\//, '');
   const base = getDaemonBaseUrl() || (typeof window !== 'undefined' ? window.location.origin : '');
   return `${base}/api/v1/plugins/${encodeURIComponent(instanceId)}/ui/${cleaned}?v=${encodeURIComponent(revision)}`;
@@ -139,6 +224,7 @@ export function TrustedPluginModuleHost({
   defaultHeight,
   compact = false,
   onAction,
+  onLoadError,
 }: TrustedPluginModuleHostProps) {
   const effectiveInstanceId = instanceId ?? pluginId;
   const registry = useSlotRegistry();
@@ -146,14 +232,18 @@ export function TrustedPluginModuleHost({
   const containerRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const isFullSize =
+    slot === 'application.shell' || slot === 'workspace.pages' || slot === 'session.stage.embedded';
   const [height, setHeight] = useState<number | null>(
-    slot === 'workspace.pages' || slot === 'session.stage.embedded' ? null : (defaultHeight ?? (compact ? 48 : 220)),
+    isFullSize ? null : (defaultHeight ?? (compact ? 48 : 220)),
   );
 
   const sessionRef = useRef(session);
   sessionRef.current = session;
   const actionRef = useRef(onAction);
   actionRef.current = onAction;
+  const loadErrorRef = useRef(onLoadError);
+  loadErrorRef.current = onLoadError;
 
   const sessionDto = useMemo(() => toPublicSessionDto(session), [session]);
   const safeProps = useMemo(() => {
@@ -176,22 +266,24 @@ export function TrustedPluginModuleHost({
     props: safeProps,
   });
 
-  // Push live theme updates without remounting module
   useEffect(() => {
     const cssVars = collectThemeCssVars();
     stateRef.current.theme = theme;
     stateRef.current.cssVars = cssVars;
     for (const cb of themeListenersRef.current) {
-      try { cb(theme, cssVars); } catch {}
+      try {
+        cb(theme, cssVars);
+      } catch {}
     }
   }, [theme]);
 
-  // Push live session/props updates without remounting module
   useEffect(() => {
     stateRef.current.session = sessionDto;
     stateRef.current.props = safeProps;
     for (const cb of contextListenersRef.current) {
-      try { cb(sessionDto, safeProps); } catch {}
+      try {
+        cb(sessionDto, safeProps);
+      } catch {}
     }
   }, [sessionDto, safeProps]);
 
@@ -203,6 +295,17 @@ export function TrustedPluginModuleHost({
     const rpcAbort = new AbortController();
     let disposed = false;
     let moduleDispose: (() => void) | undefined;
+    const owner = { instanceId: effectiveInstanceId, runId: revision, pluginId };
+    const trackedDisposers = new Set<Disposer>();
+    const trackDisposer = (dispose: Disposer): Disposer => {
+      trackedDisposers.add(dispose);
+      return () => {
+        trackedDisposers.delete(dispose);
+        dispose();
+      };
+    };
+
+    const detachLayoutOwner = slot === 'application.shell' ? layoutBridge.attachOwner(owner) : undefined;
     const serviceSubscriptions = new Map<string, () => void>();
     const outputSubscriptions = new Map<string, () => void>();
     const shellListeners = new Set<(patch: Record<string, unknown>) => void>();
@@ -212,20 +315,12 @@ export function TrustedPluginModuleHost({
     setLoading(true);
     setError(null);
 
-    const unsubscribeShell = useAppStore.subscribe((state, previous) => {
+    const unsubscribeShell = subscribeShellState((patch) => {
       if (disposed || shellListeners.size === 0) return;
-      const patch: Record<string, unknown> = {};
-      let changed = false;
-      for (const field of shellFields) {
-        if (state[field] !== previous[field]) {
-          patch[field] = state[field];
-          changed = true;
-        }
-      }
-      if (changed) {
-        for (const cb of shellListeners) {
-          try { cb(patch); } catch {}
-        }
+      for (const cb of shellListeners) {
+        try {
+          cb(patch);
+        } catch {}
       }
     });
 
@@ -233,7 +328,9 @@ export function TrustedPluginModuleHost({
       if (disposed || outputListeners.size === 0) return;
       if (frame.op === 'command_output' && outputSubscriptions.has(`${frame.sessionId}::${frame.toolCallId}`)) {
         for (const cb of outputListeners) {
-          try { cb(frame); } catch {}
+          try {
+            cb(frame);
+          } catch {}
         }
       }
     });
@@ -257,7 +354,7 @@ export function TrustedPluginModuleHost({
         outputSubscriptions.get(id)?.();
         outputSubscriptions.delete(id);
         if (method === 'outputs.subscribe') {
-          outputSubscriptions.set(id, useAppStore.getState().subscribeCommandOutput(sid, cid));
+          outputSubscriptions.set(id, useKernelStore.getState().subscribeCommandOutput(sid, cid));
         }
         return id;
       }
@@ -282,23 +379,108 @@ export function TrustedPluginModuleHost({
       );
     };
 
+    const surfaces = createPublicSurfacesApi(registry, (d) => {
+      trackedDisposers.add(d);
+    });
+
+    const kernelApi: TrustedModuleKernelApi = {
+      getSnapshot() {
+        const s = useKernelStore.getState();
+        return {
+          theme: s.theme,
+          connected: s.connected,
+          loading: s.loading,
+          plugins: s.plugins,
+          emptyComposition: s.emptyComposition,
+          compositionBindings: s.compositionBindings,
+          compositionEntries: s.compositionEntries,
+          workspaceBindingsByWorkspace: s.workspaceBindingsByWorkspace,
+          sessionBindingsBySession: s.sessionBindingsBySession,
+          pluginPermissionRevision: s.pluginPermissionRevision,
+          restartStatus: s.restartStatus,
+        };
+      },
+      subscribe(listener) {
+        return trackDisposer(useKernelStore.subscribe(listener));
+      },
+      setTheme: (next) => useKernelStore.getState().setTheme(next),
+      toggleTheme: () => useKernelStore.getState().toggleTheme(),
+      refreshPlugins: () => useKernelStore.getState().refreshPlugins(),
+      refreshComposition: (wsId) => useKernelStore.getState().refreshComposition(wsId),
+      refreshWorkspaceBindings: (wsId) => useKernelStore.getState().refreshWorkspaceBindings(wsId),
+      setWorkspaceBinding: (wsId, contract, targetId) =>
+        useKernelStore.getState().setWorkspaceBinding(wsId, contract, targetId),
+      refreshSessionBindings: (sid) => useKernelStore.getState().refreshSessionBindings(sid),
+      setSessionBinding: (sid, contract, targetId) =>
+        useKernelStore.getState().setSessionBinding(sid, contract, targetId),
+      setCompositionBinding: (contract, targetId) =>
+        useKernelStore.getState().setCompositionBinding(contract, targetId),
+      switchApplicationEntry: (targetId, opts) =>
+        useKernelStore.getState().switchApplicationEntry(targetId, opts),
+      togglePlugin: (id, enabled) => useKernelStore.getState().togglePlugin(id, enabled),
+      rollbackPlugin: (id) => useKernelStore.getState().rollbackPlugin(id),
+      restoreComposition: (source) => useKernelStore.getState().restoreComposition(source),
+      reloadPlugins: () => useKernelStore.getState().reloadPlugins(),
+      invalidatePluginPermissions: () => useKernelStore.getState().invalidatePluginPermissions(),
+      requestRestart: (opts) => kernelRecoveryClient.requestRestart(opts),
+    };
+
+    const navigateFn = (request: NavigationRequestV1) =>
+      navigationBus.navigate({
+        ...request,
+        sourceInstanceId: request.sourceInstanceId ?? effectiveInstanceId,
+        sourceRunId: request.sourceRunId ?? revision,
+      });
+
     const bridgeObj: TrustedModulePageBridge = {
-      get pluginId() { return pluginId; },
-      get instanceId() { return effectiveInstanceId; },
-      get runId() { return revision; },
-      get slotId() { return slotId; },
-      get slot() { return slot; },
-      get theme() { return stateRef.current.theme; },
-      get apiBase() { return typeof stateRef.current.props.apiBase === 'string' ? stateRef.current.props.apiBase : ''; },
-      get workspaceId() { return typeof stateRef.current.props.workspaceId === 'string' ? stateRef.current.props.workspaceId : null; },
-      get cssVars() { return stateRef.current.cssVars; },
-      get session() { return stateRef.current.session; },
-      get props() { return stateRef.current.props; },
+      get pluginId() {
+        return pluginId;
+      },
+      get instanceId() {
+        return effectiveInstanceId;
+      },
+      get runId() {
+        return revision;
+      },
+      get slotId() {
+        return slotId;
+      },
+      get slot() {
+        return slot;
+      },
+      get theme() {
+        return stateRef.current.theme;
+      },
+      get apiBase() {
+        return typeof stateRef.current.props.apiBase === 'string' ? stateRef.current.props.apiBase : '';
+      },
+      get workspaceId() {
+        return typeof stateRef.current.props.workspaceId === 'string'
+          ? stateRef.current.props.workspaceId
+          : null;
+      },
+      get cssVars() {
+        return stateRef.current.cssVars;
+      },
+      get session() {
+        return stateRef.current.session;
+      },
+      get props() {
+        return stateRef.current.props;
+      },
       mountMode: 'trusted-module',
-      call: <T = unknown>(method: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal; timeoutMs?: number }) =>
-        runMethod(method, params, options) as Promise<T>,
+      call: <T = unknown>(
+        method: string,
+        params?: Record<string, unknown>,
+        options?: { signal?: AbortSignal; timeoutMs?: number },
+      ) => runMethod(method, params, options) as Promise<T>,
       services: {
-        call: <T = { value: unknown }>(contract: string, method: string, args: unknown[] = [], options?: Record<string, unknown>) => {
+        call: <T = { value: unknown }>(
+          contract: string,
+          method: string,
+          args: unknown[] = [],
+          options?: Record<string, unknown>,
+        ) => {
           const params: Record<string, unknown> = { contract, method, args, ...(options ?? {}) };
           delete params.signal;
           delete params.timeoutMs;
@@ -312,13 +494,18 @@ export function TrustedPluginModuleHost({
           if (!connection) throw new Error('事件连接尚未就绪');
           const contract = String(options.contract ?? '');
           if (!contract) throw new Error('需要契约 ID');
-          let targetInstanceId = typeof options.instanceId === 'string' && options.instanceId ? options.instanceId : '';
+          let targetInstanceId =
+            typeof options.instanceId === 'string' && options.instanceId ? options.instanceId : '';
           if (!targetInstanceId) {
-            const resolved = (await runMethod('services.resolve', {
-              contract,
-              sessionId: sessionRef.current?.id,
-              workspaceId: sessionRef.current?.workspaceId ?? stateRef.current.props.workspaceId,
-            }, { signal: options.signal })) as { status?: string; instanceId?: string } | undefined;
+            const resolved = (await runMethod(
+              'services.resolve',
+              {
+                contract,
+                sessionId: sessionRef.current?.id,
+                workspaceId: sessionRef.current?.workspaceId ?? stateRef.current.props.workspaceId,
+              },
+              { signal: options.signal },
+            )) as { status?: string; instanceId?: string } | undefined;
             if (resolved?.status === 'ready' && resolved.instanceId) {
               targetInstanceId = resolved.instanceId;
             } else {
@@ -344,7 +531,9 @@ export function TrustedPluginModuleHost({
               cleanup();
               if (!acknowledged) reject(new DOMException('请求已取消', 'AbortError'));
             };
-            const signal = options.signal ? AbortSignal.any([options.signal, rpcAbort.signal]) : rpcAbort.signal;
+            const signal = options.signal
+              ? AbortSignal.any([options.signal, rpcAbort.signal])
+              : rpcAbort.signal;
             signal.addEventListener('abort', onAbort, { once: true });
             frontendPerfDiagnostics.adjustPluginSubscription(1);
             const rawRelease = connection.subscribeService(
@@ -363,6 +552,46 @@ export function TrustedPluginModuleHost({
           });
         },
       },
+      navigate: navigateFn,
+      navigation: {
+        navigate: navigateFn,
+        registerHandler(handler) {
+          return trackDisposer(navigationBus.registerHandler(owner, handler));
+        },
+      },
+      contributions: {
+        register(input) {
+          return trackDisposer(contributionRegistry.register(owner, input));
+        },
+        query(filter) {
+          return contributionRegistry.query(filter);
+        },
+        execute(keyOrId, invocation) {
+          return contributionRegistry.execute(keyOrId, {
+            ...invocation,
+            sourceInstanceId: invocation?.sourceInstanceId ?? effectiveInstanceId,
+          });
+        },
+        subscribe(listener) {
+          return trackDisposer(contributionRegistry.subscribe(listener));
+        },
+      },
+      application: {
+        publishState(patch) {
+          if (slot !== 'application.shell') return false;
+          return layoutBridge.publishState(owner, patch);
+        },
+        registerToastHandler(handler) {
+          if (slot !== 'application.shell') return () => {};
+          return trackDisposer(layoutBridge.registerToastHandler(owner, handler));
+        },
+        registerLegacyActionDelegate(delegate) {
+          if (slot !== 'application.shell') return () => {};
+          return trackDisposer(layoutBridge.registerLegacyActionDelegate(owner, delegate));
+        },
+      },
+      kernel: kernelApi,
+      surfaces,
       requestPluginRoute: (o) => runMethod('plugin.route', o),
       resolveService: (o) => runMethod('services.resolve', o),
       listPlugins: () => runMethod('plugins.list'),
@@ -378,30 +607,38 @@ export function TrustedPluginModuleHost({
       runCommand: (command, args = '') => runMethod('command.run', { command, args }),
       toast: (t, body, kind = 'info') => runMethod('ui.toast', { title: t, body, kind }),
       resize: (h) => {
-        if (slot !== 'workspace.pages' && slot !== 'session.stage.embedded') {
+        if (!isFullSize) {
           setHeight(Math.max(48, Math.min(960, Math.round(Number(h) || 120))));
         }
       },
       onTheme: (cb) => {
         themeListenersRef.current.add(cb);
-        return () => { themeListenersRef.current.delete(cb); };
+        return () => {
+          themeListenersRef.current.delete(cb);
+        };
       },
       onContext: (cb) => {
         contextListenersRef.current.add(cb);
-        return () => { contextListenersRef.current.delete(cb); };
+        return () => {
+          contextListenersRef.current.delete(cb);
+        };
       },
       onShellState: (cb) => {
         shellListeners.add(cb);
-        return () => { shellListeners.delete(cb); };
+        return () => {
+          shellListeners.delete(cb);
+        };
       },
       onCommandOutput: (cb) => {
         outputListeners.add(cb);
-        return () => { outputListeners.delete(cb); };
+        return () => {
+          outputListeners.delete(cb);
+        };
       },
     };
     const bridge: TrustedModulePageBridge = Object.freeze(bridgeObj);
 
-    const url = resolveModuleUrl(effectiveInstanceId, modulePath, revision);
+    const url = resolvePluginModuleUrl(effectiveInstanceId, modulePath, revision);
     void (async () => {
       try {
         const mod = (await import(/* @vite-ignore */ url)) as Partial<TrustedPluginModuleExports>;
@@ -428,14 +665,26 @@ export function TrustedPluginModuleHost({
           slotItemId: slotId,
           message: `可信前端模块加载失败: ${message}`,
         });
+        loadErrorRef.current?.(message);
       }
     })();
 
     return () => {
       disposed = true;
       rpcAbort.abort();
-      try { moduleDispose?.(); } catch {}
+      try {
+        moduleDispose?.();
+      } catch {}
       moduleDispose = undefined;
+      for (const dispose of [...trackedDisposers]) {
+        try {
+          dispose();
+        } catch {}
+      }
+      trackedDisposers.clear();
+      contributionRegistry.revokeByOwner(effectiveInstanceId, revision);
+      navigationBus.revokeByOwner(effectiveInstanceId, revision);
+      detachLayoutOwner?.();
       unsubscribeShell();
       unsubscribeOutput?.();
       shellListeners.clear();
@@ -451,7 +700,7 @@ export function TrustedPluginModuleHost({
       serviceSubscriptions.clear();
       container.replaceChildren();
     };
-  }, [pluginId, effectiveInstanceId, pluginName, revision, slot, slotId, modulePath, registry]);
+  }, [pluginId, effectiveInstanceId, pluginName, revision, slot, slotId, modulePath, registry, isFullSize]);
 
   if (error) {
     return (
@@ -472,7 +721,6 @@ export function TrustedPluginModuleHost({
     );
   }
 
-  const isFullSize = slot === 'workspace.pages' || slot === 'session.stage.embedded';
   return (
     <ModuleErrorBoundary
       title={title}
@@ -484,6 +732,7 @@ export function TrustedPluginModuleHost({
           slotItemId: slotId,
           message: `可信前端模块渲染失败: ${message}`,
         });
+        loadErrorRef.current?.(message);
       }}
     >
       <div

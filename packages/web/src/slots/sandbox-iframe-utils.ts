@@ -261,6 +261,17 @@ export function buildIframeSrcDoc(params: {
     resolveService: function (options) { return call('services.resolve', options || {}); },
     listPlugins: function () { return call('plugins.list', {}); },
     importBundle: function (options) { return call('import.bundle', options || {}); },
+    navigate: function (request) { return call('ui.navigate', request || {}); },
+    contributions: {
+      list: function (filter) { return call('contributions.list', filter || {}); },
+      execute: function (key, args) { return call('contributions.execute', { key: key, args: args || {} }); }
+    },
+    kernel: {
+      snapshot: function () { return call('kernel.snapshot', {}); },
+      switchApplication: function (instanceId, options) { return call('kernel.switchApplication', Object.assign({ instanceId: instanceId }, options || {})); },
+      setCompositionBinding: function (contract, instanceId) { return call('kernel.setCompositionBinding', { contract: contract, instanceId: instanceId }); },
+      requestRestart: function (options) { return call('kernel.requestRestart', options || {}); }
+    },
     navigateToSession: function (options) { return call('navigateToSession', options || {}); },
     navigateToFile: function (options) { return call('navigateToFile', options || {}); },
     openFile: function (options) { return call('navigateToFile', options || {}); },

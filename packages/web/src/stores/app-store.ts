@@ -3,6 +3,7 @@ import { showSessionNotification } from '../lib/desktop-notifications';
 import type {
   AddMcpServerRequest,
   AgyAuthState,
+  ApplicationSwitchResult,
   Attachment,
   AttentionItem,
   CanonicalEvent,
@@ -61,7 +62,8 @@ import type {
   Workspace,
 } from '@harnessmate/protocol';
 import { create } from 'zustand';
-import { ApiHttpError, DaemonWsClient, daemonApi, type HarnessServiceScope } from '../api/client';
+import { ApiHttpError, DaemonWsClient, daemonApi, getSharedDaemonWs, type HarnessServiceScope } from '../api/client';
+import { useKernelStore } from './kernel-store';
 import {
   HISTORY_IMPORT_CONTRACT,
   HISTORY_IMPORT_PAGE_SLOT_ID,
@@ -177,11 +179,12 @@ export interface AppState {
   sidebarCollapsed: boolean;
   inspectorOpen: boolean;
   inspectorTab: InspectorTab;
-  inspectorFile: { sessionId: string; path: string; line?: number } | null;
+  inspectorFile: { sessionId: string; path: string; line?: number; column?: number } | null;
   inspectorFileError: {
     sessionId: string | null;
     path: string;
     line?: number;
+    column?: number;
     code: string;
     message: string;
   } | null;
@@ -272,11 +275,13 @@ export interface AppState {
 
   // Actions
   init: () => Promise<void>;
+  disposeLayoutSubscriptions: () => void;
+  switchApplicationLayout: (instanceId: string | null) => Promise<ApplicationSwitchResult>;
   toggleTheme: () => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setInspectorOpen: (open: boolean) => void;
   setInspectorTab: (tab: InspectorTab) => void;
-  openInspectorFile: (sessionId: string, path: string, line?: number) => NavigateToFileResult;
+  openInspectorFile: (sessionId: string, path: string, line?: number, column?: number) => NavigateToFileResult;
   navigateToFile: (req: NavigateToFileRequest) => NavigateToFileResult;
   resolveContractLocal: (
     contract: string,
@@ -479,6 +484,7 @@ export interface AppState {
 }
 
 let wsClient: DaemonWsClient | null = null;
+let sharedWsObserverCleanup: (() => void) | null = null;
 const commandOutputRefCounts = new Map<string, number>();
 const terminalOutputRefCounts = new Map<string, number>();
 const nativeFeedControllers = new Map<string, NativeFeedController>();
@@ -716,104 +722,119 @@ export const useAppStore = create<AppState>((set, get) => {
     nativeRuntimeBySession: {},
     toasts: [],
 
+    disposeLayoutSubscriptions: () => {
+      sharedWsObserverCleanup?.();
+      sharedWsObserverCleanup = null;
+    },
+
+    switchApplicationLayout: (instanceId) =>
+      useKernelStore.getState().switchApplicationEntry(instanceId),
+
     init: async () => {
-      if (!wsClient) {
+      const handleWsFrame = (frame: import('@harnessmate/protocol').WsServerFrame) => {
+        if (frame.op === 'command_output') {
+          const key = `${frame.sessionId}::${frame.toolCallId}`;
+          set((state) => {
+            const prev = state.liveCommandOutputByKey[key];
+            const nextText = frame.snapshot
+              ? frame.chunk
+              : `${prev?.text ?? ''}${frame.chunk}`.slice(-256_000);
+            return {
+              liveCommandOutputByKey: {
+                ...state.liveCommandOutputByKey,
+                [key]: {
+                  text: nextText,
+                  done: Boolean(frame.done || prev?.done),
+                  updatedAt: frame.timestamp,
+                },
+              },
+            };
+          });
+        } else if (frame.op === 'terminal_output') {
+          set((state) => {
+            const prev = state.terminalOutputById[frame.terminalId];
+            const nextText = frame.snapshot
+              ? frame.chunk
+              : `${prev?.text ?? ''}${frame.chunk}`.slice(-524_288);
+            return {
+              terminalOutputById: {
+                ...state.terminalOutputById,
+                [frame.terminalId]: {
+                  text: nextText,
+                  truncated: Boolean(frame.truncated || prev?.truncated),
+                  ringBufferBytes: frame.ringBufferBytes ?? prev?.ringBufferBytes ?? nextText.length,
+                  updatedAt: frame.timestamp,
+                },
+              },
+            };
+          });
+        } else if (frame.op === 'terminal_status') {
+          const term = frame.terminal;
+          set((state) => {
+            const existing = state.terminalsByWorkspace[term.workspaceId] ?? [];
+            if (frame.event === 'closed') {
+              const nextOutput = { ...state.terminalOutputById };
+              delete nextOutput[term.terminalId];
+              return {
+                terminalsByWorkspace: {
+                  ...state.terminalsByWorkspace,
+                  [term.workspaceId]: existing.filter((t) => t.terminalId !== term.terminalId),
+                },
+                terminalOutputById: nextOutput,
+              };
+            }
+            const nextList = [
+              ...existing.filter((t) => t.terminalId !== term.terminalId),
+              term,
+            ].sort((a, b) => a.createdAt - b.createdAt);
+            return {
+              terminalsByWorkspace: {
+                ...state.terminalsByWorkspace,
+                [term.workspaceId]: nextList,
+              },
+            };
+          });
+        } else if (frame.op === 'attention') {
+          handleAttention(frame.item);
+        } else if (frame.op === 'plugins_changed') {
+          void get().refreshPlugins().catch(() => {});
+        } else if (frame.op === 'agy_auth_state') {
+          set((state) => {
+            const nextAuth = {
+              ...state.agyAuthStates,
+              [frame.state.instanceId]: frame.state,
+            };
+            if (frame.state.phase === 'unauthenticated' || frame.state.phase === 'failed') {
+              const nextNative = { ...state.nativeRuntimeBySession };
+              for (const sess of state.sessions) {
+                if (sess.harnessId === frame.state.instanceId) {
+                  disposeNativeFeedController(sess.id);
+                  bumpNativeScopeEpoch(sess.id);
+                  delete nextNative[sess.id];
+                }
+              }
+              return { agyAuthStates: nextAuth, nativeRuntimeBySession: nextNative };
+            }
+            return { agyAuthStates: nextAuth };
+          });
+        } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
+          ingestTriage([frame.session]);
+          if (frame.event) handleSnoozeReminder(frame.event, true);
+        }
+      };
+
+      const existingShared = getSharedDaemonWs();
+      if (existingShared) {
+        wsClient = existingShared;
+        sharedWsObserverCleanup?.();
+        sharedWsObserverCleanup = existingShared.observeFrames(handleWsFrame);
+      } else if (!wsClient) {
         wsClient = new DaemonWsClient({
           onConnected: (connected) => {
             set({ connected });
             if (connected && !get().loading) void get().refreshPlugins().catch(() => {});
           },
-          onFrame: (frame) => {
-            if (frame.op === 'command_output') {
-              const key = `${frame.sessionId}::${frame.toolCallId}`;
-              set((state) => {
-                const prev = state.liveCommandOutputByKey[key];
-                const nextText = frame.snapshot
-                  ? frame.chunk
-                  : `${prev?.text ?? ''}${frame.chunk}`.slice(-256_000);
-                return {
-                  liveCommandOutputByKey: {
-                    ...state.liveCommandOutputByKey,
-                    [key]: {
-                      text: nextText,
-                      done: Boolean(frame.done || prev?.done),
-                      updatedAt: frame.timestamp,
-                    },
-                  },
-                };
-              });
-            } else if (frame.op === 'terminal_output') {
-              set((state) => {
-                const prev = state.terminalOutputById[frame.terminalId];
-                const nextText = frame.snapshot
-                  ? frame.chunk
-                  : `${prev?.text ?? ''}${frame.chunk}`.slice(-524_288);
-                return {
-                  terminalOutputById: {
-                    ...state.terminalOutputById,
-                    [frame.terminalId]: {
-                      text: nextText,
-                      truncated: Boolean(frame.truncated || prev?.truncated),
-                      ringBufferBytes: frame.ringBufferBytes ?? prev?.ringBufferBytes ?? nextText.length,
-                      updatedAt: frame.timestamp,
-                    },
-                  },
-                };
-              });
-            } else if (frame.op === 'terminal_status') {
-              const term = frame.terminal;
-              set((state) => {
-                const existing = state.terminalsByWorkspace[term.workspaceId] ?? [];
-                if (frame.event === 'closed') {
-                  const nextOutput = { ...state.terminalOutputById };
-                  delete nextOutput[term.terminalId];
-                  return {
-                    terminalsByWorkspace: {
-                      ...state.terminalsByWorkspace,
-                      [term.workspaceId]: existing.filter((t) => t.terminalId !== term.terminalId),
-                    },
-                    terminalOutputById: nextOutput,
-                  };
-                }
-                const nextList = [
-                  ...existing.filter((t) => t.terminalId !== term.terminalId),
-                  term,
-                ].sort((a, b) => a.createdAt - b.createdAt);
-                return {
-                  terminalsByWorkspace: {
-                    ...state.terminalsByWorkspace,
-                    [term.workspaceId]: nextList,
-                  },
-                };
-              });
-            } else if (frame.op === 'attention') {
-              handleAttention(frame.item);
-            } else if (frame.op === 'plugins_changed') {
-              void get().refreshPlugins().catch(() => {});
-            } else if (frame.op === 'agy_auth_state') {
-              set((state) => {
-                const nextAuth = {
-                  ...state.agyAuthStates,
-                  [frame.state.instanceId]: frame.state,
-                };
-                if (frame.state.phase === 'unauthenticated' || frame.state.phase === 'failed') {
-                  const nextNative = { ...state.nativeRuntimeBySession };
-                  for (const sess of state.sessions) {
-                    if (sess.harnessId === frame.state.instanceId) {
-                      disposeNativeFeedController(sess.id);
-                      bumpNativeScopeEpoch(sess.id);
-                      delete nextNative[sess.id];
-                    }
-                  }
-                  return { agyAuthStates: nextAuth, nativeRuntimeBySession: nextNative };
-                }
-                return { agyAuthStates: nextAuth };
-              });
-            } else if (frame.op === 'triage_updated' && isTriageEnabled(get().plugins)) {
-              ingestTriage([frame.session]);
-              if (frame.event) handleSnoozeReminder(frame.event, true);
-            }
-          },
+          onFrame: handleWsFrame,
         });
         wsClient.connect();
       }
@@ -913,6 +934,11 @@ export const useAppStore = create<AppState>((set, get) => {
 
       const normalizedPath = parsed.path;
       const normalizedLine = explicitLine ?? parsed.line;
+      const explicitColumn =
+        typeof req.column === 'number' && Number.isSafeInteger(req.column) && req.column > 0
+          ? req.column
+          : undefined;
+      const normalizedColumn = explicitColumn ?? parsed.column;
 
       if (!targetSessionId) {
         const message = '当前没有可定位的工作区会话，无法打开文件；当前会话状态已保留。';
@@ -989,7 +1015,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       set({
-        inspectorFile: { sessionId: targetSessionId, path: normalizedPath, line: normalizedLine },
+        inspectorFile: { sessionId: targetSessionId, path: normalizedPath, line: normalizedLine, column: normalizedColumn },
         inspectorFileError: null,
         ...(req.openInspector !== false ? { inspectorTab: 'files', inspectorOpen: true } : {}),
         ...(shouldCloseWorkspacePage ? { activePluginPage: null } : {}),
@@ -1000,10 +1026,11 @@ export const useAppStore = create<AppState>((set, get) => {
         workspaceId: targetWorkspaceId,
         path: normalizedPath,
         line: normalizedLine,
+        column: normalizedColumn,
       };
     },
-    openInspectorFile: (sessionId, path, line) =>
-      get().navigateToFile({ sessionId, path, line, openInspector: true, preserveSession: true }),
+    openInspectorFile: (sessionId, path, line, column) =>
+      get().navigateToFile({ sessionId, path, line, column, openInspector: true, preserveSession: true }),
     closeInspectorFile: () => set({ inspectorFile: null, inspectorFileError: null }),
     openModal: (modal, presetHarnessId = null) =>
       set({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId, paletteInitialQuery: '', explorerInitialQuery: '' }),
@@ -2692,4 +2719,21 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
   };
+});
+
+// Keep legacy test mutations of useAppStore synchronized with kernel-store so B1–B4 component
+// tests keep passing without requiring kernel modules to import app-store.
+useAppStore.subscribe((state, prev) => {
+  const patch: Partial<ReturnType<typeof useKernelStore.getState>> = {};
+  let changed = false;
+  if (state.theme !== prev.theme) { patch.theme = state.theme; changed = true; }
+  if (state.connected !== prev.connected) { patch.connected = state.connected; changed = true; }
+  if (state.plugins !== prev.plugins) { patch.plugins = state.plugins; changed = true; }
+  if (state.emptyComposition !== prev.emptyComposition) { patch.emptyComposition = state.emptyComposition; changed = true; }
+  if (state.compositionBindings !== prev.compositionBindings) { patch.compositionBindings = state.compositionBindings; changed = true; }
+  if (state.compositionEntries !== prev.compositionEntries) { patch.compositionEntries = state.compositionEntries; changed = true; }
+  if (state.workspaceBindingsByWorkspace !== prev.workspaceBindingsByWorkspace) { patch.workspaceBindingsByWorkspace = state.workspaceBindingsByWorkspace; changed = true; }
+  if (state.sessionBindingsBySession !== prev.sessionBindingsBySession) { patch.sessionBindingsBySession = state.sessionBindingsBySession; changed = true; }
+  if (state.pluginPermissionRevision !== prev.pluginPermissionRevision) { patch.pluginPermissionRevision = state.pluginPermissionRevision; changed = true; }
+  if (changed) useKernelStore.setState(patch);
 });

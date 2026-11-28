@@ -1,0 +1,29 @@
+{
+  "id": "hm.plugin.shell-default",
+  "name": "默认工作台布局",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "permissions": [
+    "storage:plugin"
+  ],
+  "category": "ui",
+  "main": "index.mjs",
+  "provides": [
+    "application.view.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "application.shell",
+        "id": "shell",
+        "title": "默认工作台布局",
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs"
+      }
+    ]
+  },
+  "description": "默认应用布局插件：接管侧栏、检视抽屉、全局弹窗框架、命令面板、导航路由与业务快捷键。"
+}

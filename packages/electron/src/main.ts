@@ -33,6 +33,17 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let daemonProcess: ChildProcess | null = null;
 let isQuitting = false;
+let contributedTrayItems: Array<{
+  key: string;
+  id: string;
+  kind: 'menu' | 'tray';
+  label: string;
+  accelerator?: string;
+  enabled: boolean;
+  order: number;
+  ownerInstanceId: string;
+  ownerRunId: string;
+}> = [];
 
 function isAppPage(value: string): boolean {
   try {
@@ -247,6 +258,47 @@ function restartInMode(safeMode: boolean): void {
   app.quit();
 }
 
+function rebuildTrayMenu(): void {
+  if (!tray) return;
+  const pluginEntries = contributedTrayItems
+    .filter((item) => item.kind === 'tray' && item.enabled)
+    .sort((a, b) => a.order - b.order)
+    .slice(0, 16)
+    .map((item) => ({
+      label: item.label,
+      click: () => {
+        showOrCreateWindow();
+        mainWindow?.webContents.send('desktop:menuInvoke', {
+          key: item.key,
+          ownerInstanceId: item.ownerInstanceId,
+          ownerRunId: item.ownerRunId,
+        });
+      },
+    }));
+
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: '打开 HarnessMate 窗口',
+        click: () => showOrCreateWindow(),
+      },
+      ...(pluginEntries.length > 0 ? [{ type: 'separator' as const }, ...pluginEntries] : []),
+      { type: 'separator' as const },
+      {
+        label: SAFE_MODE ? '重新正常启动' : '重新以安全模式启动',
+        click: () => restartInMode(!SAFE_MODE),
+      },
+      {
+        label: '退出 HarnessMate（停止后台守护）',
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        },
+      },
+    ]),
+  );
+}
+
 function createTray(): void {
   const iconPath = resolveAppIconPath();
   let trayImage = iconPath ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
@@ -264,30 +316,37 @@ function createTray(): void {
 
   tray = new Tray(trayImage);
   tray.setToolTip('HarnessMate Desktop — 多 Harness 守护服务运行中');
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      {
-        label: '打开 HarnessMate 窗口',
-        click: () => showOrCreateWindow(),
-      },
-      {
-        label: SAFE_MODE ? '重新正常启动' : '重新以安全模式启动',
-        click: () => restartInMode(!SAFE_MODE),
-      },
-      { type: 'separator' },
-      {
-        label: '退出 HarnessMate（停止后台守护）',
-        click: () => {
-          isQuitting = true;
-          app.quit();
-        },
-      },
-    ]),
-  );
+  rebuildTrayMenu();
 
   tray.on('double-click', () => showOrCreateWindow());
   tray.on('click', () => showOrCreateWindow());
 }
+
+ipcMain.on('desktop:setMenuContributions', (event, items: unknown) => {
+  if (!trustedOwner(event)) return;
+  if (!Array.isArray(items)) {
+    contributedTrayItems = [];
+  } else {
+    contributedTrayItems = items
+      .filter(
+        (item): item is (typeof contributedTrayItems)[number] =>
+          Boolean(item) &&
+          typeof item === 'object' &&
+          typeof (item as { key?: unknown }).key === 'string' &&
+          typeof (item as { label?: unknown }).label === 'string' &&
+          typeof (item as { ownerInstanceId?: unknown }).ownerInstanceId === 'string' &&
+          typeof (item as { ownerRunId?: unknown }).ownerRunId === 'string',
+      )
+      .slice(0, 32);
+  }
+  rebuildTrayMenu();
+});
+
+ipcMain.handle('desktop:restartApp', async (event, options?: { safeMode?: boolean }) => {
+  if (!trustedOwner(event)) return { ok: false, reason: '未授权的重启调用' };
+  restartInMode(Boolean(options?.safeMode));
+  return { ok: true };
+});
 
 ipcMain.handle('dialog:pickDirectory', async (event) => {
   if (!trustedOwner(event)) return null;

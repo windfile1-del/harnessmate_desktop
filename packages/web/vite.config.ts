@@ -2,8 +2,38 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
+const FORBIDDEN_HOST_MODULES = [
+  '/stores/app-store.ts',
+  '/components/Sidebar.tsx',
+  '/components/InspectorDrawer.tsx',
+  '/components/Modals.tsx',
+  '/components/CommandPalette.tsx',
+  '/components/TriageInbox.tsx',
+  '/plugins/shell-default/',
+];
+
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    {
+      name: 'kernel-root-ownership-check',
+      generateBundle(_options, bundle) {
+        for (const output of Object.values(bundle)) {
+          if (output.type !== 'chunk') continue;
+          for (const moduleId of Object.keys(output.modules)) {
+            const normalized = moduleId.replaceAll('\\', '/');
+            const hit = FORBIDDEN_HOST_MODULES.find((suffix) => normalized.includes(suffix));
+            if (hit) {
+              throw new Error(
+                `Host kernel bundle must not statically import business/layout module (${hit}): ${normalized}`,
+              );
+            }
+          }
+        }
+      },
+    },
+  ],
   base: './',
   server: {
     port: 5173,

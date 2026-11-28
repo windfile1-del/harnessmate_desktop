@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DesktopViewFrame, DesktopViewStatus, PluginBrowserFrame, PluginBrowserStatus } from '@harnessmate/plugin-api';
+import type {
+  DesktopMenuContributionDto,
+  DesktopViewFrame,
+  DesktopViewStatus,
+  PluginBrowserFrame,
+  PluginBrowserStatus,
+} from '@harnessmate/plugin-api';
 
 const daemonPort = process.env.HARNESSMATE_PORT || '4789';
 
@@ -9,6 +15,27 @@ contextBridge.exposeInMainWorld('harnessMateBridge', {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
   notify: (title: string, body: string): void => {
     ipcRenderer.send('desktop:notify', { title, body });
+  },
+  restartApp: (options?: { safeMode?: boolean }): Promise<{ ok?: boolean; reason?: string }> =>
+    ipcRenderer.invoke('desktop:restartApp', options ?? {}),
+  menu: {
+    syncContributions: (items: DesktopMenuContributionDto[]): void => {
+      ipcRenderer.send('desktop:setMenuContributions', items);
+    },
+    onInvoke: (
+      listener: (payload: { key: string; ownerInstanceId: string; ownerRunId: string }) => void,
+    ) => {
+      const dispatch = (
+        _event: Electron.IpcRendererEvent,
+        payload: { key: string; ownerInstanceId: string; ownerRunId: string },
+      ) => {
+        listener(payload);
+      };
+      ipcRenderer.on('desktop:menuInvoke', dispatch);
+      return () => {
+        ipcRenderer.off('desktop:menuInvoke', dispatch);
+      };
+    },
   },
   desktopView: {
     call: (viewId: string, method: string, data?: unknown): Promise<void> =>

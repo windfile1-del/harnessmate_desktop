@@ -153,6 +153,13 @@ declare global {
       pickDirectory: () => Promise<string | null>;
       openExternal: (url: string) => Promise<void>;
       notify: (title: string, body: string) => void;
+      restartApp?: (options?: { safeMode?: boolean }) => Promise<{ ok?: boolean; reason?: string }>;
+      menu?: {
+        syncContributions: (items: import('@harnessmate/protocol').DesktopMenuContributionDto[]) => void;
+        onInvoke: (
+          listener: (payload: { key: string; ownerInstanceId: string; ownerRunId: string }) => void,
+        ) => () => void;
+      };
       desktopView?: {
         call: (viewId: string, method: string, data?: unknown) => Promise<void>;
         subscribe: (viewId: string, listener: (payload: { frame: DesktopViewFrame } | { status: DesktopViewStatus }) => void) => () => void;

@@ -4,6 +4,7 @@ import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } fro
 import { useShallow } from 'zustand/react/shallow';
 import { daemonApi } from '../api/client';
 import {
+  APPLICATION_VIEW_CONTRACT,
   GIT_WORKSPACE_CONTRACT,
   HISTORY_IMPORT_CONTRACT,
   SESSION_SEARCH_CONTRACT,
@@ -14,6 +15,7 @@ import {
   isContractAvailableClientSide,
   pluginProvidesContract,
 } from '../api/peer-contracts';
+import { contributionRegistry } from '../kernel/contribution-registry';
 import {
   commandKey,
   commandPaletteRegistry,
@@ -331,6 +333,32 @@ export function CommandPaletteModal({ initialQuery, onClose }: { initialQuery: s
           ['import', 'history', '历史导入', instId],
         );
       }
+      if (pluginProvidesContract(plugin, APPLICATION_VIEW_CONTRACT)) {
+        add(
+          `switch-layout:${instId}`,
+          plugin.id,
+          'navigation',
+          `切换应用布局 · ${plugin.name} (${instId})`,
+          async () => {
+            await get().switchApplicationLayout(instId);
+          },
+          ['layout', 'shell', '应用布局', instId],
+        );
+      }
+    }
+    for (const contrib of contributionRegistry.query({ kind: 'command', enabledOnly: true })) {
+      if (contrib.id.startsWith('layout.sync') || contrib.id.startsWith('layout.set')) continue;
+      if (typeof contrib.execute !== 'function') continue;
+      add(
+        `contrib:${contrib.key}`,
+        contrib.owner.pluginId ?? contrib.owner.instanceId,
+        'plugin_action',
+        contrib.title,
+        async () => {
+          await contributionRegistry.execute(contrib.key);
+        },
+        contrib.keywords ?? [],
+      );
     }
     modal('risk_rules', '打开审批规则', 'hm.plugin.approval-center');
     add('theme', 'core', 'theme', theme === 'dark' ? '切换浅色主题' : '切换深色主题',

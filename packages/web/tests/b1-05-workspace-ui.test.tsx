@@ -42,6 +42,8 @@ import {
   registerPluginIframeSlots,
 } from '../src/slots/PluginSlotSync';
 import { executeSandboxedBridgeMethod } from '../src/slots/sandbox-bridge-handler';
+import { navigationBus } from '../src/kernel/navigation-bus';
+import { createDefaultShellNavigationHandler } from '../src/plugins/shell-default/navigation';
 import { buildIframeSrcDoc } from '../src/slots/sandbox-iframe-utils';
 import { daemonApi } from '../src/api/client';
 import { PluginWorkspaceLinks, PluginWorkspaceStage } from '../src/slots/PluginWorkspace';
@@ -1144,46 +1146,54 @@ describe('B1-05 · SandboxedPluginFrame Bridge & Third-Party Custom Standard Pag
     expect(listWorkspacesSpy).toHaveBeenCalledTimes(1);
     expect((wsRes as { workspaces: Workspace[] }).workspaces).toHaveLength(2);
 
-    const navRes = await executeSandboxedBridgeMethod(execCtx, 'navigateToSession', {
-      sessionId: 'sess-sample',
-      turnId: 'import_9',
-      itemId: 'sess-sample:import_9:assistant',
-    });
-    expect(navRes).toEqual({
-      ok: true,
-      sessionId: 'sess-sample',
-      turnId: 'import_9',
-      itemId: 'sess-sample:import_9:assistant',
-    });
-    expect(selectSessionSpy).toHaveBeenCalledWith('sess-sample');
-    expect(useAppStore.getState().activePluginPage).toBeNull();
-    expect(useAppStore.getState().focusedTurn).toEqual({
-      sessionId: 'sess-sample',
-      turnId: 'import_9',
-      itemId: 'sess-sample:import_9:assistant',
-    });
+    const disposeNav = navigationBus.registerHandler(
+      { instanceId: 'hm.plugin.shell-default', runId: 'test-b1-05' },
+      createDefaultShellNavigationHandler(),
+    );
+    try {
+      const navRes = await executeSandboxedBridgeMethod(execCtx, 'navigateToSession', {
+        sessionId: 'sess-sample',
+        turnId: 'import_9',
+        itemId: 'sess-sample:import_9:assistant',
+      });
+      expect(navRes).toEqual({
+        ok: true,
+        sessionId: 'sess-sample',
+        turnId: 'import_9',
+        itemId: 'sess-sample:import_9:assistant',
+      });
+      expect(selectSessionSpy).toHaveBeenCalledWith('sess-sample');
+      expect(useAppStore.getState().activePluginPage).toBeNull();
+      expect(useAppStore.getState().focusedTurn).toEqual({
+        sessionId: 'sess-sample',
+        turnId: 'import_9',
+        itemId: 'sess-sample:import_9:assistant',
+      });
 
-    // Simulate instance switch / unmount aborting an in-flight navigateToSession before it finishes
-    const abortedController = new AbortController();
-    const deferredSync = createDeferred<Session | null>();
-    vi.spyOn(useAppStore.getState(), 'syncImportedSession').mockImplementation(() => deferredSync.promise);
-    useAppStore.setState({
-      sessions: [],
-      activePluginPage: makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
-      focusedTurn: null,
-    });
-    const slowNavPromise = executeSandboxedBridgeMethod(
-      { ...execCtx, signal: abortedController.signal, isDisposed: () => abortedController.signal.aborted },
-      'navigateToSession',
-      { sessionId: 'late-session', turnId: 'late_turn' },
-    );
-    abortedController.abort();
-    deferredSync.resolve(sampleSession);
-    const abortedNavRes = await slowNavPromise;
-    expect(abortedNavRes).toEqual({ ok: false, aborted: true });
-    expect(useAppStore.getState().focusedTurn).toBeNull();
-    expect(useAppStore.getState().activePluginPage).toBe(
-      makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
-    );
+      // Simulate instance switch / unmount aborting an in-flight navigateToSession before it finishes
+      const abortedController = new AbortController();
+      const deferredSync = createDeferred<Session | null>();
+      vi.spyOn(useAppStore.getState(), 'syncImportedSession').mockImplementation(() => deferredSync.promise);
+      useAppStore.setState({
+        sessions: [],
+        activePluginPage: makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
+        focusedTurn: null,
+      });
+      const slowNavPromise = executeSandboxedBridgeMethod(
+        { ...execCtx, signal: abortedController.signal, isDisposed: () => abortedController.signal.aborted },
+        'navigateToSession',
+        { sessionId: 'late-session', turnId: 'late_turn' },
+      );
+      abortedController.abort();
+      deferredSync.resolve(sampleSession);
+      const abortedNavRes = await slowNavPromise;
+      expect(abortedNavRes).toEqual({ ok: false, aborted: true });
+      expect(useAppStore.getState().focusedTurn).toBeNull();
+      expect(useAppStore.getState().activePluginPage).toBe(
+        makeWorkspacePageKey('hm.plugin.session-search-fts', SESSION_SEARCH_PAGE_SLOT_ID),
+      );
+    } finally {
+      disposeNav();
+    }
   });
 });

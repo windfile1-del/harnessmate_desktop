@@ -1,11 +1,12 @@
 import type { InstalledPluginInfo, PluginSlotContribution, Session } from '@harnessmate/protocol';
-import { useMemo } from 'react';
+import { useMemo, useSyncExternalStore } from 'react';
 import { getPluginInstanceId, resolveServiceSelectionClientSide } from '../api/peer-contracts';
-import { useAppStore } from '../stores/app-store';
+import { layoutBridge } from '../kernel/layout-bridge';
+import { useKernelStore } from '../stores/kernel-store';
 import { SandboxedPluginFrame, type SandboxedPluginFrameProps } from './SandboxedPluginFrame';
 import { TrustedPluginModuleHost } from './TrustedPluginModuleHost';
 
-const PERSISTENT_SURFACES = new Set(['chat', 'requests-queue', 'agy-workbench']);
+const PERSISTENT_SURFACES = new Set(['chat', 'requests-queue', 'agy-workbench', 'shell']);
 
 export function shouldUseTrustedModuleMount(
   plugin: InstalledPluginInfo,
@@ -26,14 +27,22 @@ export function shouldUseTrustedModuleMount(
 }
 
 export function useBoundSessionPlugin(contract: string, session: Session | null) {
-  const plugins = useAppStore((state) => state.plugins);
-  const sessionBindings = useAppStore((state) => (session ? state.sessionBindingsBySession[session.id] : undefined));
-  const workspaceBindings = useAppStore((state) => {
-    const workspaceId = session?.workspaceId ?? state.selectedWorkspaceId;
-    return workspaceId ? state.workspaceBindingsByWorkspace[workspaceId] : undefined;
-  });
-  const compositionBindings = useAppStore((state) => state.compositionBindings);
-  const compositionEntries = useAppStore((state) => state.compositionEntries);
+  const kernelState = useSyncExternalStore(
+    useKernelStore.subscribe,
+    useKernelStore.getState,
+    useKernelStore.getState,
+  );
+  const {
+    plugins,
+    sessionBindingsBySession,
+    workspaceBindingsByWorkspace,
+    compositionBindings,
+    compositionEntries,
+  } = kernelState;
+  const sessionBindings = session ? sessionBindingsBySession[session.id] : undefined;
+  const layoutWs = layoutBridge.getState().selectedWorkspaceId;
+  const workspaceId = session?.workspaceId ?? (typeof layoutWs === 'string' ? layoutWs : null);
+  const workspaceBindings = workspaceId ? workspaceBindingsByWorkspace[workspaceId] : undefined;
   return useMemo(() => {
     const resolution = resolveServiceSelectionClientSide({
       contract,
@@ -56,13 +65,18 @@ export function BoundSessionSurface({
   props,
   onAction,
   defaultHeight,
+  onLoadError,
 }: Pick<SandboxedPluginFrameProps, 'session' | 'props' | 'onAction' | 'defaultHeight'> & {
   plugin: ReturnType<typeof useBoundSessionPlugin>;
   surface: string;
+  onLoadError?: (message: string) => void;
 }) {
   const contribution = plugin?.contributes.slots?.find(({ id, ui }) => id === surface && Boolean(ui));
   if (!plugin || !contribution?.ui) return null;
-  if (contribution.when?.harnessKinds?.length && (!session || !contribution.when.harnessKinds.includes(session.harnessKind))) {
+  if (
+    contribution.when?.harnessKinds?.length &&
+    (!session || !contribution.when.harnessKinds.includes(session.harnessKind))
+  ) {
     return null;
   }
   const instanceId = getPluginInstanceId(plugin);
@@ -89,6 +103,7 @@ export function BoundSessionSurface({
         onAction={onAction}
         defaultHeight={defaultHeight}
         compact
+        onLoadError={onLoadError}
       />
     );
   }
@@ -109,6 +124,7 @@ export function BoundSessionSurface({
       onAction={onAction}
       defaultHeight={defaultHeight}
       compact
+      onLoadError={onLoadError}
     />
   );
 }

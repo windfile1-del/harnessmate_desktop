@@ -6,6 +6,7 @@ import {
   Cpu,
   FolderGit2,
   FolderPlus,
+  LayoutGrid,
   Moon,
   Plug,
   Plus,
@@ -16,10 +17,13 @@ import {
   Trash2,
 } from 'lucide-react';
 import {
+  APPLICATION_VIEW_CONTRACT,
   GIT_WORKSPACE_CONTRACT,
   HISTORY_IMPORT_CONTRACT,
   SESSION_SEARCH_CONTRACT,
+  getPluginInstanceId,
   isContractAvailableClientSide,
+  isPluginInstanceReady,
   pluginProvidesContract,
 } from '../api/peer-contracts';
 import { formatRelativeTime, resolveHarnessMeta } from '../lib/harness-meta';
@@ -57,6 +61,7 @@ export function Sidebar() {
     compositionBindings,
     workspaceBindingsByWorkspace,
     sessionBindingsBySession,
+    switchApplicationLayout,
   } = useAppStore(useShallow((state) => ({
     theme: state.theme,
     toggleTheme: state.toggleTheme,
@@ -82,7 +87,14 @@ export function Sidebar() {
     compositionBindings: state.compositionBindings,
     workspaceBindingsByWorkspace: state.workspaceBindingsByWorkspace,
     sessionBindingsBySession: state.sessionBindingsBySession,
+    switchApplicationLayout: state.switchApplicationLayout,
   })));
+
+  const layoutProviders = useMemo(
+    () => plugins.filter((p) => isPluginInstanceReady(p) && pluginProvidesContract(p, APPLICATION_VIEW_CONTRACT)),
+    [plugins],
+  );
+  const activeLayoutId = compositionBindings[APPLICATION_VIEW_CONTRACT] ?? '';
 
   const activeSession = selectedSessionId ? sessions.find((s) => s.id === selectedSessionId) : undefined;
   const activeWorkspaceId = activeSession?.workspaceId ?? selectedWorkspaceId;
@@ -236,6 +248,42 @@ export function Sidebar() {
         </div>
       )}
       <PluginWorkspaceLinks />
+
+      {layoutProviders.length > 1 && (
+        <div className="px-3.5 pb-2">
+          <div
+            data-testid="sidebar-layout-switcher"
+            className="space-y-1 rounded-lg px-2 py-1.5 text-[11px]"
+            style={{
+              backgroundColor: 'var(--bg-surface)',
+              border: '1px solid var(--border-hairline)',
+            }}
+          >
+            <div className="flex items-center gap-1 text-[var(--text-muted)]">
+              <LayoutGrid size={11} />
+              <span>应用布局 ({APPLICATION_VIEW_CONTRACT})</span>
+            </div>
+            <select
+              aria-label="当前应用布局"
+              value={activeLayoutId}
+              onChange={(event) => {
+                const nextId = event.target.value || null;
+                void switchApplicationLayout(nextId);
+              }}
+              className="w-full rounded border border-[var(--border-hairline)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] text-[var(--text-primary)]"
+            >
+              {layoutProviders.map((provider) => {
+                const id = getPluginInstanceId(provider);
+                return (
+                  <option key={id} value={id}>
+                    {provider.name} ({id})
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+        </div>
+      )}
 
       {/* Workspaces Strip */}
       <div className="px-3.5 pb-2.5">

@@ -8,6 +8,7 @@ import {
 import { AgyComposerControls } from '../src/components/agy/AgyComposerControls';
 import { AgySettingsSlot } from '../src/components/agy/AgySettingsSlot';
 import { AgyStudioBlockCard } from '../src/components/agy/AgyStudioBlocks';
+import { daemonApi } from '../src/api/client';
 import { executeSandboxedBridgeMethod } from '../src/slots/sandbox-bridge-handler';
 import { useAppStore } from '../src/stores/app-store';
 
@@ -317,10 +318,9 @@ describe('Phase AGY-5 UI Components', () => {
   });
 
   it('lets the plugin page manually switch the current session to a registered AGY account', async () => {
-    const switchHarness = vi.fn().mockResolvedValue(undefined);
+    const switchHarness = vi.spyOn(daemonApi, 'switchHarness').mockResolvedValue({ session: baseAgySession });
     useAppStore.setState({
       harnesses: [makeAgyHarness('agy', 'AGY Default'), makeAgyHarness('agy.work', 'AGY Work')],
-      switchHarness,
     });
     const context = {
       pluginId: 'core.account-usage', effectiveInstanceId: 'usage-second', slot: 'workspace.pages',
@@ -333,5 +333,6 @@ describe('Phase AGY-5 UI Components', () => {
     await expect(executeSandboxedBridgeMethod({ ...context, isDisposed: () => true },
       'session.switchHarness', { targetHarnessId: 'agy.work' })).rejects.toThrow('当前会话不可用');
     expect(switchHarness).not.toHaveBeenCalled();
+    switchHarness.mockRestore();
   });
 });
