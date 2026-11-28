@@ -102,6 +102,11 @@ export const PLUGIN_UI_SLOTS_V5 = {
 
 export type PluginSlotKeyV5 = keyof typeof PLUGIN_UI_SLOTS_V5;
 const workspaceSlots = {
+  'application.shell': {
+    cardinality: 'single',
+    scope: 'root',
+    description: '组合中选定的主应用布局根入口（默认与外部布局共享同一加载路径）',
+  },
   'workspace.pages': {
     cardinality: 'list',
     scope: 'root',
@@ -148,6 +153,7 @@ export const ALL_PLUGIN_UI_SLOTS = {
 export const ALL_PLUGIN_SLOT_KEYS = [
   ...PLUGIN_SLOT_KEYS,
   ...PLUGIN_SLOT_KEYS_V5,
+  'application.shell',
   'workspace.pages',
   'workspace.start',
   'inspector.files',
@@ -202,6 +208,7 @@ export const PluginSlotWhenSchema = z.object({
 export type PluginSlotWhen = z.infer<typeof PluginSlotWhenSchema>;
 
 export const PluginSlotKeyInputSchema = z.enum([
+  'application.shell',
   'workspace.pages',
   'workspace.start',
   'session.header.title',

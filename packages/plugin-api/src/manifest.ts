@@ -7,6 +7,7 @@ export const PLUGIN_API_VERSION = '4.0.0';
 export const PLUGIN_MANIFEST_VERSION = 4;
 
 export const PEER_CONTRACTS = {
+  applicationView: 'application.view.v1',
   chatView: 'chat.view.v1',
   browser: 'browser.v1',
   filePreview: 'filePreview.v1',
@@ -46,6 +47,7 @@ export const PEER_CONTRACTS = {
   agyWorkbench: 'agy.workbench.v1',
 } as const;
 export const PEER_CONTRACT_NAMES = [
+  'application.view.v1',
   'chat.view.v1',
   'browser.v1',
   'filePreview.v1',

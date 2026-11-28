@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Shell Lite</title>
+    <style>
+      body { display: flex; flex-direction: column; height: 100vh; background: var(--bg-canvas); color: var(--text-primary); }
+      header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--bg-rail); border-bottom: 1px solid var(--border-hairline); }
+      main { flex: 1; padding: 16px; overflow: auto; }
+      button, select { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border-hairline); background: var(--bg-surface); color: var(--text-primary); cursor: pointer; }
+      .card { padding: 12px; border-radius: 10px; background: var(--bg-surface); border: 1px solid var(--border-hairline); margin-bottom: 10px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>Shell Lite (Sandbox Fallback)</strong>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select id="layout-select" aria-label="切换应用布局"></select>
+        <button id="refresh-btn" type="button">刷新</button>
+      </div>
+    </header>
+    <main>
+      <div id="status" class="card">正在加载内核快照与会话列表…</div>
+      <div id="sessions"></div>
+    </main>
+    <script>
+      (function () {
+        var statusEl = document.getElementById('status');
+        var sessionsEl = document.getElementById('sessions');
+        var layoutSelect = document.getElementById('layout-select');
+        var refreshBtn = document.getElementById('refresh-btn');
+
+        async function load() {
+          try {
+            var snap = await window.harnessMate.kernel.snapshot();
+            var layouts = (snap.plugins || []).filter(function (p) {
+              return p.enabled && ((p.provides || []).indexOf('application.view.v1') >= 0);
+            });
+            layoutSelect.innerHTML = '';
+            layouts.forEach(function (p) {
+              var id = p.instanceId || p.id;
+              var opt = document.createElement('option');
+              opt.value = id;
+              opt.textContent = p.name + ' (' + id + ')';
+              if ((snap.compositionBindings || {})['application.view.v1'] === id) opt.selected = true;
+              layoutSelect.appendChild(opt);
+            });
+            var sRes = await window.harnessMate.call('transport.request', { path: '/api/v1/sessions', method: 'GET' });
+            var sessions = (sRes && sRes.sessions) || [];
+            statusEl.textContent = '已连接内核 · 会话数: ' + sessions.length;
+            sessionsEl.innerHTML = '';
+            sessions.forEach(function (s) {
+              var card = document.createElement('div');
+              card.className = 'card';
+              card.textContent = s.title + ' · ' + s.harnessId + ' (' + s.status + ')';
+              sessionsEl.appendChild(card);
+            });
+          } catch (err) {
+            statusEl.textContent = '加载失败: ' + (err && err.message ? err.message : String(err));
+          }
+        }
+
+        layoutSelect.addEventListener('change', function () {
+          if (layoutSelect.value) {
+            window.harnessMate.kernel.switchApplication(layoutSelect.value);
+          }
+        });
+        refreshBtn.addEventListener('click', load);
+        window.addEventListener('DOMContentLoaded', load);
+      })();
+    </script>
+  </body>
+</html>

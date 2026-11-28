@@ -8,6 +8,7 @@
 - `agy.runtime.internal`
 - `agy.runtime.v1`
 - `agy.workbench.v1`
+- `application.view.v1`
 - `approval-center`
 - `approval.policy.v1`
 - `attachments`

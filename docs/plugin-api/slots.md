@@ -20,6 +20,7 @@
 | `harness.settings` | `keyed` | `root` | 按 driverId 渲染 Harness 插件自定义认证与高级设置面板 |
 | `inspector.diff` | `single` | `session` | 接管或增强右侧 Diff 与检查点视图 |
 | `session.sidebar.badge` | `list` | `session-maybe` | 侧栏会话行轻量状态徽标 |
+| `application.shell` | `single` | `root` | 组合中选定的主应用布局根入口（默认与外部布局共享同一加载路径） |
 | `workspace.pages` | `list` | `root` | 在侧栏提供入口并在主工作区打开独立插件页面 |
 | `workspace.start` | `single` | `root` | 组合中提供的应用启动页与主工作区布局 |
 | `inspector.files` | `single` | `session` | 接管或增强右侧工作区文件浏览与行号预览视图 |

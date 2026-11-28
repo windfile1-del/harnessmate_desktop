@@ -68,6 +68,7 @@
               {
                 "type": "string",
                 "enum": [
+                  "application.view.v1",
                   "chat.view.v1",
                   "browser.v1",
                   "filePreview.v1",
@@ -785,6 +786,7 @@
                   "slot": {
                     "type": "string",
                     "enum": [
+                      "application.shell",
                       "workspace.pages",
                       "workspace.start",
                       "session.header.title",

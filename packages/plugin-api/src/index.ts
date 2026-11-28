@@ -1,5 +1,6 @@
 export * from './contributions.js';
 export * from './slots.js';
+export * from './application-contracts.js';
 export * from './browser-preview.js';
 export * from './desktop-view.js';
 export * from './file-preview.js';

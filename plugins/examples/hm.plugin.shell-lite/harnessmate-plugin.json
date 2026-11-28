@@ -1,0 +1,29 @@
+{
+  "id": "hm.plugin.shell-lite",
+  "name": "Shell Lite 外部布局",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "permissions": [
+    "storage:plugin"
+  ],
+  "category": "ui",
+  "main": "index.mjs",
+  "provides": [
+    "application.view.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "application.shell",
+        "id": "shell",
+        "title": "Shell Lite 外部布局",
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs"
+      }
+    ]
+  },
+  "description": "使用公开应用入口、导航、贡献与表面挂载能力的最小外部布局示例：支持真实会话、聊天、文件侧栏与领域工作页。"
+}

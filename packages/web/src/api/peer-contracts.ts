@@ -4,6 +4,8 @@ import type {
   SessionSearchHit,
 } from '@harnessmate/protocol';
 
+export const APPLICATION_VIEW_CONTRACT = 'application.view.v1';
+export const APPLICATION_SHELL_SLOT = 'application.shell';
 export const HISTORY_SOURCE_CONTRACT = 'history.source.v1';
 export const HISTORY_IMPORT_CONTRACT = 'history.import.v1';
 export const SESSION_SEARCH_CONTRACT = 'session.search.v1';
@@ -33,6 +35,7 @@ export interface NavigateToFileRequest {
   sessionId?: string;
   path: string;
   line?: number;
+  column?: number;
   openInspector?: boolean;
   preserveSession?: boolean;
 }
@@ -43,6 +46,7 @@ export interface NavigateToFileResult {
   workspaceId?: string | null;
   path: string;
   line?: number;
+  column?: number;
   errorCode?: string;
   message?: string;
 }
