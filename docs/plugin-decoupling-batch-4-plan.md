@@ -1,8 +1,8 @@
 # HarnessMate 第四批解耦与性能修复实施方案
 
-**状态：W1/W2 已开发，W3 待接续集成与性能修复。日期：2026-11-28。**
+**状态：第四批代码与离线/成品交付已完成；首段代理相对性能预算保留一项。规划核对：2026-11-28。**
 
-本批沿用“除内核外的功能由平级插件实现”的目标，接续第三批交付，重点迁出 AGY 原生功能和审批领域，并修复尚未通过的 B3-A8 性能项。本次只读取既有报告和相关入口制定计划，不重新运行第三批测试、成品验收或性能对照，也不将既有报告升级为新的独立验收结论。
+本批 AGY 原生功能、统一请求/审批和主要性能问题的代码交付已完成，固定候选为 `9df22350c10905abc2805380f216fa0735059824`。本文件保留实施要求，进度按第 12 节及[规划交接核对](plugin-decoupling-batch-4/reports/coordinator-handoff.md)登记。本次只核对现有身份与证据，未复跑测试或成品验收；首段代理相对预算和真实联网 CLI/OAuth 多账号范围继续保留。
 
 ## 1. 基准、状态和本批边界
 
@@ -14,7 +14,7 @@
 | 本批建树方式 | 从包含本计划的同一纯文档交付提交创建；正式派发时固定同一个完整 SHA，业务源码仍对应 `2a08c63` |
 | 不采用的旧基准 | `8ef6/harnessmate_desktop` 是第二批集成工作树；主目录 `D:/HarnessMate/harnessmate_desktop` 的 main 有既有未提交改动，均不作为第四批源码起点 |
 | 第三批状态 | 以用户提供的“开发已完成”和现有交付报告继续规划，不重新组织上一批独立验收 |
-| B3-A8 | **未通过，保持开放**；本批 W3 负责修复，关闭时同时关联原编号 |
+| B3-A8 | **主要失败项已修复；完整相对预算保留首段代理一项**，见[规划核对](plugin-decoupling-batch-4/reports/coordinator-handoff.md) |
 | 其他历史未验证项 | 保留第三批报告原状态；只有与第四批改动直接相关的链路进入本批验证，不重开全套 B3 验收 |
 
 依据：[B3 集成报告](plugin-decoupling-batch-3/reports/integration.md)、[W1 报告](plugin-decoupling-batch-3/reports/W1.md)、[W2 报告](plugin-decoupling-batch-3/reports/W2.md)、[W3 报告](plugin-decoupling-batch-3/reports/W3.md)。
@@ -282,9 +282,9 @@ mock、协议回放、真实 CLI/账号、浏览器、打包 Electron 和性能�
 | B4-W1 AGY 原生功能组 | 已完成（D1 契约检查点 `19a30d34d73c7a269ef7d911f40bb865a28c568a`；完整交付见 `codex/b4-w1-agy` 与 [W1.md](plugin-decoupling-batch-4/reports/W1.md)） | W1 |
 | B4-W2 请求与审批 | 已完成开发与定向验证，可供 W3 合入；包含完整 W1 `5ba2da21f149de667412231e6039868eabd009ac`，验证与真实账号边界见 [W2.md](plugin-decoupling-batch-4/reports/W2.md) | W2，交付 `codex/b4-w2-requests` |
 | B4-W3 性能与集成 | 已完成开发、三次成品性能测量、便携 EXE 打包及真实 B3↔B4 副本回退验证；包含完整 W1 `5ba2da21f149de667412231e6039868eabd009ac` 与完整 W2 `ed5b7f1cbddacedd50ec32dbf1df47426673f379`，W3 源码提交 `9d90a06a72c0f8fc6b7af26e11e3d06bce3b086b`，详见 [W3.md](plugin-decoupling-batch-4/reports/W3.md) 与 [integration.md](plugin-decoupling-batch-4/reports/integration.md) | W3，交付 `codex/b4-w3-performance` 与 `codex/b4-integration` |
-| 原 B3-A8 | **已修复并通过（关联关闭）**；保留原失败记录，见 W3 修复提交 `9d90a06a72c0f8fc6b7af26e11e3d06bce3b086b` 与 [performance-summary.json](plugin-decoupling-batch-4/reports/evidence/performance-summary.json) | W3 |
+| 原 B3-A8 | **主要预算已通过；完整相对预算保留 B4-PERF-01**：首段代理 167ms 对比 B2 144ms，+15.97%，超过原 10%；保留原始[性能证据](plugin-decoupling-batch-4/reports/evidence/performance-summary.json)及[规划核对](plugin-decoupling-batch-4/reports/coordinator-handoff.md)，不无条件登记全部通过 | W3 / 后续性能工作 |
 | 其他 B3 历史未验证项 | 保留原报告状态，本次不重验 | 按涉及领域继承 |
-| 本批合并/发行结论 | 已提交集成候选交回规划会话判断，不自动合 main | 规划会话 |
+| 本批合并/发行结论 | 代码与离线交付已登记，可以继续第五批；性能保留项和真实联网边界见规划核对，不自动合 main | 规划会话 |
 
 报告目录：`docs/plugin-decoupling-batch-4/reports/`，各包提供 `W1.md`、`W2.md`、`W3.md`，最终 `integration.md`。本文件是本批唯一实施方案；三个会话各自对应一份[启动提示词](plugin-decoupling-batch-4-prompts.md)，共同创建点固定为 `9cfdb1b401416702355ef62cfe1f775267b4ea4e`，正式开发按 W1 → W2 → W3 串行。
 
