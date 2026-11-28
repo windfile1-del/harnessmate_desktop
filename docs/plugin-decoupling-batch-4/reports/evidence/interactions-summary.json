@@ -1,0 +1,80 @@
+{
+  "disable-gpu": {
+    "gpuMode": "disable-gpu",
+    "reloadInteractiveMs": 1091,
+    "firstOpenSessionAMs": 1202,
+    "switchLatenciesMs": [
+      {
+        "direction": "A->B",
+        "ms": 1151
+      },
+      {
+        "direction": "B->A",
+        "ms": 1108
+      },
+      {
+        "direction": "A->B",
+        "ms": 346
+      },
+      {
+        "direction": "B->A",
+        "ms": 348
+      },
+      {
+        "direction": "A->B",
+        "ms": 328
+      },
+      {
+        "direction": "B->A",
+        "ms": 1289
+      }
+    ],
+    "switchMedianMs": 1108,
+    "openFileClicked": true,
+    "openFileMs": 871,
+    "stopBtnClicked": true,
+    "stopOutputMs": 297,
+    "heapUsedMB": 19.78,
+    "startupToHealthMs": 19081,
+    "startupToPageMs": 20230
+  },
+  "default-gpu": {
+    "gpuMode": "default-gpu",
+    "reloadInteractiveMs": 1355,
+    "firstOpenSessionAMs": 970,
+    "switchLatenciesMs": [
+      {
+        "direction": "A->B",
+        "ms": 905
+      },
+      {
+        "direction": "B->A",
+        "ms": 1335
+      },
+      {
+        "direction": "A->B",
+        "ms": 421
+      },
+      {
+        "direction": "B->A",
+        "ms": 344
+      },
+      {
+        "direction": "A->B",
+        "ms": 280
+      },
+      {
+        "direction": "B->A",
+        "ms": 320
+      }
+    ],
+    "switchMedianMs": 421,
+    "openFileClicked": true,
+    "openFileMs": 1557,
+    "stopBtnClicked": true,
+    "stopOutputMs": 251,
+    "heapUsedMB": 20.58,
+    "startupToHealthMs": 29107,
+    "startupToPageMs": 31122
+  }
+}

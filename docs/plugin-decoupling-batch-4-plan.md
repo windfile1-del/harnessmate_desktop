@@ -281,10 +281,10 @@ mock、协议回放、真实 CLI/账号、浏览器、打包 Electron 和性能�
 | 第四批范围、基线、契约和任务拆分 | 已完成规划 | 本规划会话 |
 | B4-W1 AGY 原生功能组 | 已完成（D1 契约检查点 `19a30d34d73c7a269ef7d911f40bb865a28c568a`；完整交付见 `codex/b4-w1-agy` 与 [W1.md](plugin-decoupling-batch-4/reports/W1.md)） | W1 |
 | B4-W2 请求与审批 | 已完成开发与定向验证，可供 W3 合入；包含完整 W1 `5ba2da21f149de667412231e6039868eabd009ac`，验证与真实账号边界见 [W2.md](plugin-decoupling-batch-4/reports/W2.md) | W2，交付 `codex/b4-w2-requests` |
-| B4-W3 性能与集成 | 未开工 | W3，前置完整 W2 |
-| 原 B3-A8 | **未通过，开放** | W3 修复并以新证据关联关闭 |
+| B4-W3 性能与集成 | 已完成开发、三次成品性能测量、便携 EXE 打包及真实 B3↔B4 副本回退验证；包含完整 W1 `5ba2da21f149de667412231e6039868eabd009ac` 与完整 W2 `ed5b7f1cbddacedd50ec32dbf1df47426673f379`，W3 源码提交 `9d90a06a72c0f8fc6b7af26e11e3d06bce3b086b`，详见 [W3.md](plugin-decoupling-batch-4/reports/W3.md) 与 [integration.md](plugin-decoupling-batch-4/reports/integration.md) | W3，交付 `codex/b4-w3-performance` 与 `codex/b4-integration` |
+| 原 B3-A8 | **已修复并通过（关联关闭）**；保留原失败记录，见 W3 修复提交 `9d90a06a72c0f8fc6b7af26e11e3d06bce3b086b` 与 [performance-summary.json](plugin-decoupling-batch-4/reports/evidence/performance-summary.json) | W3 |
 | 其他 B3 历史未验证项 | 保留原报告状态，本次不重验 | 按涉及领域继承 |
-| 本批合并/发行结论 | 未开始，不自动合 main | 本批交付后决定 |
+| 本批合并/发行结论 | 已提交集成候选交回规划会话判断，不自动合 main | 规划会话 |
 
 报告目录：`docs/plugin-decoupling-batch-4/reports/`，各包提供 `W1.md`、`W2.md`、`W3.md`，最终 `integration.md`。本文件是本批唯一实施方案；三个会话各自对应一份[启动提示词](plugin-decoupling-batch-4-prompts.md)，共同创建点固定为 `9cfdb1b401416702355ef62cfe1f775267b4ea4e`，正式开发按 W1 → W2 → W3 串行。
 

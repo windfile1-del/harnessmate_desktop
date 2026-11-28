@@ -1,0 +1,79 @@
+{
+  "b4ExeExists": true,
+  "b4ExeSizeBytes": 309538131,
+  "b4ExeSha256": "d5a91840db42cc7019fc40d25c712c6bd2df787ad50bcba5cba08316fedb5fc0",
+  "b3ExeExists": true,
+  "b3ExeSizeBytes": 308440113,
+  "b3ExeSha256": "3d529d01230430bc299a48b745d7ce15ebfcadf533a1da2135971eaf111f2336",
+  "checks": {
+    "bundledActive": {
+      "passed": true,
+      "states": {
+        "harness-agy": "ENABLED/ACTIVE",
+        "hm.plugin.agy-workbench-default": "ENABLED/ACTIVE",
+        "hm.plugin.approval-center": "ENABLED/ACTIVE",
+        "hm.plugin.approval-policy-default": "ENABLED/ACTIVE",
+        "hm.plugin.requests-view-default": "ENABLED/ACTIVE",
+        "hm.plugin.chat-default": "ENABLED/ACTIVE",
+        "hm.plugin.session-data-default": "ENABLED/ACTIVE",
+        "hm.plugin.session-runtime-default": "ENABLED/ACTIVE"
+      }
+    },
+    "agyDefaultAndExternal": {
+      "passed": true,
+      "defaultOwner": "harness-agy",
+      "agyLiteId": "hm.plugin.agy-driver-lite",
+      "hasAgyLiteDriver": true,
+      "disabledResolveStatus": "disabled",
+      "disabledProfilesHttpStatus": 404,
+      "recoveredOwner": "harness-agy"
+    },
+    "requestsAndApprovals": {
+      "passed": true,
+      "createdRuleId": "custom.c543334b",
+      "rulesCountAfterAdd": 17,
+      "rulesWhenDisabledStatus": 500,
+      "ruleStillPresentAfterReenable": true
+    },
+    "badRevisionAndCompositionRecovery": {
+      "passed": true,
+      "badBindStatus": 404,
+      "badInstallStatus": 400,
+      "healthyResolveAfterBadBind": "hm.plugin.approval-center"
+    },
+    "trustedModuleAndIframeFallback": {
+      "passed": true,
+      "trustedMounted": true,
+      "iframeCountInTrustedMode": 0,
+      "iframeCountInForcedIframeMode": 1
+    },
+    "pendingSettlementRecovery": {
+      "passed": true,
+      "pendingApprovalId": "appr_recover_1795844628649",
+      "pendingRowStatusAfterRestart": "cancelled",
+      "settledRowAfterRestart": {
+        "status": "approved",
+        "decision": "allow_once"
+      },
+      "sessionStatusAfterRestart": "idle",
+      "sessionPendingCountAfterRestart": 0
+    },
+    "b3B4UpgradeAndRollbackReadback": {
+      "passed": true,
+      "b3SeedSessionId": "sess_9880b799fede",
+      "b4NewSessionId": "sess_d89e1a688b24",
+      "b4ReadB3SessionOk": true,
+      "b3ReadOriginSession": true,
+      "b3ReadB4Session": true,
+      "b3ReadB4EventMarker": true,
+      "b3ReadB4ApprovalRule": true,
+      "b3ReadB4ApprovalRecord": true,
+      "b3NativeSnapshotStatus": 200,
+      "b3NativeBindingReadback": true,
+      "originalSeedDbUntouched": true,
+      "b3OriginDbSha256": "347949731ef27f2bc981fbfa96bd1a61497c90bdc43ffcb19d833ea73acdd8da",
+      "rollbackCaveat": "Code/data rollback preserves local DB readability; it does NOT undo external CLI/file/account side effects."
+    }
+  },
+  "allPassed": true
+}
