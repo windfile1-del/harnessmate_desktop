@@ -1,3 +1,4 @@
+import { openContractPage } from '../../api/plugin-navigation';
 import type {
   ApplicationSwitchResult,
   Disposer,
@@ -203,7 +204,11 @@ export function ShellDefaultApp({ bridge }: { bridge?: TrustedModulePageBridge }
         pluginPermissionRevision: snap.pluginPermissionRevision,
         restartStatus: snap.restartStatus,
       });
-      useAppStore.setState({
+    useAppStore.setState({
+      openModal: (modal, presetHarnessId) => {
+        if (modal === 'plugins' || modal === 'harnesses') { void openContractPage('management.view.v1', undefined, { managementTab: modal === 'harnesses' ? 'harnesses' : 'plugins' }, request => bridge.navigate(request)); return; }
+        useAppStore.setState({ activeModal: modal, newSessionPresetHarnessId: presetHarnessId ?? null });
+      },
         theme: snap.theme,
         connected: snap.connected,
         plugins: snap.plugins,
@@ -219,7 +224,10 @@ export function ShellDefaultApp({ bridge }: { bridge?: TrustedModulePageBridge }
 
     // Route kernel-owned actions on layout store through bridge.kernel
     useAppStore.setState({
-      toggleTheme: () => bridge.kernel.toggleTheme(),
+      toggleTheme: () => {
+        const theme = bridge.kernel.getSnapshot().theme === 'dark' ? 'light' : 'dark';
+        void daemonApi.getPluginSettings(bridge.instanceId).then(item => daemonApi.savePluginSettings(bridge.instanceId, { config: { ...item.config, theme }, schemaVersion: item.schemaVersion, expectedVersion: item.version })).then(() => bridge.kernel.setTheme(theme)).catch(error => { void bridge.toast('主题保存失败', String(error), 'error'); });
+      },
       refreshPlugins: async () => {
         await bridge.kernel.refreshPlugins();
         syncFromKernel();
@@ -252,29 +260,6 @@ export function ShellDefaultApp({ bridge }: { bridge?: TrustedModulePageBridge }
           title: instanceId ? '已更新会话能力绑定' : '已恢复会话默认能力绑定',
         });
       },
-      togglePlugin: async (id: string, enabled: boolean) => {
-        await bridge.kernel.togglePlugin(id, enabled);
-        syncFromKernel();
-        useAppStore.getState().pushToast({ kind: 'info', title: enabled ? '已启用插件' : '已停用插件' });
-      },
-      rollbackPlugin: async (id: string) => {
-        await bridge.kernel.rollbackPlugin(id);
-        syncFromKernel();
-        useAppStore.getState().pushToast({ kind: 'success', title: '已切换到上一版插件' });
-      },
-      reloadPlugins: async () => {
-        await bridge.kernel.reloadPlugins();
-        syncFromKernel();
-        useAppStore.getState().pushToast({ kind: 'success', title: '插件已热重载' });
-      },
-      restorePluginComposition: async (source: 'previous' | 'builtin' | 'empty') => {
-        await bridge.kernel.restoreComposition(source);
-        syncFromKernel();
-        useAppStore.getState().pushToast({
-          kind: 'success',
-          title: source === 'empty' ? '已进入空业务组合恢复模式' : '组合配置已恢复',
-        });
-      },
       switchApplicationLayout: async (instanceId: string | null): Promise<ApplicationSwitchResult> => {
         const res = await bridge.kernel.switchApplicationEntry(instanceId);
         if (res.status === 'restart_required') {
@@ -295,6 +280,11 @@ export function ShellDefaultApp({ bridge }: { bridge?: TrustedModulePageBridge }
       },
     });
 
+    void daemonApi.getPluginSettings(bridge.instanceId).then(item => {
+      const theme = item.config.theme;
+      if (theme === 'light' || theme === 'dark') bridge.kernel.setTheme(theme);
+      else return daemonApi.savePluginSettings(bridge.instanceId, { config: { ...item.config, theme: bridge.kernel.getSnapshot().theme }, schemaVersion: item.schemaVersion, expectedVersion: item.version });
+    }).catch(() => {});
     syncFromKernel();
     const unsubKernel = bridge.kernel.subscribe(syncFromKernel);
     return () => {
@@ -658,7 +648,7 @@ export function ShellDefaultApp({ bridge }: { bridge?: TrustedModulePageBridge }
 
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {!sidebarCollapsed && <Sidebar />}
-            <PluginWorkspaceStage>
+            <PluginWorkspaceStage surfaces={bridge?.surfaces}>
               <HostBoundChatStage bridge={bridge} selectedSession={selectedSession} />
             </PluginWorkspaceStage>
             {inspectorOpen && selectedSession && (

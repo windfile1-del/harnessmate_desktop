@@ -1,0 +1,30 @@
+{
+  "id": "hm.plugin.management-default",
+  "name": "设置与插件中心",
+  "version": "1.0.0",
+  "description": "设置与插件中心：普通可替换插件",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "provides": [
+    "management.view.v1"
+  ],
+  "permissions": [
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "management",
+        "title": "设置与插件中心",
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs",
+        "order": 20
+      }
+    ]
+  }
+}

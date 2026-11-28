@@ -189,8 +189,8 @@ export const PluginCommandSchema = z.object({
 export type PluginCommand = z.infer<typeof PluginCommandSchema>;
 
 export const PluginSettingSchema = z.object({
-  type: z.enum(['string', 'number', 'boolean']),
-  default: z.union([z.string(), z.number(), z.boolean()]).optional(),
+  type: z.enum(['string', 'number', 'boolean', 'object', 'array']),
+  default: z.unknown().optional(),
   description: z.string().max(240).optional(),
   volatile: z.boolean().optional(),
 }).strict();
@@ -262,6 +262,7 @@ export const PluginContributesSchema = z.object({
   slots: z.array(PluginSlotContributionSchema).max(12).optional(),
   filePreview: FilePreviewContributionSchema.optional(),
   settings: z.record(PluginSettingSchema).optional(),
+  settingsVersion: z.number().int().positive().optional(),
   uiSlots: z
     .array(z.enum(['sidebar_tool', 'inspector_tab', 'composer_action', 'modal']))
     .optional(),

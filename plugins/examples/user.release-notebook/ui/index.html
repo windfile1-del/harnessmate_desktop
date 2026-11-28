@@ -1,0 +1,5 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>发布便笺</title><style>body{margin:24px;font-family:system-ui,sans-serif}textarea{display:block;box-sizing:border-box;width:min(760px,100%);padding:14px;border:1px solid var(--border-hairline,#555);border-radius:12px;background:var(--bg-surface,#222);color:inherit;font:inherit}button{margin-top:12px;padding:8px 24px;border-radius:8px;cursor:pointer}#status{font-size:14px}</style></head><body><h1>发布便笺</h1><textarea id="note" aria-label="便笺" rows="12"></textarea><button id="save">保存</button><p id="status"></p><script>
+const field=document.getElementById('note'),status=document.getElementById('status');
+async function sync(input){try{const value=await window.harnessMate.sendToPlugin(input);field.value=value.text||'';status.textContent='已保存';}catch(e){status.textContent=String(e);}}
+document.getElementById('save').addEventListener('click',()=>sync({type:'save',text:field.value}));window.harnessMate.onContext(()=>sync({type:'read'}));
+</script></body></html>

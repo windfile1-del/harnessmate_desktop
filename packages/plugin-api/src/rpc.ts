@@ -31,6 +31,7 @@ export const HOST_SUPPORTED_FEATURES = [
   ...HOST_FEATURES_V5,
   'ui.workspace.pages',
   'runtime.trustedLocal',
+  'runtime.requestHost',
   'peer.assembly.v1',
   'desktop.view.v1',
   'plugin.routes.v1',
@@ -41,6 +42,7 @@ export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 
 export interface PluginHandshakeRequest {
   trustedLocal?: boolean;
+  dataDirectory?: string;
   protocolVersion: number;
   pluginApi: string;
   features: readonly string[];

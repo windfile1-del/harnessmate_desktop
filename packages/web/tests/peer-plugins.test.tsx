@@ -3,6 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { KernelRecoveryView } from '../src/components/KernelRecoveryView';
 import { FilePreviewBody } from '../src/components/FilePreviewBody';
+import { useKernelStore } from '../src/stores/kernel-store';
+import { kernelRecoveryClient } from '../src/kernel/recovery-client';
 import { daemonApi } from '../src/api/client';
 import { SlotRegistry, SlotRegistryProvider, SlotSessionProvider } from '../src/slots';
 import { PluginWorkspaceLinks } from '../src/slots/PluginWorkspace';
@@ -54,7 +56,8 @@ afterEach(() => {
 
 describe('Peer Plugin Web UI', () => {
   it('renders KernelRecoveryView when emptyComposition is active and supports restore actions', async () => {
-    const restoreSpy = vi.spyOn(daemonApi, 'restorePluginComposition').mockResolvedValue({
+    vi.spyOn(useKernelStore.getState(), 'refreshPlugins').mockResolvedValue();
+    const restoreSpy = vi.spyOn(kernelRecoveryClient, 'restoreComposition').mockResolvedValue({
       plugins: [],
       catalog: [],
       slashCommands: [],
@@ -71,11 +74,11 @@ describe('Peer Plugin Web UI', () => {
     expect(html).toContain('恢复模式不依赖完整插件管理中心');
     expect(html).not.toContain('打开插件恢复中心');
 
-    await useAppStore.getState().restorePluginComposition('empty');
-    await useAppStore.getState().restorePluginComposition('builtin');
+    await useKernelStore.getState().restoreComposition('empty');
+    await useKernelStore.getState().restoreComposition('builtin');
     expect(restoreSpy).toHaveBeenNthCalledWith(1, 'empty');
     expect(restoreSpy).toHaveBeenNthCalledWith(2, 'builtin');
-    expect(useAppStore.getState().emptyComposition).toBe(false);
+    expect(useKernelStore.getState().emptyComposition).toBe(false);
   });
 
   it('renders simultaneous dual browser workspace pages and session browser switcher in PluginWorkspaceLinks', async () => {

@@ -1,4 +1,4 @@
-import type { InstalledPluginInfo } from '@harnessmate/protocol';
+import type { InstalledPluginInfo, InstallPluginRequest, PluginManifest } from '@harnessmate/protocol';
 
 export interface KernelHealthSnapshot {
   status: string;
@@ -85,6 +85,12 @@ async function kernelFetch<T>(path: string, init?: RequestInit): Promise<T> {
  * Deliberately excludes business APIs, app-store, ModalHost, Sidebar, and chat modules.
  */
 export const kernelRecoveryClient = {
+  previewInstall(request: InstallPluginRequest) {
+    return kernelFetch<{ manifest: PluginManifest; digest: string; installedDigest?: string; requiresTrust: boolean }>('/api/v1/plugins/preview', { method: 'POST', body: JSON.stringify(request) });
+  },
+  install(request: InstallPluginRequest) {
+    return kernelFetch<KernelPluginsSnapshot>('/api/v1/plugins/install', { method: 'POST', body: JSON.stringify(request) });
+  },
   getHealth(signal?: AbortSignal): Promise<KernelHealthSnapshot> {
     return kernelFetch<KernelHealthSnapshot>('/api/v1/health', { signal });
   },

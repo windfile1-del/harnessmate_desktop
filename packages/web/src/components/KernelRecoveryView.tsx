@@ -21,6 +21,7 @@ import {
 
 export interface KernelRecoveryViewProps {
   reasonKind?:
+    | 'manual'
     | 'empty_composition'
     | 'entry_unbound'
     | 'entry_disabled'
@@ -35,6 +36,7 @@ export interface KernelRecoveryViewProps {
 }
 
 const REASON_HEADINGS: Record<NonNullable<KernelRecoveryViewProps['reasonKind']>, { title: string; summary: string }> = {
+  manual: { title: '内核恢复模式（手动打开）', summary: '此界面独立于管理插件，可安装、启停、恢复修订及组合。当前已启用的后台插件仍由组合管理。' },
   empty_composition: {
     title: '内核恢复模式（空业务组合）',
     summary: '当前未装配任何业务插件，仅保留内核装配、诊断与恢复能力。可启用预装组合、恢复上一套配置，或选择应用布局入口。',
@@ -183,6 +185,11 @@ export function KernelRecoveryView({
     }
   };
 
+  const [recoveryId, setRecoveryId] = useState('');
+  const [recoveryContract, setRecoveryContract] = useState('');
+  const [installPath, setInstallPath] = useState('');
+  const [installPreview, setInstallPreview] = useState<Awaited<ReturnType<typeof kernelRecoveryClient.previewInstall>>>();
+  const [trustInstall, setTrustInstall] = useState(false);
   const heading = REASON_HEADINGS[reasonKind] ?? REASON_HEADINGS.empty_composition;
   const busy = busyAction !== null;
 
@@ -284,6 +291,23 @@ export function KernelRecoveryView({
           </div>
         )}
 
+        <section className="space-y-2 rounded-xl border p-3">
+          <h2>从本地目录安装恢复插件</h2>
+          <input aria-label="恢复插件目录" value={installPath} onChange={e => { setInstallPath(e.target.value); setInstallPreview(undefined); setTrustInstall(false); }} className="w-full bg-transparent border p-2" placeholder="D:/plugins/management-lite" />
+          <button disabled={busy || !installPath.trim()} onClick={() => void runAction('预览安装', async () => { setInstallPreview(await kernelRecoveryClient.previewInstall({ mode: 'local_dir', dirPath: installPath.trim() })); }, '已读取包摘要，请核对来源')}>预览包</button>
+          {installPreview && <div><p>{installPreview.manifest.name} · {installPreview.manifest.version} · {installPreview.digest}</p>
+            {installPreview.requiresTrust && <label><input type="checkbox" checked={trustInstall} onChange={e => setTrustInstall(e.target.checked)} />信任此代码来源</label>}
+            <button disabled={busy || (installPreview.requiresTrust && !trustInstall)} onClick={() => void runAction('安装恢复插件', async () => { await kernelRecoveryClient.install({ mode: 'local_dir', dirPath: installPath.trim(), expectedDigest: installPreview.digest, expectedInstalledDigest: installPreview.installedDigest, trustCode: trustInstall }); setInstallPreview(undefined); }, '插件已安装，可启用并选择实例绑定')}>安装此修订</button>
+          </div>}
+        </section>
+        <section className="flex flex-wrap items-center gap-2 rounded border p-3"><h2 className="w-full">实例恢复</h2>
+          <select className="w-full rounded border bg-transparent p-2" aria-label="恢复实例" value={recoveryId} onChange={e => setRecoveryId(e.target.value)}><option value="">选择实例</option>{plugins.map(p => <option key={getPluginInstanceId(p)} value={getPluginInstanceId(p)}>{p.name} · {getPluginInstanceId(p)} · {p.enabled ? '启用' : '停用'}</option>)}</select>
+          <button className="rounded-lg border px-3 py-1.5" disabled={busy || !recoveryId} onClick={() => void runAction('启用实例', () => kernelRecoveryClient.togglePlugin(recoveryId, true).then(() => {}), '已启用实例')}>启用</button>
+          <button className="rounded-lg border px-3 py-1.5" disabled={busy || !recoveryId} onClick={() => void runAction('停用实例', () => kernelRecoveryClient.togglePlugin(recoveryId, false).then(() => {}), '已停用实例')}>停用</button>
+          <button className="rounded-lg border px-3 py-1.5" disabled={busy || !recoveryId} onClick={() => void runAction('回退实例', () => kernelRecoveryClient.rollbackPlugin(recoveryId).then(() => {}), '已回退实例')}>上一修订</button>
+          <input className="rounded border bg-transparent p-2" aria-label="恢复绑定契约" placeholder="能力契约" value={recoveryContract} onChange={e => setRecoveryContract(e.target.value)} />
+          <button className="rounded-lg border px-3 py-1.5" disabled={busy || !recoveryId || !recoveryContract} onClick={() => void runAction('恢复能力绑定', () => kernelRecoveryClient.setCompositionBinding(recoveryContract, recoveryId).then(() => {}), '已恢复能力绑定')}>绑定选中实例</button>
+        </section>
         {/* Primary Composition Recovery Actions */}
         <section className="space-y-2">
           <h2 className="text-[11px] font-medium uppercase tracking-widest text-[var(--text-muted)]">

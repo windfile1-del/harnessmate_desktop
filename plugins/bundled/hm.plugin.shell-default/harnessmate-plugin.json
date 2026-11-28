@@ -23,7 +23,15 @@
         "ui": "ui/index.html",
         "module": "ui/module.mjs"
       }
-    ]
+    ],
+    "settingsVersion": 1,
+    "settings": {
+      "theme": {
+        "type": "string",
+        "description": "主题：dark 或 light",
+        "default": "dark"
+      }
+    }
   },
   "description": "默认应用布局插件：接管侧栏、检视抽屉、全局弹窗框架、命令面板、导航路由与业务快捷键。"
 }

@@ -1,6 +1,7 @@
+import type { PublicSurfacesApi, MountedSurfaceHandle } from './surface-mounter';
 import { InboxWorkspaceSurface } from './InboxWorkspaceSurface';
 import { ArrowLeft, Globe, History, Puzzle, Search } from 'lucide-react';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   HISTORY_IMPORT_CONTRACT,
@@ -375,7 +376,18 @@ function WorkspacePageContent({
   return (page.render as (props: Record<string, unknown>) => ReactNode)(hostProps);
 }
 
-export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
+function PublicWorkspacePage({ surfaces, instanceId, slotId, props }: { surfaces: PublicSurfacesApi; instanceId: string; slotId: string; props: Record<string, unknown> }) {
+  const node = useRef<HTMLDivElement>(null); const handle = useRef<MountedSurfaceHandle | null>(null);
+  useEffect(() => {
+    if (!node.current) return;
+    const mounted = surfaces.mountSlotItem(node.current, { slot: 'workspace.pages', instanceId, slotId, props }); handle.current = mounted;
+    return () => { mounted.dispose(); handle.current = null; };
+  }, [surfaces, instanceId, slotId]);
+  useEffect(() => { handle.current?.update({ props }); }, [props]);
+  return <div ref={node} className="flex size-full min-h-0 min-w-0 flex-col" />;
+}
+
+export function PluginWorkspaceStage({ children, surfaces }: { children: ReactNode; surfaces?: PublicSurfacesApi }) {
   const registry = useSlotRegistry();
   const pages = useSlotItems('workspace.pages');
   const {
@@ -491,8 +503,10 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
     });
   }, [peerContract, plugins, selectedWorkspaceId, workspaceBindingsByWorkspace, compositionBindings, compositionEntries]);
 
+  const navigationContext = useAppStore(state => state.activePluginPageContext);
   const hostProps = useMemo<Record<string, unknown>>(
     () => ({
+      ...navigationContext,
       apiBase:
         typeof window !== 'undefined'
           ? window.harnessMateBridge?.daemonUrl || window.location?.origin || ''
@@ -535,6 +549,7 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
       activeSlotId,
       searchPageInitialQuery,
       importPageInitialTab,
+      navigationContext,
     ],
   );
 
@@ -622,7 +637,9 @@ export function PluginWorkspaceStage({ children }: { children: ReactNode }) {
       )}
       <div className="min-h-0 flex-1">
         <SlotErrorBoundary key={pageKey(page!)} registry={registry} item={page!}>
-          {activeSlotId === 'session-inbox' && activeInstanceId
+          {surfaces && page!.sourceKind === 'iframe'
+            ? <PublicWorkspacePage surfaces={surfaces} instanceId={page!.pluginId} slotId={page!.id} props={hostProps} />
+            : activeSlotId === 'session-inbox' && activeInstanceId
             ? <InboxWorkspaceSurface instanceId={activeInstanceId} />
             : <WorkspacePageContent page={page!} hostProps={hostProps} />}
         </SlotErrorBoundary>

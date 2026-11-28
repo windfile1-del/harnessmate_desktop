@@ -72,7 +72,6 @@ import {
   failoverContract, modelCatalogContract, modelToolsContract, selectedHarnessService,
   type FailoverContract, type ModelCatalog, type ModelToolRouter,
 } from '../plugin-host/builtin/harness-integration.js';
-import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
 import type { ApprovalCenterService, ExternalApprovalAnnotator } from './approval-center-service.js';
 import { activeRequestBrokers, getRequestBroker } from '../plugins/requests-default/index.js';
 import {
@@ -2603,8 +2602,7 @@ export class SessionManager {
 
     const { text: expandedText, expandedCommand } = native || turnOpts?.literalText || turnOpts?.mode
       ? { text, expandedCommand: undefined } : this.pluginManager.expandSlashCommand(text);
-    const baseEffectiveText = !native && turnOpts?.mode === 'plugin_development'
-      ? `${expandedText}\n\n${pluginDevelopmentBrief}` : expandedText;
+    const baseEffectiveText = expandedText;
     const terminalChips = !native && turnOpts?.terminalContexts?.length
       ? turnOpts.terminalContexts
       : undefined;

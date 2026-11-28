@@ -58,7 +58,6 @@ import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/
 import { CURATED_PLUGIN_CATALOG } from './plugin-catalog.js';
 import { PluginDevWatcher, type DevPluginLink } from './plugin-dev-mode.js';
 import { PluginRegistryService } from './plugin-registry.js';
-import { buildScaffoldFiles, writeScaffoldToDirectory } from './plugin-scaffold.js';
 
 export interface PluginTurnHookContext {
   sessionId: string;
@@ -82,6 +81,8 @@ export class PluginRevisionConflictError extends PluginApiError {
 }
 
 export interface PluginManagerOptions {
+  getInstanceConfig?: (instanceId: string) => Record<string, unknown> | undefined;
+  requestHost?: (request: { method?: string; path: string; body?: unknown }) => Promise<unknown>;
   safeMode?: boolean;
   store?: HarnessMateStore;
   permissions?: PluginPermissionService;
@@ -124,6 +125,7 @@ export class PluginManager {
   private hasLoadedRegistryFlag = false;
   private bootstrapPromise: Promise<void> | null = null;
   private readonly dataDir: string;
+  private readonly getInstanceConfig?: PluginManagerOptions['getInstanceConfig'];
   private readonly store?: HarnessMateStore;
   private readonly bundledPluginsDir?: string;
   readonly host = new PluginHost((error) => console.error('插件生命周期错误', error));
@@ -144,6 +146,7 @@ export class PluginManager {
     this.pluginsDir = fs.realpathSync(this.pluginsDir);
     this.dataDir = path.dirname(this.pluginsDir);
     this.store = options?.store;
+    this.getInstanceConfig = options?.getInstanceConfig;
     this.bundledPluginsDir = resolveBundledPluginsDir(options?.bundledPluginsDir);
     const builtins = [...BUILTIN_PLUGINS.map(({ id }) => id), ...BUNDLED_PLUGIN_IDS];
     this.composition = new PluginComposition(this.dataDir, builtins);
@@ -159,6 +162,8 @@ export class PluginManager {
       this.permissions = options.permissions ?? new PluginPermissionService(options.store);
       this.pluginSecrets = options.pluginSecrets ?? new PluginSecretStore();
       this.isolated = new IsolatedPluginManager({
+        dataDirectory: this.dataDir,
+        requestHost: options.requestHost,
         store: options.store,
         host: this.host,
         permissions: this.permissions,
@@ -719,7 +724,7 @@ export class PluginManager {
       const revision = JSON.stringify([
         undefined,
         false,
-        entry.config,
+        { ...this.getInstanceConfig?.(entry.id), ...entry.config },
         entry.bindings,
         manifest.inject,
         manifest.provides,
@@ -736,7 +741,7 @@ export class PluginManager {
         dependencies: manifest.dependencies ? Object.values(manifest.dependencies) : undefined,
         bindings: entry.bindings,
         apply: core.apply,
-        config: entry.config,
+        config: { ...this.getInstanceConfig?.(entry.id), ...entry.config },
       });
     }
     this.host.reconcile(definitions);
@@ -926,7 +931,7 @@ export class PluginManager {
       const revision = JSON.stringify([
         digest,
         trustedLocal,
-        entry.config,
+        { ...this.getInstanceConfig?.(entry.id), ...entry.config },
         entry.bindings,
         info.inject,
         info.provides,
@@ -954,7 +959,7 @@ export class PluginManager {
           entryRelativePath: info.main,
           digest,
           enabled,
-          config: entry.config,
+          config: { ...this.getInstanceConfig?.(entry.id), ...entry.config },
           bindings: entry.bindings,
           trustedLocal,
           revision,
@@ -971,7 +976,7 @@ export class PluginManager {
           dependencies: info.dependencies ? Object.values(info.dependencies) : undefined,
           bindings: entry.bindings,
           apply: core?.apply ?? (() => {}),
-          config: entry.config,
+          config: { ...this.getInstanceConfig?.(entry.id), ...entry.config },
         });
       }
     }
@@ -1731,24 +1736,6 @@ export class PluginManager {
       this.appendHostLog(id, 'info', '已取消关联开发模式插件（源码目录已保留）');
       return this.listInstalled();
     });
-  }
-
-  async scaffoldPlugin(req: ScaffoldPluginRequest): Promise<{
-    dirPath: string;
-    files: string[];
-    plugins: InstalledPluginInfo[];
-  }> {
-    const { files } = buildScaffoldFiles(req);
-    const defaultDir = path.join(this.dataDir, 'dev-plugins', req.id);
-    const targetDir = req.targetDir?.trim() ? path.resolve(req.targetDir.trim()) : defaultDir;
-    const writtenDir = writeScaffoldToDirectory(targetDir, files);
-    const plugins = req.linkDevMode && req.template !== 'browser-workspace'
-      ? await this.linkDevPlugin(writtenDir) : this.listInstalled();
-    return {
-      dirPath: writtenDir,
-      files: Object.keys(files),
-      plugins,
-    };
   }
 
   private checkPluginRoot(root: string): void {

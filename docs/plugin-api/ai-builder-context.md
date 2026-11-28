@@ -97,6 +97,13 @@ ctx.fs.{ read, list, stat, write }; ctx.provide(name, impl); ctx.get(name); ctx.
 4. **Minimal Network & Permission Scope**: Every external URL referenced in code MUST match a declared `net:<host>` permission; avoid unused high-risk permissions.
 5. **Strict HTML Sandbox Hygiene**: No external `<script src="http...">` or `<link href="http...">`, no `javascript:` URLs, no inline event handlers (`onclick=`, `onload=`, etc.), and no `../` path traversal.
 
+## B5. Management and Developer Tools
+- Settings: contributes.settings + settingsVersion; GET/PUT /api/v1/plugins/:instanceId/settings. Startup port/data root use /api/v1/plugins/host-config.
+- Ordinary services management.view.v1 and developer.tools.v1 use explicit composition bindings, with no official-ID branch or new per-business permission.
+- Tool-owned routes: /api/v1/plugin-instances/:id/routes/{context,tasks,install,scaffold,preview/replay,preview/program}. Reconnect with taskId; cancel explicitly, or retain background task on page close.
+- Trusted-local runtime.requestHost({path,method,body}) invokes public local APIs without exposing host credentials; runtime.dataDirectory is per instance. Existing source trust is required.
+- Frontend uses bridge.navigation, contributions and surfaces; never import private app-store. Development context is appended only to the current user message in plugin_development mode.
+
 ## 7. Offline Testing Kit (`@harnessmate/plugin-sdk/testing`)
 - `createMockPluginHost(opts?)`: mocks permissions, storage, logger, services, `spawnCli`, `net.openStream`, `secrets.resolve`, and captures registered drivers/slots/tools.
 - `createMockSession(opts?)` & `createMockCliProcess(opts?)`: construct deterministic sessions and NDJSON CLI streams offline.

@@ -1,3 +1,4 @@
+import { daemonApi } from '../../api/client';
 import type { NavigationRequestV1, NavigationResultV1 } from '@harnessmate/protocol';
 import {
   HISTORY_IMPORT_CONTRACT,
@@ -142,8 +143,15 @@ export function createDefaultShellNavigationHandler(): NavigationHandler {
         });
         return { requestId: req.requestId, status: 'accepted', placement: req.placement ?? 'primary' };
       }
-      const pageId = req.target.pageId ?? req.target.slotId;
-      const instanceId = req.target.instanceId;
+      let pageId = req.target.pageId ?? req.target.slotId;
+      let instanceId = req.target.instanceId;
+      if (contract && !instanceId) {
+        const resolved = await daemonApi.resolveServiceSelection(contract, { allowSingleCandidate: false });
+        if (resolved.status !== 'ready' || !resolved.instanceId) return { requestId: req.requestId, status: 'unavailable', code: 'E_SERVICE_UNAVAILABLE' };
+        instanceId = resolved.instanceId;
+        const plugin = state.plugins.find(p => (p.instanceId ?? p.id) === instanceId);
+        pageId ??= plugin?.contributes.slots?.find(s => s.slot === 'workspace.pages')?.id;
+      }
       if (instanceId && pageId) {
         const targetPlugin = state.plugins.find(
           (p) => getPluginInstanceId(p) === instanceId || p.id === instanceId,
@@ -160,7 +168,7 @@ export function createDefaultShellNavigationHandler(): NavigationHandler {
           };
         }
         state.openModal(null);
-        state.setActivePluginPage(makeWorkspacePageKey(instanceId, pageId));
+        state.setActivePluginPage(makeWorkspacePageKey(instanceId, pageId), ctx);
         return { requestId: req.requestId, status: 'accepted', placement: req.placement ?? 'primary' };
       }
       if (pageId === null || pageId === '') {
@@ -196,6 +204,7 @@ export function createDefaultShellNavigationHandler(): NavigationHandler {
 
     if (kind === 'modal') {
       const modal = (ctx.modal !== undefined ? ctx.modal : req.target.pageId || null) as ActiveModal;
+      if (modal === 'plugins' || modal === 'harnesses') return { requestId: req.requestId, status: 'unavailable', code: 'E_NOT_SUPPORTED', message: '请导航到 management.view.v1 页面' };
       const preset = typeof ctx.presetHarnessId === 'string' ? ctx.presetHarnessId : null;
       state.openModal(modal, preset);
       return { requestId: req.requestId, status: 'accepted', placement: 'modal' };

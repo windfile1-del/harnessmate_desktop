@@ -1,3 +1,4 @@
+import { generateDeveloper, developerBase } from './helpers/developer-tools.js';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,7 +13,7 @@ import {
   replayAdapterTranscript,
 } from '@harnessmate/plugin-sdk/testing';
 import type { NormalizedAdapterEvent } from '../src/harnesses/types.js';
-import { classifyPluginBuilderTier } from '../src/plugins/plugin-builder-v2.js';
+import { classifyPluginBuilderTier } from '../src/plugins/developer-tools/plugin-builder-v2.js';
 import { auditPluginPackage } from '../src/plugins/plugin-static-audit.js';
 import { createDaemon, type DaemonInstance } from '../src/server/app.js';
 
@@ -307,16 +308,12 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
       };
     };
 
-    const res = await daemon.app.inject({
-      method: 'POST',
-      url: '/api/v1/plugins/builder-v2/generate',
-      payload: {
+    const res = await generateDeveloper(daemon, {
         description: '添加一个 /standup 斜杠命令',
         harnessId: 'codex',
         workspaceId: ws.id,
         tier: 'auto',
-      },
-    });
+      });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({
       tierUsed: 'tier1',
@@ -425,17 +422,13 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
       };
     };
 
-    const genRes = await daemon.app.inject({
-      method: 'POST',
-      url: '/api/v1/plugins/builder-v2/generate',
-      payload: {
+    const genRes = await generateDeveloper(daemon, {
         description: '生成一个带 chat.block 沙箱 HTML 卡片与持久化逻辑的 V5 插件',
         harnessId: 'codex',
         workspaceId: ws.id,
         tier: 'tier2',
         template: 'isolated',
-      },
-    });
+      });
     expect(genRes.statusCode).toBe(200);
     const body = genRes.json();
     expect(body.tierUsed).toBe('tier2');
@@ -450,7 +443,7 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
     // Reject install without explicit trustCode: true
     const untrustedRes = await daemon.app.inject({
       method: 'POST',
-      url: '/api/v1/plugins/builder-v2/install',
+      url: developerBase + '/install',
       payload: {
         draftId: body.draftId,
         expectedDigest: body.digest,
@@ -463,7 +456,7 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
     // Explicit trust confirmed -> installs & activates in PluginManager!
     const installRes = await daemon.app.inject({
       method: 'POST',
-      url: '/api/v1/plugins/builder-v2/install',
+      url: developerBase + '/install',
       payload: {
         draftId: body.draftId,
         expectedDigest: body.digest,
@@ -510,16 +503,12 @@ describe('Phase 3.3 · AI Plugin Builder v2, Static Security Audit & Offline Tes
       };
     };
 
-    const failRes = await daemon.app.inject({
-      method: 'POST',
-      url: '/api/v1/plugins/builder-v2/generate',
-      payload: {
+    const failRes = await generateDeveloper(daemon, {
         description: '生成一个带自定义代码逻辑的插件',
         harnessId: 'codex',
         workspaceId: ws.id,
         tier: 'tier2',
-      },
-    });
+      });
     expect(failRes.statusCode).toBe(200);
     const failBody = failRes.json();
     expect(failCalls).toBe(3);

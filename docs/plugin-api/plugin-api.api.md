@@ -1472,6 +1472,14 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
     readonly runtime: {
         /** Whether the user authorized direct system access for this development instance. */
         readonly trustedLocal?: boolean;
+        /** Instance-scoped persistent directory, available with trusted-local consent. */
+        readonly dataDirectory?: string;
+        /** Local HTTP API transport with existing trusted-local authority; no credentials are exposed. */
+        requestHost?<T = unknown>(request: {
+            method?: string;
+            path: string;
+            body?: unknown;
+        }): Promise<T>;
         spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
     };
     readonly sessions: IsolatedPluginContext['sessions'] & {
@@ -1717,10 +1725,11 @@ import type { PluginRuntimeSlotDescriptor } from './slots.js';
 export declare const PLUGIN_RPC_PROTOCOL_VERSION = 1;
 export declare const HOST_FEATURES_V5: readonly ["harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5"];
 export type HostFeatureV5 = typeof HOST_FEATURES_V5[number];
-export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal", "peer.assembly.v1", "desktop.view.v1", "plugin.routes.v1", "approval.policy.v1", "ui.filePreview.v1"];
+export declare const HOST_SUPPORTED_FEATURES: readonly ["rpc.v1", "isolation.process", "services.third-party", "permissions.v4", "handoff.compose", "handoff.shouldOffer", "approvals.annotate", "tools.model", "commands.v4", "storage.kv", "fs.workspace", "net.fetch", "ui.slots", "harness.driver.v2", "runtime.spawnCli", "handoff.protocol.v2", "sessions.items.read", "sessions.fork", "ui.slots.v5", "ui.workspace.pages", "runtime.trustedLocal", "runtime.requestHost", "peer.assembly.v1", "desktop.view.v1", "plugin.routes.v1", "approval.policy.v1", "ui.filePreview.v1"];
 export type HostSupportedFeature = typeof HOST_SUPPORTED_FEATURES[number];
 export interface PluginHandshakeRequest {
     trustedLocal?: boolean;
+    dataDirectory?: string;
     protocolVersion: number;
     pluginApi: string;
     features: readonly string[];

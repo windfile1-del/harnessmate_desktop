@@ -1,4 +1,4 @@
-import type { AnyPluginSlotKey, Disposer, PublicSession, Session } from '@harnessmate/protocol';
+import type { AnyPluginSlotKey, Disposer, PublicSession, Session, PluginSlotRenderFailure } from '@harnessmate/protocol';
 import { createRoot, type Root } from 'react-dom/client';
 import { getPluginInstanceId, resolveServiceSelectionClientSide } from '../api/peer-contracts';
 import { useKernelStore } from '../stores/kernel-store';
@@ -24,6 +24,8 @@ export interface MountedSurfaceHandle {
 }
 
 export interface PublicSurfacesApi {
+  getRenderFailures(): readonly PluginSlotRenderFailure[];
+  clearRenderFailure(id?: string): void;
   listSlots(
     slot: AnyPluginSlotKey,
     options?: { hasSession?: boolean; matchKey?: string },
@@ -189,6 +191,8 @@ export function createPublicSurfacesApi(
         }));
     },
 
+    getRenderFailures: () => registry.getRenderFailures(),
+    clearRenderFailure: id => id ? registry.clearRenderFailure(id) : registry.clearAllRenderFailures(),
     onSlotsChanged(listener) {
       const dispose = registry.subscribe(listener);
       trackDisposer?.(dispose);

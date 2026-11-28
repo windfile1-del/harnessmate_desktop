@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 5173 --strictPort",
-    "build": "tsc -p tsconfig.json --noEmit && vite build && vite build --config vite.shell.config.ts && vite build --config vite.shell.module.config.ts && vite build --config vite.chat.config.ts && vite build --config vite.chat.module.config.ts && vite build --config vite.agy.config.ts && vite build --config vite.requests.config.ts && vite build --config vite.requests.module.config.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build && vite build --config vite.shell.config.ts && vite build --config vite.shell.module.config.ts && vite build --config vite.chat.config.ts && vite build --config vite.chat.module.config.ts && vite build --config vite.agy.config.ts && vite build --config vite.requests.config.ts && vite build --config vite.requests.module.config.ts && vite build --config vite.management.config.ts && vite build --config vite.developer-tools.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests"
   },

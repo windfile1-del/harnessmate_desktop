@@ -10,6 +10,8 @@ const FORBIDDEN_HOST_MODULES = [
   '/components/CommandPalette.tsx',
   '/components/TriageInbox.tsx',
   '/plugins/shell-default/',
+  '/plugins/management/',
+  '/plugins/developer-tools/',
 ];
 
 export default defineConfig({

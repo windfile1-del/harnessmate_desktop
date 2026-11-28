@@ -1,8 +1,8 @@
 import type { InstalledPluginInfo, PluginLogEntryDto } from '@harnessmate/protocol';
 import { Copy, RefreshCw, Search, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { daemonApi } from '../api/client';
-import { useAppStore } from '../stores/app-store';
+import { daemonApi } from '../../api/client';
+import { useManagementStore as useAppStore } from './store';
 
 const LEVEL_COLORS: Record<PluginLogEntryDto['level'], string> = {
   debug: 'var(--text-muted)',

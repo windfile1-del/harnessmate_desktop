@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import {
   HARNESS_DRIVER_CONTRACT,
   PluginApiError,
@@ -104,6 +105,7 @@ export interface ActiveIsolatedPlugin {
   instanceId: string;
   runId: string;
   info: InstalledPluginInfo;
+  trustedLocal?: boolean;
   process: IsolatedPluginProcess;
   handshake: PluginHandshakeResponse;
   subscribedEvents: Set<string>;
@@ -136,6 +138,8 @@ export interface ActiveIsolatedPlugin {
 }
 
 export interface IsolatedManagerOptions {
+  dataDirectory?: string;
+  requestHost?: (request: { method?: string; path: string; body?: unknown }) => Promise<unknown>;
   store: HarnessMateStore;
   host: PluginHost;
   permissions: PluginPermissionService;
@@ -168,6 +172,14 @@ export class IsolatedPluginManager {
     }
     opts.host.setHandoffRedactor((input) => this.redactHandoff(input));
     this.router = new IsolatedPluginRpcRouter({
+      requestHost: async (instanceId, runId, request) => {
+        const active = this.active.get(instanceId);
+        if (!active || active.runId !== runId || !active.trustedLocal) {
+          throw new PluginApiError('E_PERMISSION_DENIED', 'Existing trusted-local consent is required');
+        }
+        if (!opts.requestHost) throw new PluginApiError('E_NOT_SUPPORTED', 'Local host transport unavailable');
+        return opts.requestHost(request);
+      },
       store: opts.store,
       host: opts.host,
       permissions: opts.permissions,
@@ -568,6 +580,7 @@ export class IsolatedPluginManager {
           pluginId: info.id,
           instanceId,
           trustedLocal,
+          dataDirectory: this.opts.dataDirectory ? path.join(this.opts.dataDirectory, "plugin-data", instanceId) : undefined,
           packageRoot,
           entryRelativePath,
           packageDigest: digest,
@@ -589,6 +602,7 @@ export class IsolatedPluginManager {
           instanceId,
           runId: proc.runId,
           info,
+          trustedLocal,
           process: proc,
           handshake: { sdkVersion: '4.0.0' },
           subscribedEvents: new Set(),

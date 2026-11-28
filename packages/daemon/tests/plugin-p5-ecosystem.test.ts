@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { packageFromFilesRecord } from '../src/plugins/plugin-package.js';
 import { generatePublisherKeyPair, signPluginRelease } from '../src/plugins/plugin-registry.js';
-import { buildScaffoldFiles } from '../src/plugins/plugin-scaffold.js';
+import { buildScaffoldFiles } from '../src/plugins/developer-tools/plugin-scaffold.js';
 import { createDaemon } from '../src/server/app.js';
 
 async function waitFor(condition: () => boolean, timeoutMs = 4_000, intervalMs = 50): Promise<void> {
@@ -36,7 +36,7 @@ it('recovers a trusted browser workspace across edits, rollback, shutdown, safet
   try {
     await daemon.start();
     const generated = await daemon.app.inject({
-      method: 'POST', url: '/api/v1/plugins/scaffold',
+      method: 'POST', url: '/api/v1/plugin-instances/hm.plugin.developer-tools/routes/scaffold',
       payload: { id, name: '浏览器工作页', template: 'browser-workspace', linkDevMode: true },
     });
     expect(generated.statusCode).toBe(201);
@@ -159,7 +159,7 @@ it('scaffolds V4 templates, hot-reloads linked dev-mode plugins with unified log
     // 1. Scaffold an isolated + UI slot plugin and auto-link in dev mode
     const scaffoldRes = await daemon.app.inject({
       method: 'POST',
-      url: '/api/v1/plugins/scaffold',
+      url: '/api/v1/plugin-instances/hm.plugin.developer-tools/routes/scaffold',
       payload: {
         id: 'user.dev-demo',
         name: 'Dev Demo',
@@ -179,7 +179,7 @@ it('scaffolds V4 templates, hot-reloads linked dev-mode plugins with unified log
     expect(created.files).toContain('ui/panel.html');
 
     const browserScaffold = await daemon.app.inject({
-      method: 'POST', url: '/api/v1/plugins/scaffold', payload: {
+      method: 'POST', url: '/api/v1/plugin-instances/hm.plugin.developer-tools/routes/scaffold', payload: {
         id: 'user.dev-browser', name: 'Preview', template: 'browser-preview', linkDevMode: false,
       },
     });

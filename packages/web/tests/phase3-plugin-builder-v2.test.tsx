@@ -1,8 +1,11 @@
 import type { BuilderV2Result } from '@harnessmate/protocol';
-import { renderToStaticMarkup } from 'react-dom/server';
+import { renderToStaticMarkup as renderMarkup } from 'react-dom/server';
+import type { ReactNode } from 'react';
+import { withManagement } from './helpers/management';
+const renderToStaticMarkup = (node: ReactNode) => renderMarkup(withManagement(node));
 import { describe, expect, it } from 'vitest';
-import { PluginAuthoringForm } from '../src/components/PluginAuthoringForm';
-import { PluginBuilderV2Review } from '../src/components/PluginDraftReview';
+import { PluginAuthoringForm } from '../src/plugins/developer-tools/PluginAuthoringForm';
+import { PluginBuilderV2Review } from '../src/plugins/developer-tools/PluginDraftReview';
 
 describe('Phase 3.3 · AI Plugin Builder v2 UI', () => {
   it('renders Tier 1 / Tier 2 mode selector and harness-adapter template option in PluginAuthoringForm', () => {

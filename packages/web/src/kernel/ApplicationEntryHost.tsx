@@ -4,7 +4,7 @@ import {
   type PluginSlotContribution,
 } from '@harnessmate/protocol';
 import { Loader2 } from 'lucide-react';
-import { Component, useCallback, useMemo, useSyncExternalStore, type ErrorInfo, type ReactNode } from 'react';
+import { Component, useCallback, useMemo, useSyncExternalStore, useState, useEffect, type ErrorInfo, type ReactNode } from 'react';
 import {
   APPLICATION_SHELL_SLOT,
   APPLICATION_VIEW_CONTRACT,
@@ -63,6 +63,8 @@ class ApplicationErrorBoundary extends Component<
  * or `SandboxedPluginFrame`). Never imports or falls back to any hardcoded default layout component.
  */
 export function ApplicationEntryHost() {
+  const [manualRecovery, setManualRecovery] = useState(() => typeof location !== 'undefined' && location.hash === '#kernel-recovery');
+  useEffect(() => { const update = () => setManualRecovery(location.hash === '#kernel-recovery'); window.addEventListener('hashchange', update); return () => window.removeEventListener('hashchange', update); }, []);
   const {
     loading,
     initialized,
@@ -122,6 +124,8 @@ export function ApplicationEntryHost() {
       </div>
     );
   }
+
+  if (manualRecovery) return <div className="flex h-screen flex-col overflow-auto"><button onClick={() => { location.hash = ''; setManualRecovery(false); }}>返回应用入口</button><KernelRecoveryView reasonKind="manual" onRecovered={handleRecovered} /></div>;
 
   if (emptyComposition) {
     return (

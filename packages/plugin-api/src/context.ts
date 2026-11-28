@@ -1292,6 +1292,10 @@ export interface IsolatedPluginContextV5 extends IsolatedPluginContext {
   readonly runtime: {
     /** Whether the user authorized direct system access for this development instance. */
     readonly trustedLocal?: boolean;
+    /** Instance-scoped persistent directory, available with trusted-local consent. */
+    readonly dataDirectory?: string;
+    /** Local HTTP API transport with existing trusted-local authority; no credentials are exposed. */
+    requestHost?<T = unknown>(request: { method?: string; path: string; body?: unknown }): Promise<T>;
     spawnCli(spec: SpawnCliSpec): Promise<ManagedCliProcessHandle>;
   };
   readonly sessions: IsolatedPluginContext['sessions'] & {

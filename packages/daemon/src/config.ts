@@ -1,3 +1,4 @@
+import { migrateLegacyPluginConfig, withB4ConfigMirror } from './plugins/legacy-config-migration.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,6 +10,7 @@ import type {
 } from '@harnessmate/protocol';
 
 export interface DaemonPersistedConfig {
+  pluginConfig?: Record<string, Record<string, unknown>>;
   desktopId: string;
   desktopName: string;
   port: number;
@@ -86,6 +88,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
           raw.binaryOverrides && typeof raw.binaryOverrides === 'object' ? raw.binaryOverrides : {},
         disabledPlugins: Array.isArray(raw.disabledPlugins) ? raw.disabledPlugins : [],
       };
+      migrateLegacyPluginConfig(merged);
       saveConfig(configPath, merged);
       return merged;
     } catch {
@@ -93,6 +96,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
     }
   }
 
+  migrateLegacyPluginConfig(defaults);
   saveConfig(configPath, defaults);
   return defaults;
 }
@@ -100,7 +104,7 @@ export function loadOrCreateConfig(configPath: string, portOverride?: number): D
 export function saveConfig(configPath: string, config: DaemonPersistedConfig): void {
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   const tmpPath = `${configPath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2), 'utf8');
+  fs.writeFileSync(tmpPath, JSON.stringify(withB4ConfigMirror(config), null, 2), 'utf8');
   fs.renameSync(tmpPath, configPath);
 }
 

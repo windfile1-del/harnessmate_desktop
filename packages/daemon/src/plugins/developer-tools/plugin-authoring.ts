@@ -4,8 +4,8 @@ import {
   type GeneratePluginDraftRequest,
   type PluginManifest,
 } from '@harnessmate/protocol';
-import type { HarnessRegistry } from '../harnesses/registry.js';
-import type { AdapterSessionHandle } from '../harnesses/types.js';
+import type { AuthoringRegistry } from './ports.js';
+import type { AdapterSessionHandle } from '../../harnesses/types.js';
 
 const schemaGuide = `Return exactly one JSON object, with no Markdown, implementation plan, tools, or file operations.
 The JSON defines a data-only HarnessMate plugin. Use labels and prompts in the user's language.
@@ -23,7 +23,7 @@ For an installed plugin, keep its ID and choose a new version. When revising a p
 export class PluginAuthoring {
   private active?: AbortController;
 
-  constructor(private readonly registry: HarnessRegistry) {}
+  constructor(private readonly registry: AuthoringRegistry) {}
 
   cancel(): void {
     this.active?.abort(new Error('插件生成已取消'));

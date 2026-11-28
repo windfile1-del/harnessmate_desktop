@@ -68,12 +68,6 @@ export interface LegacyShellAdapterMeta {
  */
 export const LEGACY_SHELL_BRIDGE_ADAPTERS: readonly LegacyShellAdapterMeta[] = [
   {
-    action: 'openModal',
-    callers: ['hm.plugin.chat-default', 'hm.plugin.agy-workbench-default'],
-    owner: 'W2',
-    removeWhen: 'W2 migrates Settings, Plugin Center, and Management modals to public UI contributions/pages.',
-  },
-  {
     action: 'refreshAll',
     callers: ['hm.plugin.chat-default', 'hm.plugin.requests-view-default'],
     owner: 'W3',
@@ -270,17 +264,6 @@ export function invokeShell(name: string, args: unknown[]) {
           },
           context: opts,
           placement: 'primary',
-        }),
-      );
-    }
-    case 'openModal': {
-      const modal = typeof args[0] === 'string' ? args[0] : null;
-      const presetHarnessId = typeof args[1] === 'string' ? args[1] : null;
-      return unwrapNavigation(
-        navigationBus.navigate({
-          target: { kind: 'modal', pageId: modal ?? '' },
-          context: { modal, presetHarnessId },
-          placement: 'modal',
         }),
       );
     }

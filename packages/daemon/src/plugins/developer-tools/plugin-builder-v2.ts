@@ -20,13 +20,13 @@ import {
   type PluginManifest,
   type PluginStaticAuditReport,
 } from '@harnessmate/protocol';
-import type { HarnessRegistry } from '../harnesses/registry.js';
-import type { AdapterSessionHandle } from '../harnesses/types.js';
+
+import type { AdapterSessionHandle } from '../../harnesses/types.js';
 import type { PluginAuthoring } from './plugin-authoring.js';
-import type { PluginManager } from './plugin-manager.js';
-import { hashFiles, packageFromFilesRecord } from './plugin-package.js';
-import { auditPluginPackage } from './plugin-static-audit.js';
-import { buildSandboxedPluginHtml } from './plugin-ui.js';
+import type { DeveloperKernelPort, AuthoringRegistry } from './ports.js';
+import { hashFiles, packageFromFilesRecord } from '../plugin-package.js';
+import { auditPluginPackage } from '../plugin-static-audit.js';
+import { buildSandboxedPluginHtml } from '../plugin-ui.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,7 +42,7 @@ function resolveModuleDir(): string {
 }
 
 const MODULE_DIR = resolveModuleDir();
-const REPO_ROOT = path.resolve(MODULE_DIR, '../../../..');
+const REPO_ROOT = path.resolve(MODULE_DIR, '../../../../..');
 
 function resolveDefaultContextDocPath(): string {
   const candidates = [
@@ -219,14 +219,16 @@ const DRY_RUN_BOOTSTRAP_STUB =
 
 export class PluginBuilderV2 {
   private active?: AbortController;
+  private readonly lifetime = new AbortController();
+  dispose(): void { this.cancel(); this.lifetime.abort(new Error('开发工具已停用')); }
   private readonly stagedDrafts = new Map<string, StagedBuilderDraft>();
   private readonly stagingRoot: string;
 
   constructor(
     private readonly dataDir: string,
-    private readonly registry: HarnessRegistry,
+    private readonly registry: AuthoringRegistry,
     private readonly authoring: PluginAuthoring,
-    private readonly pluginManager: PluginManager,
+    private readonly pluginManager: DeveloperKernelPort,
     private readonly contextDocPath: string = DEFAULT_CONTEXT_DOC_PATH,
   ) {
     this.stagingRoot = path.join(dataDir, 'builder-v2-staging');
@@ -265,7 +267,7 @@ export class PluginBuilderV2 {
     // Tier 1: Preserve existing PluginAuthoring fast JSON draft flow (100% compatible)
     if (classification.tier === 'tier1') {
       const base = req.editing
-        ? this.pluginManager.getAuthoringBase(req.editing.id, req.editing.digest)
+        ? await this.pluginManager.getAuthoringBase(req.editing.id, req.editing.digest)
         : undefined;
       const manifest = await this.authoring.generate(
         {
@@ -280,8 +282,8 @@ export class PluginBuilderV2 {
         requestSignal,
         base,
       );
-      if (req.editing) this.pluginManager.getAuthoringBase(req.editing.id, req.editing.digest);
-      this.pluginManager.validateManifest(manifest);
+      if (req.editing) await this.pluginManager.getAuthoringBase(req.editing.id, req.editing.digest);
+      await this.pluginManager.validateManifest(manifest);
       return {
         tierUsed: 'tier1',
         classificationReason: classification.reason,
@@ -308,7 +310,7 @@ export class PluginBuilderV2 {
 
     const controller = new AbortController();
     this.active = controller;
-    const signal = AbortSignal.any([controller.signal, requestSignal, AbortSignal.timeout(180_000)]);
+    const signal = AbortSignal.any([this.lifetime.signal, controller.signal, requestSignal, AbortSignal.timeout(180_000)]);
 
     const contextPack = this.loadBuilderContextPack();
     const attempts: BuilderAttemptLog[] = [];
@@ -403,7 +405,8 @@ export class PluginBuilderV2 {
           fs.writeFileSync(full, content, 'utf8');
         }
 
-        const verification = await this.verifyStagedPackage(attemptDir, attemptFiles, attemptManifest, cwd);
+        const verification = await this.verifyStagedPackage(attemptDir, attemptFiles, attemptManifest, cwd, signal);
+        signal.throwIfAborted();
         lastManifest = verification.normalizedManifest ?? attemptManifest;
         lastFiles = attemptFiles;
         lastAudit = verification.audit;
@@ -487,6 +490,7 @@ export class PluginBuilderV2 {
     files: Record<string, string>,
     manifestObj: Record<string, unknown>,
     workspaceRoot: string,
+    signal?: AbortSignal,
   ): Promise<{
     passed: boolean;
     normalizedManifest?: Record<string, unknown>;
@@ -503,7 +507,7 @@ export class PluginBuilderV2 {
       const parsedV4 = PluginManifestV4Schema.parse(manifestObj);
       normalizedManifest = PluginManifestSchema.parse(parsedV4);
       packageFromFilesRecord(files);
-      this.pluginManager.validateManifest(normalizedManifest);
+      await this.pluginManager.validateManifest(normalizedManifest);
     } catch (err) {
       s1Errors.push(err instanceof Error ? err.message : String(err));
     }
@@ -531,6 +535,7 @@ export class PluginBuilderV2 {
       const full = path.join(attemptDir, rel);
       try {
         await execFileAsync(process.execPath, ['--check', full], {
+          signal,
           timeout: 5_000,
           windowsHide: true,
         });
@@ -577,6 +582,7 @@ export class PluginBuilderV2 {
               ? manifestObj.permissions.filter((p): p is string => typeof p === 'string')
               : [],
             workspaceRoot,
+            signal,
           );
           s3Details = `Mock 宿主激活成功（驱动: ${dryRunRes.drivers.length}, 插槽: ${dryRunRes.slots.length}, 命令: ${dryRunRes.commands.length}, 服务: ${dryRunRes.services.length}）`;
         } catch (err) {
@@ -661,6 +667,7 @@ export class PluginBuilderV2 {
     pluginId: string,
     permissions: string[],
     workspaceRoot: string,
+    signal?: AbortSignal,
   ): Promise<{
     drivers: string[];
     slots: string[];
@@ -702,6 +709,7 @@ export class PluginBuilderV2 {
         cwd: attemptDir,
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
+        signal,
       });
 
       let stdout = '';
@@ -763,9 +771,6 @@ export class PluginBuilderV2 {
     installMode: 'local_install' | 'dev_link';
     dirPath: string;
   }> {
-    if (!req.trustCode) {
-      throw new PluginApiError('E_PERMISSION_DENIED', '安装或热加载代码插件前必须显式确认安全信任授权');
-    }
 
     let files: Record<string, string>;
     let sourceDir: string;
@@ -817,11 +822,24 @@ export class PluginBuilderV2 {
       throw new PluginApiError('E_INVALID_INPUT', '缺少 harnessmate-plugin.json');
     }
     const manifest = PluginManifestSchema.parse(JSON.parse(manifestJson));
+    // Rebuild a fresh reviewed snapshot. Caller-supplied files can never reuse another draft's disk files.
+    sourceDir = path.join(this.stagingRoot, 'install-' + crypto.randomBytes(6).toString('hex'));
+    for (const [rel, content] of Object.entries(files)) {
+      const full = path.join(sourceDir, normalizeRelativePackagePath(rel));
+      fs.mkdirSync(path.dirname(full), { recursive: true }); fs.writeFileSync(full, content);
+    }
+    const check = await this.verifyStagedPackage(sourceDir, files, manifest as Record<string, unknown>, sourceDir, this.lifetime.signal);
+    if (!check.passed) throw new PluginApiError('E_INVALID_INPUT', check.steps.flatMap(s => s.errors).join('; '));
 
+    this.lifetime.signal.throwIfAborted();
+    if (req.installMode !== 'dev_link' && !req.trustCode) throw new PluginApiError('E_PERMISSION_DENIED', '首次安装代码来源需要确认信任');
     if (req.installMode === 'dev_link') {
       const destDir = req.targetDir?.trim()
         ? path.resolve(req.targetDir.trim())
         : path.join(this.dataDir, 'dev-plugins', manifest.id);
+      const knownSource = fs.existsSync(destDir) && await this.pluginManager.isTrustedDevSource(fs.realpathSync(destDir), manifest.id);
+      if (!req.trustCode && !knownSource) throw new PluginApiError('E_PERMISSION_DENIED', '首次关联此源码目录需要确认信任；同来源重载沿用现有授权');
+      this.lifetime.signal.throwIfAborted();
       fs.mkdirSync(destDir, { recursive: true });
       for (const [rawKey, content] of Object.entries(files)) {
         const clean = normalizeRelativePackagePath(rawKey);
@@ -829,7 +847,7 @@ export class PluginBuilderV2 {
         fs.mkdirSync(path.dirname(full), { recursive: true });
         fs.writeFileSync(full, content, 'utf8');
       }
-      const plugins = await this.pluginManager.linkDevPlugin(destDir);
+      const plugins = await this.pluginManager.linkDevPlugin(fs.realpathSync(destDir), req.trustCode ? manifest.id : undefined);
       return {
         plugins,
         installedId: manifest.id,
@@ -842,7 +860,7 @@ export class PluginBuilderV2 {
       mode: 'local_dir',
       dirPath: sourceDir,
       expectedDigest: req.expectedDigest,
-      trustCode: true,
+      trustCode: req.trustCode,
     });
     return {
       plugins,
@@ -891,7 +909,7 @@ export class PluginBuilderV2 {
   }
 
   private async invokeHarnessSingleTurn(
-    adapter: NonNullable<ReturnType<HarnessRegistry['get']>>,
+    adapter: NonNullable<ReturnType<AuthoringRegistry['get']>>,
     cwd: string,
     model: string | undefined,
     promptText: string,

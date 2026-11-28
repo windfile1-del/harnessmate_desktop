@@ -1,3 +1,5 @@
+import { openContractPage } from '../../api/plugin-navigation';
+import { withPluginDevelopmentContext } from '../../api/client';
 import type { TriageSnoozeExpired } from '@harnessmate/protocol';
 import { showSessionNotification } from '../../lib/desktop-notifications';
 import type {
@@ -400,7 +402,7 @@ clearLastRevert: (sessionId) =>
         lastRevertBySession: { ...state.lastRevertBySession, [sessionId]: null },
       }))
  };
- const shellNames = ['setSidebarCollapsed','setInspectorOpen','setInspectorTab','openModal','openPluginPanel','selectSession','openSessionSearch','openSessionSearchPage','openHistoryImportPage','setNativeWorkbenchRoute','hydrateNativeRuntime','submitNativeCommand','dispatchNativeControl','loadNativeTimeline','loadNativeWorkflowResource','setNativeAgentMode','refreshAll','focusCheckpointDiff','openSubagentMergeReview'];
+ const shellNames = ['setSidebarCollapsed','setInspectorOpen','setInspectorTab','openPluginPanel','selectSession','openSessionSearch','openSessionSearchPage','openHistoryImportPage','setNativeWorkbenchRoute','hydrateNativeRuntime','submitNativeCommand','dispatchNativeControl','loadNativeTimeline','loadNativeWorkflowResource','setNativeAgentMode','refreshAll','focusCheckpointDiff','openSubagentMergeReview'];
  const shell = Object.fromEntries(shellNames.map(name=>[name,(...args: unknown[])=>getActiveBridge().call('shell.invoke',{name,args})]));
  return {
 theme: 'dark',
@@ -429,10 +431,8 @@ serviceResolutionsByKey: {},
 pluginPermissionRevision: 0,
 selectedPluginPanel: null,
 focusedTurn: null,
-pluginCatalog: [],
 slashCommands: [],
 mcpPresets: [],
-pluginsDir: '',
 searchPageInitialQuery: '',
 searchPageTargetInstanceId: null,
 importPageTargetInstanceId: null,
@@ -480,7 +480,12 @@ loadEarlierHistory: (sessionId: string) => triggerLoadEarlierHistory(sessionId),
  openInspectorFile: (sessionId: string,path: string,line?: number)=>{ void getActiveBridge().navigateToFile({sessionId,path,line}); return {opened:true}; },
  navigateToFile: (request: NavigateToFileRequest)=>{ void getActiveBridge().navigateToFile(request); return {opened:true}; },
  pushToast: (notice: Omit<ToastNotice,'id'>)=>{ void getActiveBridge().call('ui.toast',notice); },
+ openModal: (modal, presetHarnessId) => { const bridge = getActiveBridge();
+   if (modal === 'plugins' || modal === 'harnesses') { void openContractPage('management.view.v1', undefined, { managementTab: modal === 'harnesses' ? 'harnesses' : 'plugins' }, req => bridge.call('ui.navigate', req as unknown as Record<string, unknown>)); return; }
+   void bridge.call('ui.navigate', { target: { kind: 'modal', pageId: modal ?? '' }, context: { modal, presetHarnessId }, placement: 'modal' });
+ },
  sendTurn: async (sessionId,text,attachments,options)=>{
+   text = await withPluginDevelopmentContext(text, options?.mode);
    const requestId=crypto.randomUUID();
    const receipt=await callPeer('session.runtime.v1','sendTurn',[{sessionId,text,attachments,requestId,...options}],{sessionId});
    if(!receipt.ok)throw new Error(receipt.error.message);

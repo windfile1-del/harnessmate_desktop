@@ -128,11 +128,9 @@ export function createAcpDriverPlugin(params: {
 
       if (isPrimaryInstance) {
         params.registry.setCustomAcpFactory((cfg) => wrapAcpAdapter(cfg));
-        for (const harness of params.config.customAcpHarnesses) {
-          if (!params.registry.isReserved(harness.id) && !params.registry.get(harness.id)) {
-            registerCustomHarness(harness);
-          }
-        }
+      }
+      for (const harness of ((settings as { customHarnesses?: CustomAcpHarnessConfig[] } | undefined)?.customHarnesses ?? (isPrimaryInstance ? params.config.customAcpHarnesses : []))) {
+        if (!params.registry.isReserved(harness.id) && !params.registry.get(harness.id)) registerCustomHarness(harness);
       }
 
       // Optional per-instance ACP config supplied via plugin composition settings

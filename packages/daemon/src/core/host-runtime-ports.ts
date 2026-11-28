@@ -38,7 +38,6 @@ import {
   type ModelToolRouter,
 } from '../plugin-host/builtin/harness-integration.js';
 import { sessionPluginEvent } from '../plugin-host/runtime/events.js';
-import { pluginDevelopmentBrief } from '../plugins/plugin-development-prompt.js';
 import type { PluginCapabilities, PluginToolLease } from '../plugins/plugin-capabilities.js';
 import type { PluginManager } from '../plugins/plugin-manager.js';
 import type { ApprovalCenterService } from './approval-center-service.js';
@@ -324,9 +323,7 @@ export function createHostRuntimePorts(deps: HostRuntimePortDeps): {
       const { text: expandedText, expandedCommand } = hasNative || literalText || mode
         ? { text, expandedCommand: undefined }
         : deps.getPluginManager().expandSlashCommand(text);
-      const baseEffectiveText = !hasNative && mode === 'plugin_development'
-        ? `${expandedText}\n\n${pluginDevelopmentBrief}`
-        : expandedText;
+      const baseEffectiveText = expandedText;
       const chips = !hasNative && terminalContexts?.length ? terminalContexts : undefined;
       let effectiveText = baseEffectiveText;
       if (chips) {

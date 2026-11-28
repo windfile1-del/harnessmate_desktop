@@ -1,3 +1,5 @@
+import { openContractPage } from '../api/plugin-navigation';
+import { withPluginDevelopmentContext } from '../api/client';
 import type { TriageSnoozeExpired } from '@harnessmate/protocol';
 import { showSessionNotification } from '../lib/desktop-notifications';
 import type {
@@ -218,10 +220,8 @@ export interface AppState {
   focusedTurn: { sessionId: string; turnId: string; itemId?: string } | null;
   openPluginPanel: (key: string) => void;
   focusTurn: (target: AppState['focusedTurn']) => void;
-  pluginCatalog: PluginCatalogItem[];
   slashCommands: Array<PluginSlashCommand & { pluginId: string; pluginName: string }>;
   mcpPresets: Array<PluginMcpPreset & { pluginId: string; pluginName: string }>;
-  pluginsDir: string;
   searchPageInitialQuery: string;
   searchPageTargetInstanceId: string | null;
   importPageTargetInstanceId: string | null;
@@ -240,7 +240,8 @@ export interface AppState {
   searchQuery: string;
   selectedSessionId: string | null;
   activePluginPage: string | null;
-  setActivePluginPage: (page: string | null) => void;
+  activePluginPageContext: Record<string, unknown>;
+  setActivePluginPage: (page: string | null, context?: Record<string, unknown>) => void;
 
   eventsBySession: Record<string, CanonicalEvent[]>;
   turnItemsBySession: Record<string, TurnBlockRecord[]>;
@@ -344,12 +345,6 @@ export interface AppState {
       signal?: AbortSignal;
     },
   ) => Promise<ServiceResolutionV1>;
-  installPlugin: (req: InstallPluginRequest) => Promise<void>;
-  togglePlugin: (id: string, enabled: boolean) => Promise<void>;
-  reloadPlugins: () => Promise<void>;
-  restorePluginComposition: (source: 'previous' | 'builtin' | 'empty') => Promise<void>;
-  rollbackPlugin: (id: string) => Promise<void>;
-  uninstallPlugin: (id: string) => Promise<void>;
 
   refreshMcpServers: (scope?: HarnessServiceScope) => Promise<void>;
   addMcpServer: (req: AddMcpServerRequest, scope?: HarnessServiceScope) => Promise<Array<{ harnessId: string; ok: boolean; message: string }>>;
@@ -675,10 +670,8 @@ export const useAppStore = create<AppState>((set, get) => {
     focusedTurn: null,
     openPluginPanel: (key) => set({ selectedPluginPanel: key, inspectorTab: 'plugins', inspectorOpen: true }),
     focusTurn: (focusedTurn) => set({ focusedTurn }),
-    pluginCatalog: [],
     slashCommands: [],
     mcpPresets: [],
-    pluginsDir: '',
     searchPageInitialQuery: '',
     searchPageTargetInstanceId: null,
     importPageTargetInstanceId: null,
@@ -696,7 +689,8 @@ export const useAppStore = create<AppState>((set, get) => {
     searchQuery: '',
     selectedSessionId: null,
     activePluginPage: null,
-    setActivePluginPage: (activePluginPage) => set({ activePluginPage }),
+    activePluginPageContext: {},
+    setActivePluginPage: (activePluginPage, context) => set({ activePluginPage, activePluginPageContext: context ?? {} }),
 
     eventsBySession: {},
     turnItemsBySession: {},
@@ -1366,10 +1360,8 @@ export const useAppStore = create<AppState>((set, get) => {
       set({
         plugins: pRes.plugins,
         emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
         slashCommands: pRes.slashCommands,
         mcpPresets: pRes.mcpPresets,
-        pluginsDir: pRes.pluginsDir,
         serviceResolutionsByKey: {},
       });
       void get().refreshCompositionBindings(get().selectedWorkspaceId ?? undefined).catch(() => {});
@@ -1478,96 +1470,6 @@ export const useAppStore = create<AppState>((set, get) => {
         kind: 'success',
         title: instanceId ? '已更新会话能力绑定' : '已恢复会话默认能力绑定',
       });
-    },
-
-    installPlugin: async (req) => {
-      const pRes = await daemonApi.installPlugin(req);
-      set({
-        plugins: pRes.plugins,
-        emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
-        slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets,
-        pluginsDir: pRes.pluginsDir,
-        serviceResolutionsByKey: {},
-        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
-      });
-      get().pushToast({ kind: 'success', title: '插件已安装' });
-    },
-
-    togglePlugin: async (id, enabled) => {
-      const pRes = await daemonApi.togglePlugin(id, enabled);
-      set({
-        plugins: pRes.plugins,
-        emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
-        slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets,
-        serviceResolutionsByKey: {},
-        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
-      });
-      get().pushToast({ kind: 'info', title: enabled ? '已启用插件' : '已停用插件' });
-    },
-
-    reloadPlugins: async () => {
-      const pRes = await daemonApi.reloadPlugins();
-      set({
-        plugins: pRes.plugins,
-        emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
-        slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets,
-        serviceResolutionsByKey: {},
-        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
-      });
-      const failures = pRes.plugins.filter((plugin) => plugin.loadError);
-      get().pushToast(failures.length
-        ? { kind: 'warning', title: '部分插件加载异常', body: failures.map((plugin) => plugin.name).join('、') }
-        : { kind: 'success', title: '插件已热重载' });
-    },
-
-    restorePluginComposition: async (source) => {
-      const result = await daemonApi.restorePluginComposition(source);
-      set({
-        plugins: result.plugins,
-        emptyComposition: Boolean(result.emptyComposition),
-        pluginCatalog: result.catalog,
-        slashCommands: result.slashCommands,
-        mcpPresets: result.mcpPresets,
-        serviceResolutionsByKey: {},
-        ...(result.harnesses ? { harnesses: result.harnesses } : {}),
-      });
-      get().pushToast({
-        kind: 'success',
-        title: source === 'empty' ? '已进入空业务组合恢复模式' : '组合配置已恢复',
-      });
-    },
-
-    rollbackPlugin: async (id) => {
-      const pRes = await daemonApi.rollbackPlugin(id);
-      set({
-        plugins: pRes.plugins,
-        emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
-        slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets,
-        serviceResolutionsByKey: {},
-        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
-      });
-      get().pushToast({ kind: 'success', title: '已切换到上一版插件' });
-    },
-    uninstallPlugin: async (id) => {
-      const pRes = await daemonApi.uninstallPlugin(id);
-      set({
-        plugins: pRes.plugins,
-        emptyComposition: Boolean(pRes.emptyComposition),
-        pluginCatalog: pRes.catalog,
-        slashCommands: pRes.slashCommands,
-        mcpPresets: pRes.mcpPresets,
-        serviceResolutionsByKey: {},
-        ...(pRes.harnesses ? { harnesses: pRes.harnesses } : {}),
-      });
-      get().pushToast({ kind: 'info', title: '已卸载外部插件' });
     },
 
     refreshMcpServers: async (scope) => {
@@ -1953,7 +1855,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     sendTurn: async (sessionId, text, attachments, options) => {
       try {
-        await daemonApi.sendTurn(sessionId, text, attachments, options);
+        await daemonApi.sendTurn(sessionId, await withPluginDevelopmentContext(text, options?.mode), attachments, options);
         const { session } = await daemonApi.getSession(sessionId);
         set((state) => ({
           sessions: state.sessions.map((s) => (s.id === sessionId ? session : s)),

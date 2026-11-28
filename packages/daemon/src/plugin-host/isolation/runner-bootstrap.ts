@@ -373,6 +373,8 @@ function buildContext(handshake) {
     },
     runtime: {
       trustedLocal: handshake.trustedLocal === true,
+      dataDirectory: handshake.dataDirectory,
+      requestHost(request) { return rpcCall('runtime.requestHost', request || {}); },
       async spawnCli(spec) {
         const spawned = await rpcCall('runtime.spawnCli', spec || {});
         const processId = spawned.processId;

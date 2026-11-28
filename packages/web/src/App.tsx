@@ -27,6 +27,7 @@ export function App() {
     <SlotRegistryProvider>
       <KernelSlotSync />
       <ApplicationEntryHost />
+      <a href="#kernel-recovery" aria-label="打开内核恢复" className="fixed bottom-1 right-2 z-50 rounded bg-[var(--bg-surface)] px-2 text-xs text-[var(--text-muted)]">恢复</a>
     </SlotRegistryProvider>
   );
 }

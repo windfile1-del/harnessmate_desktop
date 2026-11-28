@@ -7,7 +7,10 @@ export const pluginDevelopmentBrief = `
 - 浏览器面板可以从插件中心的「浏览器预览」模板开始。在权限中声明 browser:preview，用 harnessMate.browser.onFrame 显示画面，再执行 await harnessMate.browser.open({ url, width, height })。接收本机、局域网和远程 HTTP(S) 页面。完整接口见 docs/plugin-browser-preview.md。
 - 独立工作页使用 workspace.pages，从侧栏进入主工作区。需要本地 HTTP 服务或原生进程时，使用「浏览器工作页（本地后端）」脚手架。后端在 apply 中启动并等待就绪，用 ctx.effect 登记清理，用 ctx.slots.register 的 onMessage 处理页面请求。页面通过 window.harnessMate.sendToPlugin 调用当前运行实例。
 - 自定义右侧文件预览使用「Markdown 文件预览」脚手架。声明 contributes.filePreview.extensions 和 file:preview，导出 renderFilePreview(file) 返回版本 1 的 Markdown 或文本。安装后为工作区授权，再在组合中选择提供方。返回 null 或切回内置文本可使用原预览。
-- 需要直接使用 Node 系统能力时，请用户在插件中心「开发」页选择源码目录并点击「关联并信任」。可信运行属于该本地目录的授权。在代码里检查 ctx.runtime.trustedLocal；权限不足时提示用户授权，宿主缺少接口时说明所需的 SDK 扩展点。插件清单和构建器不会授予可信运行。浏览器桥和模型工具使用各自的授权。
+- 需要直接使用 Node 系统能力时，请用户在插件中心「开发」页选择源码目录并点击「关联并信任」。可信运行属于该本地目录的授权。在代码里检查 ctx.runtime.trustedLocal；权限不足时提示用户授权，宿主缺少接口时说明所需的 SDK 扩展点。构建通过后安装开发修订时，首次关联需明确确认来源信任；同一 ID 与真实源码目录的后续热加载沿用已授权信任，支持撤销。浏览器桥和模型工具使用各自的授权。
 - 需要事件、存储或服务时，再添加隔离入口 main: "index.mjs" 和对应权限。使用已有 SDK 与运行时，避免向宿主注入脚本。无需入口的 HTML 面板可以使用纯声明式清单。
-- 在插件中心的「开发」页选择源码目录并关联，保存文件会热重载。也可以通过「安装」选择插件目录并先预览。若声明了额外权限，提示用户在插件中心授权。交付时提供源码目录、可见入口和验证步骤。
+- 在AI 插件开发工具页选择源码目录并关联，保存文件会热重载。也可以通过「安装」选择插件目录并先预览。若声明了额外权限，提示用户在插件中心授权。交付时提供源码目录、可见入口和验证步骤。
+- SDK 公共入口：页面使用 bridge.navigation / contributions / surfaces，设置由 contributes.settings + settingsVersion 或 harness.settings 视图声明；管理通过 /api/v1/plugins 的公开安装/修订/实例/绑定 API，不导入宿主私有 store。
+- 开发工具实例拥有任务、模板和诊断；POST /api/v1/plugin-instances/:id/routes/tasks 开始生成，GET /tasks/:taskId 重连，POST /tasks/:taskId/cancel 取消。通过四步诊断后安装开发修订，预览声明页面、选择实例或绑定，再保存文件热加载。坏修订保留上一可用修订；可停用、回退包或恢复组合。
+- 只将本段作为当前用户消息的模式上下文；不替换系统提示词，退出插件开发模式后不再附加。
 [插件开发模式结束]`.trim();

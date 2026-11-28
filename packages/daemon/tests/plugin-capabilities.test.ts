@@ -47,7 +47,7 @@ it('authorizes V3 actions and model tools by workspace and revision, and rebinds
     expect((await post('/api/v1/plugins/install', { mode: 'catalog', catalogId: pluginId })).statusCode).toBe(201);
     const manifest = PluginManifestSchema.parse(installed());
     const originalDigest = installed().packageDigest;
-    expect((await post('/api/v1/plugins/preview/program', { manifest, programId: 'unique_lines', text: 'beta\nalpha\nbeta' })).json())
+    expect((await post('/api/v1/plugin-instances/hm.plugin.developer-tools/routes/preview/program', { manifest, programId: 'unique_lines', text: 'beta\nalpha\nbeta' })).json())
       .toEqual({ output: 'alpha\nbeta' });
     expect((await status(session)).pluginActions.find(({ command }: { command: string }) => command === 'unique-lines').reason).toContain('授权');
     expect((await action(session, 'unique-lines', 'b\na\nb')).statusCode).toBe(400);

@@ -40,7 +40,9 @@
     "session.handoff.v1": "handoff",
     "session.collaboration.v1": "hm.plugin.session-explorer",
     "session.orchestration.v1": "hm.plugin.multi-harness-orchestrator",
-    "session.compression.v1": "hm.plugin.context-compression"
+    "session.compression.v1": "hm.plugin.context-compression",
+    "management.view.v1": "hm.plugin.management-default",
+    "developer.tools.v1": "hm.plugin.developer-tools"
   },
   "optionalDisabled": [
     "hm.plugin.multi-harness-orchestrator",

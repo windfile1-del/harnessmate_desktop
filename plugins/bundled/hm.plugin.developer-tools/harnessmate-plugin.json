@@ -1,0 +1,31 @@
+{
+  "id": "hm.plugin.developer-tools",
+  "name": "AI 插件开发工具",
+  "version": "1.0.0",
+  "description": "AI 插件开发工具：普通可替换插件",
+  "category": "ui",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "runtime/index.mjs",
+  "provides": [
+    "developer.tools.v1"
+  ],
+  "permissions": [
+    "session:send",
+    "storage:plugin"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "developer-tools",
+        "title": "AI 插件开发工具",
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs",
+        "order": 20
+      }
+    ]
+  }
+}

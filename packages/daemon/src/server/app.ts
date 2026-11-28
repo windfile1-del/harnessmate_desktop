@@ -1,3 +1,4 @@
+import { registerPluginSettings } from './routes/plugin-settings.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import cors from '@fastify/cors';
@@ -8,9 +9,6 @@ import {
   AgyAuthLogoutRequestSchema,
   AgyAuthRespondRequestSchema,
   type AgyProfileConfig,
-  BuilderV2AuditRequestSchema,
-  BuilderV2GenerateRequestSchema,
-  BuilderV2InstallRequestSchema,
   CreateCustomRiskRuleRequestSchema,
   CreateSessionRequestSchema,
   CreateTerminalContextChipRequestSchema,
@@ -23,7 +21,6 @@ import {
   FailoverRequestSchema,
   ForkSessionRequestSchema,
   GcCheckpointsRequestSchema,
-  GeneratePluginDraftRequestSchema,
   GitCommitRequestSchema,
   GitCreatePrRequestSchema,
   GitDiscardFileRequestSchema,
@@ -42,7 +39,6 @@ import {
   ResolveApprovalRequestSchema,
   RevertCheckpointRequestSchema,
   RunHarnessCommandRequestSchema,
-  ScaffoldPluginRequestSchema,
   SendToSubagentRequestSchema,
   SendTurnRequestSchema,
   SideChatPromoteRequestSchema,
@@ -57,8 +53,8 @@ import {
   UpdateSessionRequestSchema,
   PluginPanelQuerySchema,
   PluginUiMessageRequestSchema,
-  PreviewPluginProgramRequestSchema,
-  ReplayPluginDraftRequestSchema,
+  PluginDataPanelSchema,
+  PluginProjectionSchema,
   RunPluginActionRequestSchema,
   SetPluginPermissionRequestSchema,
   UploadAttachmentRequestSchema,
@@ -123,15 +119,11 @@ import {
 import type { AgyNativeFeatureFlags } from '../harnesses/agy/native/wiring/types.js';
 import type { HarnessAdapter } from '../harnesses/types.js';
 import { PluginManager, PluginRevisionConflictError } from '../plugins/plugin-manager.js';
-import { PluginAuthoring } from '../plugins/plugin-authoring.js';
-import { PluginBuilderV2 } from '../plugins/plugin-builder-v2.js';
-import { auditPluginPackage } from '../plugins/plugin-static-audit.js';
 import { readPluginPanel } from '../plugins/plugin-panels.js';
 import { PluginCapabilities } from '../plugins/plugin-capabilities.js';
 import { registerHarnessIntegrationCompat } from './routes/harness-integration-compat.js';
 import { invalidateAccountUsage } from '../plugin-host/builtin/harness-integration.js';
 import { pluginMcpPath, registerPluginMcp } from '../plugins/plugin-mcp.js';
-import { runPluginProgram } from '../plugins/plugin-program.js';
 import { perfDiagnostics } from '../core/perf-diagnostics.js';
 import { SANDBOX_IFRAME_CSP, buildSandboxedPluginHtml, resolvePluginUiAsset } from '../plugins/plugin-ui.js';
 import { GLOBAL_WORKSPACE_SCOPE, PluginPermissionService } from '../plugin-host/permissions/permissions.js';
@@ -335,11 +327,16 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
         disposeSessionHandles: (sessionId) => sessionManager.disposeSessionHandles(sessionId),
       },
     ),
-    { store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
+    { getInstanceConfig: id => config.pluginConfig?.[id], requestHost: async (input) => {
+        const response = await app.inject({ method: (input.method ?? 'GET') as import('fastify').HTTPMethods,
+          url: input.path, payload: input.body as Record<string, unknown> | undefined,
+          remoteAddress: '127.0.0.1', headers: { host: '127.0.0.1', 'content-type': 'application/json' } });
+        const value = response.json();
+        if (response.statusCode >= 400) throw new PluginApiError(value.code ?? 'E_INVALID_INPUT', value.error ?? `HTTP ${response.statusCode}`);
+        return value;
+      }, store, permissions: pluginPermissions, pluginSecrets, crashPolicy: opts.pluginCrashPolicy, safeMode: opts.pluginSafeMode,
       bundledPluginsDir: opts.bundledPluginsDir, onDevReload: () => wsGateway.notifyPluginsChanged() },
   );
-  const pluginAuthoring = new PluginAuthoring(registry);
-  const pluginBuilderV2 = new PluginBuilderV2(paths.dataDir, registry, pluginAuthoring, pluginManager);
 
   let boundPort = config.port;
   const outboxWorker = new EffectOutboxWorker(store);
@@ -519,8 +516,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     setTimeout(() => {
       void (async () => {
         wsGateway.close();
-        pluginAuthoring.cancel();
-        pluginBuilderV2.cancel();
+
+
         await terminalWorkspace.disposeAll();
         await sessionManager.shutdown();
         await app.close();
@@ -901,6 +898,7 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
   });
 
   app.get('/api/v1/plugins', async () => buildPluginPayload());
+  registerPluginSettings(app, pluginManager, config, paths, () => wsGateway.notifyPluginsChanged());
   app.get('/api/v1/plugins/services', async (request) => {
     const { contract } = request.query as { contract?: string };
     return { providers: pluginManager.listServiceProviders(typeof contract === 'string' && contract.trim() ? contract.trim() : undefined) };
@@ -1040,30 +1038,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
       return reply.code(400).send({
         error: error instanceof Error ? error.message : String(error),
         code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
-      });
-    }
-  });
-
-  app.post('/api/v1/plugins/scaffold', async (request, reply) => {
-    const parsed = ScaffoldPluginRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({
-        error: parsed.error.issues[0]?.message ?? '插件脚手架参数无效',
-        code: 'E_INVALID_INPUT',
-      });
-    }
-    try {
-      const result = await pluginManager.scaffoldPlugin(parsed.data);
-      return reply.code(201).send({
-        dirPath: result.dirPath,
-        files: result.files,
-        ...(await updatedPlugins()),
-      });
-    } catch (error) {
-      const code = error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT';
-      return reply.code(code === 'E_CONFLICT' ? 409 : 400).send({
-        error: error instanceof Error ? error.message : String(error),
-        code,
       });
     }
   });
@@ -1504,128 +1478,6 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     }
   });
 
-  app.post('/api/v1/plugins/generate', async (request, reply) => {
-    const parsed = GeneratePluginDraftRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: '请输入需求并选择工作区与 Harness' });
-    const workspace = store.getWorkspace(parsed.data.workspaceId);
-    if (!workspace) return reply.code(404).send({ error: '工作区不存在' });
-    const abort = new AbortController();
-    const disconnect = () => abort.abort(new Error('插件生成请求已取消'));
-    reply.raw.once('close', disconnect);
-    try {
-      const editing = parsed.data.editing;
-      const base = editing && pluginManager.getAuthoringBase(editing.id, editing.digest);
-      const manifest = await pluginAuthoring.generate(parsed.data, workspace.rootPath, abort.signal, base);
-      if (editing) pluginManager.getAuthoringBase(editing.id, editing.digest);
-      pluginManager.validateManifest(manifest);
-      return { manifest };
-    } catch (error) {
-      return reply.code(error instanceof PluginRevisionConflictError ? 409 : 400).send({ error: error instanceof Error ? error.message : String(error) });
-    } finally {
-      reply.raw.off('close', disconnect);
-    }
-  });
-
-  app.post('/api/v1/plugins/builder-v2/generate', async (request, reply) => {
-    const parsed = BuilderV2GenerateRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({
-        error: parsed.error.issues[0]?.message ?? '请提供完整的插件需求、工作区与 Harness',
-        code: 'E_INVALID_INPUT',
-      });
-    }
-    const workspace = store.getWorkspace(parsed.data.workspaceId);
-    if (!workspace) return reply.code(404).send({ error: '工作区不存在' });
-    const abort = new AbortController();
-    const disconnect = () => abort.abort(new Error('AI Plugin Builder v2 请求已取消'));
-    reply.raw.once('close', disconnect);
-    try {
-      const result = await pluginBuilderV2.generate(parsed.data, workspace.rootPath, abort.signal);
-      return result;
-    } catch (error) {
-      const status =
-        error instanceof PluginRevisionConflictError
-          ? 409
-          : error instanceof PluginApiError && error.code === 'E_PERMISSION_DENIED'
-            ? 403
-            : 400;
-      return reply.code(status).send({
-        error: error instanceof Error ? error.message : String(error),
-        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
-      });
-    } finally {
-      reply.raw.off('close', disconnect);
-    }
-  });
-
-  app.post('/api/v1/plugins/builder-v2/audit', async (request, reply) => {
-    const parsed = BuilderV2AuditRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: '无效的代码包审计参数', code: 'E_INVALID_INPUT' });
-    }
-    const audit = auditPluginPackage(parsed.data.files, parsed.data.manifest);
-    return { audit };
-  });
-
-  app.post('/api/v1/plugins/builder-v2/install', async (request, reply) => {
-    const parsed = BuilderV2InstallRequestSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({
-        error: parsed.error.issues[0]?.message ?? '无效的 Builder v2 安装参数',
-        code: 'E_INVALID_INPUT',
-      });
-    }
-    try {
-      const res = await pluginBuilderV2.installDraft(parsed.data);
-      return reply.code(201).send({
-        ...(await updatedPlugins()),
-        installedId: res.installedId,
-        installMode: res.installMode,
-        dirPath: res.dirPath,
-      });
-    } catch (error) {
-      const status =
-        error instanceof PluginRevisionConflictError
-          ? 409
-          : error instanceof PluginApiError && error.code === 'E_PERMISSION_DENIED'
-            ? 403
-            : 400;
-      return reply.code(status).send({
-        error: error instanceof Error ? error.message : String(error),
-        code: error instanceof PluginApiError ? error.code : 'E_INVALID_INPUT',
-      });
-    }
-  });
-
-  app.post('/api/v1/plugins/preview/replay', async (request, reply) => {
-    const parsed = ReplayPluginDraftRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: '仅支持符合 SDK 的声明式面板草稿' });
-    const { manifest, sessionId, panelId, query } = parsed.data;
-    const session = sessionManager.getSession(sessionId);
-    if (!session) return reply.code(404).send({ error: '历史会话不存在' });
-    try {
-      pluginManager.validateManifest(manifest);
-      const panel = manifest.contributes.dataPanels?.find(({ id }) => id === panelId);
-      const projection = manifest.contributes.projections?.find(({ id }) => id === panel?.projection);
-      if (!panel || !projection) return reply.code(404).send({ error: '找不到草稿面板' });
-      return readPluginPanel(store, session, panel, projection, query);
-    } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
-    }
-  });
-
-  app.post('/api/v1/plugins/preview/program', async (request, reply) => {
-    const parsed = PreviewPluginProgramRequestSchema.safeParse(request.body);
-    if (!parsed.success) return reply.code(400).send({ error: '处理程序预览参数无效' });
-    const { manifest, programId, text } = parsed.data;
-    try {
-      pluginManager.validateManifest(manifest);
-      const program = manifest.contributes.programs?.find(({ id }) => id === programId);
-      if (!program) return reply.code(404).send({ error: '找不到草稿处理程序' });
-      return { output: runPluginProgram(program, text) };
-    } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
-  });
-
   app.post('/api/v1/plugins/:id/rollback', async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
@@ -1798,6 +1650,18 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     } catch (err) {
       return sendPluginError(reply, err, 400);
     }
+  });
+
+  app.post('/api/v1/sessions/:id/turn-projection', async (request, reply) => {
+    const session = sessionManager.getSession((request.params as { id: string }).id);
+    if (!session) return reply.code(404).send({ error: '会话不存在' });
+    const body = request.body as { panel: unknown; projection: unknown; query: unknown };
+    try {
+      const panel = PluginDataPanelSchema.parse(body.panel);
+      const projection = PluginProjectionSchema.parse(body.projection);
+      const query = PluginPanelQuerySchema.parse(body.query ?? {});
+      return readPluginPanel(store, session, panel, projection, query);
+    } catch (error) { return reply.code(400).send({ error: String(error) }); }
   });
 
   app.get('/api/v1/sessions/:id/events', async (request, reply) => {
@@ -2759,8 +2623,8 @@ export function createDaemon(opts: CreateDaemonOptions = {}): DaemonInstance {
     async stop() {
       nativeWsGateway.close();
       wsGateway.close();
-      pluginAuthoring.cancel();
-      pluginBuilderV2.cancel();
+
+
       await terminalWorkspace.disposeAll();
       await sessionManager.shutdown();
       await app.close();

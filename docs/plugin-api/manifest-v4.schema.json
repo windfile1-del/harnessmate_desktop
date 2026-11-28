@@ -921,16 +921,12 @@
                     "enum": [
                       "string",
                       "number",
-                      "boolean"
+                      "boolean",
+                      "object",
+                      "array"
                     ]
                   },
-                  "default": {
-                    "type": [
-                      "string",
-                      "number",
-                      "boolean"
-                    ]
-                  },
+                  "default": {},
                   "description": {
                     "type": "string",
                     "maxLength": 240
@@ -944,6 +940,10 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "settingsVersion": {
+              "type": "integer",
+              "exclusiveMinimum": 0
             },
             "uiSlots": {
               "type": "array",

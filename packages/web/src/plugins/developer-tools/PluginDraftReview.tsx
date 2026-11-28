@@ -15,10 +15,10 @@ import {
   XCircle,
 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
-import { daemonApi, type PluginPreview } from '../api/client';
-import { pluginEventLabels } from '../lib/plugin-panels';
-import { useAppStore } from '../stores/app-store';
-import { PluginPanelView } from './PluginDataPanel';
+import { daemonApi, type PluginPreview } from '../../api/client';
+import { pluginEventLabels } from '../../lib/plugin-panels';
+import { useManagementStore as useAppStore } from '../management/store';
+import { PluginPanelView } from '../../components/PluginPanelView';
 
 function entries(manifest?: PluginManifest) {
   const registry = new Map<string, { label: string; value: unknown }>();
@@ -125,9 +125,9 @@ function ChangeValue({ label, value }: { label: string; value: unknown }) {
 }
 
 function PluginDraftReplay({ manifest, workspaceId }: { manifest: PluginManifest; workspaceId: string }) {
-  const sessions = useAppStore((state) => state.sessions);
-  const workspaces = useAppStore((state) => state.workspaces);
-  const selectedSessionId = useAppStore((state) => state.selectedSessionId);
+  const sessions = useAppStore().sessions;
+  const workspaces = useAppStore().workspaces;
+  const selectedSessionId = useAppStore().selectedSessionId;
   const [history, setHistory] = useState<Session[]>();
   const [historyError, setHistoryError] = useState('');
   const [chosenSession, setChosenSession] = useState('');
@@ -464,7 +464,7 @@ export function PluginBuilderV2Review({
               checked={installMode === 'local_install'}
               onChange={() => onInstallModeChange('local_install')}
             />
-            <span>正式安装并热加载（签名隔离目录）</span>
+            <span>正式安装并热加载（受限沙箱）</span>
           </label>
           <label className="flex cursor-pointer items-center gap-1.5">
             <input
@@ -486,7 +486,7 @@ export function PluginBuilderV2Review({
             onChange={(e) => onTrustCodeChange(e.target.checked)}
           />
           <span>
-            我已审阅上述代码文件与权限分级，并信任此代码插件在 Node 受限沙箱中运行。
+            {installMode === 'dev_link' ? '我已审阅并信任此源码目录。此后保存的代码将以当前用户权限运行，可访问文件、网络和进程；可在开发页撤销信任。' : '我已审阅上述代码文件与权限分级，并信任此代码插件在 Node 受限沙箱中运行。'}
           </span>
         </label>
 

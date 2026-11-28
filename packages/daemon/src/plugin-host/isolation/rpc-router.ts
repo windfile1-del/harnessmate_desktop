@@ -78,6 +78,7 @@ export interface PluginLogEntry {
 }
 
 export interface PluginRouterDeps {
+  requestHost?: (instanceId: string, runId: string, request: { method?: string; path: string; body?: unknown }) => Promise<unknown>;
   store: HarnessMateStore;
   host: PluginHost;
   permissions: PluginPermissionService;
@@ -476,6 +477,18 @@ export class IsolatedPluginRpcRouter {
     if (!plugin) throw new PluginApiError('E_STALE_RUN', '插件未加载');
 
     switch (method) {
+      case 'runtime.requestHost': {
+        if (!this.deps.requestHost) throw new PluginApiError('E_NOT_SUPPORTED', 'Local host transport unavailable');
+        const path = String(params.path ?? '');
+        if (!path.startsWith('/api/v1/') || path.includes('..') || path.includes('\\')) {
+          throw new PluginApiError('E_INVALID_INPUT', 'Expected an absolute /api/v1/ path');
+        }
+        const result = await this.deps.requestHost(instanceId, meta.runId, {
+          method: String(params.method ?? 'GET'), path, body: params.body,
+        });
+        if (!this.deps.isCurrentRun(instanceId, meta.runId)) throw new PluginApiError('E_STALE_RUN', 'Retired plugin request');
+        return result;
+      }
       case 'log': {
         const level = params.level === 'debug' || params.level === 'warn' || params.level === 'error' ? params.level : 'info';
         this.appendLog({

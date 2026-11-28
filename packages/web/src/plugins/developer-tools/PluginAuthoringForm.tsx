@@ -8,8 +8,8 @@ import type {
 } from '@harnessmate/protocol';
 import { FolderOpen, Sparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { daemonApi, type PluginPreview } from '../api/client';
-import { useAppStore } from '../stores/app-store';
+import { daemonApi, type PluginPreview } from '../../api/client';
+import { useManagementStore as useAppStore } from '../management/store';
 import { PluginBuilderV2Review, PluginDraftReview } from './PluginDraftReview';
 
 const field = 'min-w-0 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 py-1.5 text-[var(--text-primary)]';
@@ -23,11 +23,12 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
   initialTier?: PluginBuilderTier;
   onInstalled: () => void;
 }) {
-  const { workspaces, harnesses, sessions, selectedSessionId, selectedWorkspaceId, installPlugin, refreshPlugins } = useAppStore();
+  const { developerInstanceId, previewPage, workspaces, harnesses, sessions, selectedSessionId, selectedWorkspaceId, installPlugin, refreshPlugins } = useAppStore();
   const selected = sessions.find(({ id }) => id === selectedSessionId);
   const [workspaceId, setWorkspaceId] = useState(selected?.workspaceId ?? selectedWorkspaceId ?? workspaces[0]?.id ?? '');
   const [harnessId, setHarnessId] = useState(selected?.harnessId ?? harnesses.find((harness) => harness.health === 'ready')?.id ?? harnesses[0]?.id ?? '');
   const [model, setModel] = useState(selected?.model ?? '');
+  const [closePolicy, setClosePolicy] = useState<'cancel' | 'background'>('cancel');
   const [description, setDescription] = useState('');
   const [builderTier, setBuilderTier] = useState<PluginBuilderTier>(initialTier ?? (editing ? 'tier1' : 'auto'));
   const [builderTemplate, setBuilderTemplate] = useState<PluginBuilderTemplate>('isolated');
@@ -40,6 +41,7 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
   const [trustCode, setTrustCode] = useState(false);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  const [installed, setInstalled] = useState<Awaited<ReturnType<typeof daemonApi.installPluginV2>>>();
   const generation = useRef<AbortController | null>(null);
   useEffect(() => () => generation.current?.abort(), []);
 
@@ -85,7 +87,7 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
           model: model || undefined,
           previous,
           editing: editing && editingDigest ? { id: editing.manifest.id, digest: editingDigest } : undefined,
-        }, controller.signal);
+        }, controller.signal, developerInstanceId, closePolicy);
         setManifestJson(JSON.stringify(manifest, null, 2));
         const request = {
           mode: 'manifest',
@@ -106,7 +108,9 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
         ...(builderTier === 'tier2' ? { template: builderTemplate } : {}),
         previous: previous as Record<string, unknown> | undefined,
         maxAttempts: 3,
-      }, controller.signal);
+        pluginId: editing?.manifest.id,
+        name: editing?.manifest.name,
+      }, controller.signal, developerInstanceId, closePolicy);
 
       if (v2Result.tierUsed === 'tier1' && v2Result.manifest) {
         const manifest = v2Result.manifest as unknown as PluginManifest;
@@ -140,19 +144,26 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
 
   const installV2 = () => run('正在安装验证通过的插件…', async () => {
     if (!builderV2Result?.digest) throw new Error('缺少已验证插件包摘要');
-    await daemonApi.installPluginV2({
+    const installed = await daemonApi.installPluginV2({
       draftId: builderV2Result.draftId,
       files: builderV2Result.files,
       expectedDigest: builderV2Result.digest,
       trustCode,
       installMode: installModeV2,
-    });
+    }, developerInstanceId);
+    setInstalled(installed);
     await refreshPlugins();
     onInstalled();
   });
 
   return (
     <div className="space-y-4 text-[12px] text-[var(--text-secondary)]">
+      {installed && <section className="space-y-2 rounded border p-3"><p>已安装开发修订 · {installed.installedId}</p>
+        {installed.activation?.previewPages?.map(page => <button key={page.instanceId + page.pageId} onClick={() => void previewPage(page.instanceId, page.pageId)}>预览 {page.pageId}（{page.instanceId}）</button>)}
+        <label>选择能力绑定<select onChange={e => { if (e.target.value) void daemonApi.setCompositionBinding(e.target.value, installed.installedId).then(refreshPlugins); }}><option value="">保留当前绑定</option>{installed.plugins.find(p => p.id === installed.installedId)?.provides?.map(c => <option key={c}>{c}</option>)}</select></label>
+        <button onClick={() => void daemonApi.reloadDevPlugin(installed.installedId).then(refreshPlugins)}>重新加载此开发修订</button>
+      </section>}
+      <label>关闭页面时<select aria-label="生成关闭策略" value={closePolicy} onChange={e => setClosePolicy(e.target.value as typeof closePolicy)}><option value="cancel">取消生成</option><option value="background">后台继续，可从任务列表重连</option></select></label>
       <section className="space-y-2.5 rounded-xl border border-[var(--border-hairline)] p-3">
         <h4 className="flex items-center gap-1.5 font-medium text-[var(--text-primary)]">
           <Sparkles size={14} />
@@ -233,7 +244,7 @@ export function PluginAuthoringForm({ initialManifest, editing, initialTier, onI
                 : '生成插件'}
           </button>
           {busy === '正在生成插件…' && (
-            <button type="button" className={button} onClick={() => generation.current?.abort()}>取消生成</button>
+            <button type="button" className={button} onClick={() => generation.current?.abort('user_cancel')}>取消生成</button>
           )}
         </div>
       </section>

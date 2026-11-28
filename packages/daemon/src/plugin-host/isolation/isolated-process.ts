@@ -54,6 +54,7 @@ export interface IsolatedProcessOptions {
   pluginId: string;
   instanceId?: string;
   trustedLocal?: boolean;
+  dataDirectory?: string;
   packageRoot: string;
   entryRelativePath: string;
   packageDigest: string;
@@ -160,6 +161,7 @@ export class IsolatedPluginProcess {
       pluginApi: PLUGIN_API_VERSION,
       features: HOST_SUPPORTED_FEATURES,
       trustedLocal: this.opts.trustedLocal === true,
+      dataDirectory: this.opts.trustedLocal ? this.opts.dataDirectory : undefined,
       pluginId: this.opts.pluginId,
       instanceId: this.instanceId,
       ...(this.opts.bindings ? { bindings: this.opts.bindings } : {}),

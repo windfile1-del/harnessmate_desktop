@@ -282,6 +282,8 @@ export function createAgyDriverPlugin(
 
       const cfg = (settings ?? {}) as {
         harnessId?: string;
+        instances?: import('@harnessmate/protocol').HarnessInstanceConfig[];
+        profiles?: AgyProfileConfig[];
         profileInstanceId?: string;
         displayName?: string;
         description?: string;
@@ -427,7 +429,7 @@ export function createAgyDriverPlugin(
       // Primary instance registers default 'agy' + legacy agyProfiles + legacy harnessInstances(driverId='agy')
       let primaryAdapter: HarnessAdapter;
       if (isPrimaryInstance) {
-        const profiles = params.config.agyProfiles ?? [];
+        const profiles = cfg.profiles ?? params.config.agyProfiles ?? [];
         const overrideAgy = params.overrides?.find((candidate) => candidate.id === 'agy');
         const primaryProfile = profiles.find((p) => p.instanceId === 'agy');
         const primaryHarnessId = cfg.harnessId?.trim() || 'agy';
@@ -480,7 +482,7 @@ export function createAgyDriverPlugin(
           });
         }
 
-        for (const instance of params.config.harnessInstances ?? []) {
+        for (const instance of cfg.instances ?? params.config.harnessInstances ?? []) {
           if (instance.driverId !== 'agy' || !instance.enabled) continue;
           if (registeredEntries.has(instance.instanceId)) continue;
           const adapter = driverFactory({

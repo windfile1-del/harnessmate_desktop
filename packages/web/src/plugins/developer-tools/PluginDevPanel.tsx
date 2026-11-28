@@ -1,8 +1,8 @@
 import type { InstalledPluginInfo, PluginScaffoldTemplateDto } from '@harnessmate/protocol';
 import { FolderOpen, Hammer, Link2, RefreshCw, Terminal, Unlink } from 'lucide-react';
 import { useState } from 'react';
-import { daemonApi } from '../api/client';
-import { useAppStore } from '../stores/app-store';
+import { daemonApi } from '../../api/client';
+import { useManagementStore as useAppStore } from '../management/store';
 
 export function PluginDevPanel({
   plugins,
@@ -11,7 +11,7 @@ export function PluginDevPanel({
   plugins: InstalledPluginInfo[];
   onOpenLogs: (pluginId: string) => void;
 }) {
-  const { refreshPlugins, pushToast } = useAppStore();
+  const { developerInstanceId, refreshPlugins, pushToast } = useAppStore();
   const [devDir, setDevDir] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -118,7 +118,7 @@ export function PluginDevPanel({
         serviceName: template === 'service' ? serviceName.trim() : undefined,
         targetDir: targetDir.trim() || undefined,
         linkDevMode: linkDevMode && template !== 'browser-workspace',
-      });
+      }, developerInstanceId);
       await refreshPlugins();
       setLastCreated({ dirPath: res.dirPath, files: res.files });
       pushToast({

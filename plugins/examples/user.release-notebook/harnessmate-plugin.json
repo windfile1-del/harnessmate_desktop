@@ -1,0 +1,34 @@
+{
+  "id": "user.release-notebook",
+  "name": "发布便笺",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "main": "index.mjs",
+  "category": "ui",
+  "permissions": [
+    "storage:plugin"
+  ],
+  "provides": [
+    "example.release-notebook.v1"
+  ],
+  "contributes": {
+    "settings": {
+      "heading": {
+        "type": "string",
+        "default": "发布便笺"
+      }
+    },
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "notes",
+        "title": "发布便笺",
+        "ui": "ui/index.html"
+      }
+    ]
+  },
+  "description": "发布便笺 — B5 public plugin example"
+}

@@ -4,6 +4,8 @@ import { SESSION_DATA_DEFAULT_MANIFEST } from '../../plugins/session-data-defaul
 import { SESSION_RUNTIME_DEFAULT_MANIFEST } from '../../plugins/session-runtime-default/index.js';
 
 export const BUNDLED_PLUGIN_IDS = [
+  'hm.plugin.management-default',
+  'hm.plugin.developer-tools',
   'hm.plugin.shell-default',
   'hm.plugin.chat-default',
   'hm.plugin.agy-workbench-default',
@@ -23,6 +25,7 @@ export const BUNDLED_PLUGIN_IDS = [
 ] as const;
 
 export const BUNDLED_TRUSTED_LOCAL_IDS = new Set<string>([
+  'hm.plugin.developer-tools',
   'hm.plugin.browser-headless',
   'hm.plugin.history-source-codex',
   'hm.plugin.history-source-claude',
@@ -39,7 +42,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     author: 'HarnessMate Core',
     category: 'harness',
     provides: ['harness.driver.v1', 'harness.driver.codex.v1', 'harness.codex'],
-    contributes: { uiSlots: ['modal'] },
+    contributes: { settingsVersion: 1, settings: {"binaryPath":{"type":"string","description":"CLI 路径"},"instances":{"type":"array","description":"账号、模型和实例"},"defaultServiceTier":{"type":"string","description":"默认服务等级"}}, uiSlots: ['modal'] },
   },
   {
     id: 'core.harness.agy',
@@ -55,7 +58,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
       'agy.accounts.v1',
       'harness.agy',
     ],
-    contributes: { uiSlots: ['modal'] },
+    contributes: { settingsVersion: 1, settings: {"profiles":{"type":"array","description":"账号配置"},"instances":{"type":"array"},"binaryPath":{"type":"string"}}, uiSlots: ['modal'] },
   },
   {
     id: 'core.harness.claude',
@@ -65,7 +68,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     author: 'HarnessMate Core',
     category: 'harness',
     provides: ['harness.driver.v1', 'harness.driver.claude.v1', 'harness.claude'],
-    contributes: { uiSlots: ['modal'] },
+    contributes: { settingsVersion: 1, settings: {"binaryPath":{"type":"string"},"instances":{"type":"array"}}, uiSlots: ['modal'] },
   },
   {
     id: 'core.harness.acp',
@@ -74,7 +77,7 @@ export const BUILTIN_PLUGINS: PluginManifest[] = [
     description: '管理通过官方 ACP 协议接入的额外 CLI。',
     category: 'harness',
     provides: ['harness.driver.v1', 'harness.driver.acp.v1', 'harness.acp'],
-    contributes: {},
+    contributes: { settingsVersion: 1, settings: {"customHarnesses":{"type":"array"},"harnessId":{"type":"string"},"command":{"type":"string"},"args":{"type":"array"},"env":{"type":"object"}},},
   },
   {
     id: 'core.attachments',

@@ -291,6 +291,11 @@ export function TrustedPluginModuleHost({
     const container = containerRef.current;
     if (!container) return;
 
+    // Each run gets its own mount node. A nested React root may defer unmount
+    // during its parent's commit; clearing its children here races that commit.
+    const moduleContainer = document.createElement('div');
+    moduleContainer.className = isFullSize ? 'flex size-full min-h-0 min-w-0 flex-1 flex-col' : 'w-full';
+    container.append(moduleContainer);
     const runtime = ensureSharedPluginRuntime();
     const rpcAbort = new AbortController();
     let disposed = false;
@@ -646,7 +651,7 @@ export function TrustedPluginModuleHost({
         if (typeof mod?.mount !== 'function') {
           throw new Error(`可信模块缺少导出 mount(): ${modulePath}`);
         }
-        const cleanup = await mod.mount({ container, bridge, runtime });
+        const cleanup = await mod.mount({ container: moduleContainer, bridge, runtime });
         if (disposed || rpcAbort.signal.aborted) {
           if (typeof cleanup === 'function') cleanup();
           return;
@@ -698,7 +703,7 @@ export function TrustedPluginModuleHost({
         frontendPerfDiagnostics.adjustPluginSubscription(-1);
       }
       serviceSubscriptions.clear();
-      container.replaceChildren();
+      moduleContainer.remove();
     };
   }, [pluginId, effectiveInstanceId, pluginName, revision, slot, slotId, modulePath, registry, isFullSize]);
 

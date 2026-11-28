@@ -87,6 +87,7 @@ export function createClaudeDriverPlugin(params: {
       const activeHandles = new Set<AdapterSessionHandle>();
 
       const cfg = (settings ?? {}) as {
+        instances?: import('@harnessmate/protocol').HarnessInstanceConfig[];
         harnessId?: string;
         displayName?: string;
         description?: string;
@@ -156,7 +157,7 @@ export function createClaudeDriverPlugin(params: {
       registeredEntries.push({ harnessId: primaryWrapped.id, driverId: 'claude', adapter: primaryWrapped });
 
       if (isPrimaryInstance) {
-        for (const inst of params.config.harnessInstances ?? []) {
+        for (const inst of cfg.instances ?? params.config.harnessInstances ?? []) {
           if (inst.driverId !== 'claude' || !inst.enabled) continue;
           if (inst.instanceId === primaryWrapped.id) continue;
           const adapter = wrapClaudeLifecycle(

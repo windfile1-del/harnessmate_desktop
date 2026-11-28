@@ -1,7 +1,7 @@
 import type { InstalledPluginInfo, PluginPermission } from '@harnessmate/protocol';
 import { useEffect, useState } from 'react';
-import { daemonApi } from '../api/client';
-import { useAppStore } from '../stores/app-store';
+import { daemonApi } from '../../api/client';
+import { useManagementStore as useAppStore } from './store';
 
 const RISK_LABEL: Record<'low' | 'medium' | 'high', string> = {
   low: '低风险',

@@ -1,3 +1,4 @@
+import type { DeveloperTaskV1, PluginSettingsDescriptorV1 } from '@harnessmate/protocol';
 import type {
   AddMcpServerRequest,
   AddTrustedPublisherRequest,
@@ -332,7 +333,50 @@ function scopedHarnessUrl(path: string, scope?: HarnessServiceScope, refresh = f
   return query.size ? `${path}?${query}` : path;
 }
 
+
+export async function requestDeveloperRoute<T = unknown>(path: string, init?: RequestInit, instanceId?: string): Promise<T> {
+  if (!instanceId) {
+    const selection = await apiFetch<ServiceResolutionV1>('/api/v1/plugins/services/resolve?contract=developer.tools.v1&allowSingleCandidate=0', { signal: init?.signal });
+    if (selection.status !== 'ready' || !selection.instanceId) throw new Error('开发工具服务未绑定或已停用');
+    instanceId = selection.instanceId;
+  }
+  return apiFetch<T>('/api/v1/plugin-instances/' + encodeURIComponent(instanceId) + '/routes' + path, init);
+}
+async function generateWithTask<T>(input: unknown, kind: 'generate' | 'author', signal?: AbortSignal, explicitInstanceId?: string, closePolicy: 'cancel' | 'background' = 'cancel'): Promise<T> {
+  const selection = explicitInstanceId ? { instanceId: explicitInstanceId } : await apiFetch<ServiceResolutionV1>('/api/v1/plugins/services/resolve?contract=developer.tools.v1&allowSingleCandidate=0', { signal });
+  const instanceId = selection.instanceId;
+  if (!instanceId) throw new Error('开发工具服务不可用');
+  const taskId = crypto.randomUUID();
+  const cancel = () => { if (closePolicy !== 'cancel' && signal?.reason !== 'user_cancel') return; void requestDeveloperRoute('/tasks/' + taskId + '/cancel', { method: 'POST', body: '{}' }, instanceId).catch(() => {}); };
+  signal?.throwIfAborted(); signal?.addEventListener('abort', cancel, { once: true });
+  try {
+    // Let the fast start acknowledgement finish even if the page closes. Then
+    // repeat cancellation so a cancel request cannot race ahead of task creation.
+    await requestDeveloperRoute('/tasks', { method: 'POST', body: JSON.stringify({ taskId, kind, input, closePolicy }) }, instanceId);
+    if (signal?.aborted) { cancel(); signal.throwIfAborted(); }
+    for (;;) {
+      signal?.throwIfAborted();
+      const { task } = await requestDeveloperRoute<{ task: DeveloperTaskV1 }>('/tasks/' + taskId, { signal }, instanceId);
+      if (task.status === 'completed') return task.result as T;
+      if (task.status === 'cancelled') throw new DOMException(task.error ?? '生成已取消', 'AbortError');
+      if (task.status === 'failed') { if (task.result) return task.result as T; throw new Error(task.error ?? '生成失败'); }
+      await new Promise<void>((resolve, reject) => { const stop = () => { clearTimeout(timer); reject(signal?.reason); }; const timer = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve(); }, 200); signal?.addEventListener('abort', stop, { once: true }); });
+    }
+  } finally { signal?.removeEventListener('abort', cancel); }
+}
+export async function withPluginDevelopmentContext(text: string, mode?: string): Promise<string> {
+  if (mode !== 'plugin_development') return text;
+  const context = await requestDeveloperRoute<{ userMessage: string }>('/context');
+  return text + '\n\n' + context.userMessage;
+}
+
 export const daemonApi = {
+  developerRoute: requestDeveloperRoute,
+  listPluginSettings: () => apiFetch<{ settings: PluginSettingsDescriptorV1[] }>('/api/v1/plugins/settings'),
+  getPluginSettings: (id: string) => apiFetch<PluginSettingsDescriptorV1>('/api/v1/plugins/' + encodeURIComponent(id) + '/settings'),
+  savePluginSettings: (id: string, input: { config: Record<string, unknown>; schemaVersion?: number; expectedVersion?: string }) => apiFetch<{ settings: PluginSettingsDescriptorV1 }>('/api/v1/plugins/' + encodeURIComponent(id) + '/settings', { method: 'PUT', body: JSON.stringify(input) }),
+  getHostConfig: () => apiFetch<{ port: number; dataRoot: string }>('/api/v1/plugins/host-config'),
+  saveHostConfig: (input: { port: number; dataRoot: string }) => apiFetch<unknown>('/api/v1/plugins/host-config', { method: 'PUT', body: JSON.stringify(input) }),
   callUiService: (callerInstanceId: string, params: Record<string, unknown>, signal?: AbortSignal) =>
     apiFetch<{ resolution: ServiceResolutionV1; value: unknown }>(
       `/api/v1/plugin-instances/${encodeURIComponent(callerInstanceId)}/services/call`,
@@ -752,10 +796,10 @@ export const daemonApi = {
     ),
 
   replayPluginDraft: (req: ReplayPluginDraftRequest, signal?: AbortSignal) =>
-    apiFetch<PluginPanelSnapshot>('/api/v1/plugins/preview/replay', { method: 'POST', body: JSON.stringify(req), signal }),
+    requestDeveloperRoute<PluginPanelSnapshot>('/preview/replay', { method: 'POST', body: JSON.stringify(req), signal }),
 
   previewPluginProgram: (request: PreviewPluginProgramRequest) =>
-    apiFetch<{ output: string }>('/api/v1/plugins/preview/program', { method: 'POST', body: JSON.stringify(request) }),
+    requestDeveloperRoute<{ output: string }>('/preview/program', { method: 'POST', body: JSON.stringify(request) }),
 
   listPluginPermissions: (id: string, workspaceId: string) =>
     apiFetch<{ permissions: PluginPermission[] }>(`/api/v1/plugins/${encodeURIComponent(id)}/permissions?workspaceId=${encodeURIComponent(workspaceId)}`),
@@ -787,33 +831,10 @@ export const daemonApi = {
       { method: 'POST', body: JSON.stringify(request) },
     ),
 
-  generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal) =>
-    apiFetch<{ manifest: PluginManifest }>('/api/v1/plugins/generate', { method: 'POST', body: JSON.stringify(req), signal }),
-
-  generatePluginV2: (req: BuilderV2GenerateRequest, signal?: AbortSignal) =>
-    apiFetch<BuilderV2Result>('/api/v1/plugins/builder-v2/generate', {
-      method: 'POST',
-      body: JSON.stringify(req),
-      signal,
-    }),
-
-  auditPluginPackage: (req: BuilderV2AuditRequest) =>
-    apiFetch<{ audit: PluginStaticAuditReport }>('/api/v1/plugins/builder-v2/audit', {
-      method: 'POST',
-      body: JSON.stringify(req),
-    }),
-
-  installPluginV2: (req: BuilderV2InstallRequest) =>
-    apiFetch<
-      PluginBundleResponse & {
-        installedId: string;
-        installMode: 'local_install' | 'dev_link';
-        dirPath: string;
-      }
-    >('/api/v1/plugins/builder-v2/install', {
-      method: 'POST',
-      body: JSON.stringify(req),
-    }),
+  generatePlugin: (req: GeneratePluginDraftRequest, signal: AbortSignal, instanceId?: string, closePolicy?: 'cancel' | 'background') => generateWithTask<{ manifest: PluginManifest }>(req, 'author', signal, instanceId, closePolicy),
+  generatePluginV2: (req: BuilderV2GenerateRequest, signal?: AbortSignal, instanceId?: string, closePolicy?: 'cancel' | 'background') => generateWithTask<BuilderV2Result>(req, 'generate', signal, instanceId, closePolicy),
+  auditPluginPackage: (req: BuilderV2AuditRequest) => requestDeveloperRoute<{ audit: PluginStaticAuditReport }>('/audit', { method: 'POST', body: JSON.stringify(req) }),
+  installPluginV2: (req: BuilderV2InstallRequest, instanceId?: string) => requestDeveloperRoute<PluginBundleResponse & { installedId: string; installMode: 'local_install' | 'dev_link'; dirPath: string; activation?: { status: string; restartRequired: boolean; previewPages?: Array<{ instanceId: string; pageId: string }> } }>('/install', { method: 'POST', body: JSON.stringify(req) }, instanceId),
 
   rollbackPlugin: (id: string) =>
     apiFetch<PluginBundleResponse>(`/api/v1/plugins/${encodeURIComponent(id)}/rollback`, { method: 'POST' }),
@@ -880,11 +901,11 @@ export const daemonApi = {
       method: 'DELETE',
     }),
 
-  scaffoldPlugin: (req: ScaffoldPluginRequest) =>
-    apiFetch<PluginBundleResponse & { dirPath: string; files: string[] }>('/api/v1/plugins/scaffold', {
+  scaffoldPlugin: (req: ScaffoldPluginRequest, instanceId?: string) =>
+    requestDeveloperRoute<PluginBundleResponse & { dirPath: string; files: string[] }>('/scaffold', {
       method: 'POST',
       body: JSON.stringify(req),
-    }),
+    }, instanceId),
 
   getPluginRegistry: () =>
     apiFetch<{ registry: PluginRegistryStateDto; catalog: PluginCatalogItem[] }>('/api/v1/plugins/registry'),

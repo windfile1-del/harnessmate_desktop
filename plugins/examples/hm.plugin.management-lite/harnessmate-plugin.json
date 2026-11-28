@@ -1,0 +1,29 @@
+{
+  "id": "user.management-lite",
+  "name": "External Management Lite",
+  "version": "1.0.0",
+  "apiVersion": 4,
+  "engines": {
+    "pluginApi": "^4.0"
+  },
+  "category": "ui",
+  "main": "index.mjs",
+  "permissions": [
+    "storage:plugin"
+  ],
+  "provides": [
+    "management.view.v1"
+  ],
+  "contributes": {
+    "slots": [
+      {
+        "slot": "workspace.pages",
+        "id": "manage",
+        "title": "外部管理",
+        "ui": "ui/index.html",
+        "module": "ui/module.mjs"
+      }
+    ]
+  },
+  "description": "External Management Lite — B5 public plugin example"
+}

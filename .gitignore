@@ -22,3 +22,7 @@ plugins/bundled/hm.plugin.agy-workbench-default/ui/
 
 /plugins/bundled/hm.plugin.requests-view-default/ui/
 /plugins/bundled/hm.plugin.shell-default/ui/
+
+/plugins/bundled/hm.plugin.developer-tools/runtime/
+/plugins/bundled/hm.plugin.management-default/ui/
+/plugins/bundled/hm.plugin.developer-tools/ui/
